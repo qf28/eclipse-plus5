@@ -1,0 +1,686 @@
+commit bbbba99a3d05675d319983f726f8ea0f0628d38c
+Author: Jeff McAffer <jeff>
+Date:   Tue May 13 01:04:41 2008 +0000
+
+    Bug 230253 Installer enhancements
+
+4	4	bundles/org.eclipse.equinox.p2.installer/installer.product
+1	1	bundles/org.eclipse.equinox.p2.installer/plugin.xml
+7	16	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallApplication.java
+132	39	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
+31	14	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
+51	0	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/VersionedName.java
+40	42	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/provisional/p2/installer/InstallDescription.java
+diff --git a/bundles/org.eclipse.equinox.p2.installer/installer.product b/bundles/org.eclipse.equinox.p2.installer/installer.product
+index 898801b..e887380 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/installer.product
++++ b/bundles/org.eclipse.equinox.p2.installer/installer.product
+@@ -47,8 +47,8 @@
+       <plugin id="org.eclipse.equinox.frameworkadmin"/>
+       <plugin id="org.eclipse.equinox.frameworkadmin.equinox"/>
+       <plugin id="org.eclipse.equinox.launcher"/>
+-      <plugin id="org.eclipse.equinox.launcher.carbon.macosx"/>
+-      <plugin id="org.eclipse.equinox.launcher.gtk.linux.x86"/>
++      <plugin id="org.eclipse.equinox.launcher.carbon.macosx" fragment="true"/>
++      <plugin id="org.eclipse.equinox.launcher.gtk.linux.x86" fragment="true"/>
+       <plugin id="org.eclipse.equinox.launcher.win32.win32.x86" fragment="true"/>
+       <plugin id="org.eclipse.equinox.p2.artifact.repository"/>
+       <plugin id="org.eclipse.equinox.p2.core"/>
+@@ -69,8 +69,8 @@
+       <plugin id="org.eclipse.osgi"/>
+       <plugin id="org.eclipse.osgi.services"/>
+       <plugin id="org.eclipse.swt"/>
+-      <plugin id="org.eclipse.swt.carbon.macosx"/>
+-      <plugin id="org.eclipse.swt.gtk.linux.x86"/>
++      <plugin id="org.eclipse.swt.carbon.macosx" fragment="true"/>
++      <plugin id="org.eclipse.swt.gtk.linux.x86" fragment="true"/>
+       <plugin id="org.eclipse.swt.win32.win32.x86" fragment="true"/>
+       <plugin id="org.sat4j.core"/>
+       <plugin id="org.sat4j.pb"/>
+diff --git a/bundles/org.eclipse.equinox.p2.installer/plugin.xml b/bundles/org.eclipse.equinox.p2.installer/plugin.xml
+index e1800df..39ef657 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/plugin.xml
++++ b/bundles/org.eclipse.equinox.p2.installer/plugin.xml
+@@ -27,7 +27,7 @@
+          </property>
+          <property
+                name="aboutText"
+-               value="p2 Installer">
++               value="P2 Installer">
+          </property>
+       </product>
+    </extension>
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallApplication.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallApplication.java
+index 9b85e23..4ce0c4b 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallApplication.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallApplication.java
+@@ -7,13 +7,12 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Code 9 - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.installer;
+ 
+ import java.io.IOException;
+ import java.lang.reflect.InvocationTargetException;
+-import java.net.MalformedURLException;
+-import java.net.URL;
+ import org.eclipse.core.net.proxy.IProxyService;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.app.IApplication;
+@@ -53,13 +52,6 @@ public class InstallApplication implements IApplication {
+ 	/**
+ 	 * Throws an exception of severity error with the given error message.
+ 	 */
+-	private static CoreException fail(String message) {
+-		return fail(message, null);
+-	}
+-
+-	/**
+-	 * Throws an exception of severity error with the given error message.
+-	 */
+ 	private static CoreException fail(String message, Throwable throwable) {
+ 		return new CoreException(new Status(IStatus.ERROR, InstallerActivator.PI_INSTALLER, message, throwable));
+ 	}
+@@ -84,13 +76,8 @@ public class InstallApplication implements IApplication {
+ 	 */
+ 	private InstallDescription fetchInstallDescription(SubMonitor monitor) throws CoreException {
+ 		String site = System.getProperty(SYS_PROP_INSTALL_DESCRIPTION);
+-		if (site == null)
+-			throw fail(Messages.App_NoSite);
+ 		try {
+-			URL siteURL = new URL(site);
+-			return InstallDescriptionParser.loadFromProperties(siteURL.openStream(), monitor);
+-		} catch (MalformedURLException e) {
+-			throw fail(Messages.App_InvalidSite + site, e);
++			return InstallDescriptionParser.createDescription(site, monitor);
+ 		} catch (IOException e) {
+ 			throw fail(Messages.App_InvalidSite + site, e);
+ 		}
+@@ -201,7 +188,11 @@ public class InstallApplication implements IApplication {
+ 		IPath agentLocation = description.getAgentLocation();
+ 		if (agentLocation != null) {
+ 			String agentArea = System.getProperty("eclipse.p2.data.area"); //$NON-NLS-1$
+-			if (agentArea == null || agentArea.length() == 0)
++			// TODO a bit of a hack here.  If the value is already set and it is set to @config/p2 then 
++			// it may well be the default value put in by PDE.  Overwrite it.
++			// Its kind of unclear why we would NOT overwrite.  At this point the user set their choice
++			// of shared or standalone and those dicate where the agent should put its info...
++			if (agentArea == null || agentArea.length() == 0 || agentArea.startsWith("@config")) //$NON-NLS-1$
+ 				System.setProperty("eclipse.p2.data.area", agentLocation.toOSString()); //$NON-NLS-1$ 
+ 		}
+ 		//start up p2
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
+index 990f825..74dd163 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
+@@ -7,16 +7,17 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Code 9 - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.installer;
+ 
+ import java.io.*;
++import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+ import org.eclipse.core.runtime.Path;
+ import org.eclipse.core.runtime.SubMonitor;
+ import org.eclipse.equinox.internal.provisional.p2.installer.InstallDescription;
+-import org.osgi.framework.Version;
+ 
+ /**
+  * This class is responsible for loading install descriptions from a stream.
+@@ -32,55 +33,130 @@ public class InstallDescriptionParser {
+ 	private static final String PROP_PROFILE_NAME = "eclipse.p2.profileName";//$NON-NLS-1$
+ 	private static final String PROP_ROOT_ID = "eclipse.p2.rootId";//$NON-NLS-1$
+ 	private static final String PROP_ROOT_VERSION = "eclipse.p2.rootVersion";//$NON-NLS-1$
++	private static final String PROP_ROOTS = "eclipse.p2.roots";//$NON-NLS-1$
+ 
+ 	/**
+ 	 * Loads and returns an install description that is stored in a properties file.
+-	 * 
++	 * @param site The site of the install properties file.
+ 	 * @param stream The stream to load the install description from. The stream
+ 	 * will be closed prior to this method returning, whether the description is
+ 	 * read successfully or not.
+ 	 */
+-	public static InstallDescription loadFromProperties(InputStream stream, SubMonitor monitor) throws IOException {
+-		BufferedInputStream in = null;
++	public static InstallDescription createDescription(String site, SubMonitor monitor) throws IOException {
++		// if no description URL was given from the outside, look for an "install.properties" file 
++		// in relative to where the installer is running.  This allows the installer to be self-contained
++		InputStream in = null;
++		if (site == null) {
++			File file = new File("installer.properties").getAbsoluteFile(); //$NON-NLS-1$
++			if (file.exists())
++				in = new FileInputStream(file);
++		} else
++			in = new URL(site).openStream();
++
++		Properties properties = new Properties();
+ 		try {
+-			Properties properties = new Properties();
+-			in = new BufferedInputStream(stream);
+-			properties.load(in);
+-			InstallDescription description = new InstallDescription(properties.getProperty(PROP_PROFILE_NAME));
+-			description.setArtifactRepository(new URL(properties.getProperty(PROP_ARTIFACT_REPOSITORY)));
+-			description.setMetadataRepository(new URL(properties.getProperty(PROP_METADATA_REPOSITORY)));
+-			description.setAutoStart(Boolean.TRUE.toString().equalsIgnoreCase(properties.getProperty(PROP_IS_AUTO_START)));
+-			description.setLauncherName(properties.getProperty(PROP_LAUNCHER_NAME));
+-			String locationString = properties.getProperty(PROP_INSTALL_LOCATION);
+-			if (locationString != null)
+-				description.setInstallLocation(new Path(locationString));
+-			locationString = properties.getProperty(PROP_AGENT_LOCATION);
+-			if (locationString != null)
+-				description.setAgentLocation(new Path(locationString));
+-			locationString = properties.getProperty(PROP_BUNDLE_LOCATION);
+-			if (locationString != null)
+-				description.setBundleLocation(new Path(locationString));
+-			description.setRootId(properties.getProperty(PROP_ROOT_ID));
+-			String versionString = properties.getProperty(PROP_ROOT_VERSION);
+-			Version version = versionString == null ? null : new Version(versionString);
+-			description.setRootVersion(version);
+-
+-			//any remaining properties are profile properties
+-			Map profileProperties = new HashMap(properties);
+-			profileProperties.remove(PROP_PROFILE_NAME);
+-			profileProperties.remove(PROP_ARTIFACT_REPOSITORY);
+-			profileProperties.remove(PROP_METADATA_REPOSITORY);
+-			profileProperties.remove(PROP_IS_AUTO_START);
+-			profileProperties.remove(PROP_LAUNCHER_NAME);
+-			profileProperties.remove(PROP_AGENT_LOCATION);
+-			profileProperties.remove(PROP_BUNDLE_LOCATION);
+-			profileProperties.remove(PROP_ROOT_ID);
+-			profileProperties.remove(PROP_ROOT_VERSION);
+-			description.setProfileProperties(profileProperties);
+-			return description;
++			if (in != null)
++				properties.load(in);
+ 		} finally {
+ 			safeClose(in);
+ 		}
++		InstallDescription result = new InstallDescription();
++		result = initiailize(result, properties);
++		initializeProfileProperties(result, properties);
++
++		// now override the properties from anything interesting in system properties
++		result = initiailize(result, System.getProperties());
++		return result;
++	}
++
++	private static InstallDescription initiailize(InstallDescription description, Properties properties) {
++		String property = properties.getProperty(PROP_ARTIFACT_REPOSITORY);
++		if (property != null)
++			description.setArtifactRepositories(getURLs(property));
++
++		property = properties.getProperty(PROP_METADATA_REPOSITORY);
++		if (property != null)
++			description.setMetadataRepositories(getURLs(property));
++
++		property = properties.getProperty(PROP_IS_AUTO_START);
++		if (property != null)
++			description.setAutoStart(Boolean.TRUE.toString().equalsIgnoreCase(property));
++
++		property = properties.getProperty(PROP_LAUNCHER_NAME);
++		if (property != null)
++			description.setLauncherName(property);
++
++		property = properties.getProperty(PROP_INSTALL_LOCATION);
++		if (property != null)
++			description.setInstallLocation(new Path(property));
++
++		property = properties.getProperty(PROP_AGENT_LOCATION);
++		if (property != null)
++			description.setAgentLocation(new Path(property));
++
++		property = properties.getProperty(PROP_BUNDLE_LOCATION);
++		if (property != null)
++			description.setBundleLocation(new Path(property));
++
++		property = properties.getProperty(PROP_PROFILE_NAME);
++		if (property != null)
++			description.setProductName(property);
++
++		// Process the retro root id and rootVersion properties
++		String id = properties.getProperty(PROP_ROOT_ID);
++		if (id != null) {
++			String version = properties.getProperty(PROP_ROOT_VERSION);
++			description.setRoots(new VersionedName[] {new VersionedName(id, version)});
++		}
++
++		String rootSpec = properties.getProperty(PROP_ROOTS);
++		if (rootSpec != null) {
++			String[] rootList = getArrayFromString(rootSpec, ",");
++			VersionedName[] roots = new VersionedName[rootList.length];
++			for (int i = 0; i < rootList.length; i++)
++				roots[i] = VersionedName.parse(rootList[i]);
++			description.setRoots(roots);
++		}
++		return description;
++	}
++
++	/**
++	 * Add all of the given properties to profile properties of the given description 
++	 * after removing the keys known to be for the installer.  This allows install descriptions 
++	 * to also set random profile properties.
++	 * @param description
++	 * @param properties
++	 */
++	private static void initializeProfileProperties(InstallDescription description, Properties properties) {
++		//any remaining properties are profile properties
++		Map profileProperties = new HashMap(properties);
++		profileProperties.remove(PROP_PROFILE_NAME);
++		profileProperties.remove(PROP_ARTIFACT_REPOSITORY);
++		profileProperties.remove(PROP_METADATA_REPOSITORY);
++		profileProperties.remove(PROP_IS_AUTO_START);
++		profileProperties.remove(PROP_LAUNCHER_NAME);
++		profileProperties.remove(PROP_AGENT_LOCATION);
++		profileProperties.remove(PROP_BUNDLE_LOCATION);
++		profileProperties.remove(PROP_ROOT_ID);
++		profileProperties.remove(PROP_ROOT_VERSION);
++		profileProperties.remove(PROP_ROOTS);
++		description.setProfileProperties(profileProperties);
++	}
++
++	private static URL[] getURLs(String spec) {
++		if (spec == null)
++			return null;
++		String[] urlSpecs = getArrayFromString(spec, ","); //$NON-NLS-1$
++		ArrayList result = new ArrayList(urlSpecs.length);
++		for (int i = 0; i < urlSpecs.length; i++) {
++			try {
++				result.add(new URL(urlSpecs[i]));
++			} catch (MalformedURLException e) {
++				// TODO Auto-generated catch block
++				e.printStackTrace();
++			}
++		}
++		return (URL[]) result.toArray(new URL[result.size()]);
+ 	}
+ 
+ 	private static void safeClose(InputStream in) {
+@@ -91,4 +167,21 @@ public class InstallDescriptionParser {
+ 			//ignore secondary failure during close
+ 		}
+ 	}
++
++	/**
++	 * Convert a list of tokens into an array. The list separator has to be
++	 * specified.
++	 */
++	public static String[] getArrayFromString(String list, String separator) {
++		if (list == null || list.trim().equals("")) //$NON-NLS-1$
++			return new String[0];
++		List result = new ArrayList();
++		for (StringTokenizer tokens = new StringTokenizer(list, separator); tokens.hasMoreTokens();) {
++			String token = tokens.nextToken().trim();
++			if (!token.equals("")) //$NON-NLS-1$
++				result.add(token);
++		}
++		return (String[]) result.toArray(new String[result.size()]);
++	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
+index 26012e6..f71c743 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Code 9 - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.installer;
+ 
+@@ -57,7 +58,15 @@ public class InstallUpdateProductOperation implements IInstallOperation {
+ 	 * Determine what top level installable units should be installed by the director
+ 	 */
+ 	private IInstallableUnit[] computeUnitsToInstall() throws CoreException {
+-		return new IInstallableUnit[] {findUnit(installDescription.getRootId(), installDescription.getRootVersion())};
++		ArrayList result = new ArrayList();
++		VersionedName roots[] = installDescription.getRoots();
++		for (int i = 0; i < roots.length; i++) {
++			VersionedName root = roots[i];
++			IInstallableUnit iu = findUnit(root);
++			if (iu != null)
++				result.add(iu);
++		}
++		return (IInstallableUnit[]) result.toArray(new IInstallableUnit[result.size()]);
+ 	}
+ 
+ 	/**
+@@ -79,7 +88,9 @@ public class InstallUpdateProductOperation implements IInstallOperation {
+ 			String env = "osgi.os=" + info.getOS() + ",osgi.ws=" + info.getWS() + ",osgi.arch=" + info.getOSArch(); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+ 			properties.put(IProfile.PROP_ENVIRONMENTS, env);
+ 			properties.putAll(installDescription.getProfileProperties());
+-			properties.put(IProfile.PROP_CACHE, installDescription.getBundleLocation().toOSString());
++			IPath location = installDescription.getBundleLocation();
++			if (location != null)
++				properties.put(IProfile.PROP_CACHE, location.toOSString());
+ 			profile = profileRegistry.addProfile(getProfileId(), properties);
+ 		}
+ 		return profile;
+@@ -89,8 +100,8 @@ public class InstallUpdateProductOperation implements IInstallOperation {
+ 	 * Performs the actual product install or update.
+ 	 */
+ 	private void doInstall(SubMonitor monitor) throws CoreException {
+-		prepareMetadataRepository();
+-		prepareArtifactRepository();
++		prepareMetadataRepositories();
++		prepareArtifactRepositories();
+ 		IProfile p = createProfile();
+ 		IInstallableUnit[] toInstall = computeUnitsToInstall();
+ 		monitor.worked(5);
+@@ -130,16 +141,18 @@ public class InstallUpdateProductOperation implements IInstallOperation {
+ 	 * Finds and returns the installable unit with the given id, and optionally the
+ 	 * given version.
+ 	 */
+-	private IInstallableUnit findUnit(String id, Version version) throws CoreException {
++	private IInstallableUnit findUnit(VersionedName spec) throws CoreException {
++		String id = spec.getId();
+ 		if (id == null)
+ 			throw fail(Messages.Op_NoId);
++		Version version = spec.getVersion();
+ 		VersionRange range = VersionRange.emptyRange;
+ 		if (version != null && !version.equals(Version.emptyVersion))
+ 			range = new VersionRange(version, true, version, true);
+ 		Query query = new InstallableUnitQuery(id, range);
+ 		Collector collector = new Collector();
+ 		Iterator matches = metadataRepoMan.query(query, collector, null).iterator();
+-		//pick the newest match
++		// pick the newest match
+ 		IInstallableUnit newest = null;
+ 		while (matches.hasNext()) {
+ 			IInstallableUnit candidate = (IInstallableUnit) matches.next();
+@@ -235,15 +248,19 @@ public class InstallUpdateProductOperation implements IInstallOperation {
+ 		profileRegistry = (IProfileRegistry) getService(IProfileRegistry.class.getName());
+ 	}
+ 
+-	private void prepareArtifactRepository() throws ProvisionException {
+-		URL artifactRepo = installDescription.getArtifactRepository();
+-		if (artifactRepo != null)
+-			artifactRepoMan.loadRepository(artifactRepo, null);
++	private void prepareArtifactRepositories() throws ProvisionException {
++		URL[] repos = installDescription.getArtifactRepositories();
++		if (repos == null)
++			return;
++		for (int i = 0; i < repos.length; i++)
++			artifactRepoMan.loadRepository(repos[i], null);
+ 	}
+ 
+-	private void prepareMetadataRepository() throws ProvisionException {
+-		URL metadataRepo = installDescription.getMetadataRepository();
+-		if (metadataRepo != null)
+-			metadataRepoMan.loadRepository(metadataRepo, null);
++	private void prepareMetadataRepositories() throws ProvisionException {
++		URL[] repos = installDescription.getMetadataRepositories();
++		if (repos == null)
++			return;
++		for (int i = 0; i < repos.length; i++)
++			metadataRepoMan.loadRepository(repos[i], null);
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/VersionedName.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/VersionedName.java
+new file mode 100644
+index 0000000..e482b72
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/VersionedName.java
+@@ -0,0 +1,51 @@
++/*******************************************************************************
++ * Copyright (c) 2008 Code 9 and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     Code 9 - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.installer;
++
++import org.osgi.framework.Version;
++
++public class VersionedName {
++	private String id;
++	private Version version;
++
++	/**
++	 * Creates and returns a new versioned id from the given spec.  The spec should be
++	 * id/version.
++	 * @param spec the spec for the versioned id to create
++	 * @return the parsed versioned id
++	 */
++	public static VersionedName parse(String spec) {
++		String[] segments = InstallDescriptionParser.getArrayFromString(spec, "/"); //$NON-NLS-1$
++		return new VersionedName(segments[0], segments.length == 1 ? null : segments[1]);
++	}
++
++	public VersionedName(String id, String version) {
++		this.id = id;
++		this.version = new Version(version == null ? "0.0.0" : version);
++	}
++
++	public VersionedName(String id, Version version) {
++		this.id = id;
++		this.version = version;
++	}
++
++	public String getId() {
++		return id;
++	}
++
++	public Version getVersion() {
++		return version;
++	}
++
++	public String toString() {
++		return id + "/" + (version == null ? "0.0.0" : version.toString());
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/provisional/p2/installer/InstallDescription.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/provisional/p2/installer/InstallDescription.java
+index b59fe5d..f260973 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/provisional/p2/installer/InstallDescription.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/provisional/p2/installer/InstallDescription.java
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Code 9 - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.provisional.p2.installer;
+ 
+@@ -14,7 +15,7 @@ import java.net.URL;
+ import java.util.HashMap;
+ import java.util.Map;
+ import org.eclipse.core.runtime.IPath;
+-import org.osgi.framework.Version;
++import org.eclipse.equinox.internal.p2.installer.VersionedName;
+ 
+ /**
+  * An install information captures all the data needed to perform a product install.
+@@ -22,20 +23,17 @@ import org.osgi.framework.Version;
+  * be installed, and where it will be installed.
+  */
+ public class InstallDescription {
+-	private URL artifactRepo;
+-	private IPath installLocation, agentLocation, bundleLocation;
++	private URL[] artifactRepos;
++	private IPath installLocation;
++	private IPath agentLocation;
++	private IPath bundleLocation;
+ 	private boolean isAutoStart;
+ 	private String launcherName;
+-	private URL metadataRepo;
++	private URL[] metadataRepos;
+ 	private String productName;
+-	private String rootId;
+-	private Version rootVersion;
++	private VersionedName[] roots;
+ 	private final Map profileProperties = new HashMap();
+ 
+-	public InstallDescription(String name) {
+-		this.productName = name;
+-	}
+-
+ 	/**
+ 	 * Returns the p2 agent location, or <code>null</code> to indicate
+ 	 * the default agent location.
+@@ -45,11 +43,11 @@ public class InstallDescription {
+ 	}
+ 
+ 	/**
+-	 * Returns the location of the artifact repository to install from
+-	 * @return an artifact repository URL
++	 * Returns the locations of the artifact repositories to install from
++	 * @return a list of artifact repository URLs
+ 	 */
+-	public URL getArtifactRepository() {
+-		return artifactRepo;
++	public URL[] getArtifactRepositories() {
++		return artifactRepos;
+ 	}
+ 
+ 	/**
+@@ -77,11 +75,11 @@ public class InstallDescription {
+ 	}
+ 
+ 	/**
+-	 * Returns the location of the metadata repository to install from
+-	 * @return a metadata repository URL
++	 * Returns the locations of the metadata repositories to install from
++	 * @return a list of metadata repository URLs
+ 	 */
+-	public URL getMetadataRepository() {
+-		return metadataRepo;
++	public URL[] getMetadataRepositories() {
++		return metadataRepos;
+ 	}
+ 
+ 	/**
+@@ -100,22 +98,6 @@ public class InstallDescription {
+ 	}
+ 
+ 	/**
+-	 * Returns the id of the root installable unit
+-	 * @return the id of the root installable unit
+-	 */
+-	public String getRootId() {
+-		return rootId;
+-	}
+-
+-	/**
+-	 * Returns the version of the root installable unit
+-	 * @return the version of the root installable unit
+-	 */
+-	public Version getRootVersion() {
+-		return rootVersion;
+-	}
+-
+-	/**
+ 	 * Returns whether the installed product should be started upon successful
+ 	 * install.
+ 	 * @return <code>true</code> if the product should be started upon successful
+@@ -129,8 +111,8 @@ public class InstallDescription {
+ 		this.agentLocation = agentLocation;
+ 	}
+ 
+-	public void setArtifactRepository(URL repository) {
+-		this.artifactRepo = repository;
++	public void setArtifactRepositories(URL[] value) {
++		this.artifactRepos = value;
+ 	}
+ 
+ 	public void setAutoStart(boolean value) {
+@@ -149,8 +131,8 @@ public class InstallDescription {
+ 		this.launcherName = name;
+ 	}
+ 
+-	public void setMetadataRepository(URL repository) {
+-		this.metadataRepo = repository;
++	public void setMetadataRepositories(URL[] value) {
++		this.metadataRepos = value;
+ 	}
+ 
+ 	/**
+@@ -161,12 +143,28 @@ public class InstallDescription {
+ 		profileProperties.putAll(properties);
+ 	}
+ 
+-	public void setRootId(String root) {
+-		this.rootId = root;
++	/**
++	 * Returns the set of roots to be installed for this installation
++	 * @return the roots to install
++	 */
++	public VersionedName[] getRoots() {
++		return roots;
+ 	}
+ 
+-	public void setRootVersion(Version version) {
+-		this.rootVersion = version;
++	/**
++	 * Set the list of roots to install
++	 * @param value the set of roots to install
++	 */
++	public void setRoots(VersionedName[] value) {
++		roots = value;
++	}
++
++	/**
++	 * Set the name of the product being installed.
++	 * @param value the new name of the product to install
++	 */
++	public void setProductName(String value) {
++		productName = value;
+ 	}
+ 
+ }
+commit 9ac636170a282d4b36cef4fd3106b9bada28095a
+Author: Jeff McAffer <jeff>
+Date:   Tue May 13 01:15:13 2008 +0000
+
+    Bug 230253 Installer enhancements
+
+4	8	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
+index 74dd163..892f021 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
+@@ -15,8 +15,8 @@ import java.io.*;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+-import org.eclipse.core.runtime.Path;
+-import org.eclipse.core.runtime.SubMonitor;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.p2.installer.InstallDescription;
+ 
+ /**
+@@ -37,10 +37,7 @@ public class InstallDescriptionParser {
+ 
+ 	/**
+ 	 * Loads and returns an install description that is stored in a properties file.
+-	 * @param site The site of the install properties file.
+-	 * @param stream The stream to load the install description from. The stream
+-	 * will be closed prior to this method returning, whether the description is
+-	 * read successfully or not.
++	 * @param site The URL of the install properties file.
+ 	 */
+ 	public static InstallDescription createDescription(String site, SubMonitor monitor) throws IOException {
+ 		// if no description URL was given from the outside, look for an "install.properties" file 
+@@ -152,8 +149,7 @@ public class InstallDescriptionParser {
+ 			try {
+ 				result.add(new URL(urlSpecs[i]));
+ 			} catch (MalformedURLException e) {
+-				// TODO Auto-generated catch block
+-				e.printStackTrace();
++				LogHelper.log(new Status(IStatus.ERROR, InstallerActivator.PI_INSTALLER, "Invalid URL in install description: " + urlSpecs[i], e)); //$NON-NLS-1$
+ 			}
+ 		}
+ 		return (URL[]) result.toArray(new URL[result.size()]);

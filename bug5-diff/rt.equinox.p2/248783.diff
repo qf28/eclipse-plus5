@@ -1,0 +1,888 @@
+commit d46b175487cc29df90089933d64fe20eeb72e8c4
+Author: DJ Houghton <dj>
+Date:   Tue Sep 30 17:41:34 2008 +0000
+
+    Bug 248783 - change the org.eclipse.p2.tests to use tar instead of unzip the platform zips on linux
+
+39	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/FileUtils.java
+141	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarEntry.java
+48	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarException.java
+153	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarFile.java
+338	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarInputStream.java
+1	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/AllTests.java
+79	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/FileUtilsTest.java
+-	-	bundles/org.eclipse.equinox.p2.tests/testData/core/a.tar.gz
+-	-	bundles/org.eclipse.equinox.p2.tests/testData/core/a.zip
+-	-	bundles/org.eclipse.equinox.p2.tests/testData/core/a2.tar.gz
+-	-	bundles/org.eclipse.equinox.p2.tests/testData/core/a2.zip
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/FileUtils.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/FileUtils.java
+index 528b432..e6649b1 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/FileUtils.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/FileUtils.java
+@@ -18,10 +18,49 @@ import org.eclipse.osgi.util.NLS;
+ 
+ public class FileUtils {
+ 
++	private static File[] untarFile(File source, File outputDir) throws IOException, TarException {
++		TarFile tarFile = new TarFile(source);
++		List untarredFiles = new ArrayList();
++		for (Enumeration e = tarFile.entries(); e.hasMoreElements();) {
++			TarEntry entry = (TarEntry) e.nextElement();
++			InputStream input = tarFile.getInputStream(entry);
++			try {
++				File outFile = new File(outputDir, entry.getName());
++				untarredFiles.add(outFile);
++				if (entry.getFileType() == TarEntry.DIRECTORY) {
++					outFile.mkdirs();
++				} else {
++					if (outFile.exists())
++						outFile.delete();
++					else
++						outFile.getParentFile().mkdirs();
++					try {
++						copyStream(input, false, new FileOutputStream(outFile), true);
++					} catch (FileNotFoundException e1) {
++						// TEMP: ignore this for now in case we're trying to replace
++						// a running eclipse.exe
++					}
++					outFile.setLastModified(entry.getTime());
++				}
++			} finally {
++				input.close();
++			}
++		}
++		return (File[]) untarredFiles.toArray(new File[untarredFiles.size()]);
++	}
++
+ 	/**
+ 	 * Unzip from a File to an output directory.
+ 	 */
+ 	public static File[] unzipFile(File zipFile, File outputDir) throws IOException {
++		// check to see if we have a tar'd and gz'd file
++		if (zipFile.getName().toLowerCase().endsWith(".tar.gz")) {
++			try {
++				return untarFile(zipFile, outputDir);
++			} catch (TarException e) {
++				throw new IOException(e.getMessage());
++			}
++		}
+ 		InputStream in = new FileInputStream(zipFile);
+ 		try {
+ 			return unzipStream(in, zipFile.length(), outputDir, null, null);
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarEntry.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarEntry.java
+new file mode 100644
+index 0000000..9f03e8b
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarEntry.java
+@@ -0,0 +1,141 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials 
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.core.helpers;
++
++/**
++ * Copied from org.eclipse.ui.internal.wizards.datatransfer.TarEntry.
++ * @since 3.3
++ */
++public class TarEntry implements Cloneable {
++	private String name;
++	private long mode, time, size;
++	private int type;
++	int filepos;
++
++	/**
++	 * Entry type for normal files.
++	 */
++	public static final int FILE = '0';
++
++	/**
++	 * Entry type for directories.
++	 */
++	public static final int DIRECTORY = '5';
++
++	/**
++	 * Create a new TarEntry for a file of the given name at the
++	 * given position in the file.
++	 * 
++	 * @param name filename
++	 * @param pos position in the file in bytes
++	 */
++	TarEntry(String name, int pos) {
++		this.name = name;
++		mode = 0644;
++		type = FILE;
++		filepos = pos;
++		time = System.currentTimeMillis() / 1000;
++	}
++
++	/**
++	 * Create a new TarEntry for a file of the given name.
++	 * 
++	 * @param name filename
++	 */
++	public TarEntry(String name) {
++		this(name, -1);
++	}
++
++	/**
++	 * Returns the type of this file, one of FILE, LINK, SYM_LINK,
++	 * CHAR_DEVICE, BLOCK_DEVICE, DIRECTORY or FIFO.
++	 * 
++	 * @return file type
++	 */
++	public int getFileType() {
++		return type;
++	}
++
++	/**
++	 * Returns the mode of the file in UNIX permissions format.
++	 * 
++	 * @return file mode
++	 */
++	public long getMode() {
++		return mode;
++	}
++
++	/**
++	 * Returns the name of the file.
++	 * 
++	 * @return filename
++	 */
++	public String getName() {
++		return name;
++	}
++
++	/**
++	 * Returns the size of the file in bytes.
++	 * 
++	 * @return filesize
++	 */
++	public long getSize() {
++		return size;
++	}
++
++	/**
++	 * Returns the modification time of the file in seconds since January
++	 * 1st 1970.
++	 * 
++	 * @return time
++	 */
++	public long getTime() {
++		return time;
++	}
++
++	/**
++	 * Sets the type of the file, one of FILE, LINK, SYMLINK, CHAR_DEVICE,
++	 * BLOCK_DEVICE, or DIRECTORY.
++	 * 
++	 * @param type
++	 */
++	public void setFileType(int type) {
++		this.type = type;
++	}
++
++	/**
++	 * Sets the mode of the file in UNIX permissions format.
++	 * 
++	 * @param mode
++	 */
++	public void setMode(long mode) {
++		this.mode = mode;
++	}
++
++	/**
++	 * Sets the size of the file in bytes.
++	 * 
++	 * @param size
++	 */
++	public void setSize(long size) {
++		this.size = size;
++	}
++
++	/**
++	 * Sets the modification time of the file in seconds since January
++	 * 1st 1970.
++	 * 
++	 * @param time
++	 */
++	public void setTime(long time) {
++		this.time = time;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarException.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarException.java
+new file mode 100644
+index 0000000..351e70f
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarException.java
+@@ -0,0 +1,48 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials 
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.core.helpers;
++
++/**
++ * Copied from org.eclipse.ui.internal.wizards.datatransfer.TarException.
++ * @since 3.3
++ */
++public class TarException extends Exception {
++	/**
++	 * Generated serial version UID for this class.
++	 */
++	private static final long serialVersionUID = 2886671254518853528L;
++
++	/**
++	 * Constructs a TarException without a detail string.
++	 */
++	public TarException() {
++		super();
++	}
++
++	/**
++	 * Constructs a TarException with the specified detail string.
++	 *
++	 * @param s the detail string
++	 */
++	public TarException(String s) {
++		super(s);
++	}
++
++	/**
++	 * Constructs a TarException with the specified detail string.
++	 *
++	 * @param s the detail string
++	 * @param cause the cause
++	 */
++	public TarException(String s, Throwable cause) {
++		super(s, cause);
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarFile.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarFile.java
+new file mode 100644
+index 0000000..97a64ad
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarFile.java
+@@ -0,0 +1,153 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials 
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.core.helpers;
++
++import java.io.*;
++import java.util.Enumeration;
++import java.util.zip.GZIPInputStream;
++
++/**
++ * Copied from org.eclipse.ui.internal.wizards.datatransfer.TarFile.
++ * @since 3.3
++ */
++public class TarFile {
++	private File file;
++	private TarInputStream entryEnumerationStream;
++	private TarEntry curEntry;
++	private TarInputStream entryStream;
++
++	private InputStream internalEntryStream;
++
++	/**
++	 * Create a new TarFile for the given file.
++	 * 
++	 * @param file
++	 * @throws TarException
++	 * @throws IOException
++	 */
++	public TarFile(File file) throws TarException, IOException {
++		this.file = file;
++
++		InputStream in = new FileInputStream(file);
++		// First, check if it's a GZIPInputStream.
++		try {
++			in = new GZIPInputStream(in);
++		} catch (IOException e) {
++			//If it is not compressed we close
++			//the old one and recreate
++			in.close();
++			in = new FileInputStream(file);
++		}
++		try {
++			entryEnumerationStream = new TarInputStream(in);
++		} catch (TarException ex) {
++			in.close();
++			throw ex;
++		}
++		curEntry = entryEnumerationStream.getNextEntry();
++	}
++
++	/**
++	 * Close the tar file input stream.
++	 * 
++	 * @throws IOException if the file cannot be successfully closed
++	 */
++	public void close() throws IOException {
++		entryEnumerationStream.close();
++		if (internalEntryStream != null)
++			internalEntryStream.close();
++	}
++
++	/**
++	 * Create a new TarFile for the given path name.
++	 * 
++	 * @param filename
++	 * @throws TarException
++	 * @throws IOException
++	 */
++	public TarFile(String filename) throws TarException, IOException {
++		this(new File(filename));
++	}
++
++	/**
++	 * Returns an enumeration cataloguing the tar archive.
++	 * 
++	 * @return enumeration of all files in the archive
++	 */
++	public Enumeration entries() {
++		return new Enumeration() {
++			public boolean hasMoreElements() {
++				return (curEntry != null);
++			}
++
++			public Object nextElement() {
++				TarEntry oldEntry = curEntry;
++				try {
++					curEntry = entryEnumerationStream.getNextEntry();
++				} catch (TarException e) {
++					curEntry = null;
++				} catch (IOException e) {
++					curEntry = null;
++				}
++				return oldEntry;
++			}
++		};
++	}
++
++	/**
++	 * Returns a new InputStream for the given file in the tar archive.
++	 * 
++	 * @param entry
++	 * @return an input stream for the given file
++	 * @throws TarException
++	 * @throws IOException
++	 */
++	public InputStream getInputStream(TarEntry entry) throws TarException, IOException {
++		if (entryStream == null || !entryStream.skipToEntry(entry)) {
++			if (internalEntryStream != null) {
++				internalEntryStream.close();
++			}
++			internalEntryStream = new FileInputStream(file);
++			// First, check if it's a GZIPInputStream.
++			try {
++				internalEntryStream = new GZIPInputStream(internalEntryStream);
++			} catch (IOException e) {
++				//If it is not compressed we close
++				//the old one and recreate
++				internalEntryStream.close();
++				internalEntryStream = new FileInputStream(file);
++			}
++			entryStream = new TarInputStream(internalEntryStream, entry) {
++				public void close() {
++					// Ignore close() since we want to reuse the stream.
++				}
++			};
++		}
++		return entryStream;
++	}
++
++	/**
++	 * Returns the path name of the file this archive represents.
++	 * 
++	 * @return path
++	 */
++	public String getName() {
++		return file.getPath();
++	}
++
++	/* (non-Javadoc)
++	 * @see java.util.zip.ZipFile#finalize()
++	 * 
++	 */
++	protected void finalize() throws Throwable {
++		close();
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarInputStream.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarInputStream.java
+new file mode 100644
+index 0000000..5ab26f3
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/TarInputStream.java
+@@ -0,0 +1,338 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials 
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.core.helpers;
++
++import java.io.*;
++
++/**
++ * Copied from org.eclipse.ui.internal.wizards.datatransfer.TarInputStream.
++ * @since 3.3
++ */
++public class TarInputStream extends FilterInputStream {
++	private int nextEntry = 0;
++	private int nextEOF = 0;
++	private int filepos = 0;
++	private int bytesread = 0;
++	private TarEntry firstEntry = null;
++	private String longLinkName = null;
++
++	/**
++	 * Creates a new tar input stream on the given input stream.
++	 * 
++	 * @param in input stream
++	 * @throws TarException
++	 * @throws IOException
++	 */
++	public TarInputStream(InputStream in) throws TarException, IOException {
++		super(in);
++
++		// Read in the first TarEntry to make sure
++		// the input is a valid tar file stream.
++		firstEntry = getNextEntry();
++	}
++
++	/**
++	 * Create a new tar input stream, skipping ahead to the given entry
++	 * in the file.
++	 * 
++	 * @param in input stream
++	 * @param entry skips to this entry in the file
++	 * @throws TarException
++	 * @throws IOException
++	 */
++	TarInputStream(InputStream in, TarEntry entry) throws TarException, IOException {
++		super(in);
++		skipToEntry(entry);
++	}
++
++	/**
++	 *  The checksum of a tar file header is simply the sum of the bytes in
++	 *  the header.
++	 * 
++	 * @param header
++	 * @return checksum
++	 */
++	private long headerChecksum(byte[] header) {
++		long sum = 0;
++		for (int i = 0; i < 512; i++) {
++			sum += header[i] & 0xff;
++		}
++		return sum;
++	}
++
++	/**
++	 * Skips ahead to the position of the given entry in the file.
++	 * 
++	 * @param entry
++	 * @returns false if the entry has already been passed
++	 * @throws TarException
++	 * @throws IOException
++	 */
++	boolean skipToEntry(TarEntry entry) throws TarException, IOException {
++		int bytestoskip = entry.filepos - bytesread;
++		if (bytestoskip < 0) {
++			return false;
++		}
++		while (bytestoskip > 0) {
++			long ret = in.skip(bytestoskip);
++			if (ret < 0) {
++				throw new IOException("early end of stream"); //$NON-NLS-1$
++			}
++			bytestoskip -= ret;
++			bytesread += ret;
++		}
++		filepos = entry.filepos;
++		nextEntry = 0;
++		nextEOF = 0;
++		// Read next header to seek to file data.
++		getNextEntry();
++		return true;
++	}
++
++	/**
++	 * Returns true if the header checksum is correct.
++	 * 
++	 * @param header
++	 * @return true if this header has a valid checksum
++	 */
++	private boolean isValidTarHeader(byte[] header) {
++		long fileChecksum, calculatedChecksum;
++		int pos, i;
++
++		pos = 148;
++		StringBuffer checksumString = new StringBuffer();
++		for (i = 0; i < 8; i++) {
++			if (header[pos + i] == ' ') {
++				continue;
++			}
++			if (header[pos + i] == 0 || !Character.isDigit((char) header[pos + i])) {
++				break;
++			}
++			checksumString.append((char) header[pos + i]);
++		}
++		if (checksumString.length() == 0) {
++			return false;
++		}
++		if (checksumString.charAt(0) != '0') {
++			checksumString.insert(0, '0');
++		}
++		try {
++			fileChecksum = Long.decode(checksumString.toString()).longValue();
++		} catch (NumberFormatException exception) {
++			//This is not valid if it cannot be parsed
++			return false;
++		}
++
++		// Blank out the checksum.
++		for (i = 0; i < 8; i++) {
++			header[pos + i] = ' ';
++		}
++		calculatedChecksum = headerChecksum(header);
++
++		return (fileChecksum == calculatedChecksum);
++	}
++
++	/**
++	 * Returns the next entry in the tar file.  Does not handle
++	 * GNU @LongLink extensions.
++	 * 
++	 * @return the next entry in the tar file
++	 * @throws TarException
++	 * @throws IOException
++	 */
++	TarEntry getNextEntryInternal() throws TarException, IOException {
++		byte[] header = new byte[512];
++		int pos = 0;
++		int i;
++
++		if (firstEntry != null) {
++			TarEntry entryReturn = firstEntry;
++			firstEntry = null;
++			return entryReturn;
++		}
++
++		while (nextEntry > 0) {
++			long ret = in.skip(nextEntry);
++			if (ret < 0) {
++				throw new IOException("early end of stream"); //$NON-NLS-1$
++			}
++			nextEntry -= ret;
++			bytesread += ret;
++		}
++
++		int bytestoread = 512;
++		while (bytestoread > 0) {
++			int ret = super.read(header, 512 - bytestoread, bytestoread);
++			if (ret < 0) {
++				throw new IOException("early end of stream"); //$NON-NLS-1$
++			}
++			bytestoread -= ret;
++			bytesread += ret;
++		}
++
++		// If we have a header of all zeros, this marks the end of the file.
++		if (headerChecksum(header) == 0) {
++			// We are at the end of the file.
++			if (filepos > 0) {
++				return null;
++			}
++
++			// Invalid stream.
++			throw new TarException("not in tar format"); //$NON-NLS-1$
++		}
++
++		// Validate checksum.
++		if (!isValidTarHeader(header)) {
++			throw new TarException("not in tar format"); //$NON-NLS-1$
++		}
++
++		while (pos < 100 && header[pos] != 0) {
++			pos++;
++		}
++		String name = new String(header, 0, pos, "UTF8"); //$NON-NLS-1$
++		// Prepend the prefix here.
++		pos = 345;
++		if (header[pos] != 0) {
++			while (pos < 500 && header[pos] != 0) {
++				pos++;
++			}
++			String prefix = new String(header, 345, pos - 345, "UTF8"); //$NON-NLS-1$
++			name = prefix + "/" + name; //$NON-NLS-1$
++		}
++
++		TarEntry entry;
++		if (longLinkName != null) {
++			entry = new TarEntry(longLinkName, filepos);
++			longLinkName = null;
++		} else {
++			entry = new TarEntry(name, filepos);
++		}
++		if (header[156] != 0) {
++			entry.setFileType(header[156]);
++		}
++
++		pos = 100;
++		StringBuffer mode = new StringBuffer();
++		for (i = 0; i < 8; i++) {
++			if (header[pos + i] == 0) {
++				break;
++			}
++			if (header[pos + i] == ' ') {
++				continue;
++			}
++			mode.append((char) header[pos + i]);
++		}
++		if (mode.length() > 0 && mode.charAt(0) != '0') {
++			mode.insert(0, '0');
++		}
++		try {
++			long fileMode = Long.decode(mode.toString()).longValue();
++			entry.setMode(fileMode);
++		} catch (NumberFormatException nfe) {
++			throw new TarException("Not a valid TAR format.", nfe);
++		}
++
++		pos = 100 + 24;
++		StringBuffer size = new StringBuffer();
++		for (i = 0; i < 12; i++) {
++			if (header[pos + i] == 0) {
++				break;
++			}
++			if (header[pos + i] == ' ') {
++				continue;
++			}
++			size.append((char) header[pos + i]);
++		}
++		if (size.charAt(0) != '0') {
++			size.insert(0, '0');
++		}
++		int fileSize;
++		try {
++			fileSize = Integer.decode(size.toString()).intValue();
++		} catch (NumberFormatException nfe) {
++			throw new TarException("Not a valid TAR format.", nfe);
++		}
++
++		entry.setSize(fileSize);
++		nextEOF = fileSize;
++		if (fileSize % 512 > 0) {
++			nextEntry = fileSize + (512 - (fileSize % 512));
++		} else {
++			nextEntry = fileSize;
++		}
++		filepos += (nextEntry + 512);
++		return entry;
++	}
++
++	/**
++	 * Moves ahead to the next file in the tar archive and returns
++	 * a TarEntry object describing it.
++	 * 
++	 * @return the next entry in the tar file
++	 * @throws TarException
++	 * @throws IOException
++	 */
++	public TarEntry getNextEntry() throws TarException, IOException {
++		TarEntry entry = getNextEntryInternal();
++
++		if (entry != null && entry.getName().equals("././@LongLink")) { //$NON-NLS-1$
++			// This is a GNU extension for doing long filenames.
++			// We get a file called ././@LongLink which just contains
++			// the real pathname.
++			byte[] longNameData = new byte[(int) entry.getSize()];
++			int bytesread = 0;
++			while (bytesread < longNameData.length) {
++				int cur = read(longNameData, bytesread, longNameData.length - bytesread);
++				if (cur < 0) {
++					throw new IOException("early end of stream"); //$NON-NLS-1$
++				}
++				bytesread += cur;
++			}
++
++			int pos = 0;
++			while (pos < longNameData.length && longNameData[pos] != 0) {
++				pos++;
++			}
++			longLinkName = new String(longNameData, 0, pos, "UTF8"); //$NON-NLS-1$
++			return getNextEntryInternal();
++		}
++		return entry;
++	}
++
++	/* (non-Javadoc)
++	 * @see java.io.FilterInputStream#read(byte[], int, int)
++	 */
++	public int read(byte[] b, int off, int len) throws IOException {
++		if (nextEOF == 0) {
++			return -1;
++		}
++		if (len > nextEOF) {
++			len = nextEOF;
++		}
++		int size = super.read(b, off, len);
++		nextEntry -= size;
++		nextEOF -= size;
++		bytesread += size;
++		return size;
++	}
++
++	/* (non-Javadoc)
++	 * @see java.io.FilterInputStream#read()
++	 */
++	public int read() throws IOException {
++		byte[] data = new byte[1];
++		int size = read(data, 0, 1);
++		if (size < 0) {
++			return size;
++		}
++		return data[0];
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/AllTests.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/AllTests.java
+index e203587..cbcf6f3 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/AllTests.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/AllTests.java
+@@ -19,6 +19,7 @@ public class AllTests extends TestCase {
+ 
+ 	public static Test suite() {
+ 		TestSuite suite = new TestSuite(AllTests.class.getName());
++		suite.addTestSuite(FileUtilsTest.class);
+ 		suite.addTestSuite(OrderedPropertiesTest.class);
+ 		suite.addTestSuite(URLUtilTest.class);
+ 		return suite;
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/FileUtilsTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/FileUtilsTest.java
+new file mode 100644
+index 0000000..e8db53d
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/FileUtilsTest.java
+@@ -0,0 +1,79 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials 
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.p2.tests.core;
++
++import java.io.File;
++import java.io.IOException;
++import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
++import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
++
++/**
++ * @since 3.5
++ */
++public class FileUtilsTest extends AbstractProvisioningTest {
++
++	/*
++	 * Test that we can expand zip files and gzip'd tar files.
++	 */
++	public void testUnzip() {
++		File temp = getTempFolder();
++		File one = new File(temp, "a.txt");
++		File two = new File(temp, "b/b.txt");
++
++		File data = getTestData("1.0", "testData/core/a.zip");
++		try {
++			FileUtils.unzipFile(data, temp);
++		} catch (IOException e) {
++			fail("1.99", e);
++		}
++		assertTrue("1.1", one.exists());
++		delete(one);
++		assertTrue("1.2", !one.exists());
++
++		data = getTestData("2.0", "testData/core/a2.zip");
++		try {
++			FileUtils.unzipFile(data, temp);
++		} catch (IOException e) {
++			fail("2.99", e);
++		}
++		assertTrue("2.1", one.exists());
++		assertTrue("2.2", two.exists());
++		delete(one);
++		delete(two);
++		assertTrue("2.3", !one.exists());
++		assertTrue("2.4", !two.exists());
++
++		data = getTestData("3.0", "testData/core/a.tar.gz");
++		try {
++			FileUtils.unzipFile(data, temp);
++		} catch (IOException e) {
++			fail("3.99", e);
++		}
++		assertTrue("3.1", one.exists());
++		delete(one);
++		assertTrue("3.2", !one.exists());
++
++		data = getTestData("2.0", "testData/core/a2.tar.gz");
++		try {
++			FileUtils.unzipFile(data, temp);
++		} catch (IOException e) {
++			fail("3.99", e);
++		}
++		assertTrue("3.1", one.exists());
++		assertTrue("3.2", two.exists());
++		delete(one);
++		delete(two);
++		assertTrue("3.3", !one.exists());
++		assertTrue("3.4", !two.exists());
++
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/testData/core/a.tar.gz b/bundles/org.eclipse.equinox.p2.tests/testData/core/a.tar.gz
+new file mode 100644
+index 0000000..3e6885c
+Binary files /dev/null and b/bundles/org.eclipse.equinox.p2.tests/testData/core/a.tar.gz differ
+diff --git a/bundles/org.eclipse.equinox.p2.tests/testData/core/a.zip b/bundles/org.eclipse.equinox.p2.tests/testData/core/a.zip
+new file mode 100644
+index 0000000..0412cb2
+Binary files /dev/null and b/bundles/org.eclipse.equinox.p2.tests/testData/core/a.zip differ
+diff --git a/bundles/org.eclipse.equinox.p2.tests/testData/core/a2.tar.gz b/bundles/org.eclipse.equinox.p2.tests/testData/core/a2.tar.gz
+new file mode 100644
+index 0000000..81ca7d6
+Binary files /dev/null and b/bundles/org.eclipse.equinox.p2.tests/testData/core/a2.tar.gz differ
+diff --git a/bundles/org.eclipse.equinox.p2.tests/testData/core/a2.zip b/bundles/org.eclipse.equinox.p2.tests/testData/core/a2.zip
+new file mode 100644
+index 0000000..1053558
+Binary files /dev/null and b/bundles/org.eclipse.equinox.p2.tests/testData/core/a2.zip differ

@@ -1,0 +1,1443 @@
+commit ae317766273ccd74fe0e1bfd1f3ccc3925356a13
+Author: Gábor Kövesdán <gabor@kovesdan.org>
+Date:   Tue Jul 14 15:34:25 2015 +0200
+
+    [WIP] Bug 350000 - [content assist] Include non-prefix matches in
+    auto-complete suggestions
+    
+    TODO:
+    - Add type code completion and corresponding tests
+    
+    Change-Id: I05d4b5770523805c1a699eca9cbec11fb45c15e8
+    Signed-off-by: Gábor Kövesdán <gabor@kovesdan.org>
+
+4	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelCompletionTests.java
+2	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/RunCompletionModelTests.java
+902	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/SubstringCompletionTests.java
+42	38	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+12	1	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistOptions.java
+89	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/CharOperation.java
+14	0	org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+3	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaCorePreferenceInitializer.java
+2	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelCompletionTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelCompletionTests.java
+index 0e6b821..e7e0a76 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelCompletionTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelCompletionTests.java
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Gábor Kövesdán - Contribution for Bug 350000 - [content assist] Include non-prefix matches in auto-complete suggestions
+  *******************************************************************************/
+ package org.eclipse.jdt.core.tests.model;
+ 
+@@ -158,6 +159,9 @@ protected CompletionResult snippetContextComplete(
+ public void setUpSuite() throws Exception {
+ 	super.setUpSuite();
+ 	this.oldOptions = JavaCore.getOptions();
++	Hashtable<String, String> options = new Hashtable<>(this.oldOptions);
++	options.put(JavaCore.CODEASSIST_SUBSTRING_MATCH, JavaCore.DISABLED);
++	JavaCore.setOptions(options);
+ 	waitUntilIndexesReady();
+ }
+ protected void setUp() throws Exception {
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/RunCompletionModelTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/RunCompletionModelTests.java
+index 8d76327..65954de 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/RunCompletionModelTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/RunCompletionModelTests.java
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Gábor Kövesdán - Contribution for Bug 350000 - [content assist] Include non-prefix matches in auto-complete suggestions
+  *******************************************************************************/
+ package org.eclipse.jdt.core.tests.model;
+ 
+@@ -37,6 +38,7 @@ public class RunCompletionModelTests extends junit.framework.TestCase {
+ 			COMPLETION_SUITES.add(CompletionWithMissingTypesTests2.class);
+ 			COMPLETION_SUITES.add(CompletionWithMissingTypesTests_1_5.class);
+ 			COMPLETION_SUITES.add(SnippetCompletionContextTests.class);
++			COMPLETION_SUITES.add(SubstringCompletionTests.class);
+ 		}
+ 		COMPLETION_SUITES.add(JavadocTypeCompletionModelTest.class);
+ 		COMPLETION_SUITES.add(JavadocFieldCompletionModelTest.class);
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/SubstringCompletionTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/SubstringCompletionTests.java
+new file mode 100644
+index 0000000..59b6cc2
+--- /dev/null
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/SubstringCompletionTests.java
+@@ -0,0 +1,902 @@
++/*******************************************************************************
++ * Copyright (c) 2015 Gábor Kövesdán and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     Gábor Kövesdán - initial version
++ *******************************************************************************/
++package org.eclipse.jdt.core.tests.model;
++
++import java.util.Hashtable;
++
++import org.eclipse.jdt.core.ICompilationUnit;
++import org.eclipse.jdt.core.JavaCore;
++import org.eclipse.jdt.core.JavaModelException;
++
++import junit.framework.Test;
++import junit.framework.TestSuite;
++
++public class SubstringCompletionTests extends AbstractJavaModelCompletionTests {
++
++public static Test suite() {
++	if (TESTS_PREFIX != null || TESTS_NAMES != null || TESTS_NUMBERS != null || TESTS_RANGE != null) {
++		return buildModelTestSuite(CompletionTests.class);
++	}
++	TestSuite suite = new Suite(CompletionTests.class.getName());
++	suite.addTest(new SubstringCompletionTests("testQualifiedNonStaticMethod"));
++	suite.addTest(new SubstringCompletionTests("testQualifiedStaticMethod"));
++	suite.addTest(new SubstringCompletionTests("testUnqualifiedNonStaticMethod"));
++	suite.addTest(new SubstringCompletionTests("testUnqualifiedStaticMethod"));
++	suite.addTest(new SubstringCompletionTests("testQualifiedNonStaticField"));
++	suite.addTest(new SubstringCompletionTests("testQualifiedStaticField"));
++	suite.addTest(new SubstringCompletionTests("testUnqualifiedNonStaticField"));
++	suite.addTest(new SubstringCompletionTests("testUnqualifiedStaticField"));
++	suite.addTest(new SubstringCompletionTests("testLocalVariable"));
++	suite.addTest(new SubstringCompletionTests("testMethodParamVariable"));
++	suite.addTest(new SubstringCompletionTests("testClassTypeInstantiation"));
++	suite.addTest(new SubstringCompletionTests("testClassTypeFieldDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testClassTypeParamDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testClassTypeLocalVarDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testClassTypeThrowsDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testClassTypeExtends"));
++	suite.addTest(new SubstringCompletionTests("testClassTypeImplements"));
++	suite.addTest(new SubstringCompletionTests("testInnerClassTypeInstantiation"));
++	suite.addTest(new SubstringCompletionTests("testInnerClassTypeFieldDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testInnerClassTypeParamDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testInnerClassTypeLocalVarDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testInnerClassTypeThrowsDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testInnerClassTypeExtends"));
++	suite.addTest(new SubstringCompletionTests("testInnerClassTypeImplements"));
++	suite.addTest(new SubstringCompletionTests("testStaticNestedClassTypeInstantiation"));
++	suite.addTest(new SubstringCompletionTests("testStaticNestedClassTypeFieldDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testStaticNestedClassTypeParamDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testStaticNestedClassTypeLocalVarDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testStaticNestedClassTypeThrowsDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testStaticNestedClassTypeExtends"));
++	suite.addTest(new SubstringCompletionTests("testStaticNestedClassTypeImplements"));
++	suite.addTest(new SubstringCompletionTests("testLocalClassTypeInstantiation"));
++	suite.addTest(new SubstringCompletionTests("testLocalClassTypeLocalVarDeclaration"));
++	suite.addTest(new SubstringCompletionTests("testLocalClassTypeExtends"));
++	return suite;
++}
++public SubstringCompletionTests(String name) {
++	super(name);
++}
++public void setUpSuite() throws Exception {
++	if (COMPLETION_PROJECT == null)  {
++		COMPLETION_PROJECT = setUpJavaProject("Completion");
++	} else {
++		setUpProjectCompliance(COMPLETION_PROJECT, "1.8");
++	}
++	super.setUpSuite();
++	Hashtable<String, String> options = new Hashtable<>(this.oldOptions);
++	options.put(JavaCore.CODEASSIST_SUBSTRING_MATCH, JavaCore.ENABLED);
++	JavaCore.setOptions(options);
++}
++public void tearDownSuite() throws Exception {
++	if (COMPLETION_SUITES == null) {
++		deleteProject("Completion");
++	} else {
++		COMPLETION_SUITES.remove(getClass());
++		if (COMPLETION_SUITES.size() == 0) {
++			deleteProject("Completion");
++			COMPLETION_SUITES = null;
++		}
++	}
++	if (COMPLETION_SUITES == null) {
++		COMPLETION_PROJECT = null;
++	}
++	super.tearDownSuite();
++}
++
++public void testQualifiedNonStaticMethod() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++		"/Completion/src/test/Test.java",
++		"package test;"+
++		"public class Test {\n" +
++		"  public Object bar1() {}\n" +
++		"  public Zork Bar2() {}\n" +
++		"  public void removeBar() {}\n" +
++		"  void foo() {\n" +
++		"    this.bar\n" +
++		"  }\n" +
++		"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "this.bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Bar2[METHOD_REF]{Bar2(), Ltest.Test;, ()LZork;, Bar2, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_STATIC + R_NON_RESTRICTED) + "}\n" +
++			"removeBar[METHOD_REF]{removeBar(), Ltest.Test;, ()V, removeBar, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_STATIC + R_NON_RESTRICTED) + "}\n" +
++			"bar1[METHOD_REF]{bar1(), Ltest.Test;, ()Ljava.lang.Object;, bar1, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_NON_STATIC + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++
++public void testUnqualifiedNonStaticMethod() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++		"/Completion/src/test/Test.java",
++		"package test;"+
++		"public class Test {\n" +
++		"  public Object bar1() {}\n" +
++		"  public Zork Bar2() {}\n" +
++		"  public void removeBar() {}\n" +
++		"  void foo() {\n" +
++		"    bar\n" +
++		"  }\n" +
++		"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Bar2[METHOD_REF]{Bar2(), Ltest.Test;, ()LZork;, Bar2, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"removeBar[METHOD_REF]{removeBar(), Ltest.Test;, ()V, removeBar, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"bar1[METHOD_REF]{bar1(), Ltest.Test;, ()Ljava.lang.Object;, bar1, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testQualifiedStaticMethod() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++		"/Completion/src/test/Test.java",
++		"package test;"+
++		"public class Test {\n" +
++		"  public static Object bar1() {}\n" +
++		"  public Zork Bar2() {}\n" +
++		"  public static void removeBar() {}\n" +
++		"  void foo() {\n" +
++		"    Test.bar\n" +
++		"  }\n" +
++		"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "Test.bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"removeBar[METHOD_REF]{removeBar(), Ltest.Test;, ()V, removeBar, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED + R_NON_INHERITED) + "}\n" +
++			"bar1[METHOD_REF]{bar1(), Ltest.Test;, ()Ljava.lang.Object;, bar1, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_NON_RESTRICTED + R_NON_INHERITED) + "}",
++			requestor.getResults());
++}
++public void testUnqualifiedStaticMethod() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++		"/Completion/src/test/Test.java",
++		"package test;"+
++		"public class Test {\n" +
++		"  public static Object bar1() {}\n" +
++		"  public Zork Bar2() {}\n" +
++		"  public static void removeBar() {}\n" +
++		"  void foo() {\n" +
++		"    Bar\n" +
++		"  }\n" +
++		"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "Bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"bar1[METHOD_REF]{bar1(), Ltest.Test;, ()Ljava.lang.Object;, bar1, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"removeBar[METHOD_REF]{removeBar(), Ltest.Test;, ()V, removeBar, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"Bar2[METHOD_REF]{Bar2(), Ltest.Test;, ()LZork;, Bar2, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testQualifiedNonStaticField() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++		"/Completion/src/test/Test.java",
++		"package test;"+
++		"public class Test {\n" +
++		"  int element;\n" +
++		"  int otherElement;\n" +
++		"  long elementCount;\n" +
++		"  void foo() {\n" +
++		"    this.elem\n" +
++		"  }\n" +
++		"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "this.elem";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"otherElement[FIELD_REF]{otherElement, Ltest.Test;, I, otherElement, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_STATIC + R_NON_RESTRICTED) + "}\n" +
++			"element[FIELD_REF]{element, Ltest.Test;, I, element, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + + R_CASE + R_NON_STATIC + R_NON_RESTRICTED) + "}\n" +
++			"elementCount[FIELD_REF]{elementCount, Ltest.Test;, J, elementCount, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_NON_STATIC + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++
++public void testUnqualifiedNonStaticField() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  int element;\n" +
++			"  int otherElement;\n" +
++			"  long elementCount;\n" +
++			"  void foo() {\n" +
++			"    elem\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "elem";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"ElementType[TYPE_REF]{java.lang.annotation.ElementType, java.lang.annotation, Ljava.lang.annotation.ElementType;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED) + "}\n" +
++			"otherElement[FIELD_REF]{otherElement, Ltest.Test;, I, otherElement, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"element[FIELD_REF]{element, Ltest.Test;, I, element, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + + R_CASE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"elementCount[FIELD_REF]{elementCount, Ltest.Test;, J, elementCount, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testQualifiedStaticField() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static int element;\n" +
++			"  int otherElement;\n" +
++			"  static long elementCount;\n" +
++			"  void foo() {\n" +
++			"    Test.elem\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "Test.elem";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"element[FIELD_REF]{element, Ltest.Test;, I, element, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_NON_RESTRICTED + R_NON_INHERITED) + "}\n" +
++			"elementCount[FIELD_REF]{elementCount, Ltest.Test;, J, elementCount, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_NON_RESTRICTED + R_NON_INHERITED) + "}",
++			requestor.getResults());
++}
++public void testUnqualifiedStaticField() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static int element;\n" +
++			"  int otherElement;\n" +
++			"  static long elementCount;\n" +
++			"  void foo() {\n" +
++			"    elem\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "elem";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"ElementType[TYPE_REF]{java.lang.annotation.ElementType, java.lang.annotation, Ljava.lang.annotation.ElementType;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED) + "}\n" +
++			"otherElement[FIELD_REF]{otherElement, Ltest.Test;, I, otherElement, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"element[FIELD_REF]{element, Ltest.Test;, I, element, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"elementCount[FIELD_REF]{elementCount, Ltest.Test;, J, elementCount, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testLocalVariable() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static int element;\n" +
++			"  int otherElement;\n" +
++			"  static long elementCount;\n" +
++			"  void foo() {\n" +
++			"    int temporaryElement = 0;\n" +
++			"    elem\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "elem";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"ElementType[TYPE_REF]{java.lang.annotation.ElementType, java.lang.annotation, Ljava.lang.annotation.ElementType;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED) + "}\n" +
++			"otherElement[FIELD_REF]{otherElement, Ltest.Test;, I, otherElement, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"temporaryElement[LOCAL_VARIABLE_REF]{temporaryElement, null, I, temporaryElement, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"element[FIELD_REF]{element, Ltest.Test;, I, element, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"elementCount[FIELD_REF]{elementCount, Ltest.Test;, J, elementCount, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testMethodParamVariable() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static int element;\n" +
++			"  int otherElement;\n" +
++			"  static long elementCount;\n" +
++			"  void foo(int initElement) {\n" +
++			"    elem\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "elem";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"ElementType[TYPE_REF]{java.lang.annotation.ElementType, java.lang.annotation, Ljava.lang.annotation.ElementType;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED) + "}\n" +
++			"initElement[LOCAL_VARIABLE_REF]{initElement, null, I, initElement, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"otherElement[FIELD_REF]{otherElement, Ltest.Test;, I, otherElement, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"element[FIELD_REF]{element, Ltest.Test;, I, element, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"elementCount[FIELD_REF]{elementCount, Ltest.Test;, J, elementCount, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_CASE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testClassTypeInstantiation() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"interface Foobar {}\n" +
++			"class SpecificFooBar implements Foobar {}\n" +
++			"class EvenMoreSpecificFooBar extends SpecificFooBar {}\n" +
++			"interface Foobaz {}\n" +
++			"class SpecificFooBaz implements Foobaz {}\n" +
++			"public class Test {\n" +
++			"  {\n" +
++			"    Foobar f = new bar\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "new bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"EvenMoreSpecificFooBar[TYPE_REF]{EvenMoreSpecificFooBar, test, Ltest.EvenMoreSpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXPECTED_TYPE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"SpecificFooBar[TYPE_REF]{SpecificFooBar, test, Ltest.SpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXPECTED_TYPE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"Foobar[TYPE_REF]{Foobar, test, Ltest.Foobar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXACT_EXPECTED_TYPE + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testClassTypeFieldDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"interface Foobar {}\n" +
++			"class SpecificFooBar implements Foobar {}\n" +
++			"class EvenMoreSpecificFooBar extends SpecificFooBar {}\n" +
++			"interface Foobaz {}\n" +
++			"class SpecificFooBaz implements Foobaz {}\n" +
++			"public class Test {\n" +
++			"  public bar\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "public bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"EvenMoreSpecificFooBar[TYPE_REF]{EvenMoreSpecificFooBar, test, Ltest.EvenMoreSpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"Foobar[TYPE_REF]{Foobar, test, Ltest.Foobar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"SpecificFooBar[TYPE_REF]{SpecificFooBar, test, Ltest.SpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testClassTypeParamDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"interface Foobar {}\n" +
++			"class SpecificFooBar implements Foobar {}\n" +
++			"class EvenMoreSpecificFooBar extends SpecificFooBar {}\n" +
++			"interface Foobaz {}\n" +
++			"class SpecificFooBaz implements Foobaz {}\n" +
++			"public class Test {\n" +
++			"  void setFoo(bar\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "void setFoo(bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"EvenMoreSpecificFooBar[TYPE_REF]{EvenMoreSpecificFooBar, test, Ltest.EvenMoreSpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"Foobar[TYPE_REF]{Foobar, test, Ltest.Foobar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"SpecificFooBar[TYPE_REF]{SpecificFooBar, test, Ltest.SpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testClassTypeLocalVarDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"interface Foobar {}\n" +
++			"class SpecificFooBar implements Foobar {}\n" +
++			"class EvenMoreSpecificFooBar extends SpecificFooBar {}\n" +
++			"interface Foobaz {}\n" +
++			"class SpecificFooBaz implements Foobaz {}\n" +
++			"public class Test {\n" +
++			"  void foo() {\n" +
++			"    final bar" +
++			"  }" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "final bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"EvenMoreSpecificFooBar[TYPE_REF]{EvenMoreSpecificFooBar, test, Ltest.EvenMoreSpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"Foobar[TYPE_REF]{Foobar, test, Ltest.Foobar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"SpecificFooBar[TYPE_REF]{SpecificFooBar, test, Ltest.SpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testClassTypeThrowsDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"interface Foobar {}\n" +
++			"class SpecificFooBar implements Foobar extends Exception {}\n" +
++			"class EvenMoreSpecificFooBar extends SpecificFooBar {}\n" +
++			"interface Foobaz {}\n" +
++			"class SpecificFooBaz implements Foobaz extends Exception {}\n" +
++			"public class Test {\n" +
++			"  void foo() throws bar {\n" +
++			"  }" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "void foo() throws bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"EvenMoreSpecificFooBar[TYPE_REF]{EvenMoreSpecificFooBar, test, Ltest.EvenMoreSpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}\n" +
++			"SpecificFooBar[TYPE_REF]{SpecificFooBar, test, Ltest.SpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED) + "}",
++			requestor.getResults());
++}
++public void testClassTypeExtends() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"interface Foobar {}\n" +
++			"class SpecificFooBar implements Foobar {}\n" +
++			"class EvenMoreSpecificFooBar extends SpecificFooBar {}\n" +
++			"interface Foobaz {}\n" +
++			"class SpecificFooBaz implements Foobaz {}\n" +
++			"public class Test extends bar {\n" +
++			"  }" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "public class Test extends bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"EvenMoreSpecificFooBar[TYPE_REF]{EvenMoreSpecificFooBar, test, Ltest.EvenMoreSpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED + R_CLASS) + "}\n" +
++			"SpecificFooBar[TYPE_REF]{SpecificFooBar, test, Ltest.SpecificFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED + R_CLASS) + "}",
++			requestor.getResults());
++}
++public void testClassTypeImplements() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"interface Foobar {}\n" +
++			"interface FoobarExtension extends Foobar {}\n" +
++			"class SpecificFooBar implements Foobar {}\n" +
++			"class EvenMoreSpecificFooBar extends SpecificFooBar {}\n" +
++			"interface Foobaz {}\n" +
++			"class SpecificFooBaz implements Foobaz {}\n" +
++			"public class Test implements bar {\n" +
++			"  }" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "public class Test implements bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Foobar[TYPE_REF]{Foobar, test, Ltest.Foobar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED + R_INTERFACE) + "}\n" +
++			"FoobarExtension[TYPE_REF]{FoobarExtension, test, Ltest.FoobarExtension;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_UNQUALIFIED + R_NON_RESTRICTED + R_INTERFACE) + "}",
++			requestor.getResults());
++}
++public void testInnerClassTypeInstantiation() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  class FooBar {}\n" +
++			"  {\n" +
++			"    Test t = new Test();\n" +
++			"    Object f = t.new bar\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "t.new bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXPECTED_TYPE + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testInnerClassTypeFieldDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  class FooBar {}\n" +
++			"  public bar\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "public bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testInnerClassTypeParamDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  class FooBar {}\n" +
++			"  void foo(bar\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "void foo(bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testInnerClassTypeLocalVarDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  class FooBar {}\n" +
++			"  {\n" +
++			"    final bar\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "final bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testInnerClassTypeThrowsDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  class FooBar extends Exception {}\n" +
++			"  void foo() throws bar" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "void foo() throws bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testInnerClassTypeExtends() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  class FooBar {}\n" +
++			"  class SpecificFooBar extends bar\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "SpecificFooBar extends bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXPECTED_TYPE + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testInnerClassTypeImplements() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  interface FooBar {}\n" +
++			"  class SpecificFooBar implements bar\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "class SpecificFooBar implements bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXPECTED_TYPE + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testStaticNestedClassTypeInstantiation() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static class FooBar {}\n" +
++			"  {\n" +
++			"    Object f = new bar\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "new bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXPECTED_TYPE + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testStaticNestedClassTypeFieldDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static class FooBar {}\n" +
++			"  public bar\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "public bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testStaticNestedClassTypeParamDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static class FooBar {}\n" +
++			"  void foo(bar\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "void foo(bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testStaticNestedClassTypeLocalVarDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static class FooBar {}\n" +
++			"  {\n" +
++			"    final bar\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "final bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testStaticNestedClassTypeThrowsDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static class FooBar extends Exception {}\n" +
++			"  void foo() throws bar" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "void foo() throws bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testStaticNestedClassTypeExtends() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static class FooBar {}\n" +
++			"  class SpecificFooBar extends bar\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "SpecificFooBar extends bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXPECTED_TYPE + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testStaticNestedClassTypeImplements() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  static interface FooBar {}\n" +
++			"  class SpecificFooBar implements bar\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "class SpecificFooBar implements bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"Test.FooBar[TYPE_REF]{FooBar, test, Ltest.Test$FooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXPECTED_TYPE + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testLocalClassTypeInstantiation() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  void foo() {\n" +
++			"    class FooBar {}\n" +
++			"    Object f = new bar\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "new bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"FooBar[TYPE_REF]{FooBar, test, LFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXPECTED_TYPE + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testLocalClassTypeLocalVarDeclaration() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  void foo() {\n" +
++			"    class FooBar {}\n" +
++			"    final bar\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "final bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"FooBar[TYPE_REF]{FooBar, test, LFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++public void testLocalClassTypeExtends() throws JavaModelException {
++	this.workingCopies = new ICompilationUnit[1];
++	this.workingCopies[0] = getWorkingCopy(
++			"/Completion/src/test/Test.java",
++			"package test;"+
++			"public class Test {\n" +
++			"  void foo() {\n" +
++			"    class FooBar {}\n" +
++			"    class SpecificFooBar extends bar\n" +
++			"  }\n" +
++			"}\n");
++
++	CompletionTestsRequestor2 requestor = new CompletionTestsRequestor2(true);
++	String str = this.workingCopies[0].getSource();
++	String completeBehind = "class SpecificFooBar extends bar";
++	int cursorLocation = str.lastIndexOf(completeBehind) + completeBehind.length();
++	this.workingCopies[0].codeComplete(cursorLocation, requestor, this.wcOwner);
++
++	assertResults(
++			"FooBar[TYPE_REF]{FooBar, test, LFooBar;, null, null, " + (R_DEFAULT + R_RESOLVED + R_INTERESTING + R_EXPECTED_TYPE + R_NON_RESTRICTED + R_UNQUALIFIED) + "}",
++			requestor.getResults());
++}
++}
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+index 7ce5155..aabbfb2 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+@@ -6,9 +6,12 @@
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
+  * Contributors:
++ *     Timo Kinnunen - Contributions for bug 377373 - [subwords] known limitations with JDT 3.8
++ *     							Bug 420953 - [subwords] Constructors that don't match prefix not found
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann - Contribution for
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
++ *     Gábor Kövesdán - Contribution for Bug 350000 - [content assist] Include non-prefix matches in auto-complete suggestions
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.codeassist;
+ 
+@@ -4842,8 +4845,7 @@ public final class CompletionEngine
+ 		nextAttribute: for (int i = 0; i < methods.length; i++) {
+ 			MethodBinding method = methods[i];
+ 
+-			if(!CharOperation.prefixEquals(token, method.selector, false)
+-					&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(token, method.selector))) continue nextAttribute;
++			if(isFailedMatch(token, method.selector)) continue nextAttribute;
+ 
+ 			int length = attributesFound == null ? 0 : attributesFound.length;
+ 			for (int j = 0; j < length; j++) {
+@@ -5770,8 +5772,7 @@ public final class CompletionEngine
+ 
+ 			if (enumConstantLength > field.name.length) continue next;
+ 
+-			if (!CharOperation.prefixEquals(enumConstantName, field.name, false /* ignore case */)
+-					&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(enumConstantName, field.name)))	continue next;
++			if (isFailedMatch(enumConstantName, field.name))	continue next;
+ 
+ 			char[] fieldName = field.name;
+ 
+@@ -5959,8 +5960,7 @@ public final class CompletionEngine
+ 		if (typeName.length > exceptionType.sourceName.length)
+ 			return;
+ 
+-		if (!CharOperation.prefixEquals(typeName, exceptionType.sourceName, false/* ignore case */)
+-				&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(typeName, exceptionType.sourceName)))
++		if (isFailedMatch(typeName, exceptionType.sourceName))
+ 			return;
+ 
+ 		if (this.options.checkDeprecation &&
+@@ -6297,8 +6297,7 @@ public final class CompletionEngine
+ 
+ 			if (fieldLength > field.name.length) continue next;
+ 
+-			if (!CharOperation.prefixEquals(fieldName, field.name, false /* ignore case */)
+-					&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(fieldName, field.name)))	continue next;
++			if (isFailedMatch(fieldName, field.name))	continue next;
+ 
+ 			if (this.options.checkDeprecation &&
+ 					field.isViewedAsDeprecated() &&
+@@ -7540,8 +7539,7 @@ public final class CompletionEngine
+ 
+ 			if (fieldLength > field.name.length) continue next;
+ 
+-			if (!CharOperation.prefixEquals(fieldName, field.name, false /* ignore case */)
+-					&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(fieldName, field.name)))	continue next;
++			if (isFailedMatch(fieldName, field.name))	continue next;
+ 
+ 			if (this.options.checkDeprecation &&
+ 					field.isViewedAsDeprecated() &&
+@@ -7781,8 +7779,7 @@ public final class CompletionEngine
+ 			if (typeLength > memberType.sourceName.length)
+ 				continue next;
+ 
+-			if (!CharOperation.prefixEquals(typeName, memberType.sourceName, false/* ignore case */)
+-					&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(typeName, memberType.sourceName)))
++			if (isFailedMatch(typeName, memberType.sourceName))
+ 				continue next;
+ 
+ 			if (this.options.checkDeprecation && memberType.isViewedAsDeprecated()) continue next;
+@@ -7838,8 +7835,7 @@ public final class CompletionEngine
+ 			if (!field.isStatic())
+ 				continue next;
+ 
+-			if (!CharOperation.prefixEquals(fieldName, field.name, false/* ignore case */)
+-				&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(fieldName, field.name)))
++			if (isFailedMatch(fieldName, field.name))
+ 				continue next;
+ 
+ 			if (this.options.checkDeprecation && field.isViewedAsDeprecated()) continue next;
+@@ -7903,8 +7899,7 @@ public final class CompletionEngine
+ 			if (methodLength > method.selector.length)
+ 				continue next;
+ 
+-			if (!CharOperation.prefixEquals(methodName, method.selector, false/* ignore case */)
+-					&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(methodName, method.selector)))
++			if (isFailedMatch(methodName, method.selector))
+ 				continue next;
+ 
+ 			int length = method.parameters.length;
+@@ -8400,8 +8395,7 @@ public final class CompletionEngine
+ 				if (methodLength > method.selector.length)
+ 					continue next;
+ 
+-				if (!CharOperation.prefixEquals(methodName, method.selector, false/* ignore case */)
+-						&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(methodName, method.selector)))
++				if (isFailedMatch(methodName, method.selector))
+ 					continue next;
+ 			}
+ 
+@@ -8555,8 +8549,7 @@ public final class CompletionEngine
+ 				}
+ 			} else {
+ 				if (methodLength > method.selector.length) continue next;
+-				if (!CharOperation.prefixEquals(methodName, method.selector, false /* ignore case */)
+-						&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(methodName, method.selector))) {
++				if (isFailedMatch(methodName, method.selector)) {
+ 					continue next;
+ 				}
+ 			}
+@@ -8890,8 +8883,7 @@ public final class CompletionEngine
+ 
+ 				if (methodLength > method.selector.length) continue next;
+ 
+-				if (!CharOperation.prefixEquals(methodName, method.selector, false /* ignore case */)
+-						&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(methodName, method.selector))) {
++				if (isFailedMatch(methodName, method.selector)) {
+ 					continue next;
+ 				}
+ 
+@@ -9628,8 +9620,7 @@ public final class CompletionEngine
+ 			if (typeLength > memberType.sourceName.length)
+ 				continue next;
+ 
+-			if (!CharOperation.prefixEquals(typeName, memberType.sourceName, false/* ignore case */)
+-					&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(typeName, memberType.sourceName)))
++			if (isFailedMatch(typeName, memberType.sourceName))
+ 				continue next;
+ 
+ 			if (this.options.checkDeprecation &&
+@@ -10160,8 +10151,7 @@ public final class CompletionEngine
+ 
+ 								if (typeLength > localType.sourceName.length)
+ 									continue next;
+-								if (!CharOperation.prefixEquals(typeName, localType.sourceName, false/* ignore case */)
+-										&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(typeName, localType.sourceName)))
++								if (isFailedMatch(typeName, localType.sourceName))
+ 									continue next;
+ 
+ 								for (int j = typesFound.size; --j >= 0;) {
+@@ -10437,8 +10427,7 @@ public final class CompletionEngine
+ 
+ 					if (typeLength > typeParameter.name.length) continue;
+ 
+-					if (!CharOperation.prefixEquals(token, typeParameter.name, false)
+-							&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(token, typeParameter.name))) continue;
++					if (isFailedMatch(token, typeParameter.name)) continue;
+ 
+ 					int relevance = computeBaseRelevance();
+ 					relevance += computeRelevanceForResolution();
+@@ -10538,8 +10527,7 @@ public final class CompletionEngine
+ 
+ 				if (typeLength > sourceType.sourceName.length) continue next;
+ 
+-				if (!CharOperation.prefixEquals(token, sourceType.sourceName, false)
+-						&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(token, sourceType.sourceName))) continue next;
++				if (isFailedMatch(token, sourceType.sourceName)) continue next;
+ 
+ 				if (this.assistNodeIsAnnotation && !hasPossibleAnnotationTarget(sourceType, scope)) {
+ 					continue next;
+@@ -10917,8 +10905,7 @@ public final class CompletionEngine
+ 					if (typeLength > 0) {
+ 						if (typeLength > refBinding.sourceName.length) continue next;
+ 	
+-						if (!CharOperation.prefixEquals(token, refBinding.sourceName, false)
+-								&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(token, refBinding.sourceName))) continue next;
++						if (isFailedMatch(token, refBinding.sourceName)) continue next;
+ 					}
+ 
+ 
+@@ -11084,8 +11071,7 @@ public final class CompletionEngine
+ 
+ 							if (typeLength > typeBinding.sourceName.length)	continue next;
+ 
+-							if (!CharOperation.prefixEquals(token, typeBinding.sourceName, false)
+-									&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(token, typeBinding.sourceName))) continue next;
++							if (isFailedMatch(token, typeBinding.sourceName)) continue next;
+ 							
+ 							int accessibility = IAccessRule.K_ACCESSIBLE;
+ 							if(typeBinding.hasRestrictedAccess()) {
+@@ -11209,8 +11195,7 @@ public final class CompletionEngine
+ 
+ 							if (typeLength > typeBinding.sourceName.length)	continue;
+ 
+-							if (!CharOperation.prefixEquals(token, typeBinding.sourceName, false)
+-									&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(token, typeBinding.sourceName)))	continue;
++							if (isFailedMatch(token, typeBinding.sourceName))	continue;
+ 
+ 							if (typesFound.contains(typeBinding))  continue;
+ 
+@@ -11734,8 +11719,7 @@ public final class CompletionEngine
+ 							if (tokenLength > local.name.length)
+ 								continue next;
+ 
+-							if (!CharOperation.prefixEquals(token, local.name, false /* ignore case */)
+-									&& !(this.options.camelCaseMatch && CharOperation.camelCaseMatch(token, local.name)))
++							if (isFailedMatch(token, local.name))
+ 								continue next;
+ 
+ 							if (local.isSecret())
+@@ -12150,6 +12134,26 @@ public final class CompletionEngine
+ 	private boolean isAllowingLongComputationProposals() {
+ 		return this.monitor != null;
+ 	}
++	
++	/**
++	 * Checks whether name matches the token according to the current
++	 * code completion settings (substring match, camel case match etc.)
++	 * and sets whether the current match is a suffix proposal.
++	 * 
++	 * @param token the token that is tested
++	 * @param name the name to match
++	 * @return <code>true</code> if the token does not match,
++	 * <code>false</code> otherwise
++	 */
++	private boolean isFailedMatch(char[] token, char[] name) {
++		if ((this.options.substringMatch && CharOperation.substringMatch(token, name))
++				|| (this.options.camelCaseMatch && CharOperation.camelCaseMatch(token, name))
++				|| CharOperation.prefixEquals(token, name, false)) {
++			return false;
++		}
++
++		return true;
++	}
+ 	private boolean isForbidden(ReferenceBinding binding) {
+ 		for (int i = 0; i <= this.forbbidenBindingsPtr; i++) {
+ 			if(this.forbbidenBindings[i] == binding) {
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistOptions.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistOptions.java
+index ce75101..8c6d3d3 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistOptions.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistOptions.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Gábor Kövesdán - Contribution for Bug 350000 - [content assist] Include non-prefix matches in auto-complete suggestions
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.codeassist.impl;
+ 
+@@ -51,6 +52,8 @@ public class AssistOptions {
+ 		"org.eclipse.jdt.core.codeComplete.discouragedReferenceCheck"; 	//$NON-NLS-1$
+ 	public static final String OPTION_CamelCaseMatch =
+ 		"org.eclipse.jdt.core.codeComplete.camelCaseMatch"; 	//$NON-NLS-1$
++	public static final String OPTION_SubstringMatch =
++			"org.eclipse.jdt.core.codeComplete.substringMatch"; 	//$NON-NLS-1$
+ 	public static final String OPTION_SuggestStaticImports =
+ 		"org.eclipse.jdt.core.codeComplete.suggestStaticImports"; 	//$NON-NLS-1$
+ 
+@@ -63,6 +66,7 @@ public class AssistOptions {
+ 	public boolean checkDiscouragedReference = false;
+ 	public boolean forceImplicitQualification = false;
+ 	public boolean camelCaseMatch = true;
++	public boolean substringMatch = true;
+ 	public boolean suggestStaticImport = true;
+ 	public char[][] fieldPrefixes = null;
+ 	public char[][] staticFieldPrefixes = null;
+@@ -229,6 +233,13 @@ public class AssistOptions {
+ 				this.camelCaseMatch = false;
+ 			}
+ 		}
++		if ((optionValue = optionsMap.get(OPTION_SubstringMatch)) != null) {
++			if (ENABLED.equals(optionValue)) {
++				this.substringMatch = true;
++			} else if (DISABLED.equals(optionValue)) {
++				this.substringMatch = false;
++			}
++		}
+ 		if ((optionValue = optionsMap.get(OPTION_PerformDeprecationCheck)) != null) {
+ 			if (ENABLED.equals(optionValue)) {
+ 				this.checkDeprecation = true;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/CharOperation.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/CharOperation.java
+index a8f65a0..ce2f726 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/CharOperation.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/CharOperation.java
+@@ -8,6 +8,7 @@
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Luiz-Otavio Zorzella <zorzella at gmail dot com> - Improve CamelCase algorithm
++ *     Gábor Kövesdán - Contribution for Bug 350000 - [content assist] Include non-prefix matches in auto-complete suggestions
+  *******************************************************************************/
+ package org.eclipse.jdt.core.compiler;
+ 
+@@ -694,6 +695,94 @@ public static final boolean camelCaseMatch(char[] pattern, int patternStart, int
+ }
+ 
+ /**
++ * Answers true if the characters of the pattern are contained in the
++ * name as a substring, in a case-insensitive way.
++ *
++ * @param pattern the given pattern
++ * @param name the given name
++ * @return true if the pattern matches the given name, false otherwise
++ * @since 3.12
++ */
++public static final boolean substringMatch(String pattern, String name) {
++	if (pattern == null || pattern.length() == 0) {
++		return true;
++	}
++	if (name == null) {
++		return false;
++	}
++	return checkSubstringMatch(pattern.toCharArray(), name.toCharArray());
++}
++
++/**
++ * Answers true if the characters of the pattern are contained in the
++ * name as a substring, in a case-insensitive way.
++ *
++ * @param pattern the given pattern
++ * @param name the given name
++ * @return true if the pattern matches the given name, false otherwise
++ * @since 3.12
++ */
++public static final boolean substringMatch(char[] pattern, char[] name) {
++	if (pattern == null || pattern.length == 0) {
++		return true;
++	}
++	if (name == null) {
++		return false;
++	}
++	return checkSubstringMatch(pattern, name);
++}
++
++/**
++ * Internal substring matching method; called after the null and length
++ * checks are performed.
++ *
++ * @param pattern the given pattern
++ * @param name the given name
++ * @return true if the pattern matches the given name, false otherwise
++ *
++ * @see CharOperation#substringMatch(char[], char[])
++ */
++private static final boolean checkSubstringMatch(char[] pattern, char[] name) {
++
++/* XXX: to be revised/enabled
++
++	// allow non-consecutive occurrence of pattern characters
++	if (pattern.length >= 3) {
++		int pidx = 0;
++
++		for (int nidx = 0; nidx < name.length; nidx++) {
++			if (Character.toLowerCase(name[nidx]) ==
++					Character.toLowerCase(pattern[pidx]))
++				pidx++;
++			if (pidx == pattern.length)
++				return true;
++		}
++
++	// for short patterns only allow consecutive occurrence
++	} else {
++*/
++		// outer loop iterates on the characters of the name; trying to
++		// match at any possible position
++		outer: for (int nidx = 0; nidx < name.length - pattern.length + 1; nidx++) {
++			// inner loop iterates on pattern characters
++			for (int pidx = 0; pidx < pattern.length; pidx++) {
++				if (Character.toLowerCase(name[nidx + pidx]) !=
++						Character.toLowerCase(pattern[pidx])) {
++					// no match until parameter list; do not match parameter list
++					if ((name[nidx + pidx] == '(') || (name[nidx + pidx] == ':'))
++						return false;
++					continue outer;
++				}
++				if (pidx == pattern.length - 1)
++					return true;
++			}
++		}
++	// XXX: }
++
++	return false;
++}
++
++/**
+  * Returns the char arrays as an array of Strings
+  *
+  * @param charArrays the char array to convert
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+index f9aa393..55ad05f 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+@@ -102,6 +102,7 @@
+  *                       - added the following constants:
+  *									COMPILER_CODEGEN_METHOD_PARAMETERS_ATTR
+  *     Harry Terkelsen (het@google.com) - Bug 449262 - Allow the use of third-party Java formatters
++ *     Gábor Kövesdán - Contribution for Bug 350000 - [content assist] Include non-prefix matches in auto-complete suggestions
+  *     
+  *******************************************************************************/
+ 
+@@ -2408,6 +2409,19 @@ public final class JavaCore extends Plugin {
+ 	 */
+ 	public static final String CODEASSIST_CAMEL_CASE_MATCH = PLUGIN_ID + ".codeComplete.camelCaseMatch"; //$NON-NLS-1$
+ 	/**
++	 * Code assist option ID: Activate Substring Code Completion.
++	 * <p>When enabled, completion shows proposals in which the pattern can
++	 *    be found as a substring in a case-insensitive way.</p>
++	 * <dl>
++	 * <dt>Option id:</dt><dd><code>"org.eclipse.jdt.core.codeComplete.substringMatch"</code></dd>
++	 * <dt>Possible values:</dt><dd><code>{ "enabled", "disabled" }</code></dd>
++	 * <dt>Default:</dt><dd><code>"enabled"</code></dd>
++	 * </dl>
++	 * @since 3.12
++	 * @category CodeAssistOptionID
++	 */
++	public static final String CODEASSIST_SUBSTRING_MATCH = PLUGIN_ID + ".codeComplete.substringMatch"; //$NON-NLS-1$
++	/**
+ 	 * Code assist option ID: Automatic Qualification of Implicit Members.
+ 	 * <p>When active, completion automatically qualifies completion on implicit
+ 	 *    field references and message expressions.</p>
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaCorePreferenceInitializer.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaCorePreferenceInitializer.java
+index 28812d7..2b1f881 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaCorePreferenceInitializer.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaCorePreferenceInitializer.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -8,6 +8,7 @@
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Harry Terkelsen (het@google.com) - Bug 449262 - Allow the use of third-party Java formatters
++ *     Gábor Kövesdán - Contribution for Bug 350000 - [content assist] Include non-prefix matches in auto-complete suggestions
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -93,6 +94,7 @@ public class JavaCorePreferenceInitializer extends AbstractPreferenceInitializer
+ 		defaultOptionsMap.put(JavaCore.CODEASSIST_FORBIDDEN_REFERENCE_CHECK, JavaCore.ENABLED);
+ 		defaultOptionsMap.put(JavaCore.CODEASSIST_DISCOURAGED_REFERENCE_CHECK, JavaCore.DISABLED);
+ 		defaultOptionsMap.put(JavaCore.CODEASSIST_CAMEL_CASE_MATCH, JavaCore.ENABLED);
++		defaultOptionsMap.put(JavaCore.CODEASSIST_SUBSTRING_MATCH, JavaCore.ENABLED);
+ 		defaultOptionsMap.put(JavaCore.CODEASSIST_SUGGEST_STATIC_IMPORTS, JavaCore.ENABLED);
+ 
+ 		// Time out for parameter names
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+index 49b71ab..8230d55 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+@@ -17,6 +17,7 @@
+  *     Thirumala Reddy Mutchukota <thirumala@google.com> - Contribution to bug: https://bugs.eclipse.org/bugs/show_bug.cgi?id=411423
+  *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
+  *     Terry Parker <tparker@google.com> - Enable the Java model caches to recover from IO errors - https://bugs.eclipse.org/455042
++ *     Gábor Kövesdán - Contribution for Bug 350000 - [content assist] Include non-prefix matches in auto-complete suggestions
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -2273,6 +2274,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 		defaultOptionsMap.put(JavaCore.CODEASSIST_FORBIDDEN_REFERENCE_CHECK, JavaCore.ENABLED);
+ 		defaultOptionsMap.put(JavaCore.CODEASSIST_DISCOURAGED_REFERENCE_CHECK, JavaCore.DISABLED);
+ 		defaultOptionsMap.put(JavaCore.CODEASSIST_CAMEL_CASE_MATCH, JavaCore.ENABLED);
++		defaultOptionsMap.put(JavaCore.CODEASSIST_SUBSTRING_MATCH, JavaCore.ENABLED);
+ 		defaultOptionsMap.put(JavaCore.CODEASSIST_SUGGEST_STATIC_IMPORTS, JavaCore.ENABLED);
+ 
+ 		// Time out for parameter names

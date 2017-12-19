@@ -1,0 +1,546 @@
+commit 517ca73566ccb2c3decbb075f1defcba36a8b437
+Author: Simon Kaegi <skaegi>
+Date:   Fri May 9 19:03:55 2008 +0000
+
+    Bug 229342 [shared] Updates to the base in a shared read-only install
+
+65	11	bundles/org.eclipse.equinox.frameworkadmin.equinox/src/org/eclipse/equinox/internal/frameworkadmin/equinox/EquinoxFwConfigFileParser.java
+2	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+16	6	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+105	39	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
+1	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+2	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/ISurrogateProfileHandler.java
+6	1	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
+28	27	bundles/org.eclipse.equinox.simpleconfigurator/src/org/eclipse/equinox/internal/simpleconfigurator/SimpleConfiguratorImpl.java
+diff --git a/bundles/org.eclipse.equinox.frameworkadmin.equinox/src/org/eclipse/equinox/internal/frameworkadmin/equinox/EquinoxFwConfigFileParser.java b/bundles/org.eclipse.equinox.frameworkadmin.equinox/src/org/eclipse/equinox/internal/frameworkadmin/equinox/EquinoxFwConfigFileParser.java
+index 64d97d0..0bf78c2 100644
+--- a/bundles/org.eclipse.equinox.frameworkadmin.equinox/src/org/eclipse/equinox/internal/frameworkadmin/equinox/EquinoxFwConfigFileParser.java
++++ b/bundles/org.eclipse.equinox.frameworkadmin.equinox/src/org/eclipse/equinox/internal/frameworkadmin/equinox/EquinoxFwConfigFileParser.java
+@@ -246,16 +246,10 @@ public class EquinoxFwConfigFileParser {
+ 		//Start figuring out stuffs 
+ 		URL rootURL = launcherData.getLauncher() != null ? launcherData.getLauncher().getParentFile().toURL() : null;
+ 
+-		// look for shared configuration to merge
+-		String sharedConfigurationArea = props.getProperty(EquinoxConstants.PROP_SHARED_CONFIGURATION_AREA);
+-		if (sharedConfigurationArea != null) {
+-			File sharedConfigIni = findSharedConfigIniFile(rootURL, sharedConfigurationArea);
+-			if (sharedConfigIni != null && sharedConfigIni.exists()) {
+-				Properties sharedProps = loadProperties(sharedConfigIni);
+-				// merge: shared properties are over-written by user customizations
+-				sharedProps.putAll(props);
+-				props = sharedProps;
+-			}
++		Properties sharedConfigProperties = getSharedConfiguration(props.getProperty(EquinoxConstants.PROP_SHARED_CONFIGURATION_AREA), getOSGiInstallArea(manipulator.getLauncherData()));
++		if (sharedConfigProperties != null) {
++			sharedConfigProperties.putAll(props);
++			props = sharedConfigProperties;
+ 		}
+ 
+ 		//Extracting fwkJar location needs to be done first 
+@@ -333,7 +327,6 @@ public class EquinoxFwConfigFileParser {
+ 
+ 		// check for a relative URL
+ 		if (!sharedConfigurationURL.getPath().startsWith("/")) { //$NON-NLS-1$
+-
+ 			if (!rootURL.getProtocol().equals(sharedConfigurationURL.getProtocol())) {
+ 				Log.log(LogService.LOG_WARNING, NLS.bind(Messages.log_shared_config_relative_url, rootURL.toExternalForm(), sharedConfigurationArea));
+ 				return null;
+@@ -496,6 +489,7 @@ public class EquinoxFwConfigFileParser {
+ 		try {
+ 			out = new FileOutputStream(outputFile);
+ 			configProps = makeRelative(configProps, launcherData.getLauncher().getParentFile().toURL(), fwJar, outputFile.getParentFile(), getOSGiInstallArea(manipulator.getLauncherData()));
++			filterPropertiesFromSharedArea(configProps, launcherData);
+ 			configProps.store(out, header);
+ 			Log.log(LogService.LOG_INFO, NLS.bind(Messages.log_fwConfigSave, outputFile));
+ 		} finally {
+@@ -508,4 +502,64 @@ public class EquinoxFwConfigFileParser {
+ 			out = null;
+ 		}
+ 	}
++
++	private void filterPropertiesFromSharedArea(Properties configProps, LauncherData launcherData) {
++		//Remove from the config file that we are about to write the properties that are unchanged compared to what is in the base 
++		Properties sharedConfigProperties = getSharedConfiguration(configProps.getProperty(EquinoxConstants.PROP_SHARED_CONFIGURATION_AREA), getOSGiInstallArea(launcherData));
++		if (sharedConfigProperties == null)
++			return;
++		Enumeration keys = configProps.propertyNames();
++		while (keys.hasMoreElements()) {
++			String key = (String) keys.nextElement();
++			String sharedValue = sharedConfigProperties.getProperty(key);
++			if (sharedValue == null)
++				continue;
++			if (equalsIgnoringSeparators(sharedValue, configProps.getProperty(key)))
++				configProps.remove(key);
++		}
++	}
++
++	private boolean equalsIgnoringSeparators(String s1, String s2) {
++		if (s1 == null && s2 == null)
++			return true;
++		if (s1 == null || s2 == null)
++			return false;
++		StringBuffer sb1 = new StringBuffer(s1);
++		StringBuffer sb2 = new StringBuffer(s2);
++		canonicalizePathsForComparison(sb1);
++		canonicalizePathsForComparison(sb2);
++		return sb1.toString().equals(sb2.toString());
++	}
++
++	private void canonicalizePathsForComparison(StringBuffer s) {
++		final String[] tokens = new String[] {"\\\\", "\\", "//", "/"}; //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$//$NON-NLS-4$
++		for (int t = 0; t < tokens.length; t++) {
++			int idx = s.length();
++			for (int i = s.length(); i != 0 && idx != -1; i--) {
++				idx = s.lastIndexOf(tokens[t], idx);
++				if (idx != -1)
++					s.replace(idx, idx + tokens[t].length(), "^"); //$NON-NLS-1$
++			}
++		}
++	}
++
++	private Properties getSharedConfiguration(String sharedConfigurationArea, File baseFile) {
++		if (sharedConfigurationArea == null)
++			return null;
++		File sharedConfigIni;
++		try {
++			sharedConfigIni = findSharedConfigIniFile(baseFile.toURL(), sharedConfigurationArea);
++		} catch (MalformedURLException e) {
++			return null;
++		}
++		if (sharedConfigIni != null && sharedConfigIni.exists())
++			try {
++				return loadProperties(sharedConfigIni);
++			} catch (FileNotFoundException e) {
++				return null;
++			} catch (IOException e) {
++				return null;
++			}
++		return null;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+index d9f2e19..ff04105 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+@@ -55,6 +55,8 @@ class Messages extends NLS {
+ 	public static String TouchpointManager_Required_Touchpoint_Not_Found;
+ 	public static String TouchpointManager_Touchpoint_Type_Mismatch;
+ 
++	public static String shared_profile_not_found;
++
+ 	static {
+ 		// initialize resource bundles
+ 		NLS.initializeMessages(BUNDLE_NAME, Messages.class);
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index 42d2e91..b77645b 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -128,15 +128,26 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	 * If the current profile for self is marked as a roaming profile, we need
+ 	 * to update its install and bundle pool locations.
+ 	 */
+-	private void updateRoamingProfile(Map profileMap) {
++	private void updateSelfProfile(Map profileMap) {
+ 		if (profileMap == null)
+ 			return;
+ 		Profile selfProfile = (Profile) profileMap.get(self);
+ 		if (selfProfile == null)
+ 			return;
++
++		boolean changed = false;
+ 		//only update if self is a roaming profile
+-		if (!Boolean.valueOf(selfProfile.getProperty(IProfile.PROP_ROAMING)).booleanValue())
+-			return;
++		if (Boolean.valueOf(selfProfile.getProperty(IProfile.PROP_ROAMING)).booleanValue())
++			changed = updateRoamingProfile(selfProfile);
++
++		if (surrogateProfileHandler != null && surrogateProfileHandler.isSurrogate(selfProfile))
++			changed = changed || surrogateProfileHandler.updateProfile(selfProfile);
++
++		if (changed)
++			saveProfile(selfProfile);
++	}
++
++	private boolean updateRoamingProfile(Profile selfProfile) {
+ 		Location installLocation = (Location) ServiceHelper.getService(EngineActivator.getContext(), Location.class.getName(), Location.INSTALL_FILTER);
+ 		File location = new File(installLocation.getURL().getPath());
+ 		boolean changed = false;
+@@ -148,8 +159,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 			selfProfile.setProperty(IProfile.PROP_CACHE, location.getAbsolutePath());
+ 			changed = true;
+ 		}
+-		if (changed)
+-			saveProfile(selfProfile);
++		return changed;
+ 	}
+ 
+ 	public synchronized String toString() {
+@@ -216,7 +226,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		if (!hasBeenRestored) {
+ 			//update roaming profile on first load
+ 			hasBeenRestored = true;
+-			updateRoamingProfile(result);
++			updateSelfProfile(result);
+ 		}
+ 		return result;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
+index f8fa946..708a3c3 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
+@@ -17,83 +17,99 @@ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ISurrogateProfileHandler;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
++import org.eclipse.equinox.internal.provisional.p2.metadata.query.InstallableUnitQuery;
+ import org.eclipse.equinox.internal.provisional.p2.query.Collector;
+ import org.eclipse.equinox.internal.provisional.p2.query.Query;
+ import org.eclipse.osgi.service.datalocation.Location;
++import org.eclipse.osgi.util.NLS;
+ 
+ public class SurrogateProfileHandler implements ISurrogateProfileHandler {
+ 
+-	private static final String ORG_ECLIPSE_EQUINOX_P2_NATIVE = "org.eclipse.equinox.p2.native"; //$NON-NLS-1$
+-	private static final String ORG_ECLIPSE_EQUINOX_P2_TYPE_ROOT = "org.eclipse.equinox.p2.type.root"; //$NON-NLS-1$
++	private static final String NATIVE_TOUCHPOINT_TYPE = "org.eclipse.equinox.p2.native"; //$NON-NLS-1$
++	private static final String PROP_TYPE_ROOT = "org.eclipse.equinox.p2.type.root"; //$NON-NLS-1$
+ 	private static final String P2_ENGINE_DIR = "p2/" + EngineActivator.ID + "/"; //$NON-NLS-1$//$NON-NLS-2$
+ 	private static final String OSGI_INSTALL_AREA = "osgi.install.area"; //$NON-NLS-1$
+ 	private static final String ECLIPSE_INI_IGNORED = "eclipse.ini.ignored"; //$NON-NLS-1$
+ 	private static final String IU_LOCKED = Integer.toString(IInstallableUnit.LOCK_UNINSTALL | IInstallableUnit.LOCK_UPDATE);
+-
+-	/**
+-	 * Profile property constant indicating the bundle pool cache location.
+-	 */
+-	public static final String PROP_SURROGATE = "org.eclipse.equinox.p2.surrogate"; //$NON-NLS-1$
++	private static final String PROP_SURROGATE = "org.eclipse.equinox.p2.surrogate"; //$NON-NLS-1$
++	private static final String PROP_SHARED_TIMESTAMP = "org.eclipse.equinox.p2.shared.timestamp"; //$NON-NLS-1$
++	private static final String PROP_BASE = "org.eclipse.equinox.p2.base"; //$NON-NLS-1$
++	private static final String PROP_RESOLVE = "org.eclipse.equinox.p2.resolve"; //$NON-NLS-1$
++	private static final String OPTIONAL = "OPTIONAL"; //$NON-NLS-1$
++	private static final String PROP_INCLUSION_RULES = "org.eclipse.equinox.p2.internal.inclusion.rules"; //$NON-NLS-1$
+ 
+ 	private SimpleProfileRegistry profileRegistry;
+ 
+-	private synchronized SimpleProfileRegistry getProfileRegistry() {
+-		if (profileRegistry == null) {
+-			String installArea = EngineActivator.getContext().getProperty(OSGI_INSTALL_AREA);
+-			try {
+-				URL registryURL = new URL(installArea + P2_ENGINE_DIR + SimpleProfileRegistry.DEFAULT_STORAGE_DIR);
+-				File sharedRegistryDirectory = new File(registryURL.getPath());
+-				profileRegistry = new SimpleProfileRegistry(sharedRegistryDirectory, null);
+-			} catch (MalformedURLException e) {
+-				//this is not possible because we know the above URL is valid
+-			}
+-		}
+-		return profileRegistry;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see org.eclipse.equinox.internal.p2.engine.ISurrogateProfileHandler#createProfile(java.lang.String)
+-	 */
+-	public Profile createProfile(String id) {
+-		final IProfile sharedProfile = getProfileRegistry().getProfile(id);
+-		if (sharedProfile == null)
+-			return null;
+-
++	private static void addSharedProfileBaseIUs(final IProfile sharedProfile, final Profile userProfile) {
+ 		Query rootIUQuery = new Query() {
+ 			public boolean isMatch(Object candidate) {
+ 				if (candidate instanceof IInstallableUnit) {
+ 					IInstallableUnit iu = (IInstallableUnit) candidate;
+-					if (Boolean.valueOf(sharedProfile.getInstallableUnitProperty(iu, ORG_ECLIPSE_EQUINOX_P2_TYPE_ROOT)).booleanValue())
++					if (Boolean.valueOf(sharedProfile.getInstallableUnitProperty(iu, PROP_TYPE_ROOT)).booleanValue())
+ 						return true;
+-					if (iu.getTouchpointType().getId().equals(ORG_ECLIPSE_EQUINOX_P2_NATIVE))
++					if (iu.getTouchpointType().getId().equals(NATIVE_TOUCHPOINT_TYPE))
+ 						return true;
+ 				}
+ 				return false;
+ 			}
+ 		};
+-
+ 		Collector rootIUs = sharedProfile.query(rootIUQuery, new Collector(), null);
+-
+-		Profile userProfile = new Profile(id, null, sharedProfile.getProperties());
+-		userProfile.setSurrogateProfileHandler(this);
+ 		for (Iterator iterator = rootIUs.iterator(); iterator.hasNext();) {
+ 			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+ 			userProfile.addInstallableUnit(iu);
+ 			userProfile.addInstallableUnitProperties(iu, sharedProfile.getInstallableUnitProperties(iu));
+ 			userProfile.setInstallableUnitProperty(iu, IInstallableUnit.PROP_PROFILE_LOCKED_IU, IU_LOCKED);
++			userProfile.setInstallableUnitProperty(iu, PROP_BASE, Boolean.TRUE.toString());
+ 		}
++	}
+ 
+-		//update properties
+-		userProfile.setProperty(PROP_SURROGATE, Boolean.TRUE.toString());
++	private static void removeUserProfileBaseIUs(final Profile userProfile) {
++		Query rootIUQuery = new Query() {
++			public boolean isMatch(Object candidate) {
++				if (candidate instanceof IInstallableUnit) {
++					IInstallableUnit iu = (IInstallableUnit) candidate;
++					if (Boolean.valueOf(userProfile.getInstallableUnitProperty(iu, PROP_BASE)).booleanValue())
++						return true;
++				}
++				return false;
++			}
++		};
++		Collector rootIUs = userProfile.query(rootIUQuery, new Collector(), null);
++		for (Iterator iterator = rootIUs.iterator(); iterator.hasNext();) {
++			IInstallableUnit iu = (IInstallableUnit) iterator.next();
++			userProfile.removeInstallableUnit(iu);
++		}
++	}
++
++	private static void markRootsOptional(final Profile userProfile) {
++		Query rootIUQuery = new Query() {
++			public boolean isMatch(Object candidate) {
++				if (candidate instanceof IInstallableUnit) {
++					IInstallableUnit iu = (IInstallableUnit) candidate;
++					if (Boolean.valueOf(userProfile.getInstallableUnitProperty(iu, PROP_TYPE_ROOT)).booleanValue())
++						return true;
++				}
++				return false;
++			}
++		};
++		Collector rootIUs = userProfile.query(rootIUQuery, new Collector(), null);
++		for (Iterator iterator = rootIUs.iterator(); iterator.hasNext();) {
++			IInstallableUnit iu = (IInstallableUnit) iterator.next();
++			userProfile.setInstallableUnitProperty(iu, PROP_INCLUSION_RULES, OPTIONAL);
++		}
++	}
++
++	private static void updateProperties(final IProfile sharedProfile, Profile userProfile) {
++		userProfile.setProperty(PROP_SHARED_TIMESTAMP, Long.toString(sharedProfile.getTimestamp()));
+ 		Location installLocation = (Location) ServiceHelper.getService(EngineActivator.getContext(), Location.class.getName(), Location.INSTALL_FILTER);
+ 		File installFolder = new File(installLocation.getURL().getPath());
+ 
+-		if (Boolean.valueOf(userProfile.getProperty(IProfile.PROP_ROAMING)).booleanValue()) {
++		if (Boolean.valueOf(sharedProfile.getProperty(IProfile.PROP_ROAMING)).booleanValue()) {
+ 			userProfile.setProperty(IProfile.PROP_INSTALL_FOLDER, installFolder.getAbsolutePath());
+ 			userProfile.setProperty(IProfile.PROP_SHARED_CACHE, installFolder.getAbsolutePath());
+ 			userProfile.setProperty(IProfile.PROP_ROAMING, Boolean.FALSE.toString());
+ 		} else {
+-			String cache = userProfile.getProperty(IProfile.PROP_CACHE);
++			String cache = sharedProfile.getProperty(IProfile.PROP_CACHE);
+ 			if (cache != null)
+ 				userProfile.setProperty(IProfile.PROP_SHARED_CACHE, cache);
+ 		}
+@@ -106,6 +122,35 @@ public class SurrogateProfileHandler implements ISurrogateProfileHandler {
+ 
+ 		File launcherConfigFile = new File(configurationFolder, ECLIPSE_INI_IGNORED);
+ 		userProfile.setProperty(IProfile.PROP_LAUNCHER_CONFIGURATION, launcherConfigFile.getAbsolutePath());
++	}
++
++	private synchronized SimpleProfileRegistry getProfileRegistry() {
++		if (profileRegistry == null) {
++			String installArea = EngineActivator.getContext().getProperty(OSGI_INSTALL_AREA);
++			try {
++				URL registryURL = new URL(installArea + P2_ENGINE_DIR + SimpleProfileRegistry.DEFAULT_STORAGE_DIR);
++				File sharedRegistryDirectory = new File(registryURL.getPath());
++				profileRegistry = new SimpleProfileRegistry(sharedRegistryDirectory, null);
++			} catch (MalformedURLException e) {
++				//this is not possible because we know the above URL is valid
++			}
++		}
++		return profileRegistry;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.engine.ISurrogateProfileHandler#createProfile(java.lang.String)
++	 */
++	public Profile createProfile(String id) {
++		final IProfile sharedProfile = getProfileRegistry().getProfile(id);
++		if (sharedProfile == null)
++			return null;
++
++		Profile userProfile = new Profile(id, null, sharedProfile.getProperties());
++		userProfile.setProperty(PROP_SURROGATE, Boolean.TRUE.toString());
++		userProfile.setSurrogateProfileHandler(this);
++		updateProperties(sharedProfile, userProfile);
++		addSharedProfileBaseIUs(sharedProfile, userProfile);
+ 		return userProfile;
+ 	}
+ 
+@@ -126,4 +171,25 @@ public class SurrogateProfileHandler implements ISurrogateProfileHandler {
+ 
+ 		return profile.query(query, collector, monitor);
+ 	}
++
++	public boolean updateProfile(Profile userProfile) {
++		final IProfile sharedProfile = getProfileRegistry().getProfile(userProfile.getProfileId());
++		if (sharedProfile == null)
++			throw new IllegalStateException(NLS.bind(Messages.shared_profile_not_found, userProfile.getProfileId()));
++
++		String sharedTimeStamp = Long.toString(sharedProfile.getTimestamp());
++		String userSharedTimeStamp = userProfile.getProperty(PROP_SHARED_TIMESTAMP);
++
++		if (userSharedTimeStamp != null && userSharedTimeStamp.equals(sharedTimeStamp))
++			return false;
++
++		updateProperties(sharedProfile, userProfile);
++		removeUserProfileBaseIUs(userProfile);
++		if (!userProfile.query(InstallableUnitQuery.ANY, new Collector(), null).isEmpty()) {
++			userProfile.setProperty(PROP_RESOLVE, Boolean.TRUE.toString());
++			markRootsOptional(userProfile);
++		}
++		addSharedProfileBaseIUs(sharedProfile, userProfile);
++		return true;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+index 48dee69..94cf942 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+@@ -42,3 +42,4 @@ profile_not_current=Profile {0} is not current.
+ profile_not_registered=Profile {0} not registered.
+ reg_dir_not_available=Registry Directory not available.
+ thread_not_owner=Thread not lock owner.
++shared_profile_not_found=Shared profile {0} not found.
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/ISurrogateProfileHandler.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/ISurrogateProfileHandler.java
+index 5c01dc4..02d6e33 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/ISurrogateProfileHandler.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/ISurrogateProfileHandler.java
+@@ -13,4 +13,6 @@ public interface ISurrogateProfileHandler {
+ 
+ 	public abstract Collector queryProfile(IProfile profile, Query query, Collector collector, IProgressMonitor monitor);
+ 
++	public abstract boolean updateProfile(Profile selfProfile);
++
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
+index 28d26cf..bb819c1 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
+@@ -256,6 +256,11 @@ public class ProfileSynchronizer {
+ 
+ 	public ProfileChangeRequest createProfileChangeRequest(ProvisioningContext context) {
+ 		ProfileChangeRequest request = new ProfileChangeRequest(profile);
++
++		boolean resolve = Boolean.valueOf(profile.getProperty("org.eclipse.equinox.p2.resolve")).booleanValue();
++		if (resolve)
++			request.removeProfileProperty("org.eclipse.equinox.p2.resolve");
++
+ 		List toAdd = new ArrayList();
+ 		List toRemove = new ArrayList();
+ 
+@@ -298,7 +303,7 @@ public class ProfileSynchronizer {
+ 				toRemove.add(iu);
+ 		}
+ 
+-		if (toAdd.isEmpty() && toRemove.isEmpty())
++		if (toAdd.isEmpty() && toRemove.isEmpty() && !resolve)
+ 			return null;
+ 
+ 		context.setExtraIUs(toAdd);
+diff --git a/bundles/org.eclipse.equinox.simpleconfigurator/src/org/eclipse/equinox/internal/simpleconfigurator/SimpleConfiguratorImpl.java b/bundles/org.eclipse.equinox.simpleconfigurator/src/org/eclipse/equinox/internal/simpleconfigurator/SimpleConfiguratorImpl.java
+index 7d19027..d6a48a2 100644
+--- a/bundles/org.eclipse.equinox.simpleconfigurator/src/org/eclipse/equinox/internal/simpleconfigurator/SimpleConfiguratorImpl.java
++++ b/bundles/org.eclipse.equinox.simpleconfigurator/src/org/eclipse/equinox/internal/simpleconfigurator/SimpleConfiguratorImpl.java
+@@ -1,12 +1,10 @@
+ /*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
++ * Copyright (c) 2007, 2008 IBM Corporation and others. All rights reserved.
++ * This program and the accompanying materials are made available under the
++ * terms of the Eclipse Public License v1.0 which accompanies this distribution,
++ * and is available at http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors: IBM Corporation - initial API and implementation
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.simpleconfigurator;
+ 
+@@ -20,17 +18,19 @@ import org.eclipse.equinox.internal.simpleconfigurator.utils.*;
+ import org.osgi.framework.Bundle;
+ import org.osgi.framework.BundleContext;
+ 
+-/**
+- * SimpleConfigurator provides ways to install bundles listed in a file accessible
+- * by the specified URL and expect states for it in advance without actual application.
++/*
++ * SimpleConfigurator provides ways to install bundles listed in a file
++ * accessible by the specified URL and expect states for it in advance without
++ * actual application.
+  * 
+  * In every methods of SimpleConfiguration object,
+- *  
+- * 1. A value will be gotten by @{link BundleContext#getProperty(key) with 
++ * 
++ * 1. A value will be gotten by @{link BundleContext#getProperty(key) with
+  * {@link SimpleConfiguratorConstants#PROP_KEY_EXCLUSIVE_INSTALLATION} as a key.
+- * 2. If it equals "true", it will do exclusive installation, which means that 
++ * 2. If it equals "true", it will do exclusive installation, which means that
+  * the bundles will not be listed in the specified url but installed at the time
+- * of the method call except SystemBundle will be uninstalled. Otherwise, no uninstallation will not be done.
++ * of the method call except SystemBundle will be uninstalled. Otherwise, no
++ * uninstallation will not be done.
+  */
+ public class SimpleConfiguratorImpl implements Configurator {
+ 
+@@ -78,15 +78,18 @@ public class SimpleConfiguratorImpl implements Configurator {
+ 			//if it is an relative file URL, then resolve it against the configuration area
+ 			URL[] configURL = EquinoxUtils.getConfigAreaURL(context);
+ 			if (configURL != null) {
+-				File target = new File(configURL[0].getFile(), url.getFile());
+-				if (target.exists())
+-					return target.toURL();
+-				else if (configURL.length > 1) {
+-					target = new File(configURL[1].getFile(), url.getFile());
+-					if (target.exists())
+-						return target.toURL();
+-				}
+-				return null;
++				File userConfig = new File(configURL[0].getFile(), url.getFile());
++				if (configURL.length == 1)
++					return userConfig.exists() ? userConfig.toURL() : null;
++
++				File sharedConfig = new File(configURL[1].getFile(), url.getFile());
++				if (!userConfig.exists())
++					return sharedConfig.exists() ? sharedConfig.toURL() : null;
++
++				if (!sharedConfig.exists())
++					return userConfig.toURL();
++
++				return (sharedConfig.lastModified() > userConfig.lastModified()) ? sharedConfig.toURL() : userConfig.toURL();
+ 			}
+ 		} catch (MalformedURLException e) {
+ 			return null;
+@@ -130,9 +133,7 @@ public class SimpleConfiguratorImpl implements Configurator {
+ 
+ 	public void applyConfiguration() throws IOException {
+ 		synchronized (configurationLock) {
+-			if (configurationURL == null)
+-				configurationURL = getConfigurationURL();
+-
++			configurationURL = getConfigurationURL();
+ 			applyConfiguration(configurationURL);
+ 		}
+ 	}
+commit 8abe84f93ca2872b4f0b9e1dd0a8e6ba854f334c
+Author: DJ Houghton <dj>
+Date:   Fri May 9 19:24:12 2008 +0000
+
+    Bug 229342 [shared] Updates to the base in a shared read-only install
+
+1	1	bundles/org.eclipse.equinox.frameworkadmin.equinox/src/org/eclipse/equinox/internal/frameworkadmin/equinox/EquinoxFwConfigFileParser.java
+diff --git a/bundles/org.eclipse.equinox.frameworkadmin.equinox/src/org/eclipse/equinox/internal/frameworkadmin/equinox/EquinoxFwConfigFileParser.java b/bundles/org.eclipse.equinox.frameworkadmin.equinox/src/org/eclipse/equinox/internal/frameworkadmin/equinox/EquinoxFwConfigFileParser.java
+index 0bf78c2..23cc06d 100644
+--- a/bundles/org.eclipse.equinox.frameworkadmin.equinox/src/org/eclipse/equinox/internal/frameworkadmin/equinox/EquinoxFwConfigFileParser.java
++++ b/bundles/org.eclipse.equinox.frameworkadmin.equinox/src/org/eclipse/equinox/internal/frameworkadmin/equinox/EquinoxFwConfigFileParser.java
+@@ -536,7 +536,7 @@ public class EquinoxFwConfigFileParser {
+ 		for (int t = 0; t < tokens.length; t++) {
+ 			int idx = s.length();
+ 			for (int i = s.length(); i != 0 && idx != -1; i--) {
+-				idx = s.lastIndexOf(tokens[t], idx);
++				idx = s.toString().lastIndexOf(tokens[t], idx);
+ 				if (idx != -1)
+ 					s.replace(idx, idx + tokens[t].length(), "^"); //$NON-NLS-1$
+ 			}

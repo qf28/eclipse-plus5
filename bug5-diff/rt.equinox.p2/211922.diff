@@ -1,0 +1,767 @@
+commit 0171362b7dbded8b7e083f04396e6c2497a920d0
+Author: Simon Kaegi <skaegi>
+Date:   Wed Dec 5 04:26:44 2007 +0000
+
+    Bug 211922  [prov] BundlePool not restored properly
+
+116	17	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+9	3	bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
+3	0	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/p2/reconciler/dropins/Activator.java
+3	0	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/p2/reconciler/dropins/Activator.java
+2	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/directorywatcher/RepositoryListenerTest.java
+0	6	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/plugin.xml
+0	332	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePool.java
+0	29	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePoolFactory.java
+2	1	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+7	6	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+index 784bfd2..c4ee151 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+@@ -14,6 +14,7 @@ import java.net.URL;
+ import java.util.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.artifact.repository.*;
++import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
+ import org.eclipse.equinox.p2.artifact.repository.*;
+ import org.eclipse.equinox.p2.artifact.repository.processing.ProcessingStep;
+ import org.eclipse.equinox.p2.artifact.repository.processing.ProcessingStepHandler;
+@@ -31,6 +32,9 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 			{"(& (namespace=eclipse) (classifier=native))", "${repoUrl}/native/${id}_${version}"}, //$NON-NLS-1$ //$NON-NLS-2$
+ 			{"(& (namespace=eclipse) (classifier=feature))", "${repoUrl}/features/${id}_${version}.jar"}}; //$NON-NLS-1$//$NON-NLS-2$
+ 	private static final String ARTIFACT_UUID = "artifact.uuid"; //$NON-NLS-1$
++	private static final String ARTIFACT_FOLDER = "artifact.folder"; //$NON-NLS-1$
++	private static final String ARTIFACT_REFERENCE = "artifact.reference"; //$NON-NLS-1$
++	private static final String JAR_EXTENSION = ".jar"; //$NON-NLS-1$
+ 
+ 	transient private Mapper mapper = new Mapper();
+ 	protected String[][] mappingRules = DEFAULT_MAPPING_RULES;
+@@ -118,12 +122,21 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		if (uuid != null)
+ 			return blobStore.fileFor(bytesFromHexString(uuid));
+ 
++		// if the artifact is just a reference then return the reference location
++		String artifactReference = descriptor.getProperty(ARTIFACT_REFERENCE);
++		if (artifactReference != null)
++			return artifactReference;
++
+ 		// if the descriptor is complete then use the mapping rules...
+ 		if (descriptor.getProcessingSteps().length == 0) {
+ 			IArtifactKey key = descriptor.getArtifactKey();
+ 			String result = mapper.map(location.toExternalForm(), key.getNamespace(), key.getClassifier(), key.getId(), key.getVersion().toString());
+-			if (result != null)
++			if (result != null) {
++				if (isFolderBased(descriptor) && result.endsWith(JAR_EXTENSION))
++					return result.substring(0, result.lastIndexOf(JAR_EXTENSION));
++
+ 				return result;
++			}
+ 		}
+ 
+ 		// in the end there is not enough information so return null 
+@@ -136,8 +149,12 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 			descriptor.setProperty(ARTIFACT_UUID, null);
+ 			IArtifactKey key = descriptor.getArtifactKey();
+ 			String result = mapper.map(location.toExternalForm(), key.getNamespace(), key.getClassifier(), key.getId(), key.getVersion().toString());
+-			if (result != null)
++			if (result != null) {
++				if (isFolderBased(descriptor) && result.endsWith(JAR_EXTENSION))
++					return result.substring(0, result.lastIndexOf(JAR_EXTENSION));
++
+ 				return result;
++			}
+ 		}
+ 
+ 		// Otherwise generate a location by creating a UUID, remembering it in the properties 
+@@ -147,6 +164,10 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		return blobStore.fileFor(bytes);
+ 	}
+ 
++	private boolean isFolderBased(IArtifactDescriptor descriptor) {
++		return Boolean.valueOf(descriptor.getProperty(ARTIFACT_FOLDER)).booleanValue();
++	}
++
+ 	private String bytesToHexString(byte[] bytes) {
+ 		StringBuffer buffer = new StringBuffer();
+ 		for (int i = 0; i < bytes.length; i++) {
+@@ -241,6 +262,25 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	}
+ 
+ 	protected IStatus downloadArtifact(IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
++
++		if (isFolderBased(descriptor)) {
++			File artifactFolder = getArtifactFile(descriptor);
++			// TODO: optimize and ensure manifest is written first
++			File zipFile = null;
++			try {
++				zipFile = File.createTempFile(artifactFolder.getName(), JAR_EXTENSION, null);
++				FileUtils.zip(new File[] {artifactFolder}, zipFile);
++				FileInputStream fis = new FileInputStream(zipFile);
++				FileUtils.copyStream(fis, true, destination, true);
++			} catch (IOException e) {
++				return new Status(IStatus.ERROR, Activator.ID, e.getMessage());
++			} finally {
++				if (zipFile != null)
++					zipFile.delete();
++			}
++			return Status.OK_STATUS;
++		}
++
+ 		String toDownload = getLocation(descriptor);
+ 		return getTransport().download(toDownload, destination, monitor);
+ 	}
+@@ -392,17 +432,33 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		// we should end up with writeable URLs...
+ 		// Make sure that the file does not exist and that the parents do
+ 		File outputFile = new File(file);
+-		if (outputFile.exists())
++		if (outputFile.exists()) {
+ 			System.err.println("Artifact repository out of synch. Overwriting " + outputFile.getAbsoluteFile()); //$NON-NLS-1$
+-		if (!outputFile.getParentFile().exists() && !outputFile.getParentFile().mkdirs())
+-			// TODO: Log an error, or throw an exception?
+-			return null;
++			delete(outputFile);
++		}
+ 
+-		// finally create and return an output stream suitably wrapped so that when it is 
+-		// closed the repository is updated with the descriptor
++		OutputStream target = null;
+ 		try {
+-			return new ArtifactOutputStream(new BufferedOutputStream(new FileOutputStream(file)), newDescriptor, outputFile);
+-		} catch (FileNotFoundException e) {
++			if (isFolderBased(descriptor)) {
++				outputFile.mkdirs();
++				if (!outputFile.exists())
++					// TODO: Log an error, or throw an exception?
++					return null;
++
++				target = new ZippedFolderOutputStream(outputFile);
++			} else {
++				// file based
++				if (!outputFile.getParentFile().exists() && !outputFile.getParentFile().mkdirs())
++					// TODO: Log an error, or throw an exception?
++					return null;
++				target = new FileOutputStream(file);
++			}
++
++			// finally create and return an output stream suitably wrapped so that when it is 
++			// closed the repository is updated with the descriptor
++
++			return new ArtifactOutputStream(new BufferedOutputStream(target), newDescriptor, outputFile);
++		} catch (IOException e) {
+ 			e.printStackTrace();
+ 		}
+ 		return null;
+@@ -443,13 +499,15 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	 * descriptor existed in the repository, and was successfully removed.
+ 	 */
+ 	private boolean doRemoveArtifact(IArtifactDescriptor descriptor) {
+-		File file = getArtifactFile(descriptor);
+-		if (file == null)
+-			return false;
+-		delete(file);
+-		if (!file.exists())
+-			return artifactDescriptors.remove(descriptor);
+-		return false;
++		if (descriptor.getProperty(ARTIFACT_REFERENCE) == null) {
++			File file = getArtifactFile(descriptor);
++			if (file == null)
++				return false;
++			delete(file);
++			if (file.exists())
++				return false;
++		}
++		return artifactDescriptors.remove(descriptor);
+ 	}
+ 
+ 	static void delete(File toDelete) {
+@@ -521,4 +579,45 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		return true;
+ 	}
+ 
++	// TODO: optimize
++	// we could stream right into the folder
++	public static class ZippedFolderOutputStream extends OutputStream {
++
++		private final File folder;
++		private final FileOutputStream fos;
++		private final File zipFile;
++
++		public ZippedFolderOutputStream(File folder) throws IOException {
++			this.folder = folder;
++			zipFile = File.createTempFile(folder.getName(), JAR_EXTENSION, null);
++			fos = new FileOutputStream(zipFile);
++		}
++
++		public void close() throws IOException {
++			fos.close();
++			FileUtils.unzipFile(zipFile, folder);
++			zipFile.delete();
++		}
++
++		public void flush() throws IOException {
++			fos.flush();
++		}
++
++		public String toString() {
++			return fos.toString();
++		}
++
++		public void write(byte[] b, int off, int len) throws IOException {
++			fos.write(b, off, len);
++		}
++
++		public void write(byte[] b) throws IOException {
++			fos.write(b);
++		}
++
++		public void write(int b) throws IOException {
++			fos.write(b);
++		}
++	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java b/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
+index 37d1035..e08a23b 100644
+--- a/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
++++ b/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
+@@ -83,7 +83,7 @@ public class RepositoryListener extends DirectoryChangeListener {
+ 		try {
+ 			repository = manager.getRepository(stateDirURL);
+ 			if (repository == null)
+-				repository = manager.createRepository(stateDirURL, "artifact listener " + repositoryName, "org.eclipse.equinox.p2.touchpoint.eclipse.bundlePool");
++				repository = manager.createRepository(stateDirURL, "artifact listener " + repositoryName, "org.eclipse.equinox.p2.artifact.repository.simpleRepository");
+ 		} finally {
+ 			context.ungetService(reference);
+ 		}
+@@ -249,9 +249,15 @@ public class RepositoryListener extends DirectoryChangeListener {
+ 		IArtifactDescriptor basicDescriptor = MetadataGeneratorHelper.createArtifactDescriptor(key, bundle, true, false);
+ 
+ 		ArtifactDescriptor pathDescriptor = new ArtifactDescriptor(basicDescriptor);
+-		pathDescriptor.setProperty("bundle.path", bundle.getAbsolutePath());
++		try {
++			pathDescriptor.setProperty("artifact.reference", bundle.toURL().toExternalForm());
++		} catch (MalformedURLException e) {
++			// unexpected
++			e.printStackTrace();
++			return null;
++		}
+ 		if (bundle.isDirectory())
+-			pathDescriptor.setProperty("bundle.folder", "true");
++			pathDescriptor.setProperty("artifact.folder", "true");
+ 
+ 		return pathDescriptor;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/p2/reconciler/dropins/Activator.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/p2/reconciler/dropins/Activator.java
+index c1159ac..19b7f56 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/p2/reconciler/dropins/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/p2/reconciler/dropins/Activator.java
+@@ -5,6 +5,7 @@ import java.io.IOException;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import org.eclipse.equinox.configurator.Configurator;
++import org.eclipse.equinox.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.p2.director.IDirector;
+ import org.eclipse.equinox.p2.directorywatcher.DirectoryWatcher;
+ import org.eclipse.equinox.p2.directorywatcher.RepositoryListener;
+@@ -36,6 +37,8 @@ public class Activator implements BundleActivator {
+ 		watcher.addListener(listener);
+ 		watcher.poll();
+ 
++		IArtifactRepository artifactRepository = listener.getArtifactRepository();
++		artifactRepository.getModifiableProperties().put("profile.extension", profile.getProfileId());
+ 		IMetadataRepository metadataRepository = listener.getMetadataRepository();
+ 		ProfileSynchronizer synchronizer = new ProfileSynchronizer(profile, metadataRepository);
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/p2/reconciler/dropins/Activator.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/p2/reconciler/dropins/Activator.java
+index c1159ac..19b7f56 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/p2/reconciler/dropins/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/p2/reconciler/dropins/Activator.java
+@@ -5,6 +5,7 @@ import java.io.IOException;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import org.eclipse.equinox.configurator.Configurator;
++import org.eclipse.equinox.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.p2.director.IDirector;
+ import org.eclipse.equinox.p2.directorywatcher.DirectoryWatcher;
+ import org.eclipse.equinox.p2.directorywatcher.RepositoryListener;
+@@ -36,6 +37,8 @@ public class Activator implements BundleActivator {
+ 		watcher.addListener(listener);
+ 		watcher.poll();
+ 
++		IArtifactRepository artifactRepository = listener.getArtifactRepository();
++		artifactRepository.getModifiableProperties().put("profile.extension", profile.getProfileId());
+ 		IMetadataRepository metadataRepository = listener.getMetadataRepository();
+ 		ProfileSynchronizer synchronizer = new ProfileSynchronizer(profile, metadataRepository);
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/directorywatcher/RepositoryListenerTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/directorywatcher/RepositoryListenerTest.java
+index fb73b00..df17acb 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/directorywatcher/RepositoryListenerTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/directorywatcher/RepositoryListenerTest.java
+@@ -5,7 +5,7 @@ import java.io.IOException;
+ import java.net.URL;
+ import java.util.Hashtable;
+ import org.eclipse.core.runtime.FileLocator;
+-import org.eclipse.equinox.internal.p2.touchpoint.eclipse.BundlePool;
++import org.eclipse.equinox.p2.artifact.repository.IFileArtifactRepository;
+ import org.eclipse.equinox.p2.directorywatcher.DirectoryWatcher;
+ import org.eclipse.equinox.p2.directorywatcher.RepositoryListener;
+ import org.eclipse.equinox.p2.metadata.IArtifactKey;
+@@ -72,7 +72,7 @@ public class RepositoryListenerTest extends AbstractProvisioningTest {
+ 		watcher.poll();
+ 		watcher.stop();
+ 
+-		BundlePool repo = (BundlePool) listener.getArtifactRepository();
++		IFileArtifactRepository repo = (IFileArtifactRepository) listener.getArtifactRepository();
+ 		IArtifactKey[] keys = repo.getArtifactKeys();
+ 		for (int i = 0; i < keys.length; i++) {
+ 			assertTrue("2.3", repo.getArtifactFile(keys[i]).toString().startsWith(folder.getAbsolutePath().toString()));
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/plugin.xml b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/plugin.xml
+index a287ce7..d042978 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/plugin.xml
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/plugin.xml
+@@ -5,12 +5,6 @@
+ 			class="org.eclipse.equinox.internal.p2.touchpoint.eclipse.EclipseTouchpoint"
+ 			version="1.0.0"/>
+ 	</extension>
+-  <extension id="bundlePool"
+-       point="org.eclipse.equinox.p2.artifact.repository.artifactRepositories">
+-    <factory
+-          class="org.eclipse.equinox.internal.p2.touchpoint.eclipse.BundlePoolFactory">
+-    </factory>
+- </extension>
+ 	<extension
+ 			point="org.eclipse.equinox.p2.garbagecollector.marksetproviders"
+ 			id="EclipseTouchpoint">
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePool.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePool.java
+deleted file mode 100644
+index ebfa24e..0000000
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePool.java
++++ /dev/null
+@@ -1,332 +0,0 @@
+-package org.eclipse.equinox.internal.p2.touchpoint.eclipse;
+-
+-import java.io.*;
+-import java.net.MalformedURLException;
+-import java.net.URL;
+-import java.util.Map;
+-import java.util.Set;
+-import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.artifact.repository.simple.SimpleArtifactRepository;
+-import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
+-import org.eclipse.equinox.p2.artifact.repository.*;
+-import org.eclipse.equinox.p2.artifact.repository.processing.ProcessingStepHandler;
+-import org.eclipse.equinox.p2.metadata.IArtifactKey;
+-
+-public class BundlePool implements IFileArtifactRepository {
+-
+-	public static final String REPOSITORY_TYPE = "org.eclipse.equinox.p2.touchpoint.eclipse.bundlePool"; //$NON-NLS-1$
+-	public static final String BUNDLE_FOLDER = "bundle.folder"; //$NON-NLS-1$
+-	public static final String BUNDLE_PATH = "bundle.path"; //$NON-NLS-1$
+-	private static final String TMP_ZIP = "tmp.zip"; //$NON-NLS-1$
+-	public static final String PROFILE_EXTENSION = "profile.extension"; //$NON-NLS-1$
+-
+-	// TODO: optimize
+-	// we could stream right into the folder
+-	public class ZippedFolderOutputStream extends OutputStream {
+-
+-		private final File bundleFolder;
+-		private final FileOutputStream fos;
+-		private final File zipFile;
+-
+-		public ZippedFolderOutputStream(File bundleFolder) throws FileNotFoundException {
+-			this.bundleFolder = bundleFolder;
+-			zipFile = new File(bundleFolder, TMP_ZIP);
+-			fos = new FileOutputStream(zipFile);
+-		}
+-
+-		public void close() throws IOException {
+-			fos.close();
+-			FileUtils.unzipFile(zipFile, bundleFolder);
+-			zipFile.delete();
+-		}
+-
+-		public void flush() throws IOException {
+-			fos.flush();
+-		}
+-
+-		public String toString() {
+-			return fos.toString();
+-		}
+-
+-		public void write(byte[] b, int off, int len) throws IOException {
+-			fos.write(b, off, len);
+-		}
+-
+-		public void write(byte[] b) throws IOException {
+-			fos.write(b);
+-		}
+-
+-		public void write(int b) throws IOException {
+-			fos.write(b);
+-		}
+-	}
+-
+-	private final SimpleArtifactRepository repository;
+-
+-	public BundlePool(SimpleArtifactRepository repository) {
+-		if (repository == null)
+-			throw new IllegalArgumentException("repository must not be null");
+-		this.repository = repository;
+-	}
+-
+-	public OutputStream getOutputStream(IArtifactDescriptor descriptor) {
+-
+-		if (Boolean.valueOf(descriptor.getProperty(BUNDLE_FOLDER)).booleanValue()) {
+-			File bundleFolder = getBundleFolder(descriptor);
+-			if (bundleFolder == null)
+-				return null;
+-
+-			if (bundleFolder.exists()) {
+-				System.err.println("Artifact repository out of synch. Overwriting " + bundleFolder.getAbsoluteFile()); //$NON-NLS-1$
+-				FileUtils.deleteAll(bundleFolder);
+-			}
+-
+-			bundleFolder.mkdirs();
+-
+-			// finally create and return an output stream suitably wrapped so that when it is 
+-			// closed the repository is updated with the descriptor
+-			try {
+-				return repository.new ArtifactOutputStream(new BufferedOutputStream(new ZippedFolderOutputStream(bundleFolder)), descriptor, bundleFolder);
+-			} catch (FileNotFoundException e) {
+-				Assert.isTrue(false, "Unexpected exception:" + e);
+-			}
+-			return null;
+-		}
+-		return repository.getOutputStream(descriptor);
+-	}
+-
+-	private File getBundleFolder(IArtifactDescriptor descriptor) {
+-		ArtifactDescriptor destinationDescriptor = new ArtifactDescriptor(descriptor);
+-
+-		String location = repository.createLocation(destinationDescriptor);
+-		return toBundleFolder(location);
+-	}
+-
+-	public File getArtifactFile(IArtifactDescriptor descriptor) {
+-		String path = descriptor.getProperty(BUNDLE_PATH);
+-		if (path != null)
+-			return new File(path);
+-
+-		if (Boolean.valueOf(descriptor.getProperty(BUNDLE_FOLDER)).booleanValue()) {
+-			String location = repository.getLocation(descriptor);
+-			return toBundleFolder(location);
+-		}
+-		return repository.getArtifactFile(descriptor);
+-	}
+-
+-	private File toBundleFolder(String location) {
+-		if (location == null || !location.endsWith(".jar"))
+-			return null;
+-
+-		location = location.substring(0, location.lastIndexOf(".jar"));
+-
+-		try {
+-			location = new URL(location).getPath();
+-		} catch (MalformedURLException e) {
+-			// should not occur
+-			e.printStackTrace();
+-		}
+-
+-		return new File(location);
+-	}
+-
+-	public void addDescriptor(IArtifactDescriptor toAdd) {
+-		repository.addDescriptor(toAdd);
+-	}
+-
+-	public boolean contains(IArtifactDescriptor descriptor) {
+-		return repository.contains(descriptor);
+-	}
+-
+-	public boolean contains(IArtifactKey key) {
+-		return repository.contains(key);
+-	}
+-
+-	public boolean equals(Object obj) {
+-		return repository.equals(obj);
+-	}
+-
+-	public Object getAdapter(Class adapter) {
+-		return repository.getAdapter(adapter);
+-	}
+-
+-	public IStatus getArtifact(IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
+-		if (Boolean.valueOf(descriptor.getProperty(BUNDLE_FOLDER)).booleanValue()) {
+-			ProcessingStepHandler handler = new ProcessingStepHandler();
+-			destination = repository.processDestination(handler, descriptor, destination, monitor);
+-			IStatus status = ProcessingStepHandler.checkStatus(destination);
+-			if (!status.isOK() && status.getSeverity() != IStatus.INFO)
+-				return status;
+-
+-			status = downloadArtifact(descriptor, destination, monitor);
+-			return repository.reportStatus(descriptor, destination, status);
+-
+-		}
+-		return repository.getArtifact(descriptor, destination, monitor);
+-	}
+-
+-	private IStatus downloadArtifact(IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
+-		File bundleFolder = getArtifactFile(descriptor);
+-		// TODO: optimize and ensure manifest is written first
+-		File zipFile = new File(bundleFolder, "tmp.zip");
+-		try {
+-			FileUtils.zip(new File[] {bundleFolder}, zipFile);
+-			FileInputStream fis = new FileInputStream(zipFile);
+-			FileUtils.copyStream(fis, true, destination, true);
+-		} catch (IOException e) {
+-			return new Status(IStatus.ERROR, Activator.ID, e.getMessage());
+-		} finally {
+-			zipFile.delete();
+-		}
+-		return Status.OK_STATUS;
+-	}
+-
+-	public IArtifactDescriptor[] getArtifactDescriptors(IArtifactKey key) {
+-		return repository.getArtifactDescriptors(key);
+-	}
+-
+-	public File getArtifactFile(IArtifactKey key) {
+-		IArtifactDescriptor descriptor = repository.getCompleteArtifactDescriptor(key);
+-		if (descriptor == null)
+-			return null;
+-		return getArtifactFile(descriptor);
+-	}
+-
+-	public IArtifactKey[] getArtifactKeys() {
+-		return repository.getArtifactKeys();
+-	}
+-
+-	public IStatus getArtifacts(IArtifactRequest[] requests, IProgressMonitor monitor) {
+-		return repository.getArtifacts(requests, monitor);
+-	}
+-
+-	public String getDescription() {
+-		return repository.getDescription();
+-	}
+-
+-	public Set getDescriptors() {
+-		return repository.getDescriptors();
+-	}
+-
+-	public URL getLocation() {
+-		return repository.getLocation();
+-	}
+-
+-	public Map getModifiableProperties() {
+-		return repository.getModifiableProperties();
+-	}
+-
+-	public String getName() {
+-		return repository.getName();
+-	}
+-
+-	public Map getProperties() {
+-		return repository.getProperties();
+-	}
+-
+-	public String getProvider() {
+-		return repository.getProvider();
+-	}
+-
+-	public String[][] getRules() {
+-		return repository.getRules();
+-	}
+-
+-	public boolean getSignatureVerification() {
+-		return repository.getSignatureVerification();
+-	}
+-
+-	public String getType() {
+-		return REPOSITORY_TYPE;
+-	}
+-
+-	public String getVersion() {
+-		return repository.getVersion();
+-	}
+-
+-	public int hashCode() {
+-		return repository.hashCode();
+-	}
+-
+-	public void initializeAfterLoad(URL location) {
+-		repository.initializeAfterLoad(location);
+-	}
+-
+-	public boolean isModifiable() {
+-		return repository.isModifiable();
+-	}
+-
+-	/**
+-	 * Removes the given descriptor, and the physical artifact corresponding
+-	 * to that descriptor. Returns <code>true</code> if and only if the
+-	 * descriptor existed in the repository, and was successfully removed.
+-	 */
+-	private boolean doRemoveArtifact(IArtifactDescriptor descriptor) {
+-		if (descriptor.getProperty(BUNDLE_PATH) != null)
+-			return getDescriptors().remove(descriptor);
+-
+-		File file = getArtifactFile(descriptor);
+-		if (file == null)
+-			return false;
+-
+-		FileUtils.deleteAll(file);
+-		if (!file.exists())
+-			return getDescriptors().remove(descriptor);
+-		return false;
+-	}
+-
+-	public void removeAll() {
+-		IArtifactDescriptor[] toRemove = (IArtifactDescriptor[]) getDescriptors().toArray(new IArtifactDescriptor[getDescriptors().size()]);
+-		boolean changed = false;
+-		for (int i = 0; i < toRemove.length; i++)
+-			changed |= doRemoveArtifact(toRemove[i]);
+-		if (changed)
+-			save();
+-	}
+-
+-	public void removeDescriptor(IArtifactDescriptor descriptor) {
+-		if (doRemoveArtifact(descriptor))
+-			save();
+-	}
+-
+-	public void removeDescriptor(IArtifactKey key) {
+-		IArtifactDescriptor[] toRemove = getArtifactDescriptors(key);
+-		boolean changed = false;
+-		for (int i = 0; i < toRemove.length; i++)
+-			changed |= doRemoveArtifact(toRemove[i]);
+-		if (changed)
+-			save();
+-	}
+-
+-	public void save() {
+-		repository.save();
+-	}
+-
+-	public void setDescription(String description) {
+-		repository.setDescription(description);
+-	}
+-
+-	public void setName(String value) {
+-		repository.setName(value);
+-	}
+-
+-	public void setProvider(String provider) {
+-		repository.setProvider(provider);
+-	}
+-
+-	public void setRules(String[][] rules) {
+-		repository.setRules(rules);
+-	}
+-
+-	public void setSignatureVerification(boolean value) {
+-		repository.setSignatureVerification(value);
+-	}
+-
+-	public void tagAsImplementation() {
+-		repository.tagAsImplementation();
+-	}
+-
+-	public String toString() {
+-		return repository.toString();
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePoolFactory.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePoolFactory.java
+deleted file mode 100644
+index 3c1b8a8..0000000
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePoolFactory.java
++++ /dev/null
+@@ -1,29 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.touchpoint.eclipse;
+-
+-import java.net.URL;
+-import org.eclipse.equinox.internal.p2.artifact.repository.simple.SimpleArtifactRepository;
+-import org.eclipse.equinox.internal.p2.artifact.repository.simple.SimpleArtifactRepositoryFactory;
+-import org.eclipse.equinox.p2.artifact.repository.IArtifactRepository;
+-
+-public class BundlePoolFactory extends SimpleArtifactRepositoryFactory {
+-
+-	public IArtifactRepository load(URL location) {
+-		SimpleArtifactRepository repository = (SimpleArtifactRepository) super.load(location);
+-		return new BundlePool(repository);
+-	}
+-
+-	public IArtifactRepository create(URL location, String name, String type) {
+-		SimpleArtifactRepository repository = (SimpleArtifactRepository) super.create(location, name, type);
+-		return new BundlePool(repository);
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+index 6f7cb54..aec8333 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+@@ -20,6 +20,7 @@ import org.eclipse.equinox.p2.metadata.*;
+ import org.osgi.framework.Version;
+ 
+ public class EclipseTouchpoint extends Touchpoint {
++	private static final String ARTIFACT_FOLDER = "artifact.folder";
+ 	private static final TouchpointType TOUCHPOINT_TYPE = new TouchpointType("eclipse", new Version("1.0")); //$NON-NLS-1$ //$NON-NLS-2$
+ 	private static final String ACTION_ADD_JVM_ARG = "addJvmArg"; //$NON-NLS-1$
+ 	private static final String ACTION_ADD_PROGRAM_ARG = "addProgramArg"; //$NON-NLS-1$
+@@ -86,7 +87,7 @@ public class EclipseTouchpoint extends Touchpoint {
+ 		Properties descriptorProperties = null;
+ 		if (isZipped(installableUnit.getTouchpointData())) {
+ 			descriptorProperties = new Properties();
+-			descriptorProperties.setProperty("bundle.folder", "true");
++			descriptorProperties.setProperty(ARTIFACT_FOLDER, Boolean.TRUE.toString());
+ 		}
+ 		return descriptorProperties;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+index 0c527cf..b0b10f6 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+@@ -28,6 +28,8 @@ public class Util {
+ 	 */
+ 	private final static String CACHE_PATH = "eclipse.p2.cache"; //$NON-NLS-1$
+ 	private final static String CONFIG_FOLDER = "eclipse.configurationFolder"; //$NON-NLS-1$
++	private static final String REPOSITORY_TYPE = "org.eclipse.equinox.p2.artifact.repository.simpleRepository"; //$NON-NLS-1$
++	private static final Object PROFILE_EXTENSION = "profile.extension";
+ 
+ 	static AgentLocation getAgentLocation() {
+ 		return (AgentLocation) ServiceHelper.getService(Activator.getContext(), AgentLocation.class.getName());
+@@ -61,7 +63,7 @@ public class Util {
+ 		if (bundlePool == null) {
+ 			// 	the given repo location is not an existing repo so we have to create something
+ 			String repositoryName = location + " - bundle pool"; //$NON-NLS-1$
+-			bundlePool = manager.createRepository(location, repositoryName, "org.eclipse.equinox.p2.touchpoint.eclipse.bundlePool"); //$NON-NLS-1$
++			bundlePool = manager.createRepository(location, repositoryName, REPOSITORY_TYPE);
+ 		}
+ 
+ 		if (bundlePool == null) {
+@@ -78,11 +80,10 @@ public class Util {
+ 		IArtifactRepository[] knownRepositories = manager.getKnownRepositories();
+ 		for (int i = 0; i < knownRepositories.length; i++) {
+ 			IArtifactRepository repository = knownRepositories[i];
+-			if (BundlePool.REPOSITORY_TYPE.equals(repository.getType())) {
+-				String profileExtension = (String) repository.getProperties().get(BundlePool.PROFILE_EXTENSION);
+-				if (profileExtension != null && profileExtension.equals(profile.getProfileId()))
+-					bundleRepositories.add(repository);
+-			}
++			String profileExtension = (String) repository.getProperties().get(PROFILE_EXTENSION);
++			if (profileExtension != null && profileExtension.equals(profile.getProfileId()))
++				bundleRepositories.add(repository);
++
+ 		}
+ 
+ 		return new AggregatedBundleRepository(bundleRepositories);

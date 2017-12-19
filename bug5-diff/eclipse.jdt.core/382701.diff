@@ -1,0 +1,569 @@
+commit 30ba2db951e79b89a330e1209e461b1c083d6de3
+Author: Jesper S Moller <jesper@selskabet.org>
+Date:   Fri Feb 1 01:03:03 2013 -0500
+
+    Bug 382701: Incremental support for semantic analysis (JSR335)
+
+5	3	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+4	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+84	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+3	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodScope.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+index 46144a5..e76175f 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2011, 2012 IBM Corporation and others.
++ * Copyright (c) 2011, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -11,6 +11,8 @@
+  * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Jesper S Moller - Contributions for
++ *							bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  
+  *******************************************************************************/
+ package org.eclipse.jdt.core.tests.compiler.regression;
+@@ -219,14 +221,14 @@ public void test009() {
+ 					"}\n" +
+ 					"public class X {\n" +
+ 					"  public void test1(int x) {\n" +
+-					"    ActionListener al = (public xyz) -> System.out.println(e); \n" +
++					"    ActionListener al = (public xyz) -> System.out.println(xyz); \n" +
+ 					"    I f = (abstract final s, @Nullable t) -> System.out.println(s + t); \n" +
+ 					"  }\n" +
+ 					"}\n",
+ 				},
+ 				"----------\n" + 
+ 				"1. ERROR in X.java (at line 7)\n" + 
+-				"	ActionListener al = (public xyz) -> System.out.println(e); \n" + 
++				"	ActionListener al = (public xyz) -> System.out.println(xyz); \n" + 
+ 				"	                            ^^^\n" + 
+ 				"Syntax error, modifiers and annotations are not allowed for the lambda parameter xyz as its type is elided\n" + 
+ 				"----------\n" + 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+index 60968ff..4d101ec 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+@@ -34,6 +34,10 @@ public abstract class FunctionalExpression extends Expression {
+ 	public void setExpectedType(TypeBinding expectedType) {
+ 		this.expectedType = expectedType;
+ 	}
++
++	public TypeBinding expectedType() {
++		return this.expectedType;
++	}
+ 	
+ 	public TypeBinding resolveType(BlockScope blockScope) {
+ 		this.constant = Constant.NotAConstant;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 2cd5914..084e79d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -16,21 +16,66 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
++import org.eclipse.jdt.core.compiler.CategorizedProblem;
++import org.eclipse.jdt.internal.compiler.CompilationResult;
++import org.eclipse.jdt.internal.compiler.impl.ReferenceContext;
+ import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
++import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
++import org.eclipse.jdt.internal.compiler.lookup.MethodScope;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
++import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
++import org.eclipse.jdt.internal.compiler.problem.AbortCompilationUnit;
++import org.eclipse.jdt.internal.compiler.problem.AbortMethod;
++import org.eclipse.jdt.internal.compiler.problem.AbortType;
++import org.eclipse.jdt.internal.compiler.problem.ProblemSeverities;
+ 
+-public class LambdaExpression extends FunctionalExpression {
++public class LambdaExpression extends FunctionalExpression implements ProblemSeverities, ReferenceContext {
+ 	Argument [] arguments;
+ 	Statement body;
++	private MethodScope scope;
++	private CompilationResult compilationResult;
++	private boolean ignoreFurtherInvestigation;
+ 	
+-	public LambdaExpression(Argument [] arguments, Statement body) {
++	public LambdaExpression(CompilationResult compilationResult, Argument [] arguments, Statement body) {
++		this.compilationResult = compilationResult;
+ 		this.arguments = arguments;
+ 		this.body = body;
+ 	}
+ 	
+ 	public TypeBinding resolveType(BlockScope blockScope) {
+ 		super.resolveType(blockScope);
+-		return TypeBinding.NULL;
++		this.scope = new MethodScope(blockScope, this, blockScope.methodScope().isStatic);
++
++		TypeBinding expected = this.expectedType();
++		if (expected == null) return TypeBinding.NULL;
++
++		MethodBinding singleAbstractMethod = expected.getSingleAbstractMethod();
++		if (this.arguments != null && singleAbstractMethod != null) {
++			int parameterCount = singleAbstractMethod.parameters != null ? singleAbstractMethod.parameters.length : 0;
++			int lambdaArgumentCount = this.arguments != null ? this.arguments.length : 0;
++
++			if (parameterCount == lambdaArgumentCount) {
++				for (int i = 0, length = this.arguments.length; i < length; i++) {
++					Argument argument = this.arguments[i];
++					if (argument.type != null) {
++						argument.resolve(this.scope); // TODO: Check it!
++					} else {
++						argument.bind(this.scope, singleAbstractMethod.parameters[i], false);
++					}
++				}
++			} /* TODO: else complain */
++		}
++		if (this.body instanceof Expression) {
++			Expression expression = (Expression) this.body;
++			if (singleAbstractMethod != null) {
++				expression.setExpectedType(singleAbstractMethod.returnType); // chain expected type for any nested lambdas.
++				/* TypeBinding expressionType = */ expression.resolveType(this.scope);
++				// TODO: checkExpressionResult(singleAbstractMethod.returnType, expression, expressionType);
++			}
++		} else {
++			this.body.resolve(this.scope);
++		}
++		return expected;
+ 	}
+ 
+ 	public StringBuffer printExpression(int tab, StringBuffer output) {
+@@ -51,4 +96,40 @@ public class LambdaExpression extends FunctionalExpression {
+ 		this.body.print(this.body instanceof Block ? tab : 0, output);
+ 		return output.append(suffix);
+ 	}
++
++	public CompilationResult compilationResult() {
++		return this.compilationResult;
++	}
++	
++	public void abort(int abortLevel, CategorizedProblem problem) {
++
++		switch (abortLevel) {
++			case AbortCompilation :
++				throw new AbortCompilation(this.compilationResult, problem);
++			case AbortCompilationUnit :
++				throw new AbortCompilationUnit(this.compilationResult, problem);
++			case AbortType :
++				throw new AbortType(this.compilationResult, problem);
++			default :
++				throw new AbortMethod(this.compilationResult, problem);
++		}
++	}
++
++	public CompilationUnitDeclaration getCompilationUnitDeclaration() {
++		return this.scope == null ? null : this.scope.compilationUnitScope().referenceContext;
++	}
++
++	public boolean hasErrors() {
++		return this.ignoreFurtherInvestigation;
++	}
++
++	public void tagAsHavingErrors() {
++		this.ignoreFurtherInvestigation = true;
++	}
++
++	public TypeBinding expectedResultType() {
++		MethodBinding singleAbstractMethod = expectedType().getSingleAbstractMethod();
++		if (singleAbstractMethod != null) return singleAbstractMethod.returnType;
++		return TypeBinding.NULL;
++	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+index 53ed355..bcf290f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+@@ -21,6 +21,8 @@
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
+  *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *								bug 394768 - [compiler][resource] Incorrect resource leak warning when creating stream in conditional
++ *     Jesper S Moller - Contributions for
++ *							bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -259,6 +261,7 @@ public void resolve(BlockScope scope) {
+ 	MethodScope methodScope = scope.methodScope();
+ 	MethodBinding methodBinding;
+ 	TypeBinding methodType =
++		(methodScope.referenceContext instanceof LambdaExpression) ? ((LambdaExpression) methodScope.referenceContext).expectedResultType() :
+ 		(methodScope.referenceContext instanceof AbstractMethodDeclaration)
+ 			? ((methodBinding = ((AbstractMethodDeclaration) methodScope.referenceContext).binding) == null
+ 				? null
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodScope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodScope.java
+index eb81321..29ef6a6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodScope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodScope.java
+@@ -16,6 +16,8 @@
+  *								bug 374605 - Unreasonable warning for enum-based switch statements
+  *								bug 382353 - [1.8][compiler] Implementation property modifiers should be accepted on default methods.
+  *								bug 382354 - [1.8][compiler] Compiler silent on conflicting modifier
++ *     Jesper S Moller - Contributions for
++ *							bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -63,7 +65,7 @@ public class MethodScope extends BlockScope {
+ 	// remember suppressed warning re missing 'default:' to give hints on possibly related flow problems
+ 	public boolean hasMissingSwitchDefault; // TODO(stephan): combine flags to a bitset?
+ 
+-public MethodScope(ClassScope parent, ReferenceContext context, boolean isStatic) {
++public MethodScope(Scope parent, ReferenceContext context, boolean isStatic) {
+ 	super(METHOD_SCOPE, parent);
+ 	this.locals = new LocalVariableBinding[5];
+ 	this.referenceContext = context;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+index d2e5fc5..b3a6a88 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+@@ -16,6 +16,8 @@
+  *								bug 366003 - CCE in ASTNode.resolveAnnotations(ASTNode.java:639)
+  *								bug 374605 - Unreasonable warning for enum-based switch statements
+  *								bug 382353 - [1.8][compiler] Implementation property modifiers should be accepted on default methods.
++ *     Jesper S Moller - Contributions for
++ *							bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.parser;
+ 
+@@ -7705,7 +7707,7 @@ protected void consumeLambdaExpression() {
+ 			problemReporter().illegalThis(arguments[i]);
+ 		}
+ 	}
+-	LambdaExpression lexp = new LambdaExpression(arguments, body);
++	LambdaExpression lexp = new LambdaExpression(this.compilationUnit.compilationResult, arguments, body);
+ 	this.intPtr--;  // ')' position, discard for now.
+ 	lexp.sourceStart = this.intStack[this.intPtr--]; // '(' position or identifier position.
+ 	lexp.sourceEnd = body.sourceEnd;
+commit 558c64a899c0debc518d6eb92e85f37b05902eba
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Fri Feb 1 03:17:08 2013 -0500
+
+    Bug 382701: Incremental progress for semantic analysis: JSR335.
+
+13	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ASTVisitor.java
+12	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+37	24	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+36	11	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+1	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ASTVisitor.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ASTVisitor.java
+index 1ce8427..453936e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ASTVisitor.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ASTVisitor.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -497,6 +497,12 @@ public abstract class ASTVisitor {
+ 	public void endVisit(Wildcard wildcard, ClassScope scope) {
+ 		// do nothing by default
+ 	}
++	public void endVisit(LambdaExpression lambdaExpression, BlockScope blockScope) {
++		// do nothing by default
++	}
++	public void endVisit(ReferenceExpression referenceExpression, BlockScope blockScope) {
++		// do nothing by default	
++	}
+ 	public boolean visit(
+     		AllocationExpression allocationExpression,
+     		BlockScope scope) {
+@@ -973,4 +979,10 @@ public abstract class ASTVisitor {
+ 	public boolean visit(Wildcard wildcard, ClassScope scope) {
+ 		return true; // do nothing by default, keep traversing
+ 	}
++	public boolean visit(LambdaExpression lambdaExpression, BlockScope blockScope) {
++		return true; // do nothing by default, keep traversing
++	}
++	public boolean visit(ReferenceExpression referenceExpression, BlockScope blockScope) {
++		return true; // do nothing by default, keep traversing
++	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+index 4d101ec..53008ed 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+@@ -16,16 +16,22 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
++import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.codegen.CodeStream;
+ import org.eclipse.jdt.internal.compiler.flow.FlowInfo;
+ import org.eclipse.jdt.internal.compiler.impl.Constant;
+ import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
+ import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ProblemReasons;
++import org.eclipse.jdt.internal.compiler.lookup.ProblemReferenceBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ 
+ public abstract class FunctionalExpression extends Expression {
+ 	
+ 	TypeBinding expectedType;
++	MethodBinding singleAbstractMethod;
++	ReferenceBinding functionalInterfaceType;
+ 
+ 	public FunctionalExpression() {
+ 		super();
+@@ -39,14 +45,15 @@ public abstract class FunctionalExpression extends Expression {
+ 		return this.expectedType;
+ 	}
+ 	
+-	public TypeBinding resolveType(BlockScope blockScope) {
++	public /* @NonNull */ TypeBinding resolveType(BlockScope blockScope) {
+ 		this.constant = Constant.NotAConstant;
+-		MethodBinding singleAbstractMethod = this.expectedType == null ? null : this.expectedType.getSingleAbstractMethod();
+-		if (singleAbstractMethod == null || !singleAbstractMethod.isValidBinding()) {
++		this.singleAbstractMethod = this.expectedType == null ? null : this.expectedType.getSingleAbstractMethod();
++		if (this.singleAbstractMethod == null || !this.singleAbstractMethod.isValidBinding()) {
+ 			blockScope.problemReporter().targetTypeIsNotAFunctionalInterface(this);
+-			return null;
++			char [][] name = this.expectedType == null ? CharOperation.NO_CHAR_CHAR : CharOperation.splitOn('.', this.expectedType.shortReadableName());
++			return this.functionalInterfaceType = new ProblemReferenceBinding(name, null, ProblemReasons.NotAFunctionalInterface);
+ 		}
+-		return this.expectedType;
++		return this.functionalInterfaceType = (ReferenceBinding) this.expectedType;
+ 	}
+ 
+ 	public int nullStatus(FlowInfo flowInfo) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 084e79d..4740cc3 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -17,10 +17,10 @@
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+ import org.eclipse.jdt.core.compiler.CategorizedProblem;
++import org.eclipse.jdt.internal.compiler.ASTVisitor;
+ import org.eclipse.jdt.internal.compiler.CompilationResult;
+ import org.eclipse.jdt.internal.compiler.impl.ReferenceContext;
+ import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
+-import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.MethodScope;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+@@ -46,36 +46,35 @@ public class LambdaExpression extends FunctionalExpression implements ProblemSev
+ 		super.resolveType(blockScope);
+ 		this.scope = new MethodScope(blockScope, this, blockScope.methodScope().isStatic);
+ 
+-		TypeBinding expected = this.expectedType();
+-		if (expected == null) return TypeBinding.NULL;
++		if (this.functionalInterfaceType.isValidBinding()) {
++			// Resolve arguments, validate signature ...
++			if (this.arguments != null && this.singleAbstractMethod != null) {
++				int parameterCount = this.singleAbstractMethod.parameters != null ? this.singleAbstractMethod.parameters.length : 0;
++				int lambdaArgumentCount = this.arguments != null ? this.arguments.length : 0;
+ 
+-		MethodBinding singleAbstractMethod = expected.getSingleAbstractMethod();
+-		if (this.arguments != null && singleAbstractMethod != null) {
+-			int parameterCount = singleAbstractMethod.parameters != null ? singleAbstractMethod.parameters.length : 0;
+-			int lambdaArgumentCount = this.arguments != null ? this.arguments.length : 0;
+-
+-			if (parameterCount == lambdaArgumentCount) {
+-				for (int i = 0, length = this.arguments.length; i < length; i++) {
+-					Argument argument = this.arguments[i];
+-					if (argument.type != null) {
+-						argument.resolve(this.scope); // TODO: Check it!
+-					} else {
+-						argument.bind(this.scope, singleAbstractMethod.parameters[i], false);
++				if (parameterCount == lambdaArgumentCount) {
++					for (int i = 0, length = this.arguments.length; i < length; i++) {
++						Argument argument = this.arguments[i];
++						if (argument.type != null) {
++							argument.resolve(this.scope); // TODO: Check it!
++						} else {
++							argument.bind(this.scope, this.singleAbstractMethod.parameters[i], false);
++						}
+ 					}
+-				}
+-			} /* TODO: else complain */
++				} /* TODO: else complain */
++			}
+ 		}
+ 		if (this.body instanceof Expression) {
+ 			Expression expression = (Expression) this.body;
+-			if (singleAbstractMethod != null) {
+-				expression.setExpectedType(singleAbstractMethod.returnType); // chain expected type for any nested lambdas.
++			if (this.functionalInterfaceType.isValidBinding()) {
++				expression.setExpectedType(this.singleAbstractMethod.returnType); // chain expected type for any nested lambdas.
+ 				/* TypeBinding expressionType = */ expression.resolveType(this.scope);
+ 				// TODO: checkExpressionResult(singleAbstractMethod.returnType, expression, expressionType);
+ 			}
+ 		} else {
+ 			this.body.resolve(this.scope);
+ 		}
+-		return expected;
++		return this.functionalInterfaceType;
+ 	}
+ 
+ 	public StringBuffer printExpression(int tab, StringBuffer output) {
+@@ -128,8 +127,22 @@ public class LambdaExpression extends FunctionalExpression implements ProblemSev
+ 	}
+ 
+ 	public TypeBinding expectedResultType() {
+-		MethodBinding singleAbstractMethod = expectedType().getSingleAbstractMethod();
+-		if (singleAbstractMethod != null) return singleAbstractMethod.returnType;
+-		return TypeBinding.NULL;
++		return this.singleAbstractMethod != null && this.singleAbstractMethod.isValidBinding() ? this.singleAbstractMethod.returnType : null;
++	}
++	
++	public void traverse(ASTVisitor visitor, BlockScope blockScope) {
++
++			if (visitor.visit(this, blockScope)) {
++				if (this.arguments != null) {
++					int argumentsLength = this.arguments.length;
++					for (int i = 0; i < argumentsLength; i++)
++						this.arguments[i].traverse(visitor, this.scope);
++				}
++
++				if (this.body != null) {
++					this.body.traverse(visitor, this.scope);
++				}
++			}
++			visitor.endVisit(this, blockScope);
+ 	}
+-}
++}
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+index 00c467c..3e3ea73 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+@@ -17,6 +17,7 @@
+ 
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
++import org.eclipse.jdt.internal.compiler.ASTVisitor;
+ import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ 
+@@ -26,13 +27,13 @@ public class ReferenceExpression extends FunctionalExpression {
+ 	protected TypeReference type;
+ 	protected Expression primary;
+ 	
+-	protected TypeReference [] typeArguments;
++	protected TypeReference [] typeParameters;
+ 	
+ 	protected SingleNameReference method; // == null ? "::new" : "::method"
+ 	
+ 	public ReferenceExpression(NameReference name, TypeReference[] typeArguments, int sourceEnd) {
+ 		this.name = name;
+-		this.typeArguments = typeArguments;
++		this.typeParameters = typeArguments;
+ 		this.method = null;
+ 		this.sourceStart = name.sourceStart;
+ 		this.sourceEnd = sourceEnd;
+@@ -40,7 +41,7 @@ public class ReferenceExpression extends FunctionalExpression {
+ 
+ 	public ReferenceExpression(NameReference name, TypeReference[] typeArguments, SingleNameReference method) {
+ 		this.name = name;
+-		this.typeArguments = typeArguments;
++		this.typeParameters = typeArguments;
+ 		this.method = method;
+ 		this.sourceStart = name.sourceStart;
+ 		this.sourceEnd = method.sourceEnd;
+@@ -48,7 +49,7 @@ public class ReferenceExpression extends FunctionalExpression {
+ 
+ 	public ReferenceExpression(Expression primary, TypeReference [] typeArguments, SingleNameReference method) {
+ 		this.primary = primary;
+-		this.typeArguments = typeArguments;
++		this.typeParameters = typeArguments;
+ 		this.method = method;
+ 		this.sourceStart = primary.sourceStart;
+ 		this.sourceEnd = method.sourceEnd;
+@@ -56,7 +57,7 @@ public class ReferenceExpression extends FunctionalExpression {
+ 
+ 	public ReferenceExpression(TypeReference type, TypeReference[] typeArguments, SingleNameReference method) {
+ 		this.type = type;
+-		this.typeArguments = typeArguments;
++		this.typeParameters = typeArguments;
+ 		this.method = method;
+ 		this.sourceStart = type.sourceStart;
+ 		this.sourceEnd = method.sourceEnd;
+@@ -64,7 +65,7 @@ public class ReferenceExpression extends FunctionalExpression {
+ 
+ 	public ReferenceExpression(TypeReference type, TypeReference[] typeArguments, int sourceEnd) {
+ 		this.type = type;
+-		this.typeArguments = typeArguments;
++		this.typeParameters = typeArguments;
+ 		this.method = null;
+ 		this.sourceStart = type.sourceStart;
+ 		this.sourceEnd = sourceEnd;
+@@ -72,7 +73,7 @@ public class ReferenceExpression extends FunctionalExpression {
+ 	
+ 	public TypeBinding resolveType(BlockScope blockScope) {
+ 		super.resolveType(blockScope);
+-		return TypeBinding.NULL;
++		return this.functionalInterfaceType;
+ 	}
+ 	
+ 	public StringBuffer printExpression(int tab, StringBuffer output) {
+@@ -85,14 +86,14 @@ public class ReferenceExpression extends FunctionalExpression {
+ 			this.primary.print(0, output);
+ 		}
+ 		output.append("::"); //$NON-NLS-1$
+-		if (this.typeArguments != null) {
++		if (this.typeParameters != null) {
+ 			output.append('<');
+-			int max = this.typeArguments.length - 1;
++			int max = this.typeParameters.length - 1;
+ 			for (int j = 0; j < max; j++) {
+-				this.typeArguments[j].print(0, output);
++				this.typeParameters[j].print(0, output);
+ 				output.append(", ");//$NON-NLS-1$
+ 			}
+-			this.typeArguments[max].print(0, output);
++			this.typeParameters[max].print(0, output);
+ 			output.append('>');
+ 		}
+ 		if (this.method == null) {
+@@ -108,4 +109,28 @@ public class ReferenceExpression extends FunctionalExpression {
+ 	public boolean isMethodReference() {
+ 		return this.method != null;
+ 	}
++	public void traverse(ASTVisitor visitor, BlockScope blockScope) {
++
++		if (visitor.visit(this, blockScope)) {
++
++			if (this.name != null)
++				this.name.traverse(visitor, blockScope);
++
++			if (this.type != null)
++				this.type.traverse(visitor, blockScope);
++
++			if (this.primary != null)
++				this.primary.traverse(visitor, blockScope);
++
++			int length = this.typeParameters == null ? 0 : this.typeParameters.length;
++			for (int i = 0; i < length; i++) {
++				this.typeParameters[i].traverse(visitor, blockScope);
++			}
++
++			if (this.method != null)
++				this.method.traverse(visitor, blockScope);
++
++		}
++		visitor.endVisit(this, blockScope);
++	}
+ }
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
+index 00d80d5..69c00df 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
+@@ -32,4 +32,5 @@ public interface ProblemReasons {
+ 	final int InvalidTypeForAutoManagedResource = 15;
+ 	final int VarargsElementTypeNotVisible = 16;
+ 	final int NoSuchSingleAbstractMethod = 17;
++	final int NotAFunctionalInterface = 18;
+ }

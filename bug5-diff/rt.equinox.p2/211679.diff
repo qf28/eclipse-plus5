@@ -1,0 +1,2394 @@
+commit 543700cc542e4e0cf01609814a947f10b6dd835b
+Author: Susan Franklin <sfranklin>
+Date:   Fri Mar 7 00:15:41 2008 +0000
+
+    Bug 211679 - [prov] [ui] Replacement UI for extension locations
+
+52	7	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AddRepositoryDialog.java
+7	2	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AddRepositoryDialog.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AddRepositoryDialog.java
+index 7fdfd21..303e29f 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AddRepositoryDialog.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AddRepositoryDialog.java
+@@ -45,6 +45,11 @@ public abstract class AddRepositoryDialog extends StatusDialog {
+ 	Button okButton;
+ 	Text url;
+ 	URL[] knownRepositories;
++	protected static final int NON_REPO_ERROR = 0;
++	protected static final String FILE_PROTOCOL = "file"; //$NON-NLS-1$
++	protected static final String FILE_PROTOCOL_PREFIX = "file:"; //$NON-NLS-1$
++	protected static final String JAR_PATH_PREFIX = "jar:";//$NON-NLS-1$
++	protected static final String JAR_PATH_SUFFIX = "!/"; //$NON-NLS-1$
+ 	static final String[] ARCHIVE_EXTENSIONS = new String[] {"*.jar;*.zip"}; //$NON-NLS-1$ 
+ 	static String lastLocalLocation = null;
+ 	static String lastArchiveLocation = null;
+@@ -103,7 +108,7 @@ public abstract class AddRepositoryDialog extends StatusDialog {
+ 				String path = dialog.open();
+ 				if (path != null) {
+ 					lastLocalLocation = path;
+-					url.setText("file:" + path); //$NON-NLS-1$
++					url.setText(FILE_PROTOCOL_PREFIX + path);
+ 					validateRepositoryURL(true);
+ 				}
+ 			}
+@@ -120,7 +125,7 @@ public abstract class AddRepositoryDialog extends StatusDialog {
+ 				String path = dialog.open();
+ 				if (path != null) {
+ 					lastArchiveLocation = path;
+-					url.setText("jar:file:" + path + "!/"); //$NON-NLS-1$ //$NON-NLS-2$
++					url.setText(FILE_PROTOCOL_PREFIX + JAR_PATH_PREFIX + path + JAR_PATH_SUFFIX);
+ 					validateRepositoryURL(true);
+ 				}
+ 			}
+@@ -137,7 +142,13 @@ public abstract class AddRepositoryDialog extends StatusDialog {
+ 
+ 	}
+ 
+-	private URL getUserURL() {
++	/**
++	 * Get the URL as currently typed in by the user.  Return null if there
++	 * is a problem with the URL.
++	 * 
++	 * @return the URL currently typed in by the user.
++	 */
++	protected URL getUserURL() {
+ 		URL userURL;
+ 		try {
+ 			userURL = new URL(url.getText().trim());
+@@ -170,13 +181,13 @@ public abstract class AddRepositoryDialog extends StatusDialog {
+ 		status[0] = Status.OK_STATUS;
+ 		final URL userURL = getUserURL();
+ 		if (url.getText().length() == 0)
+-			status[0] = new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, 0, ProvUIMessages.RepositoryGroup_URLRequired, null);
++			status[0] = new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, NON_REPO_ERROR, ProvUIMessages.RepositoryGroup_URLRequired, null);
+ 		else if (userURL == null)
+-			status[0] = new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, 0, ProvUIMessages.AddRepositoryDialog_InvalidURL, null);
++			status[0] = new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, NON_REPO_ERROR, ProvUIMessages.AddRepositoryDialog_InvalidURL, null);
+ 		else {
+ 			for (int i = 0; i < knownRepositories.length; i++) {
+ 				if (knownRepositories[i].toExternalForm().equalsIgnoreCase(userURL.toExternalForm())) {
+-					status[0] = new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, IStatus.OK, ProvUIMessages.AddRepositoryDialog_DuplicateURL, null);
++					status[0] = new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, NON_REPO_ERROR, ProvUIMessages.AddRepositoryDialog_DuplicateURL, null);
+ 					break;
+ 				}
+ 			}
+@@ -188,17 +199,51 @@ public abstract class AddRepositoryDialog extends StatusDialog {
+ 						}
+ 					});
+ 				} catch (InvocationTargetException e) {
+-					return ProvUI.handleException(e, ProvUIMessages.AddRepositoryDialog_URLValidationError, StatusManager.SHOW | StatusManager.LOG);
++					return ProvUI.handleException(e.getCause(), ProvUIMessages.AddRepositoryDialog_URLValidationError, StatusManager.SHOW | StatusManager.LOG);
+ 				} catch (InterruptedException e) {
+ 					// ignore
+ 				}
+ 		}
++		// If the repositories themselves didn't know what to do with this
++		// URL, consult subclasses.  There may be additional work that could
++		// be done to make the location valid.
++		if (!status[0].isOK() && status[0].getCode() != NON_REPO_ERROR)
++			status[0] = handleInvalidRepositoryURL(userURL, status[0]);
++
++		// At this point the subclasses may have decided to opt out of
++		// this dialog.
++		if (status[0].getSeverity() == IStatus.CANCEL) {
++			cancelPressed();
++		}
++
+ 		setOkEnablement(status[0].isOK());
+ 		updateStatus(status[0]);
+ 		return status[0];
+ 
+ 	}
+ 
++	/**
++	 * The repository manager has failed in validating a URL.
++	 * Perform any additional handling of the URL and return a status
++	 * indicating whether the repository URL is still invalid.  Subclasses
++	 * may override when there is additional work, such as repository
++	 * generation, repository authenticatoin, or repository repair that may
++	 * be appropriate for a given URL.
++	 * 
++	 * @param url the URL describing the invalid repository
++	 * @param status the status returned by the repository manager.
++	 * 
++	 * @return a status indicating the current status of the repository.
++	 * Callers may return the original status.  A status with severity
++	 * <code>OK</code> indicates that the caller can proceed with adding
++	 * the repository.  A status with severity <code>CANCEL</code> indicates
++	 * that the dialog should be cancelled.  Any other severity should be 
++	 * reported to the user and indicates an invalid URL.
++	 */
++	protected IStatus handleInvalidRepositoryURL(URL userURL, IStatus status) {
++		return status;
++	}
++
+ 	protected void updateButtonsEnableState(IStatus status) {
+ 		setOkEnablement(!status.matches(IStatus.ERROR));
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
+index 5ec36c1..d3da7c9 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
+@@ -39,6 +39,12 @@ public class ProvisioningUtil {
+ 		if (manager == null)
+ 			throw new ProvisionException(ProvUIMessages.ProvisioningUtil_NoRepositoryManager);
+ 		manager.addRepository(location);
++		notifyRepositoryAdded();
++	}
++
++	// TODO temporary
++	// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=199806
++	public static void notifyRepositoryAdded() {
+ 		EventObject event = new EventObject(IProvisioningListener.REPO_ADDED);
+ 		ProvUIActivator.getDefault().notifyListeners(event);
+ 	}
+@@ -92,8 +98,7 @@ public class ProvisioningUtil {
+ 			throw new ProvisionException(ProvUIMessages.ProvisioningUtil_NoRepositoryManager);
+ 		}
+ 		manager.addRepository(location);
+-		EventObject event = new EventObject(IProvisioningListener.REPO_ADDED);
+-		ProvUIActivator.getDefault().notifyListeners(event);
++		notifyRepositoryAdded();
+ 	}
+ 
+ 	public static String getArtifactRepositoryProperty(URL location, String key) throws ProvisionException {
+commit 2495552d0e0be6bc8e50eb22fbbdf8ba168cc99d
+Author: Susan Franklin <sfranklin>
+Date:   Fri Mar 7 00:27:18 2008 +0000
+
+    Bug 211679 - [prov] [ui] Replacement UI for extension locations
+
+2	0	bundles/org.eclipse.equinox.p2.ui.sdk/META-INF/MANIFEST.MF
+3	2	bundles/org.eclipse.equinox.p2.ui.sdk/plugin.properties
+8	0	bundles/org.eclipse.equinox.p2.ui.sdk/plugin.xml
+30	3	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
+23	0	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationDialog.java
+23	0	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationFromArchiveDialog.java
+128	0	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java
+30	3	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
+46	0	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ExternalFilesPreferencePage.java
+3	2	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceConstants.java
+3	2	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceInitializer.java
+19	87	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ProvisioningPreferencePage.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.ui.sdk/META-INF/MANIFEST.MF
+index 43114d0..8b41665 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/META-INF/MANIFEST.MF
+@@ -14,9 +14,11 @@ Import-Package: org.eclipse.equinox.internal.p2.core.helpers,
+  org.eclipse.equinox.internal.provisional.p2.director,
+  org.eclipse.equinox.internal.provisional.p2.engine,
+  org.eclipse.equinox.internal.provisional.p2.metadata,
++ org.eclipse.equinox.internal.provisional.p2.metadata.generator,
+  org.eclipse.equinox.internal.provisional.p2.metadata.query,
+  org.eclipse.equinox.internal.provisional.p2.metadata.repository,
+  org.eclipse.equinox.internal.provisional.p2.query,
++ org.eclipse.equinox.internal.provisional.p2.reconciler,
+  org.eclipse.equinox.internal.provisional.p2.ui,
+  org.eclipse.equinox.internal.provisional.p2.ui.actions,
+  org.eclipse.equinox.internal.provisional.p2.ui.dialogs,
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/plugin.properties b/bundles/org.eclipse.equinox.p2.ui.sdk/plugin.properties
+index 12ebc4d..f12bbbd 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/plugin.properties
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/plugin.properties
+@@ -18,7 +18,8 @@ IU.license=License Agreement
+ IU.copyright=Copyright
+ Repository.name=General Information
+ Update.command=Software Updates...
+-automaticUpdatesPrefPage = Automatic Updates
+ provisioningPrefPage = Install/Update
+-preferenceKeywords.general=automatic update schedule download software install
++automaticUpdatesPrefPage = Automatic Updates
++externalFilesPrefPage = Updating from the File System
++preferenceKeywords.general=automatic update schedule download software install import bundle
+ preferences=Update and Install Preferences
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/plugin.xml b/bundles/org.eclipse.equinox.p2.ui.sdk/plugin.xml
+index 1aa2523..93cfbfe 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/plugin.xml
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/plugin.xml
+@@ -71,6 +71,14 @@
+             id="org.eclipse.equinox.internal.p2.ui.sdk.AutomaticUpdatesPreferencePage">
+             <keywordReference id="org.eclipse.equinox.p2.ui.sdk.updates.general"/>
+       </page>
++      
++      <page
++            name="%externalFilesPrefPage"
++            category="org.eclipse.equinox.internal.p2.ui.sdk.ProvisioningPreferencePage"
++            class="org.eclipse.equinox.internal.p2.ui.sdk.prefs.ExternalFilesPreferencePage"
++            id="org.eclipse.equinox.internal.p2.ui.sdk.ExternalFilesPreferencePage">
++            <keywordReference id="org.eclipse.equinox.p2.ui.sdk.updates.general"/>
++      </page>
+    </extension>
+ 
+       <extension
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
+index 7d9a42a..f2cbaf7 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
+@@ -25,6 +25,30 @@ public class ProvSDKMessages extends NLS {
+ 		NLS.initializeMessages(BUNDLE_NAME, ProvSDKMessages.class);
+ 	}
+ 	public static String AddColocatedRepositoryDialog_InvalidURL;
++	public static String AddColocatedRepositoryDialog_MissingProfile;
++	public static String ConfirmRepoGenerationDialog_FileDescription;
++	public static String ConfirmRepoGenerationDialog_Message;
++	public static String ConfirmRepoGenerationFromArchiveDialog_FileDescription;
++	public static String ConfirmRepoGenerationFromArchiveDialog_Message;
++	public static String ExternalFileHandler_BundleInstalledOK;
++	public static String ExternalFileHandler_ErrorCopyingFile;
++	public static String ExternalFileHandler_ErrorExpandingArchive;
++	public static String ExternalFileHandler_PromptForInstallBundle;
++	public static String ExternalFileHandler_RepositoryGeneratedOK;
++	public static String ExternalFileHandler_UnexpectedError;
++	public static String ExternalFileHandler_UserGeneratedRepoName;
++	public static String ExternalFilesPreferencePage_AddBundleGroup;
++	public static String ExternalFilesPreferencePage_ArchiveRepoGenerationGroup;
++	public static String ExternalFilesPreferencePage_AutoInstallBundleAlways;
++	public static String ExternalFilesPreferencePage_AutoInstallBundleNever;
++	public static String ExternalFilesPreferencePage_AutoInstallBundlePrompt;
++	public static String ExternalFilesPreferencePage_GenerateArchiveRepoAlways;
++	public static String ExternalFilesPreferencePage_GenerateArchiveRepoNever;
++	public static String ExternalFilesPreferencePage_GenerateArchiveRepoPrompt;
++	public static String ExternalFilesPreferencePage_GenerateRepoAlways;
++	public static String ExternalFilesPreferencePage_GenerateRepoNever;
++	public static String ExternalFilesPreferencePage_GenerateRepoPrompt;
++	public static String ExternalFilesPreferencePage_RepoGenerationGroup;
+ 	public static String RepositoryManipulationDialog_ErrorRetrievingSites;
+ 	public static String RepositoryManipulationDialog_AddButton;
+ 	public static String RepositoryManipulationDialog_LocationColumnHeader;
+@@ -104,7 +128,10 @@ public class ProvSDKMessages extends NLS {
+ 	public static String AutomaticUpdatesJob_Updates;
+ 	public static String AutomaticUpdatesDialog_ClickToReviewDownloaded;
+ 	public static String AutomaticUpdatesDialog_ClickToReviewNotDownloaded;
+-	public static String ProvisioningPreferencePage_Always;
++	public static String ConfirmWithPathDetails_Browse;
++	public static String ConfirmWithPathDetails_SaveIn;
++	public static String ConfirmWithPathDetails_SelectDirectory;
++	public static String ProvisioningPreferencePage_AlwaysOpenWizard;
+ 	public static String ProvisioningPreferencePage_BrowsingPrefsGroup;
+ 	public static String ProvisioningPreferencePage_ShowLatestVersions;
+ 	public static String ProvisioningPreferencePage_ShowAllVersions;
+@@ -112,9 +139,9 @@ public class ProvSDKMessages extends NLS {
+ 	public static String ProvisioningPreferencePage_enableGC;
+ 	public static String ProvisioningPreferencePage_gcImmediately;
+ 	public static String ProvisioningPreferencePage_gcRetentionTime;
+-	public static String ProvisioningPreferencePage_Never;
++	public static String ProvisioningPreferencePage_NeverOpenWizard;
+ 	public static String ProvisioningPreferencePage_OpenWizardIfInvalid;
+-	public static String ProvisioningPreferencePage_Prompt;
++	public static String ProvisioningPreferencePage_PromptToOpenWizard;
+ 	public static String ProvSDKQueryProvider_ErrorRetrievingProfile;
+ 	public static String ProvSDKUIActivator_ErrorWritingLicenseRegistry;
+ 	public static String ProvSDKUIActivator_LaunchUpdateManager;
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationDialog.java
+new file mode 100644
+index 0000000..5f7a81f
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationDialog.java
+@@ -0,0 +1,23 @@
++package org.eclipse.equinox.internal.p2.ui.sdk.externalFiles;
++
++import java.io.File;
++import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKMessages;
++import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKUIActivator;
++import org.eclipse.equinox.internal.p2.ui.sdk.prefs.PreferenceConstants;
++import org.eclipse.osgi.util.NLS;
++import org.eclipse.swt.widgets.Shell;
++
++/**
++ * @since 3.4
++ *
++ */
++public class ConfirmRepoGenerationDialog extends ConfirmWithPathDetailsDialog {
++
++	public ConfirmRepoGenerationDialog(Shell parentShell, File file, File targetRepoLocation) {
++		super(parentShell, targetRepoLocation, NLS.bind(ProvSDKMessages.ConfirmRepoGenerationDialog_Message, file.getAbsolutePath()), ProvSDKUIActivator.getDefault().getPreferenceStore(), PreferenceConstants.PREF_GENERATE_REPOFOLDER);
++	}
++
++	protected String getLocationDescription() {
++		return ProvSDKMessages.ConfirmRepoGenerationDialog_FileDescription;
++	}
++}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationFromArchiveDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationFromArchiveDialog.java
+new file mode 100644
+index 0000000..1ced4c0
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationFromArchiveDialog.java
+@@ -0,0 +1,23 @@
++package org.eclipse.equinox.internal.p2.ui.sdk.externalFiles;
++
++import java.io.File;
++import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKMessages;
++import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKUIActivator;
++import org.eclipse.equinox.internal.p2.ui.sdk.prefs.PreferenceConstants;
++import org.eclipse.osgi.util.NLS;
++import org.eclipse.swt.widgets.Shell;
++
++/**
++ * @since 3.4
++ *
++ */
++public class ConfirmRepoGenerationFromArchiveDialog extends ConfirmWithPathDetailsDialog {
++
++	public ConfirmRepoGenerationFromArchiveDialog(Shell parentShell, File archive, File targetRepoLocation) {
++		super(parentShell, targetRepoLocation, NLS.bind(ProvSDKMessages.ConfirmRepoGenerationFromArchiveDialog_Message, archive.getAbsolutePath()), ProvSDKUIActivator.getDefault().getPreferenceStore(), PreferenceConstants.PREF_GENERATE_REPOFOLDER);
++	}
++
++	protected String getLocationDescription() {
++		return ProvSDKMessages.ConfirmRepoGenerationFromArchiveDialog_FileDescription;
++	}
++}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java
+new file mode 100644
+index 0000000..a6368fc
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java
+@@ -0,0 +1,128 @@
++package org.eclipse.equinox.internal.p2.ui.sdk.externalFiles;
++
++import java.io.File;
++import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKMessages;
++import org.eclipse.jface.dialogs.IDialogConstants;
++import org.eclipse.jface.dialogs.MessageDialogWithToggle;
++import org.eclipse.jface.preference.IPreferenceStore;
++import org.eclipse.swt.SWT;
++import org.eclipse.swt.events.*;
++import org.eclipse.swt.graphics.Point;
++import org.eclipse.swt.layout.GridData;
++import org.eclipse.swt.layout.GridLayout;
++import org.eclipse.swt.widgets.*;
++
++/**
++ * @since 3.4
++ *
++ */
++public abstract class ConfirmWithPathDetailsDialog extends MessageDialogWithToggle {
++
++	File targetLocation;
++	Composite detailsArea;
++	Text location;
++	String pathLocationText;
++
++	/**
++	 * 
++	 * @param parentShell
++	 * @param file
++	 */
++	public ConfirmWithPathDetailsDialog(Shell parentShell, File targetRepoLocation, String message, IPreferenceStore prefStore, String prefKey) {
++		super(parentShell, ProvSDKMessages.ProvSDKUIActivator_Question, null, message, NONE, new String[] {IDialogConstants.YES_LABEL, IDialogConstants.NO_LABEL, IDialogConstants.SHOW_DETAILS_LABEL}, 0, null, false);
++		this.targetLocation = targetRepoLocation;
++		pathLocationText = targetRepoLocation.getAbsolutePath();
++		setPrefStore(prefStore);
++		setPrefKey(prefKey);
++	}
++
++	protected Composite createDetailsArea(final Composite parent) {
++		Composite composite = new Composite(parent, SWT.BORDER);
++		GridLayout layout = new GridLayout();
++		layout.marginLeft = layout.marginRight = layout.marginTop = layout.marginBottom = 0;
++		layout.numColumns = 3;
++		composite.setLayout(layout);
++		GridData gd = new GridData(SWT.FILL, SWT.FILL, true, true);
++		composite.setLayoutData(gd);
++
++		// Descriptive text describing the location's usage
++		Text text = new Text(composite, SWT.MULTI | SWT.READ_ONLY | SWT.WRAP);
++		gd = new GridData(SWT.FILL, SWT.FILL, true, true);
++		initializeDialogUnits(text);
++		gd.heightHint = convertHeightInCharsToPixels(2);
++		gd.horizontalSpan = 3;
++		text.setLayoutData(gd);
++		text.setText(getLocationDescription());
++
++		// Location text box and browse button
++		Label label = new Label(composite, SWT.NONE);
++		label.setText(ProvSDKMessages.ConfirmWithPathDetails_SaveIn);
++		location = new Text(composite, SWT.BORDER);
++		if (pathLocationText != null)
++			location.setText(pathLocationText);
++		location.addModifyListener(new ModifyListener() {
++			public void modifyText(ModifyEvent e) {
++				pathLocationText = location.getText().trim();
++			}
++
++		});
++		location.setLayoutData(new GridData(SWT.FILL, SWT.FILL, true, false));
++		Button locationButton = new Button(composite, SWT.PUSH);
++		locationButton.setText(ProvSDKMessages.ConfirmWithPathDetails_Browse);
++		locationButton.addSelectionListener(new SelectionAdapter() {
++			public void widgetSelected(SelectionEvent event) {
++				DirectoryDialog dialog = new DirectoryDialog(parent.getShell(), SWT.APPLICATION_MODAL);
++				dialog.setMessage(ProvSDKMessages.ConfirmWithPathDetails_SelectDirectory);
++				String dir = dialog.open();
++				if (dir != null) {
++					location.setText(dir);
++				}
++			}
++		});
++		return composite;
++	}
++
++	protected abstract String getLocationDescription();
++
++	protected void buttonPressed(int id) {
++		if (id == IDialogConstants.DETAILS_ID) {
++			// was the details button pressed?
++			toggleDetailsArea();
++		} else {
++			super.buttonPressed(id);
++		}
++	}
++
++	/**
++	 * Toggles the unfolding of the details area. This is triggered by the user
++	 * pressing the details button.
++	 */
++	private void toggleDetailsArea() {
++		Point windowSize = getShell().getSize();
++		Point oldSize = getShell().computeSize(SWT.DEFAULT, SWT.DEFAULT);
++		if (detailsArea != null) {
++			detailsArea.dispose();
++			detailsArea = null;
++			getDetailsButton().setText(IDialogConstants.SHOW_DETAILS_LABEL);
++		} else {
++			detailsArea = createDetailsArea((Composite) getContents());
++			getDetailsButton().setText(IDialogConstants.HIDE_DETAILS_LABEL);
++			getContents().getShell().layout();
++		}
++		Point newSize = getShell().computeSize(SWT.DEFAULT, SWT.DEFAULT);
++		getShell().setSize(new Point(windowSize.x, windowSize.y + (newSize.y - oldSize.y)));
++	}
++
++	private Button getDetailsButton() {
++		return getButton(2); // index of details button as specified in the constructor
++	}
++
++	public File getTargetLocation() {
++		if (pathLocationText != null) {
++			File file = new File(pathLocationText);
++			if (file.isDirectory() || file.mkdirs())
++				return file;
++		}
++		return targetLocation;
++	}
++}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
+index fe1c939..395da1b 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
+@@ -9,6 +9,30 @@
+ #     IBM Corporation - initial API and implementation
+ ###############################################################################
+ AddColocatedRepositoryDialog_InvalidURL=The URL is not valid.
++AddColocatedRepositoryDialog_MissingProfile=Could not retrieve a description of the running system.
++ConfirmRepoGenerationDialog_FileDescription=Additional files must be generated to make the directory contents available.  Please specify a path for the additional files.
++ConfirmRepoGenerationDialog_Message=The directory "{0}" does not contain files that describe a known software site.  Do you want to generate these files so that the contents of this folder are available for installation?
++ConfirmRepoGenerationFromArchiveDialog_FileDescription=The contents of the archive file will be expanded into a directory, along with generated files that make them available for install.  Please specify a path for these files.
++ConfirmRepoGenerationFromArchiveDialog_Message=The archive file "{0}" does not contain files that describe a known software site.  Do you want to generate these files and expand the contents of this archive to make it available for installation?
++ExternalFileHandler_BundleInstalledOK=Bundle was successfully installed in {0}
++ExternalFileHandler_ErrorCopyingFile=Error while trying to copy the file {0}
++ExternalFileHandler_ErrorExpandingArchive=Error while expanding the archive {0}
++ExternalFileHandler_PromptForInstallBundle=The file "{0}" is recognized as a software plug-in.  Do you want to add it to the running program?  (Requires restart when finished).
++ExternalFileHandler_RepositoryGeneratedOK=Repository was successfully generated at {0}
++ExternalFileHandler_UnexpectedError=Unexpected error while processing {0}.
++ExternalFileHandler_UserGeneratedRepoName=User-Generated Content from {0}
++ExternalFilesPreferencePage_AddBundleGroup=When I add a plug-in file as an update site
++ExternalFilesPreferencePage_ArchiveRepoGenerationGroup=When I add an unrecognized archive file as an update site
++ExternalFilesPreferencePage_AutoInstallBundleAlways=Automatically &install the plugin
++ExternalFilesPreferencePage_AutoInstallBundleNever=&Repor&t an error
++ExternalFilesPreferencePage_AutoInstallBundlePrompt=Ask &me if the plugin should be installed
++ExternalFilesPreferencePage_GenerateArchiveRepoAlways=&Expand the archive and generate the information necessary to install the archive contents
++ExternalFilesPreferencePage_GenerateArchiveRepoNever=Re&port the unrecognized archive content as an error
++ExternalFilesPreferencePage_GenerateArchiveRepoPrompt=As&k me if the information should be generated
++ExternalFilesPreferencePage_GenerateRepoAlways=&Generate the information necessary to install the directory contents
++ExternalFilesPreferencePage_GenerateRepoNever=&Report the unrecognized directory as an error
++ExternalFilesPreferencePage_GenerateRepoPrompt=&Ask me if the information should be generated
++ExternalFilesPreferencePage_RepoGenerationGroup=When I add an unrecognized directory as an update site
+ UpdateAndInstallDialog_InstalledFeatures=&Installed Features
+ UpdateAndInstallDialog_AvailableFeatures=&Available Features
+ UpdateAndInstallDialog_AlertCheckbox=Automatically check for updates and alert me when they are found
+@@ -88,6 +112,9 @@ AutomaticUpdatesPreferencePage_RemindGroup=&When updates are found
+ AutomaticUpdatesPreferencePage_RemindSchedule=&Remind me about updates every:
+ AutomaticUpdatesPreferencePage_RemindOnce=Notify me &once about updates
+ AutomaticUpdatesJob_Updates=Updates
++ConfirmWithPathDetails_Browse=&Browse...
++ConfirmWithPathDetails_SaveIn=&Save in:
++ConfirmWithPathDetails_SelectDirectory=Select a directory
+ ProvSDKQueryProvider_ErrorRetrievingProfile=Error while retrieving profile {0}
+ ProvSDKUIActivator_ErrorWritingLicenseRegistry=Error writing license registry.  Accepted licenses will not be remembered.
+ ProvSDKUIActivator_LaunchUpdateManager=Launch...
+@@ -99,7 +126,7 @@ ProvSDKUIActivator_UnsupportedFeatureMessage=A feature that you have selected us
+ \
+ Do you want to launch the older Update Manager?
+ ProvSDKUIActivator_UnsupportedFeatureTitle=Unsupported Install
+-ProvisioningPreferencePage_Always=&Open the wizard anyway to review or change selections
++ProvisioningPreferencePage_AlwaysOpenWizard=&Open the wizard anyway to review or change selections
+ ProvisioningPreferencePage_BrowsingPrefsGroup=Browsing for updates
+ ProvisioningPreferencePage_ShowLatestVersions=Show only the &latest versions of available software
+ ProvisioningPreferencePage_ShowAllVersions=Show all &versions of available software
+@@ -107,6 +134,6 @@ ProvisioningPreferencePage_gcGroup=System cleanup
+ ProvisioningPreferencePage_enableGC=Automatically delete unused files
+ ProvisioningPreferencePage_gcImmediately=Delete unused files immediately
+ ProvisioningPreferencePage_gcRetentionTime=Keep unused files for ???
+-ProvisioningPreferencePage_Never=&Report the problems and do not open the wizard
++ProvisioningPreferencePage_NeverOpenWizard=&Report the problems and do not open the wizard
+ ProvisioningPreferencePage_OpenWizardIfInvalid=When software selected for an install wizard may not be compatible
+-ProvisioningPreferencePage_Prompt=&Ask me what to do when it happens
++ProvisioningPreferencePage_PromptToOpenWizard=&Ask me what to do when it happens
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ExternalFilesPreferencePage.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ExternalFilesPreferencePage.java
+new file mode 100644
+index 0000000..ce1475f
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ExternalFilesPreferencePage.java
+@@ -0,0 +1,46 @@
++/*******************************************************************************
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.ui.sdk.prefs;
++
++import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKMessages;
++import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKUIActivator;
++import org.eclipse.jface.dialogs.MessageDialogWithToggle;
++import org.eclipse.jface.preference.FieldEditorPreferencePage;
++import org.eclipse.jface.preference.RadioGroupFieldEditor;
++import org.eclipse.ui.IWorkbench;
++import org.eclipse.ui.IWorkbenchPreferencePage;
++
++/**
++ * Preference page for provisioning preferences.
++ * 
++ * @since 3.4
++ */
++
++public class ExternalFilesPreferencePage extends FieldEditorPreferencePage implements IWorkbenchPreferencePage {
++	public ExternalFilesPreferencePage() {
++		super(GRID);
++		setPreferenceStore(ProvSDKUIActivator.getDefault().getPreferenceStore());
++	}
++
++	protected void createFieldEditors() {
++		addField(new RadioGroupFieldEditor(PreferenceConstants.PREF_GENERATE_REPOFOLDER, ProvSDKMessages.ExternalFilesPreferencePage_RepoGenerationGroup, 1, new String[][] { {ProvSDKMessages.ExternalFilesPreferencePage_GenerateRepoAlways, MessageDialogWithToggle.ALWAYS}, {ProvSDKMessages.ExternalFilesPreferencePage_GenerateRepoNever, MessageDialogWithToggle.NEVER}, {ProvSDKMessages.ExternalFilesPreferencePage_GenerateRepoPrompt, MessageDialogWithToggle.PROMPT}}, getFieldEditorParent(), true));
++		addField(new RadioGroupFieldEditor(PreferenceConstants.PREF_GENERATE_ARCHIVEREPOFOLDER, ProvSDKMessages.ExternalFilesPreferencePage_ArchiveRepoGenerationGroup, 1, new String[][] { {ProvSDKMessages.ExternalFilesPreferencePage_GenerateArchiveRepoAlways, MessageDialogWithToggle.ALWAYS}, {ProvSDKMessages.ExternalFilesPreferencePage_GenerateArchiveRepoNever, MessageDialogWithToggle.NEVER}, {ProvSDKMessages.ExternalFilesPreferencePage_GenerateArchiveRepoPrompt, MessageDialogWithToggle.PROMPT}}, getFieldEditorParent(), true));
++		addField(new RadioGroupFieldEditor(PreferenceConstants.PREF_AUTO_INSTALL_BUNDLES, ProvSDKMessages.ExternalFilesPreferencePage_AddBundleGroup, 1, new String[][] { {ProvSDKMessages.ExternalFilesPreferencePage_AutoInstallBundleAlways, MessageDialogWithToggle.ALWAYS}, {ProvSDKMessages.ExternalFilesPreferencePage_AutoInstallBundleNever, MessageDialogWithToggle.NEVER}, {ProvSDKMessages.ExternalFilesPreferencePage_AutoInstallBundlePrompt, MessageDialogWithToggle.PROMPT}}, getFieldEditorParent(), true));
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.ui.IWorkbenchPreferencePage#init(org.eclipse.ui.IWorkbench)
++	 */
++	public void init(IWorkbench workbench) {
++		// nothing to do
++
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceConstants.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceConstants.java
+index 58f37f4..426a6cd 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceConstants.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceConstants.java
+@@ -25,6 +25,7 @@ public class PreferenceConstants {
+ 	public static final String PREF_REMIND_ELAPSED = "remindElapsedTime";//$NON-NLS-1$
+ 	public static final String PREF_SHOW_LATEST_VERSION = "showLatestVersion"; //$NON-NLS-1$
+ 	public static final String PREF_OPEN_WIZARD_ON_NONOK_PLAN = "allowNonOKPlan"; //$NON-NLS-1$
+-	public static final String PREF_ENABLE_GC = "enableArtifactGC"; //$NON-NLS-1$
+-	public static final String PREF_GC_IMMEDIATELY = "gcUnusedFilesImmediately"; //$NON-NLS-1$
++	public static final String PREF_GENERATE_REPOFOLDER = "generateReposForFolder"; //$NON-NLS-1$
++	public static final String PREF_GENERATE_ARCHIVEREPOFOLDER = "generateReposForArchive"; //$NON-NLS-1$
++	public static final String PREF_AUTO_INSTALL_BUNDLES = "autoInstallBundles"; //$NON-NLS-1$
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceInitializer.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceInitializer.java
+index 220093c..d5f84e1 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceInitializer.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceInitializer.java
+@@ -31,10 +31,11 @@ public class PreferenceInitializer extends AbstractPreferenceInitializer {
+ 		node.putBoolean(PreferenceConstants.PREF_DOWNLOAD_ONLY, false);
+ 		node.putBoolean(PreferenceConstants.PREF_REMIND_SCHEDULE, false);
+ 		node.putBoolean(PreferenceConstants.PREF_SHOW_LATEST_VERSION, true);
+-		node.putBoolean(PreferenceConstants.PREF_ENABLE_GC, false);
+-		node.putBoolean(PreferenceConstants.PREF_GC_IMMEDIATELY, true);
+ 		node.put(PreferenceConstants.PREF_REMIND_ELAPSED, ProvSDKMessages.AutomaticUpdateScheduler_30Minutes);
+ 		node.put(PreferenceConstants.PREF_OPEN_WIZARD_ON_NONOK_PLAN, MessageDialogWithToggle.PROMPT);
++		node.put(PreferenceConstants.PREF_GENERATE_REPOFOLDER, MessageDialogWithToggle.PROMPT);
++		node.put(PreferenceConstants.PREF_GENERATE_ARCHIVEREPOFOLDER, MessageDialogWithToggle.PROMPT);
++		node.put(PreferenceConstants.PREF_AUTO_INSTALL_BUNDLES, MessageDialogWithToggle.PROMPT);
+ 	}
+ 
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ProvisioningPreferencePage.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ProvisioningPreferencePage.java
+index 88d0500..770b8d9 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ProvisioningPreferencePage.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ProvisioningPreferencePage.java
+@@ -24,7 +24,7 @@ import org.eclipse.ui.IWorkbench;
+ import org.eclipse.ui.IWorkbenchPreferencePage;
+ 
+ /**
+- * Preference page for provisioning preferences.
++ * Preference page for general provisioning preferences.
+  * 
+  * @since 3.4
+  */
+@@ -32,12 +32,8 @@ import org.eclipse.ui.IWorkbenchPreferencePage;
+ public class ProvisioningPreferencePage extends PreferencePage implements IWorkbenchPreferencePage {
+ 
+ 	private Group browsingGroup, validateGroup;
+-	// private Button garbageCollectorCheck;
+-	// private Button deleteImmediatelyRadio, scheduleRadio;
+ 	private Button showLatestRadio, showAllRadio;
+-	private Button always, never, prompt;
+-
+-	// private static final int INDENT = 30;
++	private Button alwaysShowFailedPlan, neverShowFailedPlan, promptOnFailedPlan;
+ 
+ 	protected Control createContents(Composite parent) {
+ 		Composite container = new Composite(parent, SWT.NULL);
+@@ -75,70 +71,23 @@ public class ProvisioningPreferencePage extends PreferencePage implements IWorkb
+ 		gd = new GridData(GridData.FILL_HORIZONTAL);
+ 		validateGroup.setLayoutData(gd);
+ 
+-		always = new Button(validateGroup, SWT.RADIO);
+-		always.setText(ProvSDKMessages.ProvisioningPreferencePage_Always);
++		alwaysShowFailedPlan = new Button(validateGroup, SWT.RADIO);
++		alwaysShowFailedPlan.setText(ProvSDKMessages.ProvisioningPreferencePage_AlwaysOpenWizard);
+ 		gd = new GridData();
+ 		gd.horizontalSpan = 3;
+-		always.setLayoutData(gd);
++		alwaysShowFailedPlan.setLayoutData(gd);
+ 
+-		never = new Button(validateGroup, SWT.RADIO);
+-		never.setText(ProvSDKMessages.ProvisioningPreferencePage_Never);
++		neverShowFailedPlan = new Button(validateGroup, SWT.RADIO);
++		neverShowFailedPlan.setText(ProvSDKMessages.ProvisioningPreferencePage_NeverOpenWizard);
+ 		gd = new GridData();
+ 		gd.horizontalSpan = 3;
+-		never.setLayoutData(gd);
++		neverShowFailedPlan.setLayoutData(gd);
+ 
+-		prompt = new Button(validateGroup, SWT.RADIO);
+-		prompt.setText(ProvSDKMessages.ProvisioningPreferencePage_Prompt);
++		promptOnFailedPlan = new Button(validateGroup, SWT.RADIO);
++		promptOnFailedPlan.setText(ProvSDKMessages.ProvisioningPreferencePage_PromptToOpenWizard);
+ 		gd = new GridData();
+ 		gd.horizontalSpan = 3;
+-		prompt.setLayoutData(gd);
+-
+-		/*
+-		 * Removed until we really implement this
+-		 *
+-		gcGroup = new Group(container, SWT.NONE);
+-		gcGroup.setText(ProvSDKMessages.ProvisioningPreferencePage_gcGroup);
+-		layout = new GridLayout();
+-		layout.numColumns = 3;
+-		gcGroup.setLayout(layout);
+-		gd = new GridData(GridData.FILL_HORIZONTAL);
+-		gcGroup.setLayoutData(gd);
+-
+-		garbageCollectorCheck = new Button(gcGroup, SWT.CHECK);
+-		garbageCollectorCheck.setText(ProvSDKMessages.ProvisioningPreferencePage_enableGC);
+-		gd = new GridData();
+-		gd.horizontalSpan = 3;
+-		garbageCollectorCheck.setLayoutData(gd);
+-		garbageCollectorCheck.addSelectionListener(new SelectionAdapter() {
+-			public void widgetSelected(SelectionEvent e) {
+-				pageChanged();
+-			}
+-		});
+-
+-		deleteImmediatelyRadio = new Button(gcGroup, SWT.RADIO);
+-		deleteImmediatelyRadio.setText(ProvSDKMessages.ProvisioningPreferencePage_gcImmediately);
+-		gd = new GridData();
+-		gd.horizontalSpan = 3;
+-		gd.horizontalIndent = INDENT;
+-		deleteImmediatelyRadio.setLayoutData(gd);
+-		deleteImmediatelyRadio.addSelectionListener(new SelectionAdapter() {
+-			public void widgetSelected(SelectionEvent e) {
+-				pageChanged();
+-			}
+-		});
+-
+-		scheduleRadio = new Button(gcGroup, SWT.RADIO);
+-		scheduleRadio.setText(ProvSDKMessages.ProvisioningPreferencePage_gcRetentionTime);
+-		gd = new GridData();
+-		gd.horizontalSpan = 3;
+-		gd.horizontalIndent = INDENT;
+-		scheduleRadio.setLayoutData(gd);
+-		scheduleRadio.addSelectionListener(new SelectionAdapter() {
+-			public void widgetSelected(SelectionEvent e) {
+-				pageChanged();
+-			}
+-		});
+-		*/
++		promptOnFailedPlan.setLayoutData(gd);
+ 
+ 		initialize();
+ 
+@@ -149,56 +98,39 @@ public class ProvisioningPreferencePage extends PreferencePage implements IWorkb
+ 
+ 	private void initialize() {
+ 		Preferences pref = ProvSDKUIActivator.getDefault().getPluginPreferences();
+-		// garbageCollectorCheck.setSelection(pref.getBoolean(PreferenceConstants.PREF_ENABLE_GC));
+-		// scheduleRadio.setSelection(!pref.getBoolean(PreferenceConstants.PREF_GC_IMMEDIATELY));
+-		// deleteImmediatelyRadio.setSelection(pref.getBoolean(PreferenceConstants.PREF_GC_IMMEDIATELY));
+ 		showLatestRadio.setSelection(pref.getBoolean(PreferenceConstants.PREF_SHOW_LATEST_VERSION));
+ 		showAllRadio.setSelection(!pref.getBoolean(PreferenceConstants.PREF_SHOW_LATEST_VERSION));
+ 		String openWizard = pref.getString(PreferenceConstants.PREF_OPEN_WIZARD_ON_NONOK_PLAN);
+-		always.setSelection(openWizard.equals(MessageDialogWithToggle.ALWAYS));
+-		never.setSelection(openWizard.equals(MessageDialogWithToggle.NEVER));
+-		prompt.setSelection(openWizard.equals(MessageDialogWithToggle.PROMPT));
++		alwaysShowFailedPlan.setSelection(openWizard.equals(MessageDialogWithToggle.ALWAYS));
++		neverShowFailedPlan.setSelection(openWizard.equals(MessageDialogWithToggle.NEVER));
++		promptOnFailedPlan.setSelection(openWizard.equals(MessageDialogWithToggle.PROMPT));
+ 	}
+ 
+ 	protected void performDefaults() {
+ 		super.performDefaults();
+ 		Preferences pref = ProvSDKUIActivator.getDefault().getPluginPreferences();
+-		// garbageCollectorCheck.setSelection(pref.getDefaultBoolean(PreferenceConstants.PREF_ENABLE_GC));
+-		// deleteImmediatelyRadio.setSelection(pref.getDefaultBoolean(PreferenceConstants.PREF_GC_IMMEDIATELY));
+-		// scheduleRadio.setSelection(!pref.getDefaultBoolean(PreferenceConstants.PREF_GC_IMMEDIATELY));
+ 		showLatestRadio.setSelection(pref.getDefaultBoolean(PreferenceConstants.PREF_SHOW_LATEST_VERSION));
+ 		showAllRadio.setSelection(!pref.getDefaultBoolean(PreferenceConstants.PREF_SHOW_LATEST_VERSION));
+ 		String openWizard = pref.getDefaultString(PreferenceConstants.PREF_OPEN_WIZARD_ON_NONOK_PLAN);
+-		always.setSelection(openWizard.equals(MessageDialogWithToggle.ALWAYS));
+-		never.setSelection(openWizard.equals(MessageDialogWithToggle.NEVER));
+-		prompt.setSelection(openWizard.equals(MessageDialogWithToggle.PROMPT));
++		alwaysShowFailedPlan.setSelection(openWizard.equals(MessageDialogWithToggle.ALWAYS));
++		neverShowFailedPlan.setSelection(openWizard.equals(MessageDialogWithToggle.NEVER));
++		promptOnFailedPlan.setSelection(openWizard.equals(MessageDialogWithToggle.PROMPT));
+ 	}
+ 
+ 	public boolean performOk() {
+ 		Preferences pref = ProvSDKUIActivator.getDefault().getPluginPreferences();
+ 		pref.setValue(PreferenceConstants.PREF_SHOW_LATEST_VERSION, showLatestRadio.getSelection());
+-		if (always.getSelection())
++		if (alwaysShowFailedPlan.getSelection())
+ 			pref.setValue(PreferenceConstants.PREF_OPEN_WIZARD_ON_NONOK_PLAN, MessageDialogWithToggle.ALWAYS);
+-		else if (never.getSelection())
++		else if (neverShowFailedPlan.getSelection())
+ 			pref.setValue(PreferenceConstants.PREF_OPEN_WIZARD_ON_NONOK_PLAN, MessageDialogWithToggle.NEVER);
+ 		else
+ 			pref.setValue(PreferenceConstants.PREF_OPEN_WIZARD_ON_NONOK_PLAN, MessageDialogWithToggle.PROMPT);
+ 
+-		// pref.setValue(PreferenceConstants.PREF_GC_IMMEDIATELY, deleteImmediatelyRadio.getSelection());
+-		// pref.setValue(PreferenceConstants.PREF_ENABLE_GC, garbageCollectorCheck.getSelection());
+ 		ProvSDKUIActivator.getDefault().savePluginPreferences();
+ 		return true;
+ 	}
+ 
+-	/*
+-	void pageChanged() {
+-		boolean enabled = garbageCollectorCheck.getSelection();
+-		scheduleRadio.setEnabled(enabled);
+-		deleteImmediatelyRadio.setEnabled(enabled);
+-
+-	}
+-	*/
+-
+ 	public void init(IWorkbench workbench) {
+ 		// Nothing to do
+ 	}
+commit 16e098bbb5f55996dac67234fc764098cae8afb5
+Author: Susan Franklin <sfranklin>
+Date:   Fri Mar 7 00:33:40 2008 +0000
+
+    Bug 211679 - [prov] [ui] Replacement UI for extension locations
+
+39	2	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/AddColocatedRepositoryDialog.java
+324	0	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ExternalFileHandler.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/AddColocatedRepositoryDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/AddColocatedRepositoryDialog.java
+index de6697c..6da0a89 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/AddColocatedRepositoryDialog.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/AddColocatedRepositoryDialog.java
+@@ -10,11 +10,18 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.ui.sdk;
+ 
++import java.io.File;
+ import java.net.URL;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.Status;
++import org.eclipse.equinox.internal.p2.ui.sdk.externalFiles.ExternalFileHandler;
++import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
++import org.eclipse.equinox.internal.provisional.p2.ui.ProvUI;
+ import org.eclipse.equinox.internal.provisional.p2.ui.dialogs.AddRepositoryDialog;
+-import org.eclipse.equinox.internal.provisional.p2.ui.operations.AddColocatedRepositoryOperation;
+-import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningOperation;
++import org.eclipse.equinox.internal.provisional.p2.ui.operations.*;
+ import org.eclipse.swt.widgets.Shell;
++import org.eclipse.ui.statushandlers.StatusManager;
+ 
+ /**
+  * Dialog that allows colocated metadata and artifact repositories
+@@ -33,4 +40,34 @@ public class AddColocatedRepositoryDialog extends AddRepositoryDialog {
+ 	protected ProvisioningOperation getOperation(URL url) {
+ 		return new AddColocatedRepositoryOperation(getShell().getText(), url);
+ 	}
++
++	protected IStatus handleInvalidRepositoryURL(URL url, final IStatus status) {
++		// If it was set up with jar protocol, now convert it back to file.
++
++		if (!FILE_PROTOCOL.equalsIgnoreCase(url.getProtocol()))
++			return status;
++		String path = url.getPath();
++		if (path.startsWith(JAR_PATH_PREFIX))
++			path = path.substring(JAR_PATH_PREFIX.length());
++		if (path.endsWith(JAR_PATH_SUFFIX))
++			path = path.substring(0, path.length() - JAR_PATH_SUFFIX.length());
++		final File file = new File(path);
++
++		IStatus externalFileStatus = new ExternalFileHandler(getProfile(), file, getShell()).processFile(status);
++		if (externalFileStatus.getCode() == ExternalFileHandler.REPO_GENERATED || externalFileStatus.getCode() == ExternalFileHandler.BUNDLE_INSTALLED) {
++			// TODO workaround for bug #199806
++			ProvisioningUtil.notifyRepositoryAdded();
++			return Status.CANCEL_STATUS;
++		}
++		return externalFileStatus;
++	}
++
++	private IProfile getProfile() {
++		try {
++			return ProvisioningUtil.getProfile(ProvSDKUIActivator.getProfileId());
++		} catch (ProvisionException e) {
++			ProvUI.handleException(e, ProvSDKMessages.AddColocatedRepositoryDialog_MissingProfile, StatusManager.LOG);
++			return null;
++		}
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ExternalFileHandler.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ExternalFileHandler.java
+new file mode 100644
+index 0000000..43d0139
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ExternalFileHandler.java
+@@ -0,0 +1,324 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ ******************************************************************************/
++
++package org.eclipse.equinox.internal.p2.ui.sdk.externalFiles;
++
++import java.io.*;
++import java.lang.reflect.InvocationTargetException;
++import java.net.URL;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipInputStream;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKMessages;
++import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKUIActivator;
++import org.eclipse.equinox.internal.p2.ui.sdk.prefs.PreferenceConstants;
++import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
++import org.eclipse.equinox.internal.provisional.p2.metadata.generator.BundleDescriptionFactory;
++import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
++import org.eclipse.equinox.internal.provisional.p2.ui.ProvUI;
++import org.eclipse.jface.dialogs.IDialogConstants;
++import org.eclipse.jface.dialogs.MessageDialogWithToggle;
++import org.eclipse.jface.operation.IRunnableWithProgress;
++import org.eclipse.osgi.service.datalocation.Location;
++import org.eclipse.osgi.service.resolver.PlatformAdmin;
++import org.eclipse.osgi.service.resolver.StateObjectFactory;
++import org.eclipse.osgi.util.NLS;
++import org.eclipse.swt.widgets.Shell;
++import org.eclipse.ui.PlatformUI;
++import org.eclipse.ui.statushandlers.StatusManager;
++import org.osgi.framework.ServiceReference;
++
++/**
++ * Utility class that handles files or folders that are not recognized as valid
++ * repositories.  Consults the user (and user preferences) to determine how to handle
++ * the file.
++ * 
++ * @since 3.4
++ *
++ */
++public class ExternalFileHandler {
++
++	public static final int REPO_GENERATED = 3000;
++	public static final int BUNDLE_INSTALLED = 3001;
++	private static final String FILE = "file"; //$NON-NLS-1$
++	File file;
++	Shell shell;
++	IProfile profile;
++
++	public ExternalFileHandler(IProfile profile, File file, Shell shell) {
++		this.file = file;
++		this.shell = shell;
++		this.profile = profile;
++	}
++
++	public IStatus processFile(IStatus originalStatus) {
++		/*	if (file == null)
++					return originalStatus;
++
++				if (file.isDirectory()) {
++					return generateRepoFromDirectory(originalStatus);
++				}
++				if (isBundle()) {
++					return autoInstallBundle(originalStatus);
++				}
++				if (isArchive()) {
++					return generateRepoFromArchive(originalStatus);
++				}
++		*/
++		return originalStatus;
++	}
++
++	IStatus generateRepoFromDirectory(IStatus originalStatus) {
++		String generateRepo = ProvSDKUIActivator.getDefault().getPreferenceStore().getString(PreferenceConstants.PREF_GENERATE_REPOFOLDER);
++		if (MessageDialogWithToggle.NEVER.equals(generateRepo))
++			return originalStatus;
++		if (MessageDialogWithToggle.ALWAYS.equals(generateRepo)) {
++			IMetadataRepository repository = generateRepository(file, file, false);
++			if (repository != null)
++				return generateOKStatus();
++			return originalStatus;
++		}
++		final ConfirmRepoGenerationDialog dialog = new ConfirmRepoGenerationDialog(shell, file, file);
++		dialog.open();
++
++		// Any answer but yes means report an error
++		if (dialog.getReturnCode() == IDialogConstants.YES_ID) {
++			IMetadataRepository repository = generateRepository(file, dialog.getTargetLocation(), false);
++			if (repository != null)
++				return generateOKStatus();
++		}
++		return originalStatus;
++	}
++
++	IStatus generateRepoFromArchive(IStatus originalStatus) {
++		String generateRepoFromArchive = ProvSDKUIActivator.getDefault().getPreferenceStore().getString(PreferenceConstants.PREF_GENERATE_ARCHIVEREPOFOLDER);
++		if (MessageDialogWithToggle.NEVER.equals(generateRepoFromArchive))
++			return originalStatus;
++		File targetLocation = getDefaultUnzipFolder();
++		if (targetLocation == null)
++			return originalStatus;
++		if (MessageDialogWithToggle.ALWAYS.equals(generateRepoFromArchive)) {
++			IMetadataRepository repository = generateRepository(file, targetLocation, true);
++			if (repository != null)
++				return generateOKStatus();
++			return originalStatus;
++		}
++
++		ConfirmRepoGenerationFromArchiveDialog dialog = new ConfirmRepoGenerationFromArchiveDialog(shell, file, targetLocation);
++		dialog.open();
++
++		// Any answer but yes means report an original status
++		if (dialog.getReturnCode() == IDialogConstants.YES_ID) {
++			IMetadataRepository repository = generateRepository(file, dialog.getTargetLocation(), true);
++			if (repository != null)
++				return generateOKStatus();
++			return originalStatus;
++		}
++		return originalStatus;
++	}
++
++	IStatus autoInstallBundle(IStatus originalStatus) {
++		try {
++			String autoInstallBundle = ProvSDKUIActivator.getDefault().getPreferenceStore().getString(PreferenceConstants.PREF_AUTO_INSTALL_BUNDLES);
++			if (MessageDialogWithToggle.NEVER.equals(autoInstallBundle))
++				return originalStatus;
++			if (MessageDialogWithToggle.ALWAYS.equals(autoInstallBundle)) {
++				if (copyToDropins(file))
++					return installOKStatus();
++				return originalStatus;
++			}
++			MessageDialogWithToggle dialog = MessageDialogWithToggle.openYesNoQuestion(shell, ProvSDKMessages.ProvSDKUIActivator_Question, NLS.bind(ProvSDKMessages.ExternalFileHandler_PromptForInstallBundle, file.getAbsolutePath()), null, false, ProvSDKUIActivator.getDefault().getPreferenceStore(), PreferenceConstants.PREF_AUTO_INSTALL_BUNDLES);
++			// Any answer but yes means report original status
++			if (dialog.getReturnCode() == IDialogConstants.YES_ID) {
++				if (copyToDropins(file))
++					return installOKStatus();
++			}
++		} catch (FileNotFoundException e) {
++			// Shouldn't happen, but maybe user deleted it just after selecting it?
++			ProvUI.handleException(e, NLS.bind(ProvSDKMessages.ExternalFileHandler_ErrorCopyingFile, file.getAbsolutePath()), StatusManager.SHOW | StatusManager.LOG);
++		} catch (IOException e) {
++			ProvUI.handleException(e, NLS.bind(ProvSDKMessages.ExternalFileHandler_ErrorCopyingFile, file.getAbsolutePath()), StatusManager.SHOW | StatusManager.LOG);
++		}
++		return originalStatus;
++	}
++
++	boolean copyToDropins(File source) throws IOException {
++		boolean success = false;
++		/*		File dropinsFolder = ReconcilerHelper.getDropInsDirectory();
++				if (!dropinsFolder.exists())
++					dropinsFolder.mkdirs();
++				File copiedBundle = new File(dropinsFolder, source.getName());
++				if (!copiedBundle.exists())
++					copiedBundle.createNewFile();
++				success = FileUtils.copyStream(new FileInputStream(file), true, new FileOutputStream(copiedBundle), true) > 0;
++				if (success)
++					ProvUI.requestRestart(true, shell);
++		*/
++		return success;
++	}
++
++	IMetadataRepository generateRepository(final File source, final File targetLocation, final boolean unzipSource) {
++		final IMetadataRepository[] repository = new IMetadataRepository[1];
++		/*		runBackground(new IRunnableWithProgress() {
++					public void run(IProgressMonitor monitor) {
++						try {
++							File src = source;
++							if (unzipSource) {
++								FileUtils.unzipFile(source, targetLocation);
++								src = targetLocation;
++							}
++							repository[0] = ReconcilerHelper.generateRepository(profile, src, targetLocation, makeRepositoryName(src), false);
++						} catch (IOException e) {
++							ProvUI.handleException(e, NLS.bind(ProvSDKMessages.ExternalFileHandler_ErrorExpandingArchive, source.getAbsolutePath()), StatusManager.SHOW | StatusManager.LOG);
++						}
++					}
++				});
++		*/
++		return repository[0];
++	}
++
++	// TODO we may want to allow the user to name a generated repo.
++	// For now we create a name.
++	String makeRepositoryName(File targetLocation) {
++		return NLS.bind(ProvSDKMessages.ExternalFileHandler_UserGeneratedRepoName, targetLocation.getAbsolutePath());
++
++	}
++
++	boolean isBundle() {
++		if (file == null)
++			return false;
++		BundleDescriptionFactory factory = getBundleDescriptionFactory();
++		if (factory == null)
++			return false;
++		return factory.getBundleDescription(file) != null;
++	}
++
++	private BundleDescriptionFactory getBundleDescriptionFactory() {
++
++		ServiceReference reference = ProvSDKUIActivator.getContext().getServiceReference(PlatformAdmin.class.getName());
++		if (reference == null)
++			return null;
++		PlatformAdmin platformAdmin = (PlatformAdmin) ProvSDKUIActivator.getContext().getService(reference);
++		if (platformAdmin == null)
++			return null;
++
++		try {
++			StateObjectFactory stateObjectFactory = platformAdmin.getFactory();
++			return new BundleDescriptionFactory(stateObjectFactory, null);
++		} finally {
++			ProvSDKUIActivator.getContext().ungetService(reference);
++		}
++	}
++
++	boolean isArchive() {
++		if (file == null)
++			return false;
++		InputStream in = null;
++		ZipInputStream zipStream = null;
++		try {
++			in = new FileInputStream(file);
++			zipStream = new ZipInputStream(new BufferedInputStream(in));
++			ZipEntry ze = zipStream.getNextEntry();
++			if (ze == null) {
++				in.close();
++				zipStream.close();
++				return false;
++			}
++		} catch (FileNotFoundException e) {
++			return false;
++		} catch (IOException e) {
++			return false;
++		} finally {
++			safeClose(in);
++			safeClose(zipStream);
++		}
++		return true;
++	}
++
++	void safeClose(InputStream stream) {
++		if (stream == null)
++			return;
++		try {
++			stream.close();
++		} catch (IOException e) {
++			// ignore
++		}
++	}
++
++	File getDefaultUnzipFolder() {
++		File unzipFolder;
++		// Make an auto-generated repo location a peer to the drop-ins directory
++		/*
++				String dropInsParent = ReconcilerHelper.getDropInsDirectory().getParent();
++				if (dropInsParent != null) {
++					unzipFolder = new File(dropInsParent, file.getName());
++					unzipFolder = makeUnusedFolder(unzipFolder);
++					if (unzipFolder != null)
++						return unzipFolder;
++				}
++		*/
++		// For some reason we had a failure with the drop-ins directory
++		Location location = Platform.getConfigurationLocation();
++		if (location != null) {
++			URL configURL = location.getURL();
++			if (configURL != null && configURL.getProtocol().startsWith(FILE)) {
++				unzipFolder = new File(configURL.getFile(), file.getName());
++				unzipFolder = makeUnusedFolder(unzipFolder);
++				if (unzipFolder != null)
++					return unzipFolder;
++			}
++		}
++		return null;
++	}
++
++	File makeUnusedFolder(File suggestedFolder) {
++		if (!suggestedFolder.exists()) {
++			if (suggestedFolder.mkdir())
++				return suggestedFolder;
++		} else {
++			// TODO hack, need to figure out what to do generate a unique name that's not too long, a la version qualifiers
++			File generatedPath = new File(suggestedFolder.getParent(), suggestedFolder.getName() + new Long(System.currentTimeMillis()).toString());
++			if (!generatedPath.exists()) {
++				if (generatedPath.mkdir())
++					return generatedPath;
++			}
++		}
++		return null;
++	}
++
++	void runBackground(final IRunnableWithProgress runnable) {
++		try {
++			PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
++
++				public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
++					runnable.run(monitor);
++				}
++
++			});
++		} catch (InvocationTargetException e) {
++			ProvUI.handleException(e.getCause(), NLS.bind(ProvSDKMessages.ExternalFileHandler_UnexpectedError, file.getAbsoluteFile()), StatusManager.SHOW | StatusManager.LOG);
++
++		} catch (InterruptedException e) {
++			// Nothing to report
++		}
++	}
++
++	IStatus generateOKStatus() {
++		return new Status(IStatus.OK, ProvSDKUIActivator.PLUGIN_ID, REPO_GENERATED, NLS.bind(ProvSDKMessages.ExternalFileHandler_RepositoryGeneratedOK, file.getAbsolutePath()), null);
++	}
++
++	IStatus installOKStatus() {
++		// temp
++		return Status.OK_STATUS;
++		//		return new Status(IStatus.OK, ProvSDKUIActivator.PLUGIN_ID, BUNDLE_INSTALLED, NLS.bind(ProvSDKMessages.ExternalFileHandler_BundleInstalledOK, ReconcilerHelper.getDropInsDirectory().getAbsolutePath()), null);
++	}
++
++}
+commit 1c1030611d24a6a3e3e55cd66ed8a929c0e27239
+Author: Susan Franklin <sfranklin>
+Date:   Thu Mar 13 18:35:47 2008 +0000
+
+    Bug 211679 - [prov] [ui] Replacement UI for extension locations
+
+2	4	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
+1	1	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/RepositoryManipulationDialog.java
+0	23	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationDialog.java
+0	23	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationFromArchiveDialog.java
+4	2	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java
+92	114	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ExternalFileHandler.java
+0	2	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/MetadataGeneratingURLValidator.java
+3	5	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
+2	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+2	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+4	10	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AddRepositoryDialog.java
+34	17	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulatorDropTarget.java
+3	2	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/TextURLDropAdapter.java
+48	6	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/URLDropAdapter.java
+16	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/URLValidator.java
+30	9	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UpdateAndInstallGroup.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
+index 7bc1d1c..d7fb4f9 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
+@@ -27,17 +27,15 @@ public class ProvSDKMessages extends NLS {
+ 	public static String AddColocatedRepositoryDialog_InvalidURL;
+ 	public static String AddColocatedRepositoryDialog_MissingProfile;
+ 	public static String AddColocatedRepositoryDialog_Title;
+-	public static String ConfirmRepoGenerationDialog_FileDescription;
+-	public static String ConfirmRepoGenerationDialog_Message;
+-	public static String ConfirmRepoGenerationFromArchiveDialog_FileDescription;
+-	public static String ConfirmRepoGenerationFromArchiveDialog_Message;
+ 	public static String ExternalFileHandler_BundleInstalledOK;
+ 	public static String ExternalFileHandler_ErrorCopyingFile;
+ 	public static String ExternalFileHandler_ErrorExpandingArchive;
++	public static String ExternalFileHandler_ErrorLoadingFromZipDirectory;
+ 	public static String ExternalFileHandler_PromptForInstallBundle;
+ 	public static String ExternalFileHandler_RepositoryGeneratedOK;
+ 	public static String ExternalFileHandler_UnexpectedError;
+ 	public static String ExternalFileHandler_UserGeneratedRepoName;
++	public static String ExternalFileHandler_PromptForUnzip;
+ 	public static String ExternalFilesPreferencePage_AddBundleGroup;
+ 	public static String ExternalFilesPreferencePage_ArchiveRepoGenerationGroup;
+ 	public static String ExternalFilesPreferencePage_AutoInstallBundleAlways;
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/RepositoryManipulationDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/RepositoryManipulationDialog.java
+index eb0e396..4a68027 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/RepositoryManipulationDialog.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/RepositoryManipulationDialog.java
+@@ -85,7 +85,7 @@ public class RepositoryManipulationDialog extends TrayDialog {
+ 		repositoryViewer.setLabelProvider(new ProvElementLabelProvider());
+ 
+ 		DropTarget target = new DropTarget(repositoryViewer.getControl(), DND.DROP_MOVE | DND.DROP_COPY | DND.DROP_LINK);
+-		target.setTransfer(new Transfer[] {URLTransfer.getInstance()});
++		target.setTransfer(new Transfer[] {URLTransfer.getInstance(), FileTransfer.getInstance()});
+ 		target.addDropListener(new RepositoryManipulatorDropTarget(manipulator, repositoryViewer.getControl()));
+ 
+ 		GridData data = new GridData(GridData.FILL_BOTH);
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationDialog.java
+deleted file mode 100644
+index 5f7a81f..0000000
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationDialog.java
++++ /dev/null
+@@ -1,23 +0,0 @@
+-package org.eclipse.equinox.internal.p2.ui.sdk.externalFiles;
+-
+-import java.io.File;
+-import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKMessages;
+-import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKUIActivator;
+-import org.eclipse.equinox.internal.p2.ui.sdk.prefs.PreferenceConstants;
+-import org.eclipse.osgi.util.NLS;
+-import org.eclipse.swt.widgets.Shell;
+-
+-/**
+- * @since 3.4
+- *
+- */
+-public class ConfirmRepoGenerationDialog extends ConfirmWithPathDetailsDialog {
+-
+-	public ConfirmRepoGenerationDialog(Shell parentShell, File file, File targetRepoLocation) {
+-		super(parentShell, targetRepoLocation, NLS.bind(ProvSDKMessages.ConfirmRepoGenerationDialog_Message, file.getAbsolutePath()), ProvSDKUIActivator.getDefault().getPreferenceStore(), PreferenceConstants.PREF_GENERATE_REPOFOLDER);
+-	}
+-
+-	protected String getLocationDescription() {
+-		return ProvSDKMessages.ConfirmRepoGenerationDialog_FileDescription;
+-	}
+-}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationFromArchiveDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationFromArchiveDialog.java
+deleted file mode 100644
+index 1ced4c0..0000000
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmRepoGenerationFromArchiveDialog.java
++++ /dev/null
+@@ -1,23 +0,0 @@
+-package org.eclipse.equinox.internal.p2.ui.sdk.externalFiles;
+-
+-import java.io.File;
+-import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKMessages;
+-import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKUIActivator;
+-import org.eclipse.equinox.internal.p2.ui.sdk.prefs.PreferenceConstants;
+-import org.eclipse.osgi.util.NLS;
+-import org.eclipse.swt.widgets.Shell;
+-
+-/**
+- * @since 3.4
+- *
+- */
+-public class ConfirmRepoGenerationFromArchiveDialog extends ConfirmWithPathDetailsDialog {
+-
+-	public ConfirmRepoGenerationFromArchiveDialog(Shell parentShell, File archive, File targetRepoLocation) {
+-		super(parentShell, targetRepoLocation, NLS.bind(ProvSDKMessages.ConfirmRepoGenerationFromArchiveDialog_Message, archive.getAbsolutePath()), ProvSDKUIActivator.getDefault().getPreferenceStore(), PreferenceConstants.PREF_GENERATE_REPOFOLDER);
+-	}
+-
+-	protected String getLocationDescription() {
+-		return ProvSDKMessages.ConfirmRepoGenerationFromArchiveDialog_FileDescription;
+-	}
+-}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java
+index 328e4f1..d305523 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java
+@@ -24,7 +24,7 @@ public abstract class ConfirmWithPathDetailsDialog extends MessageDialogWithTogg
+ 	String pathLocationText;
+ 
+ 	public ConfirmWithPathDetailsDialog(Shell parentShell, File targetRepoLocation, String message, IPreferenceStore prefStore, String prefKey) {
+-		super(parentShell, ProvSDKMessages.ProvSDKUIActivator_Question, null, message, NONE, new String[] {IDialogConstants.YES_LABEL, IDialogConstants.NO_LABEL, IDialogConstants.SHOW_DETAILS_LABEL}, 0, null, false);
++		super(parentShell, ProvSDKMessages.ProvSDKUIActivator_Question, null, message, NONE, new String[] {IDialogConstants.YES_LABEL, IDialogConstants.NO_LABEL, IDialogConstants.CANCEL_LABEL, IDialogConstants.SHOW_DETAILS_LABEL}, 2, null, false);
+ 		this.targetLocation = targetRepoLocation;
+ 		pathLocationText = targetRepoLocation.getAbsolutePath();
+ 		setPrefStore(prefStore);
+@@ -34,7 +34,9 @@ public abstract class ConfirmWithPathDetailsDialog extends MessageDialogWithTogg
+ 	protected Composite createDetailsArea(final Composite parent) {
+ 		Composite composite = new Composite(parent, SWT.BORDER);
+ 		GridLayout layout = new GridLayout();
+-		layout.marginLeft = layout.marginRight = layout.marginTop = layout.marginBottom = 0;
++		initializeDialogUnits(composite);
++		layout.marginLeft = layout.marginRight = layout.marginBottom = 0;
++		layout.marginTop = convertHeightInCharsToPixels(1);
+ 		layout.numColumns = 3;
+ 		composite.setLayout(layout);
+ 		GridData gd = new GridData(SWT.FILL, SWT.FILL, true, true);
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ExternalFileHandler.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ExternalFileHandler.java
+index 43d0139..9557f1d 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ExternalFileHandler.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ExternalFileHandler.java
+@@ -12,27 +12,30 @@
+ package org.eclipse.equinox.internal.p2.ui.sdk.externalFiles;
+ 
+ import java.io.*;
+-import java.lang.reflect.InvocationTargetException;
++import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipInputStream;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
+ import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKMessages;
+ import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKUIActivator;
+ import org.eclipse.equinox.internal.p2.ui.sdk.prefs.PreferenceConstants;
++import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.generator.BundleDescriptionFactory;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.internal.provisional.p2.ui.ProvUI;
++import org.eclipse.equinox.internal.provisional.p2.ui.dialogs.URLValidator;
++import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningUtil;
+ import org.eclipse.jface.dialogs.IDialogConstants;
+ import org.eclipse.jface.dialogs.MessageDialogWithToggle;
+-import org.eclipse.jface.operation.IRunnableWithProgress;
+ import org.eclipse.osgi.service.datalocation.Location;
+ import org.eclipse.osgi.service.resolver.PlatformAdmin;
+ import org.eclipse.osgi.service.resolver.StateObjectFactory;
+ import org.eclipse.osgi.util.NLS;
++import org.eclipse.swt.custom.BusyIndicator;
+ import org.eclipse.swt.widgets.Shell;
+-import org.eclipse.ui.PlatformUI;
+ import org.eclipse.ui.statushandlers.StatusManager;
+ import org.osgi.framework.ServiceReference;
+ 
+@@ -46,13 +49,18 @@ import org.osgi.framework.ServiceReference;
+  */
+ public class ExternalFileHandler {
+ 
+-	public static final int REPO_GENERATED = 3000;
+-	public static final int BUNDLE_INSTALLED = 3001;
+ 	private static final String FILE = "file"; //$NON-NLS-1$
+ 	File file;
+ 	Shell shell;
+ 	IProfile profile;
+ 
++	// TODO
++	// copied from reconciler activator until there is API
++	// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=222456
++	private static final String DROPINS_DIRECTORY = "org.eclipse.equinox.p2.reconciler.dropins.directory"; //$NON-NLS-1$
++	private static final String OSGI_CONFIGURATION_AREA = "osgi.configuration.area"; //$NON-NLS-1$
++	private static final String DROPINS = "dropins"; //$NON-NLS-1$
++
+ 	public ExternalFileHandler(IProfile profile, File file, Shell shell) {
+ 		this.file = file;
+ 		this.shell = shell;
+@@ -60,40 +68,13 @@ public class ExternalFileHandler {
+ 	}
+ 
+ 	public IStatus processFile(IStatus originalStatus) {
+-		/*	if (file == null)
+-					return originalStatus;
+-
+-				if (file.isDirectory()) {
+-					return generateRepoFromDirectory(originalStatus);
+-				}
+-				if (isBundle()) {
+-					return autoInstallBundle(originalStatus);
+-				}
+-				if (isArchive()) {
+-					return generateRepoFromArchive(originalStatus);
+-				}
+-		*/
+-		return originalStatus;
+-	}
+-
+-	IStatus generateRepoFromDirectory(IStatus originalStatus) {
+-		String generateRepo = ProvSDKUIActivator.getDefault().getPreferenceStore().getString(PreferenceConstants.PREF_GENERATE_REPOFOLDER);
+-		if (MessageDialogWithToggle.NEVER.equals(generateRepo))
+-			return originalStatus;
+-		if (MessageDialogWithToggle.ALWAYS.equals(generateRepo)) {
+-			IMetadataRepository repository = generateRepository(file, file, false);
+-			if (repository != null)
+-				return generateOKStatus();
++		if (file == null)
+ 			return originalStatus;
++		if (isBundle()) {
++			return autoInstallBundle(originalStatus);
+ 		}
+-		final ConfirmRepoGenerationDialog dialog = new ConfirmRepoGenerationDialog(shell, file, file);
+-		dialog.open();
+-
+-		// Any answer but yes means report an error
+-		if (dialog.getReturnCode() == IDialogConstants.YES_ID) {
+-			IMetadataRepository repository = generateRepository(file, dialog.getTargetLocation(), false);
+-			if (repository != null)
+-				return generateOKStatus();
++		if (isArchive()) {
++			return generateRepoFromArchive(originalStatus);
+ 		}
+ 		return originalStatus;
+ 	}
+@@ -102,25 +83,34 @@ public class ExternalFileHandler {
+ 		String generateRepoFromArchive = ProvSDKUIActivator.getDefault().getPreferenceStore().getString(PreferenceConstants.PREF_GENERATE_ARCHIVEREPOFOLDER);
+ 		if (MessageDialogWithToggle.NEVER.equals(generateRepoFromArchive))
+ 			return originalStatus;
+-		File targetLocation = getDefaultUnzipFolder();
++		final File targetLocation = getDefaultUnzipFolder();
+ 		if (targetLocation == null)
+ 			return originalStatus;
+ 		if (MessageDialogWithToggle.ALWAYS.equals(generateRepoFromArchive)) {
+-			IMetadataRepository repository = generateRepository(file, targetLocation, true);
+-			if (repository != null)
++			final IMetadataRepository[] repository = new IMetadataRepository[1];
++			BusyIndicator.showWhile(shell.getDisplay(), new Runnable() {
++				public void run() {
++					repository[0] = unzipAndGenerateRepository(file, targetLocation, null);
++				}
++			});
++			if (repository[0] != null)
+ 				return generateOKStatus();
+ 			return originalStatus;
+ 		}
++		MessageDialogWithToggle dialog = MessageDialogWithToggle.openYesNoCancelQuestion(shell, ProvSDKMessages.ProvSDKUIActivator_Question, NLS.bind(ProvSDKMessages.ExternalFileHandler_PromptForUnzip, file.getAbsolutePath()), null, false, ProvSDKUIActivator.getDefault().getPreferenceStore(), PreferenceConstants.PREF_GENERATE_ARCHIVEREPOFOLDER);
+ 
+-		ConfirmRepoGenerationFromArchiveDialog dialog = new ConfirmRepoGenerationFromArchiveDialog(shell, file, targetLocation);
+-		dialog.open();
+-
+-		// Any answer but yes means report an original status
+ 		if (dialog.getReturnCode() == IDialogConstants.YES_ID) {
+-			IMetadataRepository repository = generateRepository(file, dialog.getTargetLocation(), true);
+-			if (repository != null)
++			final IMetadataRepository[] repository = new IMetadataRepository[1];
++			BusyIndicator.showWhile(shell.getDisplay(), new Runnable() {
++				public void run() {
++					repository[0] = unzipAndGenerateRepository(file, targetLocation, null);
++				}
++			});
++			if (repository[0] != null)
+ 				return generateOKStatus();
+ 			return originalStatus;
++		} else if (dialog.getReturnCode() == IDialogConstants.CANCEL_ID) {
++			return Status.CANCEL_STATUS;
+ 		}
+ 		return originalStatus;
+ 	}
+@@ -135,11 +125,12 @@ public class ExternalFileHandler {
+ 					return installOKStatus();
+ 				return originalStatus;
+ 			}
+-			MessageDialogWithToggle dialog = MessageDialogWithToggle.openYesNoQuestion(shell, ProvSDKMessages.ProvSDKUIActivator_Question, NLS.bind(ProvSDKMessages.ExternalFileHandler_PromptForInstallBundle, file.getAbsolutePath()), null, false, ProvSDKUIActivator.getDefault().getPreferenceStore(), PreferenceConstants.PREF_AUTO_INSTALL_BUNDLES);
+-			// Any answer but yes means report original status
++			MessageDialogWithToggle dialog = MessageDialogWithToggle.openYesNoCancelQuestion(shell, ProvSDKMessages.ProvSDKUIActivator_Question, NLS.bind(ProvSDKMessages.ExternalFileHandler_PromptForInstallBundle, file.getAbsolutePath()), null, false, ProvSDKUIActivator.getDefault().getPreferenceStore(), PreferenceConstants.PREF_AUTO_INSTALL_BUNDLES);
+ 			if (dialog.getReturnCode() == IDialogConstants.YES_ID) {
+ 				if (copyToDropins(file))
+ 					return installOKStatus();
++			} else if (dialog.getReturnCode() == IDialogConstants.CANCEL_ID) {
++				return Status.CANCEL_STATUS;
+ 			}
+ 		} catch (FileNotFoundException e) {
+ 			// Shouldn't happen, but maybe user deleted it just after selecting it?
+@@ -152,44 +143,31 @@ public class ExternalFileHandler {
+ 
+ 	boolean copyToDropins(File source) throws IOException {
+ 		boolean success = false;
+-		/*		File dropinsFolder = ReconcilerHelper.getDropInsDirectory();
+-				if (!dropinsFolder.exists())
+-					dropinsFolder.mkdirs();
+-				File copiedBundle = new File(dropinsFolder, source.getName());
+-				if (!copiedBundle.exists())
+-					copiedBundle.createNewFile();
+-				success = FileUtils.copyStream(new FileInputStream(file), true, new FileOutputStream(copiedBundle), true) > 0;
+-				if (success)
+-					ProvUI.requestRestart(true, shell);
+-		*/
+-		return success;
+-	}
++		File dropinsFolder = getDropInsDirectory();
++		if (!dropinsFolder.exists())
++			dropinsFolder.mkdirs();
++		File copiedBundle = new File(dropinsFolder, source.getName());
++		if (!copiedBundle.exists())
++			copiedBundle.createNewFile();
++		success = FileUtils.copyStream(new FileInputStream(file), true, new FileOutputStream(copiedBundle), true) > 0;
++		if (success)
++			ProvUI.requestRestart(true, shell);
+ 
+-	IMetadataRepository generateRepository(final File source, final File targetLocation, final boolean unzipSource) {
+-		final IMetadataRepository[] repository = new IMetadataRepository[1];
+-		/*		runBackground(new IRunnableWithProgress() {
+-					public void run(IProgressMonitor monitor) {
+-						try {
+-							File src = source;
+-							if (unzipSource) {
+-								FileUtils.unzipFile(source, targetLocation);
+-								src = targetLocation;
+-							}
+-							repository[0] = ReconcilerHelper.generateRepository(profile, src, targetLocation, makeRepositoryName(src), false);
+-						} catch (IOException e) {
+-							ProvUI.handleException(e, NLS.bind(ProvSDKMessages.ExternalFileHandler_ErrorExpandingArchive, source.getAbsolutePath()), StatusManager.SHOW | StatusManager.LOG);
+-						}
+-					}
+-				});
+-		*/
+-		return repository[0];
++		return success;
+ 	}
+ 
+-	// TODO we may want to allow the user to name a generated repo.
+-	// For now we create a name.
+-	String makeRepositoryName(File targetLocation) {
+-		return NLS.bind(ProvSDKMessages.ExternalFileHandler_UserGeneratedRepoName, targetLocation.getAbsolutePath());
+-
++	IMetadataRepository unzipAndGenerateRepository(final File source, final File targetLocation, IProgressMonitor monitor) {
++		IMetadataRepository repository = null;
++		try {
++			FileUtils.unzipFile(source, targetLocation);
++			URL repoLocation = new URL(URLValidator.makeFileURLString(targetLocation.getAbsolutePath()));
++			repository = ProvisioningUtil.loadMetadataRepository(repoLocation, monitor);
++		} catch (IOException e) {
++			ProvUI.handleException(e, NLS.bind(ProvSDKMessages.ExternalFileHandler_ErrorExpandingArchive, source.getAbsolutePath()), StatusManager.SHOW | StatusManager.LOG);
++		} catch (ProvisionException e) {
++			ProvUI.handleException(e, NLS.bind(ProvSDKMessages.ExternalFileHandler_ErrorLoadingFromZipDirectory, targetLocation.getAbsolutePath()), StatusManager.SHOW | StatusManager.LOG);
++		}
++		return repository;
+ 	}
+ 
+ 	boolean isBundle() {
+@@ -255,16 +233,14 @@ public class ExternalFileHandler {
+ 
+ 	File getDefaultUnzipFolder() {
+ 		File unzipFolder;
+-		// Make an auto-generated repo location a peer to the drop-ins directory
+-		/*
+-				String dropInsParent = ReconcilerHelper.getDropInsDirectory().getParent();
+-				if (dropInsParent != null) {
+-					unzipFolder = new File(dropInsParent, file.getName());
+-					unzipFolder = makeUnusedFolder(unzipFolder);
+-					if (unzipFolder != null)
+-						return unzipFolder;
+-				}
+-		*/
++		// Unzip content in a peer to the drop-ins directory
++		String dropInsParent = getDropInsDirectory().getParent();
++		if (dropInsParent != null) {
++			unzipFolder = new File(dropInsParent, file.getName());
++			unzipFolder = makeUnusedFolder(unzipFolder);
++			if (unzipFolder != null)
++				return unzipFolder;
++		}
+ 		// For some reason we had a failure with the drop-ins directory
+ 		Location location = Platform.getConfigurationLocation();
+ 		if (location != null) {
+@@ -294,31 +270,33 @@ public class ExternalFileHandler {
+ 		return null;
+ 	}
+ 
+-	void runBackground(final IRunnableWithProgress runnable) {
+-		try {
+-			PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
+-
+-				public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
+-					runnable.run(monitor);
+-				}
+-
+-			});
+-		} catch (InvocationTargetException e) {
+-			ProvUI.handleException(e.getCause(), NLS.bind(ProvSDKMessages.ExternalFileHandler_UnexpectedError, file.getAbsoluteFile()), StatusManager.SHOW | StatusManager.LOG);
+-
+-		} catch (InterruptedException e) {
+-			// Nothing to report
+-		}
+-	}
+-
+ 	IStatus generateOKStatus() {
+-		return new Status(IStatus.OK, ProvSDKUIActivator.PLUGIN_ID, REPO_GENERATED, NLS.bind(ProvSDKMessages.ExternalFileHandler_RepositoryGeneratedOK, file.getAbsolutePath()), null);
++		return new Status(IStatus.OK, ProvSDKUIActivator.PLUGIN_ID, URLValidator.REPO_AUTO_GENERATED, NLS.bind(ProvSDKMessages.ExternalFileHandler_RepositoryGeneratedOK, file.getAbsolutePath()), null);
+ 	}
+ 
+ 	IStatus installOKStatus() {
+-		// temp
+-		return Status.OK_STATUS;
+-		//		return new Status(IStatus.OK, ProvSDKUIActivator.PLUGIN_ID, BUNDLE_INSTALLED, NLS.bind(ProvSDKMessages.ExternalFileHandler_BundleInstalledOK, ReconcilerHelper.getDropInsDirectory().getAbsolutePath()), null);
++		return new Status(IStatus.OK, ProvSDKUIActivator.PLUGIN_ID, URLValidator.ALTERNATE_ACTION_TAKEN, NLS.bind(ProvSDKMessages.ExternalFileHandler_BundleInstalledOK, getDropInsDirectory().getAbsolutePath()), null);
+ 	}
+ 
++	// TODO
++	// copied from reconciler activator
++	// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=222456
++	File getDropInsDirectory() {
++
++		String watchedDirectoryProperty = ProvSDKUIActivator.getContext().getProperty(DROPINS_DIRECTORY);
++		if (watchedDirectoryProperty != null) {
++			File folder = new File(watchedDirectoryProperty);
++			return folder;
++		}
++		try {
++			//TODO: a proper install area would be better. osgi.install.area is relative to the framework jar
++			URL baseURL = new URL(ProvSDKUIActivator.getContext().getProperty(OSGI_CONFIGURATION_AREA));
++			URL folderURL = new URL(baseURL, "../" + DROPINS); //$NON-NLS-1$
++			File folder = new File(folderURL.getPath());
++			return folder;
++		} catch (MalformedURLException e) {
++			e.printStackTrace();
++		}
++		return null;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/MetadataGeneratingURLValidator.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/MetadataGeneratingURLValidator.java
+index 94b5787..a502d37 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/MetadataGeneratingURLValidator.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/MetadataGeneratingURLValidator.java
+@@ -71,8 +71,6 @@ public class MetadataGeneratingURLValidator extends DefaultMetadataURLValidator
+ 
+ 		IStatus externalFileStatus = new ExternalFileHandler(profile, file, shell).processFile(status);
+ 		if (externalFileStatus.getCode() == REPO_AUTO_GENERATED || externalFileStatus.getCode() == ALTERNATE_ACTION_TAKEN) {
+-			// TODO workaround for bug #199806
+-			ProvisioningUtil.notifyRepositoryAdded();
+ 			return Status.CANCEL_STATUS;
+ 		}
+ 		return externalFileStatus;
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
+index 3ed9c15..760682d 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
+@@ -11,17 +11,15 @@
+ AddColocatedRepositoryDialog_InvalidURL=The URL is not valid.
+ AddColocatedRepositoryDialog_MissingProfile=Could not retrieve a description of the running system.
+ AddColocatedRepositoryDialog_Title=Add Site
+-ConfirmRepoGenerationDialog_FileDescription=Additional files must be generated to make the directory contents available.  Please specify a path for the additional files.
+-ConfirmRepoGenerationDialog_Message=The directory "{0}" does not contain files that describe a known software site.  Do you want to generate these files so that the contents of this folder are available for installation?
+-ConfirmRepoGenerationFromArchiveDialog_FileDescription=The contents of the archive file will be expanded into a directory, along with generated files that make them available for install.  Please specify a path for these files.
+-ConfirmRepoGenerationFromArchiveDialog_Message=The archive file "{0}" does not contain files that describe a known software site.  Do you want to generate these files and expand the contents of this archive to make it available for installation?
+ ExternalFileHandler_BundleInstalledOK=Bundle was successfully installed in {0}
+ ExternalFileHandler_ErrorCopyingFile=Error while trying to copy the file {0}
+ ExternalFileHandler_ErrorExpandingArchive=Error while expanding the archive {0}
+-ExternalFileHandler_PromptForInstallBundle=The file "{0}" is recognized as a software plug-in.  Do you want to add it to the running program?  (Requires restart when finished).
++ExternalFileHandler_ErrorLoadingFromZipDirectory=Error reading the content expanded in {0}
++ExternalFileHandler_PromptForInstallBundle="{0}" is a software plug-in.  Do you want to install it?  (Requires restart when finished).
+ ExternalFileHandler_RepositoryGeneratedOK=Repository was successfully generated at {0}
+ ExternalFileHandler_UnexpectedError=Unexpected error while processing {0}.
+ ExternalFileHandler_UserGeneratedRepoName=User-Generated Content from {0}
++ExternalFileHandler_PromptForUnzip=Do you want to expand the contents of {0} and make it available for install?
+ ExternalFilesPreferencePage_AddBundleGroup=When I add a plug-in file as an update site
+ ExternalFilesPreferencePage_ArchiveRepoGenerationGroup=When I add an unrecognized archive file as an update site
+ ExternalFilesPreferencePage_AutoInstallBundleAlways=Automatically &install the plugin
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+index 079b1f2..6631e87 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+@@ -126,6 +126,8 @@ public class ProvUIMessages extends NLS {
+ 	public static String RepositoryGroup_RepositoryFile;
+ 	public static String RepositoryGroup_SelectRepositoryDirectory;
+ 	public static String RepositoryGroup_URLRequired;
++	public static String RepositoryManipulatorDropTarget_DragAndDropJobLabel;
++	public static String RepositoryManipulatorDropTarget_DragSourceNotValid;
+ 
+ 	// Dialogs
+ 	public static String AddRepositoryDialog_DuplicateURL;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index a41d055..818bb95 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -91,6 +91,8 @@ RepositoryGroup_ArchivedRepoBrowseButton=&Archive...
+ RepositoryGroup_SelectRepositoryDirectory=Select a repository root directory:
+ RepositoryGroup_RepositoryFile=Repository archive
+ RepositoryGroup_URLRequired=Must specify a URL
++RepositoryManipulatorDropTarget_DragAndDropJobLabel=Drag and drop operation for {0}
++RepositoryManipulatorDropTarget_DragSourceNotValid={0} is not recognized as a valid software site location.
+ 
+ AcceptLicensesWizardPage_AcceptMultiple=I &accept the terms of the license agreements
+ AcceptLicensesWizardPage_AcceptSingle=I &accept the terms of the license agreement
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AddRepositoryDialog.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AddRepositoryDialog.java
+index 35e21ac..0d9528e 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AddRepositoryDialog.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AddRepositoryDialog.java
+@@ -76,14 +76,8 @@ public abstract class AddRepositoryDialog extends StatusDialog {
+ 		data.widthHint = convertHorizontalDLUsToPixels(IDialogConstants.ENTRY_FIELD_WIDTH);
+ 		url.setLayoutData(data);
+ 		DropTarget target = new DropTarget(url, DND.DROP_MOVE | DND.DROP_COPY | DND.DROP_LINK);
+-		target.setTransfer(new Transfer[] {URLTransfer.getInstance()});
+-		target.addDropListener(new TextURLDropAdapter(url) {
+-			protected void handleURLString(String urlText, DropTargetEvent event) {
+-				super.handleURLString(urlText, event);
+-				// validate the URL with remote checking since drop is more heavyweight than typing text
+-				validateRepositoryURL(true);
+-			}
+-		});
++		target.setTransfer(new Transfer[] {URLTransfer.getInstance(), FileTransfer.getInstance()});
++		target.addDropListener(new TextURLDropAdapter(url, true));
+ 		url.addModifyListener(new ModifyListener() {
+ 			public void modifyText(ModifyEvent e) {
+ 				validateRepositoryURL(false);
+@@ -111,7 +105,7 @@ public abstract class AddRepositoryDialog extends StatusDialog {
+ 				String path = dialog.open();
+ 				if (path != null) {
+ 					lastLocalLocation = path;
+-					url.setText(URLValidator.FILE_PROTOCOL_PREFIX + path);
++					url.setText(URLValidator.makeFileURLString(path));
+ 					validateRepositoryURL(true);
+ 				}
+ 			}
+@@ -128,7 +122,7 @@ public abstract class AddRepositoryDialog extends StatusDialog {
+ 				String path = dialog.open();
+ 				if (path != null) {
+ 					lastArchiveLocation = path;
+-					url.setText(URLValidator.FILE_PROTOCOL_PREFIX + URLValidator.JAR_PATH_PREFIX + path + URLValidator.JAR_PATH_SUFFIX);
++					url.setText(URLValidator.makeJarURLString(path));
+ 					validateRepositoryURL(true);
+ 				}
+ 			}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulatorDropTarget.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulatorDropTarget.java
+index e27bbfb..ed7caaf 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulatorDropTarget.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulatorDropTarget.java
+@@ -2,17 +2,25 @@ package org.eclipse.equinox.internal.provisional.p2.ui.dialogs;
+ 
+ import java.net.MalformedURLException;
+ import java.net.URL;
+-import org.eclipse.core.runtime.Assert;
+-import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.jobs.Job;
++import org.eclipse.equinox.internal.p2.ui.ProvUIActivator;
++import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.provisional.p2.ui.*;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningOperation;
+-import org.eclipse.swt.custom.BusyIndicator;
++import org.eclipse.osgi.util.NLS;
+ import org.eclipse.swt.dnd.DND;
+ import org.eclipse.swt.dnd.DropTargetEvent;
+ import org.eclipse.swt.widgets.Control;
++import org.eclipse.ui.progress.WorkbenchJob;
+ import org.eclipse.ui.statushandlers.StatusManager;
+ 
+ /**
++ * RepositoryManipulatorDropTarget recognizes both URLTransfer and
++ * FileTransfer data types.  Files are converted to URL's with the file
++ * protocol.  Any dropped URLs (or Files) are interpreted to mean that the
++ * user wishes to add these files as repositories.
++ * 
+  * @since 3.4
+  *
+  */
+@@ -21,36 +29,45 @@ public class RepositoryManipulatorDropTarget extends URLDropAdapter {
+ 	Control control;
+ 
+ 	public RepositoryManipulatorDropTarget(IRepositoryManipulator manipulator, Control control) {
++		super(true); // convert file drops to URL
+ 		Assert.isNotNull(manipulator);
+ 		this.manipulator = manipulator;
+ 		this.control = control;
+ 	}
+ 
+-	protected void handleURLString(String urlText, final DropTargetEvent event) {
++	protected void handleDrop(String urlText, final DropTargetEvent event) {
+ 		event.detail = DND.DROP_NONE;
+-		if (!dropTargetIsValid(event))
+-			return;
+-		final URL url;
++		final URL[] url = new URL[1];
+ 		try {
+-			url = new URL(urlText);
++			url[0] = new URL(urlText);
+ 		} catch (MalformedURLException e) {
+ 			ProvUI.reportStatus(URLValidator.getInvalidURLStatus(urlText), StatusManager.SHOW | StatusManager.LOG);
+ 			return;
+ 		}
+-		BusyIndicator.showWhile(control.getDisplay(), new Runnable() {
+-			public void run() {
+-				IStatus status = manipulator.getURLValidator(control.getShell()).validateRepositoryURL(url, true, null);
++		if (url[0] == null)
++			return;
++
++		Job job = new WorkbenchJob(NLS.bind(ProvUIMessages.RepositoryManipulatorDropTarget_DragAndDropJobLabel, manipulator.getLabel())) {
++
++			public IStatus runInUIThread(IProgressMonitor monitor) {
++				IStatus status = manipulator.getURLValidator(control.getShell()).validateRepositoryURL(url[0], true, monitor);
+ 				if (status.isOK()) {
+-					ProvisioningOperation addOperation = manipulator.getAddOperation(url);
++					ProvisioningOperation addOperation = manipulator.getAddOperation(url[0]);
+ 					ProvisioningOperationRunner.run(addOperation, control.getShell());
+ 					event.detail = DND.DROP_LINK;
+-				} else if (status.getCode() == URLValidator.REPO_AUTO_GENERATED) {
++				} else if (status.getCode() == URLValidator.REPO_AUTO_GENERATED || status.getCode() == URLValidator.ALTERNATE_ACTION_TAKEN) {
+ 					event.detail = DND.DROP_COPY;
+-				} else if (!(status.getCode() == URLValidator.ALTERNATE_ACTION_TAKEN)) {
+-					ProvUI.reportStatus(status, StatusManager.BLOCK | StatusManager.LOG);
++				} else if (status.getSeverity() == IStatus.CANCEL) {
++					event.detail = DND.DROP_NONE;
++				} else {
++					status = new MultiStatus(ProvUIActivator.PLUGIN_ID, 0, new IStatus[] {status}, NLS.bind(ProvUIMessages.RepositoryManipulatorDropTarget_DragSourceNotValid, url[0].toExternalForm()), null);
++					event.detail = DND.DROP_NONE;
+ 				}
+-
++				return status;
+ 			}
+-		});
++		};
++		job.setPriority(Job.SHORT);
++		job.setUser(true);
++		job.schedule();
+ 	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/TextURLDropAdapter.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/TextURLDropAdapter.java
+index 5e7aa02..22d23b5 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/TextURLDropAdapter.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/TextURLDropAdapter.java
+@@ -23,14 +23,15 @@ public class TextURLDropAdapter extends URLDropAdapter {
+ 
+ 	Text text;
+ 
+-	public TextURLDropAdapter(Text text) {
++	public TextURLDropAdapter(Text text, boolean convertFileToURL) {
++		super(convertFileToURL);
+ 		this.text = text;
+ 	}
+ 
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.ui.dialogs.URLDropAdapter#handleURLString(java.lang.String, org.eclipse.swt.dnd.DropTargetEvent)
+ 	 */
+-	protected void handleURLString(String urlText, DropTargetEvent event) {
++	protected void handleDrop(String urlText, DropTargetEvent event) {
+ 		text.setText(urlText);
+ 		event.detail = DND.DROP_LINK;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/URLDropAdapter.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/URLDropAdapter.java
+index 6471787..0b3da16 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/URLDropAdapter.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/URLDropAdapter.java
+@@ -15,10 +15,20 @@ import org.eclipse.swt.dnd.*;
+ 
+ /**
+  * URLDropAdapter can receive URL text from a drop.
++ * The URLDropAdapter should only be used with
++ * the URLTransfer mechanism unless otherwise stated.  
++ * 
+  * @since 3.4
+  *
+  */
+ public abstract class URLDropAdapter extends DropTargetAdapter {
++
++	private boolean convertFileToURL = false;
++
++	protected URLDropAdapter(boolean convertFileToURL) {
++		this.convertFileToURL = convertFileToURL;
++	}
++
+ 	public void dragEnter(DropTargetEvent e) {
+ 		if (!dropTargetIsValid(e)) {
+ 			e.detail = DND.DROP_NONE;
+@@ -34,16 +44,48 @@ public abstract class URLDropAdapter extends DropTargetAdapter {
+ 	}
+ 
+ 	public void drop(DropTargetEvent event) {
+-		if (event.data == null) {
+-			event.detail = DND.DROP_NONE;
+-			return;
++		if (dropTargetIsValid(event)) {
++			String urlText = getURLText(event);
++			if (urlText != null) {
++				handleDrop(urlText, event);
++				return;
++			}
+ 		}
+-		handleURLString((String) event.data, event);
++		event.detail = DND.DROP_NONE;
+ 	}
+ 
++	private String getURLText(DropTargetEvent event) {
++		if (URLTransfer.getInstance().isSupportedType(event.currentDataType))
++			return (String) URLTransfer.getInstance().nativeToJava(event.currentDataType);
++		if (convertFileToURL && FileTransfer.getInstance().isSupportedType(event.currentDataType)) {
++			String[] names = (String[]) FileTransfer.getInstance().nativeToJava(event.currentDataType);
++			if (names != null && names.length == 1)
++				return URLValidator.makeJarURLString(names[0]);
++		}
++		return null;
++	}
++
++	/**
++	 * Determine whether the drop target is valid.  Subclasses may override.
++	 * @param event the drop target event
++	 * @return <code>true</code> if drop should proceed, <code>false</code> if it should not.
++	 */
+ 	protected boolean dropTargetIsValid(DropTargetEvent event) {
+-		return true;
++		if (URLTransfer.getInstance().isSupportedType(event.currentDataType) && URLTransfer.getInstance().nativeToJava(event.currentDataType) != null)
++			return true;
++		if (!convertFileToURL)
++			return false;
++		if (FileTransfer.getInstance().isSupportedType(event.currentDataType)) {
++			String[] names = (String[]) FileTransfer.getInstance().nativeToJava(event.currentDataType);
++			return names != null && names.length == 1;
++		}
++		return false;
+ 	}
+ 
+-	protected abstract void handleURLString(String urlText, DropTargetEvent event);
++	/**
++	 * Handle the drop with the given text as the URL.  
++	 * @param urlText The url text specified by the drop.  It is never <code>null</code>.
++	 * @param event the originating drop target event.  
++	 */
++	protected abstract void handleDrop(String urlText, DropTargetEvent event);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/URLValidator.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/URLValidator.java
+index cecaefb..1b14f3e 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/URLValidator.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/URLValidator.java
+@@ -31,6 +31,8 @@ public abstract class URLValidator {
+ 	public static final String FILE_PROTOCOL_PREFIX = "file:"; //$NON-NLS-1$
+ 	public static final String JAR_PATH_PREFIX = "jar:";//$NON-NLS-1$
+ 	public static final String JAR_PATH_SUFFIX = "!/"; //$NON-NLS-1$
++	public static final String JAR_EXTENSION = ".jar"; //$NON-NLS-1$
++	public static final String ZIP_EXTENSION = ".zip"; //$NON-NLS-1$
+ 
+ 	public static final int LOCAL_VALIDATION_ERROR = 3000;
+ 	public static final int REPO_AUTO_GENERATED = 3001;
+@@ -40,5 +42,19 @@ public abstract class URLValidator {
+ 		return new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, LOCAL_VALIDATION_ERROR, NLS.bind(ProvUIMessages.URLValidator_UnrecognizedURL, urlText), null);
+ 	}
+ 
++	public static boolean isFileURL(URL url) {
++		return url.getProtocol().equals(FILE_PROTOCOL);
++	}
++
++	public static String makeJarURLString(String path) {
++		if (path.toLowerCase().endsWith(JAR_EXTENSION))
++			return FILE_PROTOCOL_PREFIX + JAR_PATH_PREFIX + path + JAR_PATH_SUFFIX;
++		return makeFileURLString(path);
++	}
++
++	public static String makeFileURLString(String path) {
++		return FILE_PROTOCOL_PREFIX + path;
++	}
++
+ 	protected abstract IStatus validateRepositoryURL(URL url, boolean contactRepositories, IProgressMonitor monitor);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UpdateAndInstallGroup.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UpdateAndInstallGroup.java
+index a0bfc4d..066a28e 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UpdateAndInstallGroup.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UpdateAndInstallGroup.java
+@@ -10,6 +10,8 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.provisional.p2.ui.dialogs;
+ 
++import java.net.MalformedURLException;
++import java.net.URL;
+ import org.eclipse.core.runtime.Assert;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.p2.ui.actions.PropertyDialogAction;
+@@ -46,7 +48,8 @@ public class UpdateAndInstallGroup {
+ 	private static final String BUTTONACTION = "buttonAction"; //$NON-NLS-1$
+ 	private static final int DEFAULT_HEIGHT = 240;
+ 	private static final int DEFAULT_WIDTH = 300;
+-	static final int INDEX_AVAILABLE = 1;
++	private static final int INDEX_INSTALLED = 0;
++	private static final int INDEX_AVAILABLE = 1;
+ 	TabFolder tabFolder;
+ 	AvailableIUGroup availableIUGroup;
+ 	InstalledIUGroup installedIUGroup;
+@@ -197,6 +200,8 @@ public class UpdateAndInstallGroup {
+ 			}
+ 		});
+ 
++		setDropTarget(installedIUGroup.getStructuredViewer().getControl());
++
+ 		validateInstalledIUButtons(installedIUGroup.getStructuredViewer().getSelection());
+ 		return composite;
+ 	}
+@@ -354,17 +359,33 @@ public class UpdateAndInstallGroup {
+ 			return;
+ 
+ 		DropTarget target = new DropTarget(control, DND.DROP_MOVE | DND.DROP_COPY | DND.DROP_LINK);
+-		target.setTransfer(new Transfer[] {URLTransfer.getInstance()});
++		target.setTransfer(new Transfer[] {URLTransfer.getInstance(), FileTransfer.getInstance()});
+ 		target.addDropListener(new RepositoryManipulatorDropTarget(repositoryManipulator, control) {
+ 			protected boolean dropTargetIsValid(DropTargetEvent event) {
+-				// If we are on available features page, all drops are good.
+-				if (tabFolder.getSelectionIndex() == UpdateAndInstallGroup.INDEX_AVAILABLE)
+-					return true;
+-				if (tabFolder.getItem(INDEX_AVAILABLE) == event.item)
+-					return true;
+-				return false;
++				if (URLTransfer.getInstance().isSupportedType(event.currentDataType)) {
++					// If we are on available features page or tab, all drops are good.
++					if (tabFolder.getSelectionIndex() == UpdateAndInstallGroup.INDEX_AVAILABLE)
++						return super.dropTargetIsValid(event);
++					// This is not working
++					// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=222120
++					if (tabFolder.getItem(INDEX_AVAILABLE) == event.item)
++						return super.dropTargetIsValid(event);
++					if (tabFolder.getSelectionIndex() == UpdateAndInstallGroup.INDEX_INSTALLED) {
++						String path = (String) URLTransfer.getInstance().nativeToJava(event.currentDataType);
++						if (path != null) {
++							URL url = null;
++							try {
++								url = new URL(path);
++							} catch (MalformedURLException e) {
++								return false;
++							}
++							if (url != null && URLValidator.isFileURL(url))
++								return true;
++						}
++					}
++				}
++				return super.dropTargetIsValid(event);
+ 			}
+ 		});
+-
+ 	}
+ }
+commit a4f8047903dbdb5ea5ece491f443e5a765ee0a12
+Author: Susan Franklin <sfranklin>
+Date:   Thu Mar 13 18:37:15 2008 +0000
+
+    Bug 211679 - [prov] [ui] Replacement UI for extension locations
+
+0	3	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
+0	125	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java
+0	3	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
+0	1	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ExternalFilesPreferencePage.java
+0	1	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceConstants.java
+0	1	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceInitializer.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
+index d7fb4f9..68efddc 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKMessages.java
+@@ -129,9 +129,6 @@ public class ProvSDKMessages extends NLS {
+ 	public static String AutomaticUpdatesJob_Updates;
+ 	public static String AutomaticUpdatesDialog_ClickToReviewDownloaded;
+ 	public static String AutomaticUpdatesDialog_ClickToReviewNotDownloaded;
+-	public static String ConfirmWithPathDetails_Browse;
+-	public static String ConfirmWithPathDetails_SaveIn;
+-	public static String ConfirmWithPathDetails_SelectDirectory;
+ 	public static String ProvisioningPreferencePage_AlwaysOpenWizard;
+ 	public static String ProvisioningPreferencePage_BrowsingPrefsGroup;
+ 	public static String ProvisioningPreferencePage_ShowLatestVersions;
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java
+deleted file mode 100644
+index d305523..0000000
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/externalFiles/ConfirmWithPathDetailsDialog.java
++++ /dev/null
+@@ -1,125 +0,0 @@
+-package org.eclipse.equinox.internal.p2.ui.sdk.externalFiles;
+-
+-import java.io.File;
+-import org.eclipse.equinox.internal.p2.ui.sdk.ProvSDKMessages;
+-import org.eclipse.jface.dialogs.IDialogConstants;
+-import org.eclipse.jface.dialogs.MessageDialogWithToggle;
+-import org.eclipse.jface.preference.IPreferenceStore;
+-import org.eclipse.swt.SWT;
+-import org.eclipse.swt.events.*;
+-import org.eclipse.swt.graphics.Point;
+-import org.eclipse.swt.layout.GridData;
+-import org.eclipse.swt.layout.GridLayout;
+-import org.eclipse.swt.widgets.*;
+-
+-/**
+- * @since 3.4
+- *
+- */
+-public abstract class ConfirmWithPathDetailsDialog extends MessageDialogWithToggle {
+-
+-	File targetLocation;
+-	Composite detailsArea;
+-	Text location;
+-	String pathLocationText;
+-
+-	public ConfirmWithPathDetailsDialog(Shell parentShell, File targetRepoLocation, String message, IPreferenceStore prefStore, String prefKey) {
+-		super(parentShell, ProvSDKMessages.ProvSDKUIActivator_Question, null, message, NONE, new String[] {IDialogConstants.YES_LABEL, IDialogConstants.NO_LABEL, IDialogConstants.CANCEL_LABEL, IDialogConstants.SHOW_DETAILS_LABEL}, 2, null, false);
+-		this.targetLocation = targetRepoLocation;
+-		pathLocationText = targetRepoLocation.getAbsolutePath();
+-		setPrefStore(prefStore);
+-		setPrefKey(prefKey);
+-	}
+-
+-	protected Composite createDetailsArea(final Composite parent) {
+-		Composite composite = new Composite(parent, SWT.BORDER);
+-		GridLayout layout = new GridLayout();
+-		initializeDialogUnits(composite);
+-		layout.marginLeft = layout.marginRight = layout.marginBottom = 0;
+-		layout.marginTop = convertHeightInCharsToPixels(1);
+-		layout.numColumns = 3;
+-		composite.setLayout(layout);
+-		GridData gd = new GridData(SWT.FILL, SWT.FILL, true, true);
+-		composite.setLayoutData(gd);
+-
+-		// Descriptive text describing the location's usage
+-		Text text = new Text(composite, SWT.MULTI | SWT.READ_ONLY | SWT.WRAP);
+-		gd = new GridData(SWT.FILL, SWT.FILL, true, true);
+-		initializeDialogUnits(text);
+-		gd.heightHint = convertHeightInCharsToPixels(2);
+-		gd.horizontalSpan = 3;
+-		text.setLayoutData(gd);
+-		text.setText(getLocationDescription());
+-
+-		// Location text box and browse button
+-		Label label = new Label(composite, SWT.NONE);
+-		label.setText(ProvSDKMessages.ConfirmWithPathDetails_SaveIn);
+-		location = new Text(composite, SWT.BORDER);
+-		if (pathLocationText != null)
+-			location.setText(pathLocationText);
+-		location.addModifyListener(new ModifyListener() {
+-			public void modifyText(ModifyEvent e) {
+-				pathLocationText = location.getText().trim();
+-			}
+-
+-		});
+-		location.setLayoutData(new GridData(SWT.FILL, SWT.FILL, true, false));
+-		Button locationButton = new Button(composite, SWT.PUSH);
+-		locationButton.setText(ProvSDKMessages.ConfirmWithPathDetails_Browse);
+-		locationButton.addSelectionListener(new SelectionAdapter() {
+-			public void widgetSelected(SelectionEvent event) {
+-				DirectoryDialog dialog = new DirectoryDialog(parent.getShell(), SWT.APPLICATION_MODAL);
+-				dialog.setMessage(ProvSDKMessages.ConfirmWithPathDetails_SelectDirectory);
+-				String dir = dialog.open();
+-				if (dir != null) {
+-					location.setText(dir);
+-				}
+-			}
+-		});
+-		return composite;
+-	}
+-
+-	protected abstract String getLocationDescription();
+-
+-	protected void buttonPressed(int id) {
+-		if (id == IDialogConstants.DETAILS_ID) {
+-			// was the details button pressed?
+-			toggleDetailsArea();
+-		} else {
+-			super.buttonPressed(id);
+-		}
+-	}
+-
+-	/**
+-	 * Toggles the unfolding of the details area. This is triggered by the user
+-	 * pressing the details button.
+-	 */
+-	private void toggleDetailsArea() {
+-		Point windowSize = getShell().getSize();
+-		Point oldSize = getShell().computeSize(SWT.DEFAULT, SWT.DEFAULT);
+-		if (detailsArea != null) {
+-			detailsArea.dispose();
+-			detailsArea = null;
+-			getDetailsButton().setText(IDialogConstants.SHOW_DETAILS_LABEL);
+-		} else {
+-			detailsArea = createDetailsArea((Composite) getContents());
+-			getDetailsButton().setText(IDialogConstants.HIDE_DETAILS_LABEL);
+-			getContents().getShell().layout();
+-		}
+-		Point newSize = getShell().computeSize(SWT.DEFAULT, SWT.DEFAULT);
+-		getShell().setSize(new Point(windowSize.x, windowSize.y + (newSize.y - oldSize.y)));
+-	}
+-
+-	private Button getDetailsButton() {
+-		return getButton(2); // index of details button as specified in the constructor
+-	}
+-
+-	public File getTargetLocation() {
+-		if (pathLocationText != null) {
+-			File file = new File(pathLocationText);
+-			if (file.isDirectory() || file.mkdirs())
+-				return file;
+-		}
+-		return targetLocation;
+-	}
+-}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
+index 760682d..22fcbe7 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/messages.properties
+@@ -113,9 +113,6 @@ AutomaticUpdatesPreferencePage_RemindGroup=&When updates are found
+ AutomaticUpdatesPreferencePage_RemindSchedule=&Remind me about updates every:
+ AutomaticUpdatesPreferencePage_RemindOnce=Notify me &once about updates
+ AutomaticUpdatesJob_Updates=Updates
+-ConfirmWithPathDetails_Browse=&Browse...
+-ConfirmWithPathDetails_SaveIn=&Save in:
+-ConfirmWithPathDetails_SelectDirectory=Select a directory
+ ProvSDKQueryProvider_ErrorRetrievingProfile=Error while retrieving profile {0}
+ ProvSDKUIActivator_ErrorWritingLicenseRegistry=Error writing license registry.  Accepted licenses will not be remembered.
+ ProvSDKUIActivator_LaunchUpdateManager=Launch...
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ExternalFilesPreferencePage.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ExternalFilesPreferencePage.java
+index ce1475f..438122e 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ExternalFilesPreferencePage.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/ExternalFilesPreferencePage.java
+@@ -31,7 +31,6 @@ public class ExternalFilesPreferencePage extends FieldEditorPreferencePage imple
+ 	}
+ 
+ 	protected void createFieldEditors() {
+-		addField(new RadioGroupFieldEditor(PreferenceConstants.PREF_GENERATE_REPOFOLDER, ProvSDKMessages.ExternalFilesPreferencePage_RepoGenerationGroup, 1, new String[][] { {ProvSDKMessages.ExternalFilesPreferencePage_GenerateRepoAlways, MessageDialogWithToggle.ALWAYS}, {ProvSDKMessages.ExternalFilesPreferencePage_GenerateRepoNever, MessageDialogWithToggle.NEVER}, {ProvSDKMessages.ExternalFilesPreferencePage_GenerateRepoPrompt, MessageDialogWithToggle.PROMPT}}, getFieldEditorParent(), true));
+ 		addField(new RadioGroupFieldEditor(PreferenceConstants.PREF_GENERATE_ARCHIVEREPOFOLDER, ProvSDKMessages.ExternalFilesPreferencePage_ArchiveRepoGenerationGroup, 1, new String[][] { {ProvSDKMessages.ExternalFilesPreferencePage_GenerateArchiveRepoAlways, MessageDialogWithToggle.ALWAYS}, {ProvSDKMessages.ExternalFilesPreferencePage_GenerateArchiveRepoNever, MessageDialogWithToggle.NEVER}, {ProvSDKMessages.ExternalFilesPreferencePage_GenerateArchiveRepoPrompt, MessageDialogWithToggle.PROMPT}}, getFieldEditorParent(), true));
+ 		addField(new RadioGroupFieldEditor(PreferenceConstants.PREF_AUTO_INSTALL_BUNDLES, ProvSDKMessages.ExternalFilesPreferencePage_AddBundleGroup, 1, new String[][] { {ProvSDKMessages.ExternalFilesPreferencePage_AutoInstallBundleAlways, MessageDialogWithToggle.ALWAYS}, {ProvSDKMessages.ExternalFilesPreferencePage_AutoInstallBundleNever, MessageDialogWithToggle.NEVER}, {ProvSDKMessages.ExternalFilesPreferencePage_AutoInstallBundlePrompt, MessageDialogWithToggle.PROMPT}}, getFieldEditorParent(), true));
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceConstants.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceConstants.java
+index 426a6cd..f070d55 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceConstants.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceConstants.java
+@@ -25,7 +25,6 @@ public class PreferenceConstants {
+ 	public static final String PREF_REMIND_ELAPSED = "remindElapsedTime";//$NON-NLS-1$
+ 	public static final String PREF_SHOW_LATEST_VERSION = "showLatestVersion"; //$NON-NLS-1$
+ 	public static final String PREF_OPEN_WIZARD_ON_NONOK_PLAN = "allowNonOKPlan"; //$NON-NLS-1$
+-	public static final String PREF_GENERATE_REPOFOLDER = "generateReposForFolder"; //$NON-NLS-1$
+ 	public static final String PREF_GENERATE_ARCHIVEREPOFOLDER = "generateReposForArchive"; //$NON-NLS-1$
+ 	public static final String PREF_AUTO_INSTALL_BUNDLES = "autoInstallBundles"; //$NON-NLS-1$
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceInitializer.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceInitializer.java
+index d5f84e1..4d7b5d4 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceInitializer.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/prefs/PreferenceInitializer.java
+@@ -33,7 +33,6 @@ public class PreferenceInitializer extends AbstractPreferenceInitializer {
+ 		node.putBoolean(PreferenceConstants.PREF_SHOW_LATEST_VERSION, true);
+ 		node.put(PreferenceConstants.PREF_REMIND_ELAPSED, ProvSDKMessages.AutomaticUpdateScheduler_30Minutes);
+ 		node.put(PreferenceConstants.PREF_OPEN_WIZARD_ON_NONOK_PLAN, MessageDialogWithToggle.PROMPT);
+-		node.put(PreferenceConstants.PREF_GENERATE_REPOFOLDER, MessageDialogWithToggle.PROMPT);
+ 		node.put(PreferenceConstants.PREF_GENERATE_ARCHIVEREPOFOLDER, MessageDialogWithToggle.PROMPT);
+ 		node.put(PreferenceConstants.PREF_AUTO_INSTALL_BUNDLES, MessageDialogWithToggle.PROMPT);
+ 	}
+commit 53b79311d527f77e3b2045273d4199d80df3d17e
+Author: Susan Franklin <sfranklin>
+Date:   Thu Mar 13 21:11:18 2008 +0000
+
+    Bug 211679 - [prov] [ui] Replacement UI for extension locations - drag and drop error reporting
+
+11	3	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/UpdateAndInstallDialog.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+21	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/IRepositoryManipulator.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulatorDropTarget.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UpdateAndInstallGroup.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/UpdateAndInstallDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/UpdateAndInstallDialog.java
+index 43d24ea..163aa2f 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/UpdateAndInstallDialog.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/UpdateAndInstallDialog.java
+@@ -131,7 +131,7 @@ public class UpdateAndInstallDialog extends TrayDialog {
+ 
+ 	private IRepositoryManipulator getRepositoryManipulator() {
+ 		return new IRepositoryManipulator() {
+-			public String getLabel() {
++			public String getManipulatorLabel() {
+ 				return ProvSDKMessages.UpdateAndInstallDialog_ManageSites;
+ 
+ 			}
+@@ -142,7 +142,11 @@ public class UpdateAndInstallDialog extends TrayDialog {
+ 			}
+ 
+ 			public ProvisioningOperation getAddOperation(URL repoURL) {
+-				return new AddColocatedRepositoryOperation(ProvSDKMessages.UpdateAndInstallDialog_AddSiteOperationlabel, repoURL);
++				return new AddColocatedRepositoryOperation(getAddOperationLabel(), repoURL);
++			}
++
++			public String getAddOperationLabel() {
++				return ProvSDKMessages.UpdateAndInstallDialog_AddSiteOperationlabel;
+ 			}
+ 
+ 			public URL[] getKnownRepositories() {
+@@ -154,7 +158,11 @@ public class UpdateAndInstallDialog extends TrayDialog {
+ 			}
+ 
+ 			public ProvisioningOperation getRemoveOperation(URL[] reposToRemove) {
+-				return new RemoveColocatedRepositoryOperation(ProvSDKMessages.UpdateAndInstallDialog_RemoveSiteOperationLabel, reposToRemove);
++				return new RemoveColocatedRepositoryOperation(getRemoveOperationLabel(), reposToRemove);
++			}
++
++			public String getRemoveOperationLabel() {
++				return ProvSDKMessages.UpdateAndInstallDialog_RemoveSiteOperationLabel;
+ 			}
+ 
+ 			public URLValidator getURLValidator(Shell shell) {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index 818bb95..77ac11d 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -91,7 +91,7 @@ RepositoryGroup_ArchivedRepoBrowseButton=&Archive...
+ RepositoryGroup_SelectRepositoryDirectory=Select a repository root directory:
+ RepositoryGroup_RepositoryFile=Repository archive
+ RepositoryGroup_URLRequired=Must specify a URL
+-RepositoryManipulatorDropTarget_DragAndDropJobLabel=Drag and drop operation for {0}
++RepositoryManipulatorDropTarget_DragAndDropJobLabel=Drag and drop operation for "{0}"
+ RepositoryManipulatorDropTarget_DragSourceNotValid={0} is not recognized as a valid software site location.
+ 
+ AcceptLicensesWizardPage_AcceptMultiple=I &accept the terms of the license agreements
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/IRepositoryManipulator.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/IRepositoryManipulator.java
+index bf7e0a5..1ee0f64 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/IRepositoryManipulator.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/IRepositoryManipulator.java
+@@ -36,7 +36,7 @@ public interface IRepositoryManipulator {
+ 	 * the manager is a dialog that lets you manipulate repositories, the label
+ 	 * could be used in the button that launches the dialog.
+ 	 */
+-	public String getLabel();
++	public String getManipulatorLabel();
+ 
+ 	/**
+ 	 * Return an array of URLs containing the repositories already known.
+@@ -50,10 +50,30 @@ public interface IRepositoryManipulator {
+ 	public ProvisioningOperation getAddOperation(URL repoURL);
+ 
+ 	/**
++	 * Return a String describing a possible add operation.  This is used 
++	 * when prompting or reporting errors involving a possible add operation.
++	 */
++	public String getAddOperationLabel();
++
++	/**
+ 	 * Return an operation that could be used to remove the specified URL as
+ 	 * a repositories.
+ 	 */
+ 	public ProvisioningOperation getRemoveOperation(URL[] repoURLs);
+ 
++	/**
++	 * Return a String describing a possible remove operation.  This is used 
++	 * when prompting or reporting errors involving a possible remove operation.
++	 */
++	public String getRemoveOperationLabel();
++
++	/**
++	 * Get a URL validator that could be used to validate URLs supplied
++	 * by the user.
++	 * 
++	 * @param shell the shell used by the validator to report any problems.
++	 * @return the validator to be used.
++	 */
++
+ 	public URLValidator getURLValidator(Shell shell);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulatorDropTarget.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulatorDropTarget.java
+index ed7caaf..602407d 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulatorDropTarget.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulatorDropTarget.java
+@@ -47,7 +47,7 @@ public class RepositoryManipulatorDropTarget extends URLDropAdapter {
+ 		if (url[0] == null)
+ 			return;
+ 
+-		Job job = new WorkbenchJob(NLS.bind(ProvUIMessages.RepositoryManipulatorDropTarget_DragAndDropJobLabel, manipulator.getLabel())) {
++		Job job = new WorkbenchJob(NLS.bind(ProvUIMessages.RepositoryManipulatorDropTarget_DragAndDropJobLabel, manipulator.getAddOperationLabel())) {
+ 
+ 			public IStatus runInUIThread(IProgressMonitor monitor) {
+ 				IStatus status = manipulator.getURLValidator(control.getShell()).validateRepositoryURL(url[0], true, monitor);
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UpdateAndInstallGroup.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UpdateAndInstallGroup.java
+index 066a28e..d7a4b5f 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UpdateAndInstallGroup.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UpdateAndInstallGroup.java
+@@ -154,7 +154,7 @@ public class UpdateAndInstallGroup {
+ 		installButton = createVerticalButton(composite, ProvUIMessages.InstallIUCommandLabel, false);
+ 		installButton.setData(BUTTONACTION, new InstallAction(availableIUGroup.getStructuredViewer(), profileId, null, policies, parent.getShell()));
+ 		if (repositoryManipulator != null) {
+-			Button repoButton = createVerticalButton(composite, repositoryManipulator.getLabel(), false);
++			Button repoButton = createVerticalButton(composite, repositoryManipulator.getManipulatorLabel(), false);
+ 			repoButton.setData(BUTTONACTION, new Action() {
+ 				public void runWithEvent(Event event) {
+ 					repositoryManipulator.manipulateRepositories(getTabFolder().getShell());

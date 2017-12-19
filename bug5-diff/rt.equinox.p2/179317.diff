@@ -1,0 +1,785 @@
+commit f48384700164785982a4929dc796257c664ef88c
+Author: Simon Kaegi <skaegi>
+Date:   Fri Nov 23 06:07:22 2007 +0000
+
+    Bug 179317  [prov] eclipse touchpoint should add the unzipped items to the eclipse.cache repo
+
+1	1	bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+5	1	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+14	2	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorRequest.java
+23	10	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+10	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/p2/artifact/repository/IArtifactRepositoryManager.java
+5	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
+6	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/plugin.xml
+298	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePool.java
+29	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePoolFactory.java
+22	24	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+11	30	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+index d611b79..10e4fae 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+@@ -7,7 +7,7 @@ Bundle-Localization: plugin
+ Bundle-Version: 0.1.0.qualifier
+ Export-Package: org.eclipse.equinox.internal.p2.artifact.mirror;x-internal:=true,
+  org.eclipse.equinox.internal.p2.artifact.repository;x-friends:="org.eclipse.equinox.p2.metadata.generator,org.eclipse.equinox.p2.test",
+- org.eclipse.equinox.internal.p2.artifact.repository.simple;x-friends:="org.eclipse.equinox.p2.selfhosting",
++ org.eclipse.equinox.internal.p2.artifact.repository.simple;x-friends:="org.eclipse.equinox.p2.selfhosting,org.eclipse.equinox.p2.touchpoint.eclipse",
+  org.eclipse.equinox.p2.artifact.repository,
+  org.eclipse.equinox.p2.artifact.repository.processing,
+  org.eclipse.equinox.spi.p2.artifact.repository
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+index b9087ca..f8e4012 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+@@ -65,7 +65,11 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 	}
+ 
+ 	public IArtifactRequest createMirrorRequest(IArtifactKey key, IArtifactRepository destination) {
+-		return new MirrorRequest(key, destination);
++		return createMirrorRequest(key, destination, null);
++	}
++
++	public IArtifactRequest createMirrorRequest(IArtifactKey key, IArtifactRepository destination, Properties destinationDescriptorProperties) {
++		return new MirrorRequest(key, destination, destinationDescriptorProperties);
+ 	}
+ 
+ 	public IArtifactRepository createRepository(URL location, String name, String type) {
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorRequest.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorRequest.java
+index f5c1cb1..896a91e 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorRequest.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorRequest.java
+@@ -12,6 +12,7 @@ package org.eclipse.equinox.internal.p2.artifact.repository;
+ 
+ import java.io.IOException;
+ import java.io.OutputStream;
++import java.util.Properties;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.p2.artifact.repository.*;
+ import org.eclipse.equinox.p2.artifact.repository.processing.ProcessingStepDescriptor;
+@@ -21,11 +22,19 @@ import org.eclipse.equinox.p2.metadata.IArtifactKey;
+ public class MirrorRequest extends ArtifactRequest {
+ 	private static final ProcessingStepDescriptor[] EMPTY_STEPS = new ProcessingStepDescriptor[0];
+ 
+-	private IArtifactRepository target;
++	private final IArtifactRepository target;
+ 
+-	public MirrorRequest(IArtifactKey key, IArtifactRepository targetRepository) {
++	private final Properties targetDescriptorProperties;
++
++	public MirrorRequest(IArtifactKey key, IArtifactRepository targetRepository, Properties targetDescriptorProperties) {
+ 		super(key);
+ 		target = targetRepository;
++		if (targetDescriptorProperties == null || targetDescriptorProperties.isEmpty()) {
++			this.targetDescriptorProperties = null;
++		} else {
++			this.targetDescriptorProperties = new Properties();
++			this.targetDescriptorProperties.putAll(targetDescriptorProperties);
++		}
+ 	}
+ 
+ 	public void perform(IProgressMonitor monitor) {
+@@ -76,6 +85,9 @@ public class MirrorRequest extends ArtifactRequest {
+ 		destinationDescriptor.setProperty(IArtifactDescriptor.DOWNLOAD_MD5, null);
+ 		//		destinationDescriptor.setProperty(IArtifactDescriptor.DOWNLOAD_SIZE, null);
+ 
++		if (targetDescriptorProperties != null)
++			destinationDescriptor.addProperties(targetDescriptorProperties);
++
+ 		OutputStream destination = target.getOutputStream(destinationDescriptor);
+ 		if (destination == null) {
+ 			setResult(new Status(IStatus.ERROR, Activator.ID, "Can't get an output stream to " + target + " to store " + getArtifactKey()));
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+index b159d99..26fd87e 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+@@ -102,7 +102,7 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		}
+ 	}
+ 
+-	private IArtifactDescriptor getCompleteArtifactDescriptor(IArtifactKey key) {
++	public IArtifactDescriptor getCompleteArtifactDescriptor(IArtifactKey key) {
+ 		for (Iterator iterator = artifactDescriptors.iterator(); iterator.hasNext();) {
+ 			IArtifactDescriptor desc = (IArtifactDescriptor) iterator.next();
+ 			// look for a descriptor that matches the key and is "complete"
+@@ -112,7 +112,7 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		return null;
+ 	}
+ 
+-	private String getLocation(IArtifactDescriptor descriptor) {
++	public String getLocation(IArtifactDescriptor descriptor) {
+ 		// if the artifact has a uuid then use it
+ 		String uuid = descriptor.getProperty(ARTIFACT_UUID);
+ 		if (uuid != null)
+@@ -130,7 +130,7 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		return null;
+ 	}
+ 
+-	private String createLocation(ArtifactDescriptor descriptor) {
++	public String createLocation(ArtifactDescriptor descriptor) {
+ 		// if the descriptor is canonical, clear out any UUID that might be set and use the Mapper
+ 		if (descriptor.getProcessingSteps().length == 0) {
+ 			descriptor.setProperty(ARTIFACT_UUID, null);
+@@ -199,15 +199,16 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 
+ 	public IStatus getArtifact(IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
+ 		ProcessingStepHandler handler = new ProcessingStepHandler();
+-		destination = addPostSteps(handler, descriptor, destination, monitor);
+-		destination = handler.createAndLink(descriptor.getProcessingSteps(), descriptor, destination, monitor);
+-		destination = addPreSteps(handler, descriptor, destination, monitor);
++		destination = processDestination(handler, descriptor, destination, monitor);
+ 		IStatus status = handler.checkStatus(destination);
+ 		if (!status.isOK() && status.getSeverity() != IStatus.INFO)
+ 			return status;
+-		String toDownload = getLocation(descriptor);
+-		status = getTransport().download(toDownload, destination, monitor);
+ 
++		status = downloadArtifact(descriptor, destination, monitor);
++		return reportStatus(descriptor, destination, status);
++	}
++
++	public IStatus reportStatus(IArtifactDescriptor descriptor, OutputStream destination, IStatus status) {
+ 		// If the destination is just a normal stream then the status is simple.  Just return
+ 		// it and do not close the destination
+ 		if (!(destination instanceof ProcessingStep))
+@@ -226,12 +227,24 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		if (!stepStatus.isMultiStatus() && stepStatus.isOK())
+ 			return status;
+ 		// else gather up the status from the 
+-		MultiStatus result = new MultiStatus(Activator.ID, IStatus.OK, new IStatus[0], "Status of getting artifact " + toDownload, null);
++		MultiStatus result = new MultiStatus(Activator.ID, IStatus.OK, new IStatus[0], "Status of getting artifact " + descriptor.getArtifactKey(), null);
+ 		result.merge(status);
+ 		result.merge(stepStatus);
+ 		return result;
+ 	}
+ 
++	public OutputStream processDestination(ProcessingStepHandler handler, IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
++		destination = addPostSteps(handler, descriptor, destination, monitor);
++		destination = handler.createAndLink(descriptor.getProcessingSteps(), descriptor, destination, monitor);
++		destination = addPreSteps(handler, descriptor, destination, monitor);
++		return destination;
++	}
++
++	protected IStatus downloadArtifact(IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
++		String toDownload = getLocation(descriptor);
++		return getTransport().download(toDownload, destination, monitor);
++	}
++
+ 	private OutputStream addPostSteps(ProcessingStepHandler handler, IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
+ 		ArrayList steps = new ArrayList();
+ 		if (signatureVerification)
+@@ -269,7 +282,7 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		return (IArtifactDescriptor[]) result.toArray(new IArtifactDescriptor[result.size()]);
+ 	}
+ 
+-	private class ArtifactOutputStream extends OutputStream {
++	public class ArtifactOutputStream extends OutputStream {
+ 		private OutputStream destination;
+ 		private IArtifactDescriptor descriptor;
+ 		private long count = 0;
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/p2/artifact/repository/IArtifactRepositoryManager.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/p2/artifact/repository/IArtifactRepositoryManager.java
+index dd47b92..7f6de19 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/p2/artifact/repository/IArtifactRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/p2/artifact/repository/IArtifactRepositoryManager.java
+@@ -11,6 +11,7 @@
+ package org.eclipse.equinox.p2.artifact.repository;
+ 
+ import java.net.URL;
++import java.util.Properties;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.p2.metadata.IArtifactKey;
+@@ -82,4 +83,13 @@ public interface IArtifactRepositoryManager {
+ 	 */
+ 	public IArtifactRequest createMirrorRequest(IArtifactKey key, IArtifactRepository destination);
+ 
++	/**
++	 * Return a new request to mirror the given artifact into the destination repository.
++	 * @param key the artifact to mirror
++	 * @param destination the destination where the artifact will be mirrored
++	 * @param destinationDescriptorProperties additional properties for use in creating the repositor's ArtifactDescriptor
++	 * @return the newly created request object
++	 */
++	public IArtifactRequest createMirrorRequest(IArtifactKey key, IArtifactRepository destination, Properties destinationDescriptorProperties);
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
+index ac3748e..c8586be 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
+@@ -8,13 +8,18 @@ Bundle-Version: 0.1.0.qualifier
+ Import-Package: org.eclipse.core.runtime;common=split,
+  org.eclipse.equinox.frameworkadmin,
+  org.eclipse.equinox.internal.frameworkadmin.utils,
++ org.eclipse.equinox.internal.p2.artifact.repository,
++ org.eclipse.equinox.internal.p2.artifact.repository.simple,
+  org.eclipse.equinox.internal.p2.core.helpers,
+  org.eclipse.equinox.p2.artifact.repository,
++ org.eclipse.equinox.p2.artifact.repository.processing,
+  org.eclipse.equinox.p2.core.location,
+  org.eclipse.equinox.p2.core.repository,
+  org.eclipse.equinox.p2.download,
+  org.eclipse.equinox.p2.engine,
+  org.eclipse.equinox.p2.metadata,
++ org.eclipse.equinox.spi.p2.artifact.repository,
++ org.eclipse.equinox.spi.p2.core.repository,
+  org.eclipse.osgi.framework.util,
+  org.eclipse.osgi.service.datalocation;version="1.0.0",
+  org.eclipse.osgi.service.environment;version="1.0.0",
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/plugin.xml b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/plugin.xml
+index 37cda27..8aac950 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/plugin.xml
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/plugin.xml
+@@ -5,4 +5,10 @@
+ 			class="org.eclipse.equinox.internal.p2.touchpoint.eclipse.EclipseTouchpoint"
+ 			version="1.0.0"/>
+ 	</extension>
++ <extension id="bundlePool"
++       point="org.eclipse.equinox.p2.artifact.repository.artifactRepositories">
++    <factory
++          class="org.eclipse.equinox.internal.p2.touchpoint.eclipse.BundlePoolFactory">
++    </factory>
++ </extension>
+ </plugin>
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePool.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePool.java
+new file mode 100644
+index 0000000..8a6dbba
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePool.java
+@@ -0,0 +1,298 @@
++package org.eclipse.equinox.internal.p2.touchpoint.eclipse;
++
++import java.io.*;
++import java.net.MalformedURLException;
++import java.net.URL;
++import java.util.Map;
++import java.util.Set;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.artifact.repository.simple.SimpleArtifactRepository;
++import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
++import org.eclipse.equinox.p2.artifact.repository.*;
++import org.eclipse.equinox.p2.artifact.repository.processing.ProcessingStepHandler;
++import org.eclipse.equinox.p2.metadata.IArtifactKey;
++
++public class BundlePool implements IArtifactRepository, IFileArtifactRepository {
++
++	private static final String BUNDLE_FOLDER = "bundle.folder";
++
++	// TODO: optimize
++	// we could stream right into the folder
++	public class ZippedFolderOutputStream extends OutputStream {
++
++		private final File bundleFolder;
++		private final FileOutputStream fos;
++		private final File zipFile;
++
++		public ZippedFolderOutputStream(File bundleFolder) throws FileNotFoundException {
++			this.bundleFolder = bundleFolder;
++			zipFile = new File(bundleFolder, "tmp.zip");
++			fos = new FileOutputStream(zipFile);
++		}
++
++		public void close() throws IOException {
++			fos.close();
++			FileUtils.unzipFile(zipFile, bundleFolder);
++			zipFile.delete();
++		}
++
++		public void flush() throws IOException {
++			fos.flush();
++		}
++
++		public String toString() {
++			return fos.toString();
++		}
++
++		public void write(byte[] b, int off, int len) throws IOException {
++			fos.write(b, off, len);
++		}
++
++		public void write(byte[] b) throws IOException {
++			fos.write(b);
++		}
++
++		public void write(int b) throws IOException {
++			fos.write(b);
++		}
++	}
++
++	private final SimpleArtifactRepository repository;
++
++	public BundlePool(SimpleArtifactRepository repository) {
++		this.repository = repository;
++	}
++
++	public OutputStream getOutputStream(IArtifactDescriptor descriptor) {
++
++		if (Boolean.valueOf(descriptor.getProperty(BUNDLE_FOLDER)).booleanValue()) {
++			File bundleFolder = getBundleFolder(descriptor);
++			if (bundleFolder == null)
++				return null;
++
++			if (bundleFolder.exists()) {
++				System.err.println("Artifact repository out of synch. Overwriting " + bundleFolder.getAbsoluteFile()); //$NON-NLS-1$
++				try {
++					FileUtils.deleteAll(bundleFolder);
++				} catch (IOException e) {
++					// Unexpected ad we should log this however we should continue on
++					e.printStackTrace();
++				}
++			}
++
++			bundleFolder.mkdirs();
++
++			// finally create and return an output stream suitably wrapped so that when it is 
++			// closed the repository is updated with the descriptor
++			try {
++				return repository.new ArtifactOutputStream(new BufferedOutputStream(new ZippedFolderOutputStream(bundleFolder)), descriptor);
++			} catch (FileNotFoundException e) {
++				// unexpected
++				e.printStackTrace();
++			}
++			return null;
++		}
++		return repository.getOutputStream(descriptor);
++	}
++
++	private File getBundleFolder(IArtifactDescriptor descriptor) {
++		ArtifactDescriptor destinationDescriptor = new ArtifactDescriptor(descriptor);
++
++		String location = repository.createLocation(destinationDescriptor);
++		return toBundleFolder(location);
++	}
++
++	public File getArtifactFile(IArtifactDescriptor descriptor) {
++		if (Boolean.valueOf(descriptor.getProperty(BUNDLE_FOLDER)).booleanValue()) {
++			String location = repository.getLocation(descriptor);
++			return toBundleFolder(location);
++		}
++		return repository.getArtifactFile(descriptor);
++	}
++
++	private File toBundleFolder(String location) {
++		if (location == null || !location.endsWith(".jar"))
++			return null;
++
++		location = location.substring(0, location.lastIndexOf(".jar"));
++
++		try {
++			location = new URL(location).getPath();
++		} catch (MalformedURLException e) {
++			// should not occur
++			e.printStackTrace();
++		}
++
++		return new File(location);
++	}
++
++	public void addDescriptor(IArtifactDescriptor toAdd) {
++		repository.addDescriptor(toAdd);
++	}
++
++	public boolean contains(IArtifactDescriptor descriptor) {
++		return repository.contains(descriptor);
++	}
++
++	public boolean contains(IArtifactKey key) {
++		return repository.contains(key);
++	}
++
++	public boolean equals(Object obj) {
++		return repository.equals(obj);
++	}
++
++	public Object getAdapter(Class adapter) {
++		return repository.getAdapter(adapter);
++	}
++
++	public IStatus getArtifact(IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
++		if (Boolean.valueOf(descriptor.getProperty(BUNDLE_FOLDER)).booleanValue()) {
++			ProcessingStepHandler handler = new ProcessingStepHandler();
++			destination = repository.processDestination(handler, descriptor, destination, monitor);
++			IStatus status = handler.checkStatus(destination);
++			if (!status.isOK() && status.getSeverity() != IStatus.INFO)
++				return status;
++
++			status = downloadArtifact(descriptor, destination, monitor);
++			return repository.reportStatus(descriptor, destination, status);
++
++		}
++		return repository.getArtifact(descriptor, destination, monitor);
++	}
++
++	private IStatus downloadArtifact(IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
++		File bundleFolder = getArtifactFile(descriptor);
++		// TODO: optimize and ensure manifest is written first
++		File zipFile = new File(bundleFolder, "tmp.zip");
++		try {
++			FileUtils.zip(new File[] {bundleFolder}, zipFile);
++			FileInputStream fis = new FileInputStream(zipFile);
++			FileUtils.copyStream(fis, true, destination, true);
++		} catch (IOException e) {
++			return new Status(IStatus.ERROR, Activator.ID, e.getMessage());
++		} finally {
++			zipFile.delete();
++		}
++		return Status.OK_STATUS;
++	}
++
++	public IArtifactDescriptor[] getArtifactDescriptors(IArtifactKey key) {
++		return repository.getArtifactDescriptors(key);
++	}
++
++	public File getArtifactFile(IArtifactKey key) {
++		IArtifactDescriptor descriptor = repository.getCompleteArtifactDescriptor(key);
++		if (descriptor == null)
++			return null;
++		return getArtifactFile(descriptor);
++	}
++
++	public IArtifactKey[] getArtifactKeys() {
++		return repository.getArtifactKeys();
++	}
++
++	public IStatus getArtifacts(IArtifactRequest[] requests, IProgressMonitor monitor) {
++		return repository.getArtifacts(requests, monitor);
++	}
++
++	public String getDescription() {
++		return repository.getDescription();
++	}
++
++	public Set getDescriptors() {
++		return repository.getDescriptors();
++	}
++
++	public URL getLocation() {
++		return repository.getLocation();
++	}
++
++	public Map getModifiableProperties() {
++		return repository.getModifiableProperties();
++	}
++
++	public String getName() {
++		return repository.getName();
++	}
++
++	public Map getProperties() {
++		return repository.getProperties();
++	}
++
++	public String getProvider() {
++		return repository.getProvider();
++	}
++
++	public String[][] getRules() {
++		return repository.getRules();
++	}
++
++	public boolean getSignatureVerification() {
++		return repository.getSignatureVerification();
++	}
++
++	public String getType() {
++		return repository.getType();
++	}
++
++	public String getVersion() {
++		return repository.getVersion();
++	}
++
++	public int hashCode() {
++		return repository.hashCode();
++	}
++
++	public void initializeAfterLoad(URL location) {
++		repository.initializeAfterLoad(location);
++	}
++
++	public boolean isModifiable() {
++		return repository.isModifiable();
++	}
++
++	public void removeAll() {
++		repository.removeAll();
++	}
++
++	public void removeDescriptor(IArtifactDescriptor descriptor) {
++		repository.removeDescriptor(descriptor);
++	}
++
++	public void removeDescriptor(IArtifactKey key) {
++		repository.removeDescriptor(key);
++	}
++
++	public void save() {
++		repository.save();
++	}
++
++	public void setDescription(String description) {
++		repository.setDescription(description);
++	}
++
++	public void setName(String value) {
++		repository.setName(value);
++	}
++
++	public void setProvider(String provider) {
++		repository.setProvider(provider);
++	}
++
++	public void setRules(String[][] rules) {
++		repository.setRules(rules);
++	}
++
++	public void setSignatureVerification(boolean value) {
++		repository.setSignatureVerification(value);
++	}
++
++	public void tagAsImplementation() {
++		repository.tagAsImplementation();
++	}
++
++	public String toString() {
++		return repository.toString();
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePoolFactory.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePoolFactory.java
+new file mode 100644
+index 0000000..3c1b8a8
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/BundlePoolFactory.java
+@@ -0,0 +1,29 @@
++/*******************************************************************************
++ * Copyright (c) 2007 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.touchpoint.eclipse;
++
++import java.net.URL;
++import org.eclipse.equinox.internal.p2.artifact.repository.simple.SimpleArtifactRepository;
++import org.eclipse.equinox.internal.p2.artifact.repository.simple.SimpleArtifactRepositoryFactory;
++import org.eclipse.equinox.p2.artifact.repository.IArtifactRepository;
++
++public class BundlePoolFactory extends SimpleArtifactRepositoryFactory {
++
++	public IArtifactRepository load(URL location) {
++		SimpleArtifactRepository repository = (SimpleArtifactRepository) super.load(location);
++		return new BundlePool(repository);
++	}
++
++	public IArtifactRepository create(URL location, String name, String type) {
++		SimpleArtifactRepository repository = (SimpleArtifactRepository) super.create(location, name, type);
++		return new BundlePool(repository);
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+index c5430bf..f0bebfd 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+@@ -10,8 +10,7 @@ package org.eclipse.equinox.internal.p2.touchpoint.eclipse;
+ 
+ import java.io.File;
+ import java.io.IOException;
+-import java.util.Collection;
+-import java.util.Map;
++import java.util.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.frameworkadmin.Manipulator;
+@@ -61,11 +60,9 @@ public class EclipseTouchpoint extends Touchpoint {
+ 
+ 	// TODO: Here we may want to consult multiple caches
+ 	IArtifactRequest[] collect(IInstallableUnit installableUnit, Profile profile) {
+-		IArtifactRepository targetRepo = null;
+ 		IArtifactKey[] toDownload = installableUnit.getArtifacts();
+ 		if (toDownload == null || toDownload.length == 0)
+ 			return IArtifactRepositoryManager.NO_ARTIFACT_REQUEST;
+-		IArtifactRequest[] requests = new IArtifactRequest[toDownload.length];
+ 
+ 		IFileArtifactRepository bundlePool = Util.getBundlePoolRepo(profile);
+ 		if (isCompletelyInRepo(bundlePool, toDownload))
+@@ -73,26 +70,29 @@ public class EclipseTouchpoint extends Touchpoint {
+ 
+ 		//If the installable unit has installation information, then the artifact is put in the download cache
+ 		//otherwise it is a jar'ed bundle and we directly store it in the plugin cache
+-		if (isZipped(installableUnit.getTouchpointData())) {
+-			targetRepo = Util.getDownloadCacheRepo();
+-		} else {
+-			targetRepo = bundlePool;
+-		}
+-		int count = 0;
++
++		List requests = new ArrayList();
+ 		for (int i = 0; i < toDownload.length; i++) {
+ 			IArtifactKey key = toDownload[i];
+-			if (!targetRepo.contains(key)) {
+-				requests[count++] = Util.getArtifactRepositoryManager().createMirrorRequest(key, targetRepo);
++			if (!bundlePool.contains(key)) {
++				Properties descriptorProperties = getArtifactDescriptorProperties(installableUnit);
++				requests.add(Util.getArtifactRepositoryManager().createMirrorRequest(key, bundlePool, descriptorProperties));
+ 			}
+ 		}
+ 
+-		if (requests.length == count)
+-			return requests;
+-		IArtifactRequest[] result = new IArtifactRequest[count];
+-		System.arraycopy(requests, 0, result, 0, count);
++		IArtifactRequest[] result = (IArtifactRequest[]) requests.toArray(new IArtifactRequest[requests.size()]);
+ 		return result;
+ 	}
+ 
++	private Properties getArtifactDescriptorProperties(IInstallableUnit installableUnit) {
++		Properties descriptorProperties = null;
++		if (isZipped(installableUnit.getTouchpointData())) {
++			descriptorProperties = new Properties();
++			descriptorProperties.setProperty("bundle.folder", "true");
++		}
++		return descriptorProperties;
++	}
++
+ 	public IStatus completePhase(IProgressMonitor monitor, Profile profile, String phaseId, Map touchpointParameters) {
+ 		Manipulator manipulator = (Manipulator) touchpointParameters.get(PARM_MANIPULATOR);
+ 		try {
+@@ -169,7 +169,7 @@ public class EclipseTouchpoint extends Touchpoint {
+ 
+ 						File fileLocation = null;
+ 						try {
+-							fileLocation = Util.getBundleFile(artifactKey, isZipped(iu.getTouchpointData()), profile);
++							fileLocation = Util.getBundleFile(artifactKey, profile);
+ 						} catch (IOException e) {
+ 							return createError(e.getMessage(), e);
+ 						}
+@@ -199,7 +199,7 @@ public class EclipseTouchpoint extends Touchpoint {
+ 
+ 						File fileLocation = null;
+ 						try {
+-							fileLocation = Util.getBundleFile(artifactKey, isZipped(iu.getTouchpointData()), profile);
++							fileLocation = Util.getBundleFile(artifactKey, profile);
+ 						} catch (IOException e) {
+ 							return createError(e.getMessage(), e);
+ 						}
+@@ -233,7 +233,7 @@ public class EclipseTouchpoint extends Touchpoint {
+ 
+ 						File fileLocation = null;
+ 						try {
+-							fileLocation = Util.getBundleFile(artifactKey, isZipped(iu.getTouchpointData()), profile);
++							fileLocation = Util.getBundleFile(artifactKey, profile);
+ 						} catch (IOException e) {
+ 							return createError(e.getMessage(), e);
+ 						}
+@@ -263,7 +263,7 @@ public class EclipseTouchpoint extends Touchpoint {
+ 
+ 						File fileLocation = null;
+ 						try {
+-							fileLocation = Util.getBundleFile(artifactKey, isZipped(iu.getTouchpointData()), profile);
++							fileLocation = Util.getBundleFile(artifactKey, profile);
+ 						} catch (IOException e) {
+ 							return createError(e.getMessage(), e);
+ 						}
+@@ -511,10 +511,9 @@ public class EclipseTouchpoint extends Touchpoint {
+ 		if (artifactKey == null)
+ 			throw new IllegalArgumentException("No artifact found that matches: " + bundleId);
+ 
+-		boolean isZipped = isZipped(iu.getTouchpointData());
+ 		File bundleFile;
+ 		try {
+-			bundleFile = Util.getBundleFile(artifactKey, isZipped, profile);
++			bundleFile = Util.getBundleFile(artifactKey, profile);
+ 			if (bundleFile == null)
+ 				return createError("The artifact " + artifactKey.toString() + " to install was not found.");
+ 
+@@ -579,10 +578,9 @@ public class EclipseTouchpoint extends Touchpoint {
+ 		if (artifactKey == null)
+ 			throw new IllegalArgumentException("No artifact found that matches: " + bundleId);
+ 
+-		boolean isZipped = isZipped(iu.getTouchpointData());
+ 		File bundleFile;
+ 		try {
+-			bundleFile = Util.getBundleFile(artifactKey, isZipped, profile);
++			bundleFile = Util.getBundleFile(artifactKey, profile);
+ 			if (bundleFile == null)
+ 				return createError("The artifact " + artifactKey.toString() + " to uninstall was not found.");
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+index 291f9c6..88ab4da 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+@@ -7,7 +7,8 @@ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.Path;
+ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.frameworkadmin.FrameworkAdmin;
+-import org.eclipse.equinox.internal.p2.core.helpers.*;
++import org.eclipse.equinox.internal.p2.core.helpers.Headers;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.artifact.repository.*;
+ import org.eclipse.equinox.p2.core.location.AgentLocation;
+ import org.eclipse.equinox.p2.engine.Profile;
+@@ -54,21 +55,20 @@ public class Util {
+ 	static IFileArtifactRepository getBundlePoolRepo(Profile profile) {
+ 		URL location = getBundlePoolLocation(profile);
+ 		IArtifactRepositoryManager manager = getArtifactRepositoryManager();
+-		IArtifactRepository repository = manager.loadRepository(location, null);
+-		if (repository == null) {
++		IArtifactRepository bundlePool = manager.loadRepository(location, null);
++		if (bundlePool == null) {
+ 			// 	the given repo location is not an existing repo so we have to create something
+ 			// TODO for now create a random repo by default.
+ 			String repositoryName = location + " - bundle pool"; //$NON-NLS-1$
+-			repository = manager.createRepository(location, repositoryName, "org.eclipse.equinox.p2.artifact.repository.simpleRepository"); //$NON-NLS-1$
++			bundlePool = manager.createRepository(location, repositoryName, "org.eclipse.equinox.p2.touchpoint.eclipse.bundlePool"); //$NON-NLS-1$
+ 			// TODO: do we still need to do this
+-			tagAsImplementation(repository);
++			tagAsImplementation(bundlePool);
+ 		}
+ 
+-		IFileArtifactRepository bundlePool = (IFileArtifactRepository) repository.getAdapter(IFileArtifactRepository.class);
+ 		if (bundlePool == null) {
+ 			throw new IllegalArgumentException("BundlePool repository not writeable: " + location); //$NON-NLS-1$
+ 		}
+-		return bundlePool;
++		return (IFileArtifactRepository) bundlePool;
+ 	}
+ 
+ 	private static URL getDownloadCacheLocation() {
+@@ -127,29 +127,10 @@ public class Util {
+ 		return bundleInfo;
+ 	}
+ 
+-	static File getBundleFile(IArtifactKey artifactKey, boolean isZipped, Profile profile) throws IOException {
+-
+-		if (!isZipped) {
+-			IFileArtifactRepository bundlePool = getBundlePoolRepo(profile);
+-			File bundleJar = bundlePool.getArtifactFile(artifactKey);
+-			return bundleJar;
+-		}
+-
+-		// Handle zipped
+-		IFileArtifactRepository downloadCache = getDownloadCacheRepo();
+-		File bundleJar = downloadCache.getArtifactFile(artifactKey);
+-		if (bundleJar == null)
+-			return null;
+-
+-		File bundleFolder = new File(getBundlePoolLocation(profile).getFile(), "plugins/" + artifactKey.getId() + '_' + artifactKey.getVersion()); //$NON-NLS-1$
+-		if (bundleFolder.exists())
+-			return bundleFolder;
+-
+-		if (!bundleFolder.mkdir())
+-			throw new IOException("Can't create the folder: " + bundleFolder);
+-
+-		FileUtils.unzipFile(bundleJar, bundleFolder);
+-		return bundleFolder;
++	static File getBundleFile(IArtifactKey artifactKey, Profile profile) throws IOException {
++		IFileArtifactRepository bundlePool = getBundlePoolRepo(profile);
++		File bundleJar = bundlePool.getArtifactFile(artifactKey);
++		return bundleJar;
+ 	}
+ 
+ 	static File getConfigurationFolder(Profile profile) {

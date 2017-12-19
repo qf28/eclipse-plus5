@@ -1,0 +1,858 @@
+commit 9b8300bd40097f83910af2d40fdc1cb6ee0c88af
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sun Sep 10 20:06:38 2017 +0200
+
+    Bug 522073: [9] core support for --limit-modules
+    
+    Change-Id: Icff39b706fc8a78c404d15030551934ed0976fc9
+
+80	1	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+5	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/util/JRTUtil.java
+17	0	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+73	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+4	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
+5	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+143	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModuleEntryProcessor.java
+27	60	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 01b88c5..398656e 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -46,8 +46,10 @@ import org.eclipse.jdt.core.dom.CompilationUnit;
+ import org.eclipse.jdt.core.tests.util.Util;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
++import org.eclipse.jdt.internal.compiler.util.JRTUtil;
+ import org.eclipse.jdt.internal.core.ClasspathAttribute;
+ import org.eclipse.jdt.internal.core.ClasspathEntry;
++import org.eclipse.jdt.internal.core.builder.ClasspathJrt;
+ import org.eclipse.jdt.internal.core.util.Messages;
+ 
+ import junit.framework.Test;
+@@ -5417,7 +5419,84 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 				this.problemRequestor);
+ 
+ 		} finally {
+-			this.deleteProject("org.astro.patch");
++			this.deleteProject("mod.one.patch");
++		}
++	}
++	public void testLimitModules1() throws CoreException, IOException {
++		if (!isJRE9) return;
++		String save = System.getProperty("modules.to.load");
++		JRTUtil.reset();
++		ClasspathJrt.resetCaches();
++		try {
++			// allow for a few more than we are using via limit-modules:
++			System.setProperty("modules.to.load", "java.base,java.desktop,java.datatransfer,java.rmi,java.sql,java.prefs,java.xml");
++			IClasspathAttribute[] attributes = {
++					JavaCore.newClasspathAttribute(IClasspathAttribute.MODULE, "true"),
++					JavaCore.newClasspathAttribute(IClasspathAttribute.LIMIT_MODULES, "java.base,java.desktop")
++			};
++			IJavaProject project = createJava9ProjectWithJREAttributes("org.astro", new String[]{"src", "src2"}, attributes);
++
++			String[] sources = {
++				"src/module-info.java",
++				"module org.astro {\n" +
++				"	requires java.base;\n" +
++				"	requires java.desktop;\n" +
++				"	requires java.datatransfer;\n" + // within the closure of java.desktop
++				"	requires java.sql;\n" + // not included
++				"}\n",
++				"src/org/astro/Test2.java",
++				"package org.astro;\n" +
++				"class Test2 {\n" +
++				"	java.awt.Window window;\n" +
++				"}\n",
++				"src2/org/astro/Test3.java",
++				"package org.astro;\n" +
++				"class Test3 {\n" +
++				"	java.awt.datatransfer.Clipboard clippy;\n" +
++				"}\n"
++			};
++			createSourceFiles(project, sources);
++			
++			getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = project.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers",
++					"java.sql cannot be resolved to a module", // outside limited scope
++					markers);
++
++			this.problemRequestor.reset();
++			ICompilationUnit cu = getCompilationUnit("/org.astro/src/module-info.java");
++			cu.getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++				"Unexpected problems",
++				"----------\n" +
++				"1. ERROR in /org.astro/src/module-info.java\n" + 
++				"java.sql cannot be resolved to a module\n" +
++				"----------\n",
++				this.problemRequestor);
++
++			this.problemRequestor.reset();
++			cu = getCompilationUnit("/org.astro/src/org/astro/Test2.java");
++			cu.getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++				"Unexpected problems",
++				"----------\n" +
++				"----------\n",
++				this.problemRequestor);
++
++			this.problemRequestor.reset();
++			cu = getCompilationUnit("/org.astro/src/org/astro/Test3.java");
++			cu.getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++				"Unexpected problems",
++				"----------\n" +
++				"----------\n",
++				this.problemRequestor);
++
++		} finally {
++			this.deleteProject("org.astro");
++			System.setProperty("modules.to.load", save);
++			JRTUtil.reset();
++			ClasspathJrt.resetCaches();
+ 		}
+ 	}
+ 	protected void assertNoErrors() throws CoreException {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/util/JRTUtil.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/util/JRTUtil.java
+index d26a30c..cda9dbb 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/util/JRTUtil.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/util/JRTUtil.java
+@@ -123,6 +123,11 @@ public class JRTUtil {
+ 	    return system;
+ 	}
+ 
++	/** TEST ONLY (use when changing the "modules.to.load" property). */
++	public static void reset() {
++		images = null;
++	}
++
+ 	/**
+ 	 * Given the path of a modular image file, this method walks the archive content and
+ 	 * notifies the supplied visitor about packages and files visited.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+index 6b2d5a6..0b25df9 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+@@ -172,6 +172,23 @@ public interface IClasspathAttribute {
+ 	String PATCH_MODULE = "patch-module"; //$NON-NLS-1$
+ 
+ 	/**
++	 * Constant for the name of the limit-modules attribute.
++	 * 
++	 * <p>The value of this attribute must be a comma-separated list of names of modules
++	 * defined in the classpath entry, to which this attribute is attached.
++	 * The set of modules observable through this entry will be limited to
++	 * the transitive closure of modules in this list.</p>
++	 * 
++	 * <p>This attribute is supported for classpath entries of kind
++	 * {@link IClasspathEntry#CPE_CONTAINER}.
++	 * A classpath entry having this attribute must also have the
++	 * {@link #MODULE} attribute with value <code>"true"</code>.</p>
++	 *
++	 * @since 3.13 BETA_JAVA9
++	 */
++	String LIMIT_MODULES = "limit-modules"; //$NON-NLS-1$
++
++	/**
+ 	 * Constant of the name of the module-main-class attribute.
+ 	 * The classpath entry holding this attribute must refer to a source folder
+ 	 * containing the implementation of a module.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+index 914f902..3156313 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 201y IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -22,6 +22,7 @@ import java.net.URI;
+ import java.nio.file.FileVisitResult;
+ import java.nio.file.attribute.BasicFileAttributes;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Hashtable;
+@@ -29,6 +30,7 @@ import java.util.Iterator;
+ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.jar.Manifest;
+ import java.util.stream.Collectors;
+ 
+@@ -79,6 +81,10 @@ import org.eclipse.jdt.core.WorkingCopyOwner;
+ import org.eclipse.jdt.core.compiler.CategorizedProblem;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.core.eval.IEvaluationContext;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
++import org.eclipse.jdt.internal.compiler.env.IModule;
++import org.eclipse.jdt.internal.compiler.env.IModule.IModuleReference;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.compiler.util.JRTUtil;
+ import org.eclipse.jdt.internal.compiler.util.ObjectVector;
+@@ -643,6 +649,9 @@ public class JavaProject
+ 							if (info.jrtRoots == null || !info.jrtRoots.containsKey(entryPath)) {
+ 								ObjectVector imageRoots = new ObjectVector();
+ 								loadModulesInJimage(entryPath, imageRoots, rootToResolvedEntries, resolvedEntry, referringEntry);
++								String limitModules = ClasspathEntry.getExtraAttribute(resolvedEntry, IClasspathAttribute.LIMIT_MODULES);
++								if (limitModules != null)
++									imageRoots = filterLimitedModules(entryPath, imageRoots, limitModules);
+ 								info.setJrtPackageRoots(entryPath, imageRoots);
+ 								accumulatedRoots.addAll(imageRoots);
+ 								rootIDs.add(rootID);
+@@ -691,6 +700,69 @@ public class JavaProject
+ 		}
+ 	}
+ 
++	private ObjectVector filterLimitedModules(IPath jrtPath, ObjectVector imageRoots, String limitModules) {
++		Set<String> limitModulesSet = new HashSet<>(Arrays.asList(limitModules.split(","))); //$NON-NLS-1$
++		ModuleLookup lookup = new ModuleLookup(jrtPath.toFile());
++		// collect all module roots:
++		for (int i = 0; i < imageRoots.size(); i++) {
++			lookup.recordRoot((JrtPackageFragmentRoot) imageRoots.elementAt(i));
++		}
++		// for those contained in limitModules, add the transitive closure:
++		for (int i = 0; i < imageRoots.size(); i++) {
++			String moduleName = ((JrtPackageFragmentRoot) imageRoots.elementAt(i)).moduleName;
++			if (limitModulesSet.contains(moduleName))
++				lookup.addTransitive(moduleName);
++		}
++		// map the result back to package fragment roots:
++		ObjectVector result = new ObjectVector(lookup.resultModuleSet.size());
++		for (IModule mod : lookup.resultModuleSet) {
++			result.add(lookup.getRoot(mod));
++		}
++		return result;
++	}
++
++	/** Helper for computing the transitive closure of a set of modules. */
++	private static class ModuleLookup {
++		File jrtFile;
++		Map<String, JrtPackageFragmentRoot> modNames2Roots = new HashMap<>();
++		Map<String, IModule> modules = new HashMap<>();
++		Set<IModule> resultModuleSet = new HashSet<>();
++		
++		public ModuleLookup(File jrtFile) {
++			this.jrtFile = jrtFile;
++		}
++
++		void recordRoot(JrtPackageFragmentRoot root) {
++			this.modNames2Roots.put(root.moduleName, root);
++		}
++		void addTransitive(String moduleName) {
++			IModule module = getModule(moduleName);
++			if (module != null && this.resultModuleSet.add(module)) {
++				for (IModuleReference reqRef : module.requires())
++					addTransitive(String.valueOf(reqRef.name()));
++			}
++		}
++		private IModule getModule(String moduleName) {
++			IModule result = this.modules.get(moduleName);
++			if (result == null) {
++				JrtPackageFragmentRoot root = this.modNames2Roots.get(moduleName);
++				if (root != null) {
++					try {
++						ClassFileReader classFile = JRTUtil.getClassfile(this.jrtFile, TypeConstants.MODULE_INFO_CLASS_NAME_STRING, root.moduleName);
++						result = classFile.getModuleDeclaration();
++						this.modules.put(moduleName, result);
++					} catch (IOException | ClassFormatException e) {
++						JavaCore.getJavaCore().getLog().log(new Status(IStatus.ERROR, JavaCore.PLUGIN_ID, "Failed to read module-info.class", e)); //$NON-NLS-1$
++					}
++				}
++			}
++			return result;
++		}
++		JrtPackageFragmentRoot getRoot(IModule module) {
++			return this.modNames2Roots.get(String.valueOf(module.name()));
++		}
++	}
++
+ 	/**
+ 	 * This bogus package fragment root acts as placeholder plus bridge for the
+ 	 * real one until the module name becomes available. It is useful in certain
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
+index e570dc0..0da310f 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
+@@ -33,8 +33,10 @@ import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+ /**
+- * An instance of this class collects add-exports and add-reads options from a project's
+- * class path entries, and performs the corresponding updates when requested by the compiler.
++ * An instance of this class collects <code>add-exports</code> and <code>add-reads</code> options from
++ * a project's class path entries, and performs the corresponding updates when requested by the compiler.
++ * <p>For <code>patch-module</code> and <code>limit-modules</code> see
++ * org.eclipse.jdt.internal.core.builder.ModuleEntryProcessor.</p>
+  */
+ public class ModuleUpdater {
+ 
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+index 45c8c7d..97f430c 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+@@ -271,4 +271,9 @@ public NameEnvironmentAnswer findClass(String typeName, String qualifiedPackageN
+ 	// 
+ 	return findClass(typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName, false);
+ }
++/** TEST ONLY */
++public static void resetCaches() {
++	PackageCache.clear();
++	ModulesCache.clear();
++}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModuleEntryProcessor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModuleEntryProcessor.java
+new file mode 100644
+index 0000000..0773626
+--- /dev/null
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModuleEntryProcessor.java
+@@ -0,0 +1,143 @@
++/*******************************************************************************
++ * Copyright (c) 2017 GK Software AG, and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
++ * Contributors:
++ *     Stephan Herrmann - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core.builder;
++
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
++
++import org.eclipse.jdt.core.IClasspathAttribute;
++import org.eclipse.jdt.core.IClasspathEntry;
++import org.eclipse.jdt.core.IPackageFragmentRoot;
++import org.eclipse.jdt.internal.compiler.env.IModule;
++import org.eclipse.jdt.internal.compiler.env.IModule.IModuleReference;
++import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
++import org.eclipse.jdt.internal.core.ClasspathEntry;
++import org.eclipse.jdt.internal.core.JavaProject;
++import org.eclipse.jdt.internal.core.JrtPackageFragmentRoot;
++import org.eclipse.jdt.internal.core.ModuleUpdater;
++
++/** 
++ * Collection of functions to process classpath attributes relating to modules (from JEP 261).
++ * For <code>add-exports</code> and <code>add-reads</code> see {@link ModuleUpdater}.
++ */
++class ModuleEntryProcessor {
++
++	// ------------- patch-module: ---------------
++
++	/**
++	 * Establish that an entry with <code>patch-module</code> appears at position 0, if any.
++	 * This ensures that in the first iteration we find the patchedModule (see e.g., collectModuleEntries()),
++	 * which later can be combined into each src-entry (see {@link #combinePatchIntoModuleEntry(ClasspathLocation, IModule, Map)}).
++	 * @see IClasspathAttribute#PATCH_MODULE
++	 */
++	static String pushPatchToFront(IClasspathEntry[] classpathEntries) {
++		String patchedModule = null;
++		for (int i = 0; i < classpathEntries.length; i++) {
++			IClasspathEntry entry = classpathEntries[i];
++			patchedModule = ClasspathEntry.getExtraAttribute(entry, IClasspathAttribute.PATCH_MODULE);
++			if (patchedModule != null) {
++				if (i > 0) {
++					IClasspathEntry tmp = classpathEntries[0];
++					classpathEntries[0] = entry;
++					classpathEntries[i] = tmp;
++				}
++				return patchedModule;
++			}
++		}
++		return null;
++	}
++
++	/**
++	 * Given that sourceLocation belongs to the project that patches another module, combine this source location
++	 * into the existing {@link IModulePathEntry} for the module to be patched.
++	 * @param sourceLocation source location of the patch project
++	 * @param patchedModule module defined in the target location
++	 * @param moduleEntries map of known module locations
++	 */
++	static void combinePatchIntoModuleEntry(ClasspathLocation sourceLocation, IModule patchedModule, Map<String, IModulePathEntry> moduleEntries) {
++		sourceLocation.setModule(patchedModule);
++		String patchedModuleName = String.valueOf(patchedModule.name());
++		IModulePathEntry mainEntry = moduleEntries.get(patchedModuleName);
++		ClasspathLocation[] combinedLocations = null;
++		if (mainEntry instanceof ModulePathEntry.Multi) {
++			((ModulePathEntry.Multi) mainEntry).addPatchLocation(sourceLocation);
++			return;
++		} else if (mainEntry instanceof ClasspathJrt) {
++			combinedLocations = new ClasspathLocation[] { (ClasspathLocation) mainEntry, sourceLocation };
++			moduleEntries.put(patchedModuleName, new ModulePathEntry.Multi(null, patchedModule, combinedLocations));
++			return;
++		} else if (mainEntry instanceof ModulePathEntry) {
++			ClasspathLocation[] mainLocs = ((ModulePathEntry) mainEntry).locations;
++			combinedLocations = Arrays.copyOf(mainLocs, mainLocs.length+1);
++			combinedLocations[combinedLocations.length-1] = sourceLocation;
++		} else if (mainEntry instanceof ClasspathLocation) {
++			combinedLocations = new ClasspathLocation[] { (ClasspathLocation) mainEntry, sourceLocation };
++		} else {
++			throw new IllegalStateException("Cannot patch the module of classpath entry "+mainEntry); //$NON-NLS-1$
++		}
++		moduleEntries.put(patchedModuleName, new ModulePathEntry(null, patchedModule, combinedLocations));
++	}
++
++	// ------------- limit-modules: ---------------
++
++	/**
++	 * Reads a <code>limit-modules</code> attribute, and computes the transitive closure of requested modules. 
++	 * @param javaProject the current java project
++	 * @param entry the classpath entry to process
++	 * @return a set of module names or <code>null</code> if the classpath attribute was not set.
++	 * @see IClasspathAttribute#LIMIT_MODULES
++	 */
++	static Set<String> computeLimitModules(JavaProject javaProject, ClasspathEntry entry) {
++		String extraAttribute = ClasspathEntry.getExtraAttribute(entry, IClasspathAttribute.LIMIT_MODULES);
++		if (extraAttribute == null)
++			return null;
++		
++		// collect all modules of this CP entry:
++		Map<String, IModule> modules = new HashMap<>();
++		for (IPackageFragmentRoot root : javaProject.findPackageFragmentRoots(entry)) {
++			if (root instanceof JrtPackageFragmentRoot) {
++				IModule module = ((JrtPackageFragmentRoot) root).getModule();
++				if (module != null)
++					modules.put(String.valueOf(module.name()), module);
++			}
++		}
++
++		// collect the transitive closure of modules contained in limitSet
++		Set<String> limitSet = new HashSet<>(Arrays.asList(extraAttribute.split(","))); //$NON-NLS-1$
++		Set<String> result = new HashSet<>(limitSet);
++		for (Map.Entry<String, IModule> moduleEntry: modules.entrySet()) {
++			if (limitSet.contains(moduleEntry.getKey()))
++				addTransitive(moduleEntry.getValue(), modules, result);
++		}
++		return result;
++	}
++
++	private static void addTransitive(IModule module, Map<String, IModule> modules, Set<String> result) {
++		if (module.requires() != null) {
++			for (int i = 0; i < module.requires().length; i++) {
++				IModuleReference requires = module.requires()[i];
++				String requiredName = String.valueOf(requires.name());
++				if (result.add(requiredName)) {
++					IModule requiredModule = modules.get(requiredName);
++					if (requiredModule != null)
++						addTransitive(requiredModule, modules, result);
++				}
++			}
++		}
++	}
++}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+index b587d14..2a7a9ab 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+@@ -118,7 +118,7 @@ private void computeClasspathLocations(
+ 	}
+ 	IModuleDescription mod = null;
+ 	
+-	String patchedModuleName = pushPatchToFront(classpathEntries);
++	String patchedModuleName = ModuleEntryProcessor.pushPatchToFront(classpathEntries);
+ 	IModule patchedModule = null;
+ 
+ 	nextEntry : for (int i = 0, l = classpathEntries.length; i < l; i++) {
+@@ -135,6 +135,12 @@ private void computeClasspathLocations(
+ 		if (target == null) continue nextEntry;
+ 		boolean isOnModulePath = isOnModulePath(entry);
+ 
++		Set<String> limitModules = ModuleEntryProcessor.computeLimitModules(javaProject, entry);
++		if (patchedModuleName != null &&  limitModules != null && !limitModules.contains(patchedModuleName)) {
++			// TODO(SHMOD) report an error
++			patchedModuleName = null;
++		}
++
+ 		if (this.moduleUpdater != null)
+ 			this.moduleUpdater.computeModuleUpdates(entry);
+ 
+@@ -159,7 +165,7 @@ private void computeClasspathLocations(
+ 							entry.fullExclusionPatternChars(),
+ 							entry.ignoreOptionalProblems());
+ 				if (patchedModule != null) {
+-					combineIntoModuleEntry(sourceLocation, patchedModule, moduleEntries);
++					ModuleEntryProcessor.combinePatchIntoModuleEntry(sourceLocation, patchedModule, moduleEntries);
+ 				}
+ 				sLocations.add(sourceLocation);
+ 				continue nextEntry;
+@@ -218,9 +224,11 @@ private void computeClasspathLocations(
+ 					ModulePathEntry projectEntry = new ModulePathEntry(prereqJavaProject.getPath(), info,
+ 							projectLocations.toArray(new ClasspathLocation[projectLocations.size()]));
+ 					String moduleName = String.valueOf(info.name());
+-					moduleEntries.put(moduleName, projectEntry);
+-					if (moduleName.equals(patchedModuleName))
+-						patchedModule = info;
++					if (limitModules == null || limitModules.contains(moduleName)) {
++						moduleEntries.put(moduleName, projectEntry);
++						if (moduleName.equals(patchedModuleName))
++							patchedModule = info;
++					}
+ 				}
+ 				continue nextEntry;
+ 
+@@ -247,7 +255,8 @@ private void computeClasspathLocations(
+ 					// TODO: Ideally we need to do something like mapToModulePathEntry using the path and if it is indeed
+ 					// a module path entry, then add the corresponding entry here, but that would need the target platform
+ 					if (moduleEntries != null) {
+-						patchedModule = collectModuleEntries(bLocation, path, isOnModulePath, patchedModuleName, patchedModule, moduleEntries);
++						patchedModule = collectModuleEntries(bLocation, path, isOnModulePath,
++											limitModules, patchedModuleName, patchedModule, moduleEntries);
+ 					}
+ 					if (binaryLocationsPerProject != null) { // normal builder mode
+ 						IProject p = resource.getProject(); // can be the project being built
+@@ -270,7 +279,8 @@ private void computeClasspathLocations(
+ 					ClasspathLocation bLocation = ClasspathLocation.forLibrary(path.toOSString(), accessRuleSet, externalAnnotationPath, isOnModulePath);
+ 					bLocations.add(bLocation);
+ 					if (moduleEntries != null) {
+-						patchedModule = collectModuleEntries(bLocation, path, isOnModulePath, patchedModuleName, patchedModule, moduleEntries);
++						patchedModule = collectModuleEntries(bLocation, path, isOnModulePath,
++											limitModules, patchedModuleName, patchedModule, moduleEntries);
+ 					}
+ 				}
+ 				continue nextEntry;
+@@ -326,35 +336,14 @@ private void computeClasspathLocations(
+ 		this.modulePathEntries = moduleEntries;
+ }
+ 
+-/**
+- * Establish that an entry with --patch-module appears at position 0, if any.
+- * This ensures that in the first iteration we find the patchedModule (see e.g., collectModuleEntries()),
+- * which later can be combined into each src-entry (see combineIntoModuleEntry()).
+- */
+-private String pushPatchToFront(IClasspathEntry[] classpathEntries) {
+-	String patchedModule = null;
+-	for (int i = 0; i < classpathEntries.length; i++) {
+-		IClasspathEntry entry = classpathEntries[i];
+-		patchedModule = ClasspathEntry.getExtraAttribute(entry, IClasspathAttribute.PATCH_MODULE);
+-		if (patchedModule != null) {
+-			if (i > 0) {
+-				IClasspathEntry tmp = classpathEntries[0];
+-				classpathEntries[0] = entry;
+-				classpathEntries[i] = tmp;
+-			}
+-			return patchedModule;
+-		}
+-	}
+-	return null;
+-}
+-
+ /** Returns the patched module if that is served by the current (binary) location. */
+-IModule collectModuleEntries(ClasspathLocation bLocation, IPath path, boolean isOnModulePath,
++IModule collectModuleEntries(ClasspathLocation bLocation, IPath path, boolean isOnModulePath, Set<String> limitModules,
+ 								String patchedModuleName, IModule patchedModule, Map<String, IModulePathEntry> moduleEntries) {
+ 	if (bLocation instanceof IMultiModuleEntry) {
+ 		IMultiModuleEntry binaryModulePathEntry = (IMultiModuleEntry) bLocation;
+ 		for (String moduleName : binaryModulePathEntry.getModuleNames()) {
+-			moduleEntries.put(moduleName, binaryModulePathEntry);
++			if (limitModules == null || limitModules.contains(moduleName))
++				moduleEntries.put(moduleName, binaryModulePathEntry);
+ 		}
+ 		if (patchedModuleName != null) {
+ 			IModule module = binaryModulePathEntry.getModule(patchedModuleName.toCharArray());
+@@ -367,41 +356,19 @@ IModule collectModuleEntries(ClasspathLocation bLocation, IPath path, boolean is
+ 		IModule module = binaryModulePathEntry.getModule();
+ 		if (module != null) {
+ 			String moduleName = String.valueOf(module.name());
+-			moduleEntries.put(moduleName, binaryModulePathEntry);
+-			if (patchedModuleName != null) {
+-				if (moduleName.equals(patchedModuleName))
+-					return module;
+-				// TODO(SHMOD): report problem: patchedModuleName didn't match a module from this location
++			if (limitModules == null || limitModules.contains(moduleName)) {
++				moduleEntries.put(moduleName, binaryModulePathEntry);
++				if (patchedModuleName != null) {
++					if (moduleName.equals(patchedModuleName))
++						return module;
++					// TODO(SHMOD): report problem: patchedModuleName didn't match a module from this location
++				}
+ 			}
+ 		}
+ 	}
+ 	return patchedModule;
+ }
+ 
+-void combineIntoModuleEntry(ClasspathLocation sourceLocation, IModule patchedModule, Map<String, IModulePathEntry> moduleEntries) {
+-	sourceLocation.setModule(patchedModule);
+-	String patchedModuleName = String.valueOf(patchedModule.name());
+-	IModulePathEntry mainEntry = moduleEntries.get(patchedModuleName);
+-	ClasspathLocation[] combinedLocations = null;
+-	if (mainEntry instanceof ModulePathEntry.Multi) {
+-		((ModulePathEntry.Multi) mainEntry).addPatchLocation(sourceLocation);
+-		return;
+-	} else if (mainEntry instanceof ClasspathJrt) {
+-		combinedLocations = new ClasspathLocation[] { (ClasspathLocation) mainEntry, sourceLocation };
+-		moduleEntries.put(patchedModuleName, new ModulePathEntry.Multi(null, patchedModule, combinedLocations));
+-		return;
+-	} else if (mainEntry instanceof ModulePathEntry) {
+-		ClasspathLocation[] mainLocs = ((ModulePathEntry) mainEntry).locations;
+-		combinedLocations = Arrays.copyOf(mainLocs, mainLocs.length+1);
+-		combinedLocations[combinedLocations.length-1] = sourceLocation;
+-	} else if (mainEntry instanceof ClasspathLocation) {
+-		combinedLocations = new ClasspathLocation[] { (ClasspathLocation) mainEntry, sourceLocation };
+-	} else {
+-		throw new IllegalStateException("Cannot patch the module of classpath entry "+mainEntry); //$NON-NLS-1$
+-	}
+-	moduleEntries.put(patchedModuleName, new ModulePathEntry(null, patchedModule, combinedLocations));
+-}
+-
+ protected boolean isOnModulePath(ClasspathEntry entry) {
+ 	return entry.isModular();
+ }
+commit 54049bd43ee6ccfbd3f1b67192d2ed3baee764e3
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Sep 16 00:24:04 2017 +0200
+
+    Bug 522073: [9] core support for --limit-modules
+    
+    Change-Id: I76108badc213df8e13405dde9bd0dd93ebb5202b
+
+1	0	org.eclipse.jdt.core/META-INF/MANIFEST.MF
+49	0	org.eclipse.jdt.core/model/org/eclipse/jdt/core/provisional/JavaModelAccess.java
+1	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathChange.java
+1	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+22	8	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+diff --git a/org.eclipse.jdt.core/META-INF/MANIFEST.MF b/org.eclipse.jdt.core/META-INF/MANIFEST.MF
+index 3b66877..602a1e1 100644
+--- a/org.eclipse.jdt.core/META-INF/MANIFEST.MF
++++ b/org.eclipse.jdt.core/META-INF/MANIFEST.MF
+@@ -18,6 +18,7 @@ Export-Package: org.eclipse.jdt.core,
+  org.eclipse.jdt.core.jdom,
+  org.eclipse.jdt.core.search,
+  org.eclipse.jdt.core.util,
++ org.eclipse.jdt.core.provisional;x-friends:="org.eclipse.jdt.ui",
+  org.eclipse.jdt.internal.codeassist;x-internal:=true,
+  org.eclipse.jdt.internal.codeassist.complete;x-internal:=true,
+  org.eclipse.jdt.internal.codeassist.impl;x-internal:=true,
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/provisional/JavaModelAccess.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/provisional/JavaModelAccess.java
+new file mode 100644
+index 0000000..9e7835c
+--- /dev/null
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/provisional/JavaModelAccess.java
+@@ -0,0 +1,49 @@
++/*******************************************************************************
++ * Copyright (c) 2017 GK Software AG, and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
++ * Contributors:
++ *     Stephan Herrmann - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.core.provisional;
++
++import org.eclipse.jdt.core.IClasspathAttribute;
++import org.eclipse.jdt.core.IClasspathEntry;
++import org.eclipse.jdt.core.IJavaProject;
++import org.eclipse.jdt.core.IPackageFragmentRoot;
++import org.eclipse.jdt.core.JavaModelException;
++import org.eclipse.jdt.internal.core.JavaProject;
++
++/**
++ * Provisional API for use by JDT/UI, which may possibly be removed in a future version.
++ */
++public class JavaModelAccess {
++
++	/**
++	 * In a Java 9 project, a classpath entry can be filtered using a {@link IClasspathAttribute#LIMIT_MODULES} attribute,
++	 * in which case {@link IJavaProject#findPackageFragmentRoots(IClasspathEntry)} will not contain all roots physically
++	 * present in the container.
++	 * This provisional API can be used to bypass the filter and get really all roots to which the given entry is resolved.
++	 * 
++	 * @param javaProject the Java project to search in
++	 * @param entry a classpath entry of the Java project
++	 * @return the unfiltered array of package fragment roots to which the classpath entry resolves
++	 */
++	public static IPackageFragmentRoot[] getUnfilteredPackageFragmentRoots(IJavaProject javaProject, IClasspathEntry entry) {
++		try {
++			JavaProject internalProject = (JavaProject) javaProject; // cast should be safe since IJavaProject is @noimplement
++			IClasspathEntry[] resolvedEntries = internalProject.resolveClasspath(new IClasspathEntry[]{ entry });
++			return internalProject.computePackageFragmentRoots(resolvedEntries, false /* not exported roots */, false /* ignore limit-modules! */, null /* no reverse map */);
++		} catch (JavaModelException e) {
++			// according to comment in JavaProject.findPackageFragmentRoots() we assume that this is caused by the project no longer existing
++			return new IPackageFragmentRoot[] {};
++		}
++	}
++}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathChange.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathChange.java
+index c8155ae..92a2f4a 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathChange.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathChange.java
+@@ -347,6 +347,7 @@ public class ClasspathChange {
+ 							rootIDs,
+ 							null, // inside original project
+ 							false, // don't retrieve exported roots
++							true, // respect limit-modules
+ 							null); /*no reverse map*/
+ 						// https://bugs.eclipse.org/bugs/show_bug.cgi?id=335986
+ 						// When a package fragment's corresponding resource is removed from the project, 
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+index b96754e..1aa138d 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+@@ -1150,6 +1150,7 @@ public class DeltaProcessor {
+ 					javaProject.computePackageFragmentRoots(
+ 						javaProject.getResolvedClasspath(),
+ 						false,
++						true, // respect limit modules
+ 						null /*no reverse map*/));
+ 			}
+ 
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+index 3156313..b3caeb6 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+@@ -475,7 +475,7 @@ public class JavaProject
+ 		IClasspathEntry[] resolvedClasspath = getResolvedClasspath();
+ 
+ 		// compute the pkg fragment roots
+-		IPackageFragmentRoot[] roots = computePackageFragmentRoots(resolvedClasspath, false, null /*no reverse map*/);
++		IPackageFragmentRoot[] roots = computePackageFragmentRoots(resolvedClasspath, false, true, null /*no reverse map*/);
+ 		info.setChildren(roots);
+ 		IModuleDescription module = null;
+ 		IModuleDescription current = null;
+@@ -581,6 +581,7 @@ public class JavaProject
+ 				computePackageFragmentRoots(
+ 					new IClasspathEntry[]{ resolvedEntry },
+ 					false, // don't retrieve exported roots
++					true, // respect limit-modules
+ 					null /* no reverse map */
+ 				);
+ 		} catch (JavaModelException e) {
+@@ -597,6 +598,7 @@ public class JavaProject
+ 	 * @param rootIDs HashSet
+ 	 * @param referringEntry the CP entry (project) referring to this entry, or null if initial project
+ 	 * @param retrieveExportedRoots boolean
++	 * @param respectLimitModules if true a limit-modules attribute will be evaluated to filter the resulting roots
+ 	 * @throws JavaModelException
+ 	 */
+ 	public void computePackageFragmentRoots(
+@@ -605,6 +607,7 @@ public class JavaProject
+ 		HashSet rootIDs,
+ 		IClasspathEntry referringEntry,
+ 		boolean retrieveExportedRoots,
++		boolean respectLimitModules,
+ 		Map rootToResolvedEntries) throws JavaModelException {
+ 
+ 		String rootID = ((ClasspathEntry)resolvedEntry).rootID();
+@@ -646,18 +649,21 @@ public class JavaProject
+ 					if (JavaModel.isFile(target)) {
+ 						if (JavaModel.isJimage((File) target)) {
+ 							PerProjectInfo info = getPerProjectInfo();
++							ObjectVector imageRoots;
+ 							if (info.jrtRoots == null || !info.jrtRoots.containsKey(entryPath)) {
+-								ObjectVector imageRoots = new ObjectVector();
++								imageRoots = new ObjectVector();
+ 								loadModulesInJimage(entryPath, imageRoots, rootToResolvedEntries, resolvedEntry, referringEntry);
++								info.setJrtPackageRoots(entryPath, imageRoots); // unfiltered
++								rootIDs.add(rootID);
++							} else {
++								imageRoots = info.jrtRoots.get(entryPath);
++							}
++							if (respectLimitModules) {
+ 								String limitModules = ClasspathEntry.getExtraAttribute(resolvedEntry, IClasspathAttribute.LIMIT_MODULES);
+ 								if (limitModules != null)
+ 									imageRoots = filterLimitedModules(entryPath, imageRoots, limitModules);
+-								info.setJrtPackageRoots(entryPath, imageRoots);
+-								accumulatedRoots.addAll(imageRoots);
+-								rootIDs.add(rootID);
+-							} else {
+-								accumulatedRoots.addAll(info.jrtRoots.get(entryPath));
+ 							}
++							accumulatedRoots.addAll(imageRoots);
+ 						} else if (JavaModel.isJmod((File) target)) {
+ 							root = new JModPackageFragmentRoot(entryPath, this);
+ 						}
+@@ -688,6 +694,7 @@ public class JavaProject
+ 							rootIDs,
+ 							rootToResolvedEntries == null ? resolvedEntry : ((ClasspathEntry)resolvedEntry).combineWith((ClasspathEntry) referringEntry), // only combine if need to build the reverse map
+ 							retrieveExportedRoots,
++							respectLimitModules,
+ 							rootToResolvedEntries);
+ 					}
+ 				break;
+@@ -827,12 +834,14 @@ public class JavaProject
+ 	 * Only works with resolved entries
+ 	 * @param resolvedClasspath IClasspathEntry[]
+ 	 * @param retrieveExportedRoots boolean
++	 * @param respectLimitModules if true a limit-modules attribute will be evaluated to filter the resulting roots
+ 	 * @return IPackageFragmentRoot[]
+ 	 * @throws JavaModelException
+ 	 */
+ 	public IPackageFragmentRoot[] computePackageFragmentRoots(
+ 					IClasspathEntry[] resolvedClasspath,
+ 					boolean retrieveExportedRoots,
++					boolean respectLimitModules,
+ 					Map rootToResolvedEntries) throws JavaModelException {
+ 
+ 		ObjectVector accumulatedRoots = new ObjectVector();
+@@ -842,6 +851,7 @@ public class JavaProject
+ 			new HashSet(5), // rootIDs
+ 			null, // inside original project
+ 			retrieveExportedRoots,
++			respectLimitModules,
+ 			rootToResolvedEntries);
+ 		IPackageFragmentRoot[] rootArray = new IPackageFragmentRoot[accumulatedRoots.size()];
+ 		accumulatedRoots.copyInto(rootArray);
+@@ -858,6 +868,7 @@ public class JavaProject
+ 	 * @param rootIDs HashSet
+ 	 * @param referringEntry project entry referring to this CP or null if initial project
+ 	 * @param retrieveExportedRoots boolean
++	 * @param respectLimitModules if true a limit-modules attribute will be evaluated to filter the resulting roots
+ 	 * @throws JavaModelException
+ 	 */
+ 	public void computePackageFragmentRoots(
+@@ -866,6 +877,7 @@ public class JavaProject
+ 		HashSet rootIDs,
+ 		IClasspathEntry referringEntry,
+ 		boolean retrieveExportedRoots,
++		boolean respectLimitModules,
+ 		Map rootToResolvedEntries) throws JavaModelException {
+ 
+ 		if (referringEntry == null){
+@@ -878,6 +890,7 @@ public class JavaProject
+ 				rootIDs,
+ 				referringEntry,
+ 				retrieveExportedRoots,
++				respectLimitModules,
+ 				rootToResolvedEntries);
+ 		}
+ 	}
+@@ -1416,6 +1429,7 @@ public class JavaProject
+ 						computePackageFragmentRoots(
+ 							resolveClasspath(new IClasspathEntry[] {entry}),
+ 							false, // don't retrieve exported roots
++							true, // respect limit-modules
+ 							null); /*no reverse map*/
+ 				}
+ 			}
+@@ -1609,7 +1623,7 @@ public class JavaProject
+ 
+ 	public IPackageFragmentRoot[] getAllPackageFragmentRoots(Map rootToResolvedEntries) throws JavaModelException {
+ 
+-		return computePackageFragmentRoots(getResolvedClasspath(), true/*retrieveExportedRoots*/, rootToResolvedEntries);
++		return computePackageFragmentRoots(getResolvedClasspath(), true/*retrieveExportedRoots*/, true/*respectLimitModules*/, rootToResolvedEntries);
+ 	}
+ 
+ 	/**

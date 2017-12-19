@@ -1,0 +1,311 @@
+commit 0466838d72f58188d39507baed0319c88b52b5ff
+Author: Henrik Lindberg <helindbe>
+Date:   Tue Apr 28 15:29:08 2009 +0000
+
+    Bug 274011 [ui] Available Software Dialog handles "authentication problem" badly.
+    Exceptions and status codes now find their way to the UI. The remainder needs to be handled there though.
+
+3	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/artifact/repository/SimpleArtifactRepositoryFactory.java
+7	1	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CacheManager.java
+7	1	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManager.java
+6	4	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryTransport.java
+1	1	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/messages.properties
+27	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/AllServerTests.java
+59	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/AuthTest.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvUI.java
+2	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/artifact/repository/SimpleArtifactRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/artifact/repository/SimpleArtifactRepositoryFactory.java
+index 0584638..4477ffa 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/artifact/repository/SimpleArtifactRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/artifact/repository/SimpleArtifactRepositoryFactory.java
+@@ -64,6 +64,9 @@ public class SimpleArtifactRepositoryFactory extends ArtifactRepositoryFactory {
+ 					artifacts = new BufferedOutputStream(new FileOutputStream(localFile));
+ 					IStatus status = getTransport().download(SimpleArtifactRepository.getActualLocation(location, compress), artifacts, sub.newChild(100));
+ 					if (!status.isOK()) {
++						// not meaningful to continue on an authentication exception (user will likely just be prompted again)
++						if (status.getCode() == ProvisionException.REPOSITORY_FAILED_AUTHENTICATION)
++							throw new ProvisionException(status);
+ 						// retry uncompressed
+ 						compress = false;
+ 						status = getTransport().download(SimpleArtifactRepository.getActualLocation(location, compress), artifacts, sub.newChild(100));
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CacheManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CacheManager.java
+index 19ba18c..b13355b 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CacheManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CacheManager.java
+@@ -87,6 +87,7 @@ public class CacheManager {
+ 	 * @throws AuthenticationFailedException if jar not available and xml causes authentication fail
+ 	 * @throws IOException on general IO errors
+ 	 * @throws ProvisionException on any error (e.g. user cancellation, unknown host, malformed address, connection refused, etc.)
++	 * @throws OperationCanceledException - if user canceled
+ 	 */
+ 	public File createCache(URI repositoryLocation, String prefix, IProgressMonitor monitor) throws IOException, ProvisionException {
+ 
+@@ -121,6 +122,10 @@ public class CacheManager {
+ 				lastModifiedRemote = getTransport().getLastModified(jarLocation, submonitor.newChild(1));
+ 				if (lastModifiedRemote <= 0)
+ 					LogHelper.log(new Status(IStatus.WARNING, Activator.ID, "Server returned lastModified <= 0 for " + jarLocation)); //$NON-NLS-1$
++			} catch (AuthenticationFailedException e) {
++				// it is not meaningful to continue - the credentials are for the server
++				// do not pass the exception - it gives no additional meaningful user information
++				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.CacheManager_AuthenticationFaileFor_0, repositoryLocation), null));
+ 			} catch (Exception e) {
+ 				// not ideal, just skip the jar on error, and try the xml instead - report errors for
+ 				// the xml.
+@@ -151,7 +156,8 @@ public class CacheManager {
+ 				} catch (FileNotFoundException e) {
+ 					throw new FileNotFoundException(NLS.bind(Messages.CacheManager_Neither_0_nor_1_found, jarLocation, xmlLocation));
+ 				} catch (AuthenticationFailedException e) {
+-					throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, NLS.bind(Messages.CacheManager_AuthenticationFaileFor_0, repositoryLocation), e));
++					// do not pass the exception, it provides no additional meaningful user information
++					throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.CacheManager_AuthenticationFaileFor_0, repositoryLocation), null));
+ 				} catch (CoreException e) {
+ 					IStatus status = e.getStatus();
+ 					if (status == null)
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManager.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManager.java
+index 19ba18c..b13355b 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManager.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManager.java
+@@ -87,6 +87,7 @@ public class CacheManager {
+ 	 * @throws AuthenticationFailedException if jar not available and xml causes authentication fail
+ 	 * @throws IOException on general IO errors
+ 	 * @throws ProvisionException on any error (e.g. user cancellation, unknown host, malformed address, connection refused, etc.)
++	 * @throws OperationCanceledException - if user canceled
+ 	 */
+ 	public File createCache(URI repositoryLocation, String prefix, IProgressMonitor monitor) throws IOException, ProvisionException {
+ 
+@@ -121,6 +122,10 @@ public class CacheManager {
+ 				lastModifiedRemote = getTransport().getLastModified(jarLocation, submonitor.newChild(1));
+ 				if (lastModifiedRemote <= 0)
+ 					LogHelper.log(new Status(IStatus.WARNING, Activator.ID, "Server returned lastModified <= 0 for " + jarLocation)); //$NON-NLS-1$
++			} catch (AuthenticationFailedException e) {
++				// it is not meaningful to continue - the credentials are for the server
++				// do not pass the exception - it gives no additional meaningful user information
++				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.CacheManager_AuthenticationFaileFor_0, repositoryLocation), null));
+ 			} catch (Exception e) {
+ 				// not ideal, just skip the jar on error, and try the xml instead - report errors for
+ 				// the xml.
+@@ -151,7 +156,8 @@ public class CacheManager {
+ 				} catch (FileNotFoundException e) {
+ 					throw new FileNotFoundException(NLS.bind(Messages.CacheManager_Neither_0_nor_1_found, jarLocation, xmlLocation));
+ 				} catch (AuthenticationFailedException e) {
+-					throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, NLS.bind(Messages.CacheManager_AuthenticationFaileFor_0, repositoryLocation), e));
++					// do not pass the exception, it provides no additional meaningful user information
++					throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.CacheManager_AuthenticationFaileFor_0, repositoryLocation), null));
+ 				} catch (CoreException e) {
+ 					IStatus status = e.getStatus();
+ 					if (status == null)
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryTransport.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryTransport.java
+index 915866b..ae2ef09 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryTransport.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryTransport.java
+@@ -58,7 +58,7 @@ public class RepositoryTransport extends Transport {
+ 
+ 		boolean promptUser = false;
+ 		AuthenticationInfo loginDetails = null;
+-		for (int i = RepositoryPreferences.getLoginRetryCount(); i > 0; i++) {
++		for (int i = RepositoryPreferences.getLoginRetryCount(); i > 0; i--) {
+ 			FileReader reader = null;
+ 			try {
+ 				loginDetails = Credentials.forLocation(toDownload, promptUser, loginDetails);
+@@ -127,7 +127,7 @@ public class RepositoryTransport extends Transport {
+ 
+ 		boolean promptUser = false;
+ 		AuthenticationInfo loginDetails = null;
+-		for (int i = RepositoryPreferences.getLoginRetryCount(); i > 0; i++) {
++		for (int i = RepositoryPreferences.getLoginRetryCount(); i > 0; i--) {
+ 			FileReader reader = null;
+ 			try {
+ 				loginDetails = Credentials.forLocation(toDownload, promptUser, loginDetails);
+@@ -176,16 +176,18 @@ public class RepositoryTransport extends Transport {
+ 	 * @throws OperationCanceledException if the operation was canceled by the user.
+ 	 * @return last modified date (possibly 0)
+ 	 */
+-	public long getLastModified(URI toDownload, IProgressMonitor monitor) throws UserCancelledException, CoreException, FileNotFoundException, AuthenticationFailedException {
++	public long getLastModified(URI toDownload, IProgressMonitor monitor) throws CoreException, FileNotFoundException, AuthenticationFailedException {
+ 		boolean promptUser = false;
+ 		AuthenticationInfo loginDetails = null;
+-		for (int i = RepositoryPreferences.getLoginRetryCount(); i > 0; i++) {
++		for (int i = RepositoryPreferences.getLoginRetryCount(); i > 0; i--) {
+ 			try {
+ 				loginDetails = Credentials.forLocation(toDownload, promptUser, loginDetails);
+ 				IConnectContext context = (loginDetails == null) ? null : ConnectContextFactory.createUsernamePasswordConnectContext(loginDetails.getUserName(), loginDetails.getPassword());
+ 				// get the remote info
+ 				FileInfoReader reader = new FileInfoReader(context);
+ 				return reader.getLastModified(toDownload, monitor);
++			} catch (UserCancelledException e) {
++				throw new OperationCanceledException();
+ 			} catch (CoreException e) {
+ 				// must translate this core exception as it is most likely not informative to a user
+ 				throw new CoreException(RepositoryStatus.forStatus(e.getStatus(), toDownload));
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/messages.properties b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/messages.properties
+index 97e433f..45d2af7 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/messages.properties
+@@ -70,4 +70,4 @@ fetching_0_1_of_2_at_3=Fetching {0} ({1} of {2} at {3}/s)
+ fetching_0_from_1_2_of_3_at_4=Fetching {0} ({2} of {3} at {4}/s) from {1}
+ FileTransport_reader=File Transport Reader
+ connection_to_0_failed_on_1_retry_attempt_2=Connection to {0} failed on {1}. Retry attempt {2} started
+-UnableToRead_0_TooManyAttempts=Unable to read repository at: {0}. Too many failed attempts.
++UnableToRead_0_TooManyAttempts=Unable to read repository at: {0}. Too many failed login attempts.
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/AllServerTests.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/AllServerTests.java
+new file mode 100644
+index 0000000..67e130e
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/AllServerTests.java
+@@ -0,0 +1,27 @@
++/*******************************************************************************
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.p2.tests.metadata.repository;
++
++import junit.framework.*;
++
++/**
++ * Performs all automated metadata repository tests that requires a local test server running
++ * on port 8080.
++ */
++public class AllServerTests extends TestCase {
++
++	public static Test suite() {
++		TestSuite suite = new TestSuite(AllServerTests.class.getName());
++		suite.addTestSuite(AuthTest.class);
++		return suite;
++	}
++
++}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/AuthTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/AuthTest.java
+new file mode 100644
+index 0000000..d2e5879
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/AuthTest.java
+@@ -0,0 +1,59 @@
++/*******************************************************************************
++ * Copyright (c) 2006-2009, Cloudsmith Inc.
++ * The code, documentation and other materials contained herein have been
++ * licensed under the Eclipse Public License - v 1.0 by the copyright holder
++ * listed above, as the Initial Contributor under such license. The text of
++ * such license is available at www.eclipse.org.
++ ******************************************************************************/
++
++package org.eclipse.equinox.p2.tests.metadata.repository;
++
++import java.net.URI;
++import junit.framework.TestCase;
++import org.eclipse.core.runtime.OperationCanceledException;
++import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
++import org.eclipse.equinox.p2.tests.TestActivator;
++import org.osgi.framework.ServiceReference;
++
++public class AuthTest extends TestCase {
++	//	private static String UPDATE_SITE = "http://p2.piggott.ca/updateSite/";
++	private static String UPDATE_SITE = "http://localhost:8080/private/composite/one";
++	private IMetadataRepositoryManager mgr;
++	private URI repoLoc;
++
++	protected void setUp() throws Exception {
++		super.setUp();
++		repoLoc = new URI(UPDATE_SITE);
++
++		ServiceReference sr2 = TestActivator.context.getServiceReference(IMetadataRepositoryManager.class.getName());
++		mgr = (IMetadataRepositoryManager) TestActivator.context.getService(sr2);
++		if (mgr == null) {
++			throw new RuntimeException("Repository manager could not be loaded");
++		}
++		mgr.removeRepository(repoLoc);
++		if (mgr.contains(repoLoc))
++			throw new RuntimeException("Error - An earlier test did not leave a clean state - could not remove repo");
++	}
++
++	@Override
++	protected void tearDown() throws Exception {
++		super.tearDown();
++		mgr.removeRepository(repoLoc);
++	}
++
++	public void testLoad() throws ProvisionException {
++		boolean caught = false;
++		try {
++			mgr.loadRepository(repoLoc, null);
++		} catch (OperationCanceledException e) {
++			/* ignore - the operation is supposed to be canceled */
++			caught = true;
++		} catch (ProvisionException e) {
++			caught = false;
++		}
++		assertTrue("Cancel should have been caught (1)", caught);
++
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvUI.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvUI.java
+index c02f643..d3ddfc4 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvUI.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvUI.java
+@@ -84,7 +84,7 @@ public class ProvUI {
+ 		int code = status.getCode();
+ 		// Special handling when the location is bad (not found, etc.) vs. a failure
+ 		// associated with a known repo.
+-		if (code == ProvisionException.REPOSITORY_NOT_FOUND || code == ProvisionException.REPOSITORY_INVALID_LOCATION) {
++		if (code == ProvisionException.REPOSITORY_NOT_FOUND || code == ProvisionException.REPOSITORY_INVALID_LOCATION || code == ProvisionException.REPOSITORY_FAILED_AUTHENTICATION) {
+ 			if (!hasNotFoundStatusBeenReported(location)) {
+ 				PlatformUI.getWorkbench().getDisplay().asyncExec(new Runnable() {
+ 					public void run() {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+index 5584f17..c93195b 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+@@ -120,7 +120,8 @@ public abstract class QueryableRepositoryManager implements IQueryable {
+ 	protected void handleLoadFailure(ProvisionException e, URI problemRepo) {
+ 		int code = e.getStatus().getCode();
+ 		// special handling when the repo is bad.  We don't want to continually report it
+-		if (code == ProvisionException.REPOSITORY_NOT_FOUND || code == ProvisionException.REPOSITORY_INVALID_LOCATION) {
++		// TODO: consider alternative approach when it was not possible to authenticate
++		if (code == ProvisionException.REPOSITORY_NOT_FOUND || code == ProvisionException.REPOSITORY_INVALID_LOCATION || code == ProvisionException.REPOSITORY_FAILED_AUTHENTICATION) {
+ 			// If we thought we had loaded it, get rid of the reference
+ 			loaded.remove(problemRepo);
+ 			// If we've already reported a URL is not found, don't report again.
+commit 293ca51a83820e4795638c9dd08d566cba114c4a
+Author: Susan Franklin <sfranklin>
+Date:   Tue Apr 28 21:52:29 2009 +0000
+
+    Bug 274011 - [ui] Available Software Dialog handles "authentication problem" badly
+    Backing out changes
+
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvUI.java
+1	2	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvUI.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvUI.java
+index d3ddfc4..c02f643 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvUI.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvUI.java
+@@ -84,7 +84,7 @@ public class ProvUI {
+ 		int code = status.getCode();
+ 		// Special handling when the location is bad (not found, etc.) vs. a failure
+ 		// associated with a known repo.
+-		if (code == ProvisionException.REPOSITORY_NOT_FOUND || code == ProvisionException.REPOSITORY_INVALID_LOCATION || code == ProvisionException.REPOSITORY_FAILED_AUTHENTICATION) {
++		if (code == ProvisionException.REPOSITORY_NOT_FOUND || code == ProvisionException.REPOSITORY_INVALID_LOCATION) {
+ 			if (!hasNotFoundStatusBeenReported(location)) {
+ 				PlatformUI.getWorkbench().getDisplay().asyncExec(new Runnable() {
+ 					public void run() {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+index c93195b..5584f17 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+@@ -120,8 +120,7 @@ public abstract class QueryableRepositoryManager implements IQueryable {
+ 	protected void handleLoadFailure(ProvisionException e, URI problemRepo) {
+ 		int code = e.getStatus().getCode();
+ 		// special handling when the repo is bad.  We don't want to continually report it
+-		// TODO: consider alternative approach when it was not possible to authenticate
+-		if (code == ProvisionException.REPOSITORY_NOT_FOUND || code == ProvisionException.REPOSITORY_INVALID_LOCATION || code == ProvisionException.REPOSITORY_FAILED_AUTHENTICATION) {
++		if (code == ProvisionException.REPOSITORY_NOT_FOUND || code == ProvisionException.REPOSITORY_INVALID_LOCATION) {
+ 			// If we thought we had loaded it, get rid of the reference
+ 			loaded.remove(problemRepo);
+ 			// If we've already reported a URL is not found, don't report again.

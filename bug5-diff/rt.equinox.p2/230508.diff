@@ -1,0 +1,264 @@
+commit 3c7c2542873c686b57bd1ea1ca94ae033445d495
+Author: DJ Houghton <dj>
+Date:   Thu May 8 15:24:41 2008 +0000
+
+    Bug 230508 - Problems uninstalling features from different sites
+
+17	3	bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationArtifactRepository.java
+6	2	bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationArtifactRepositoryFactory.java
+9	3	bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationMetadataRepository.java
+6	2	bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationMetadataRepositoryFactory.java
+2	3	bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/SiteListener.java
+15	2	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+diff --git a/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationArtifactRepository.java b/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationArtifactRepository.java
+index 19f9516..70591a0 100644
+--- a/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationArtifactRepository.java
+@@ -30,6 +30,8 @@ public class ExtensionLocationArtifactRepository extends AbstractRepository impl
+ 	public static final Integer VERSION = new Integer(1);
+ 	private static final String POOLED = ".pooled"; //$NON-NLS-1$
+ 	private final IFileArtifactRepository artifactRepository;
++	private boolean initialized = false;
++	private File base;
+ 
+ 	/*
+ 	 * Return the location of a local repository based on
+@@ -55,18 +57,21 @@ public class ExtensionLocationArtifactRepository extends AbstractRepository impl
+ 	public ExtensionLocationArtifactRepository(URL location, IFileArtifactRepository repository, IProgressMonitor monitor) throws ProvisionException {
+ 		super(Activator.getRepositoryName(location), TYPE, VERSION.toString(), location, null, null, null);
+ 		this.artifactRepository = repository;
++		this.base = getBaseDirectory(location);
++	}
+ 
+-		File base = getBaseDirectory(location);
++	private void ensureInitialized() {
++		if (initialized)
++			return;
+ 		File plugins = new File(base, PLUGINS);
+ 		File features = new File(base, FEATURES);
+-
+ 		DirectoryWatcher watcher = new DirectoryWatcher(new File[] {plugins, features});
+ 		DirectoryChangeListener listener = new RepositoryListener(Activator.getContext(), null, artifactRepository);
+ 		if (location.getPath().endsWith(POOLED))
+ 			listener = new BundlePoolFilteredListener(listener);
+-
+ 		watcher.addListener(listener);
+ 		watcher.poll();
++		initialized = true;
+ 	}
+ 
+ 	public static void validate(URL location, IProgressMonitor monitor) throws ProvisionException {
+@@ -141,38 +146,47 @@ public class ExtensionLocationArtifactRepository extends AbstractRepository impl
+ 	}
+ 
+ 	public boolean contains(IArtifactDescriptor descriptor) {
++		ensureInitialized();
+ 		return artifactRepository.contains(descriptor);
+ 	}
+ 
+ 	public boolean contains(IArtifactKey key) {
++		ensureInitialized();
+ 		return artifactRepository.contains(key);
+ 	}
+ 
+ 	public IStatus getArtifact(IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
++		ensureInitialized();
+ 		return artifactRepository.getArtifact(descriptor, destination, monitor);
+ 	}
+ 
+ 	public IArtifactDescriptor[] getArtifactDescriptors(IArtifactKey key) {
++		ensureInitialized();
+ 		return artifactRepository.getArtifactDescriptors(key);
+ 	}
+ 
+ 	public IArtifactKey[] getArtifactKeys() {
++		ensureInitialized();
+ 		return artifactRepository.getArtifactKeys();
+ 	}
+ 
+ 	public IStatus getArtifacts(IArtifactRequest[] requests, IProgressMonitor monitor) {
++		ensureInitialized();
+ 		return artifactRepository.getArtifacts(requests, monitor);
+ 	}
+ 
+ 	public OutputStream getOutputStream(IArtifactDescriptor descriptor) throws ProvisionException {
++		ensureInitialized();
+ 		return artifactRepository.getOutputStream(descriptor);
+ 	}
+ 
+ 	public File getArtifactFile(IArtifactKey key) {
++		ensureInitialized();
+ 		return artifactRepository.getArtifactFile(key);
+ 	}
+ 
+ 	public File getArtifactFile(IArtifactDescriptor descriptor) {
++		ensureInitialized();
+ 		return artifactRepository.getArtifactFile(descriptor);
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationArtifactRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationArtifactRepositoryFactory.java
+index a549e61..fdf2ec1 100644
+--- a/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationArtifactRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationArtifactRepositoryFactory.java
+@@ -36,13 +36,17 @@ public class ExtensionLocationArtifactRepositoryFactory implements IArtifactRepo
+ 			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, Messages.failed_create_local_artifact_repository));
+ 		// make sure that we aren't trying to create a repo at a location
+ 		// where one already exists
++		boolean failed = false;
+ 		try {
+ 			new SimpleArtifactRepositoryFactory().load(repoLocation, null);
+-			String msg = NLS.bind(Messages.repo_already_exists, location.toExternalForm());
+-			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_EXISTS, msg, null));
++			failed = true;
+ 		} catch (ProvisionException e) {
+ 			// expected
+ 		}
++		if (failed) {
++			String msg = NLS.bind(Messages.repo_already_exists, location.toExternalForm());
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_EXISTS, msg, null));
++		}
+ 		IFileArtifactRepository repo = (IFileArtifactRepository) new SimpleArtifactRepositoryFactory().create(repoLocation, name, type, properties);
+ 		return new ExtensionLocationArtifactRepository(location, repo, null);
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationMetadataRepository.java b/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationMetadataRepository.java
+index 5e2c486..c8650d6 100644
+--- a/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationMetadataRepository.java
++++ b/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationMetadataRepository.java
+@@ -30,6 +30,8 @@ public class ExtensionLocationMetadataRepository extends AbstractMetadataReposit
+ 	public static final String TYPE = "org.eclipse.equinox.p2.extensionlocation.metadataRepository"; //$NON-NLS-1$
+ 	public static final Integer VERSION = new Integer(1);
+ 	private final IMetadataRepository metadataRepository;
++	private boolean initialized = false;
++	private File base;
+ 
+ 	/*
+ 	 * Return the URL for this repo's nested local repository.
+@@ -54,18 +56,21 @@ public class ExtensionLocationMetadataRepository extends AbstractMetadataReposit
+ 	public ExtensionLocationMetadataRepository(URL location, IMetadataRepository repository, IProgressMonitor monitor) throws ProvisionException {
+ 		super(Activator.getRepositoryName(location), TYPE, VERSION.toString(), location, null, null, null);
+ 		this.metadataRepository = repository;
++		this.base = getBaseDirectory(location);
++	}
+ 
+-		File base = getBaseDirectory(location);
++	private void ensureInitialized() {
++		if (initialized)
++			return;
+ 		File plugins = new File(base, PLUGINS);
+ 		File features = new File(base, FEATURES);
+-
+ 		DirectoryWatcher watcher = new DirectoryWatcher(new File[] {plugins, features});
+ 		DirectoryChangeListener listener = new RepositoryListener(Activator.getContext(), metadataRepository, null);
+ 		if (getProperties().get(SiteListener.SITE_POLICY) != null)
+ 			listener = new SiteListener(getProperties(), location.toExternalForm(), new BundlePoolFilteredListener(listener));
+-
+ 		watcher.addListener(listener);
+ 		watcher.poll();
++		initialized = true;
+ 	}
+ 
+ 	/* (non-Javadoc)
+@@ -93,6 +98,7 @@ public class ExtensionLocationMetadataRepository extends AbstractMetadataReposit
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.query.IQueryable#query(org.eclipse.equinox.internal.provisional.p2.query.Query, org.eclipse.equinox.internal.provisional.p2.query.Collector, org.eclipse.core.runtime.IProgressMonitor)
+ 	 */
+ 	public Collector query(Query query, Collector collector, IProgressMonitor monitor) {
++		ensureInitialized();
+ 		return metadataRepository.query(query, collector, monitor);
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationMetadataRepositoryFactory.java
+index a5f590f..7e6db68 100644
+--- a/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/ExtensionLocationMetadataRepositoryFactory.java
+@@ -35,13 +35,17 @@ public class ExtensionLocationMetadataRepositoryFactory implements IMetadataRepo
+ 			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, Messages.failed_create_local_artifact_repository));
+ 		// ensure that we aren't trying to create a repository at a location
+ 		// where one already exists
++		boolean failed = false;
+ 		try {
+ 			new SimpleMetadataRepositoryFactory().load(repoLocation, null);
+-			String msg = NLS.bind(Messages.repo_already_exists, location.toExternalForm());
+-			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_EXISTS, msg, null));
++			failed = true;
+ 		} catch (ProvisionException e) {
+ 			// expected
+ 		}
++		if (failed) {
++			String msg = NLS.bind(Messages.repo_already_exists, location.toExternalForm());
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_EXISTS, msg, null));
++		}
+ 		IMetadataRepository repository = new SimpleMetadataRepositoryFactory().create(repoLocation, name, null, properties);
+ 		return new ExtensionLocationMetadataRepository(location, repository, null);
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/SiteListener.java b/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/SiteListener.java
+index 4ad82a5..01beb7b 100644
+--- a/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/SiteListener.java
++++ b/bundles/org.eclipse.equinox.p2.extensionlocation/src/org/eclipse/equinox/internal/p2/extensionlocation/SiteListener.java
+@@ -14,8 +14,7 @@ import java.io.*;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Status;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.core.helpers.URLUtil;
+ import org.eclipse.equinox.internal.p2.metadata.generator.features.FeatureParser;
+@@ -180,7 +179,7 @@ public class SiteListener extends RepositoryListener {
+ 			String line = (String) e.nextElement();
+ 			StringTokenizer tokenizer = new StringTokenizer(line, ";"); //$NON-NLS-1$
+ 			String targetSite = tokenizer.nextToken();
+-			if (targetSite.startsWith("file:") && targetSite.endsWith("/eclipse/")) //$NON-NLS-1$//$NON-NLS-2$
++			if (targetSite.startsWith("file:") && new Path(targetSite).lastSegment().equals("eclipse")) //$NON-NLS-1$//$NON-NLS-2$
+ 				targetSite = targetSite.substring(0, targetSite.length() - 8);
+ 			if (!url.equals(targetSite))
+ 				continue;
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+index 8b74e25..7ab852c 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+@@ -18,6 +18,7 @@ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.extensionlocation.SiteListener;
+ import org.eclipse.equinox.internal.p2.update.*;
++import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+ import org.eclipse.equinox.internal.provisional.p2.directorywatcher.DirectoryChangeListener;
+@@ -154,7 +155,7 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		for (Iterator iter = sites.iterator(); iter.hasNext();) {
+ 			Site site = (Site) iter.next();
+ 			String siteURL = site.getUrl();
+-			if (siteURL.startsWith("file:") && siteURL.endsWith("/eclipse/")) //$NON-NLS-1$//$NON-NLS-2$
++			if (siteURL.startsWith("file:") && new Path(siteURL).lastSegment().equals("eclipse")) //$NON-NLS-1$ //$NON-NLS-2$
+ 				siteURL = siteURL.substring(0, siteURL.length() - 8);
+ 			IMetadataRepository match = getMatchingRepo(configRepositories, siteURL);
+ 			if (match == null) {
+@@ -171,6 +172,12 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 						metadataRepository = Activator.createExtensionLocationMetadataRepository(location, "extension location metadata repository: " + location.toExternalForm(), properties); //$NON-NLS-1$
+ 					} catch (ProvisionException ex) {
+ 						metadataRepository = Activator.loadMetadataRepository(location, null);
++						// set the repository properties here in case they have changed since the last time we loaded
++						for (Iterator inner = properties.keySet().iterator(); inner.hasNext();) {
++							String key = (String) inner.next();
++							String value = (String) properties.get(key);
++							metadataRepository.setProperty(key, value);
++						}
+ 					}
+ 					newRepos.add(metadataRepository);
+ 
+@@ -178,7 +185,13 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 					try {
+ 						Activator.createExtensionLocationArtifactRepository(location, "extension location artifact repository: " + location.toExternalForm(), properties); //$NON-NLS-1$
+ 					} catch (ProvisionException ex) {
+-						Activator.loadArtifactRepository(location, null);
++						IArtifactRepository artifactRepository = Activator.loadArtifactRepository(location, null);
++						// set the repository properties here in case they have changed since the last time we loaded
++						for (Iterator inner = properties.keySet().iterator(); inner.hasNext();) {
++							String key = (String) inner.next();
++							String value = (String) properties.get(key);
++							artifactRepository.setProperty(key, value);
++						}
+ 					}
+ 				} catch (MalformedURLException e) {
+ 					LogHelper.log(new Status(IStatus.ERROR, Activator.ID, NLS.bind(Messages.errorLoadingRepository, siteURL), e));

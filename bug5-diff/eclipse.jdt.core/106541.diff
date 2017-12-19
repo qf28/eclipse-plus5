@@ -1,0 +1,4276 @@
+commit 15c06de7002d8ed32fc40a1830b1a71e0fcb86e6
+Author: Jesse Garms <jgarms>
+Date:   Wed Aug 10 18:10:32 2005 +0000
+
+    Bug 106541 ClassLoader problem when generating code with APT
+    
+    Patch from Dan Somerfield. Explicitly keep track of factory classloaders, so that classes can be loaded from processors.
+
+33	19	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
+20	2	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
+index e4bf6d9..5f35428 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
+@@ -38,20 +38,28 @@ public class AnnotationProcessorFactoryLoader {
+     private static final String[] AUTOLOAD_SERVICES = {
+         "META-INF/services/com.sun.mirror.apt.AnnotationProcessorFactory" //$NON-NLS-1$
+     };
+-	
+-	/** map of plugin names -> factories */
+-	private static final HashMap<String, AnnotationProcessorFactory> PLUGIN_FACTORY_MAP = new HashMap<String, AnnotationProcessorFactory>();
+-	
+-	/** Loader instance -- holds all workspace and project data */
++    
++    private static boolean VERBOSE_LOAD = false;
++    
++    /** Loader instance -- holds all workspace and project data */
+ 	private static AnnotationProcessorFactoryLoader LOADER;
+ 	
+-	private static boolean VERBOSE_LOAD = false;
+ 	
+ 	// Members -- workspace and project data	
+ 	
+-	private final Map<IJavaProject, List<AnnotationProcessorFactory>> _project2Factories = new HashMap<IJavaProject, List<AnnotationProcessorFactory>>();
++	/** map of plugin names -> factories */
++	private final HashMap<String, AnnotationProcessorFactory> _pluginFactoryMap = 
++		new HashMap<String, AnnotationProcessorFactory>();
++	
++	private final Map<IJavaProject, List<AnnotationProcessorFactory>> _project2Factories = 
++		new HashMap<IJavaProject, List<AnnotationProcessorFactory>>();
++	
+ 	private final Set<IJavaProject> _projectsLoaded = new HashSet<IJavaProject>();
+-
++	
++    private final Map<IJavaProject, ClassLoader> _classLoaderMap = 
++    	new HashMap<IJavaProject, ClassLoader>();
++    
++    
+ 	/** 
+ 	 * Singleton
+ 	 */
+@@ -84,18 +92,24 @@ public class AnnotationProcessorFactoryLoader {
+ 		}
+ 		// Load the project
+ 		List<FactoryContainer> containers = FactoryPath.getEnabledContainers(jproj);
+-		factories = loadFactories(containers);
++		factories = loadFactories(containers, jproj);
+ 		_projectsLoaded.add(jproj);
+ 		_project2Factories.put(jproj, factories);
+ 		return factories;
+     	
+     }
+     
++    public ClassLoader getClassLoaderForJavaProject(IJavaProject project)
++    {
++        return _classLoaderMap.get(project);
++    }
++    
+     
+-	private static List<AnnotationProcessorFactory> loadFactories( List<FactoryContainer> containers )
++	private List<AnnotationProcessorFactory> loadFactories( List<FactoryContainer> containers, IJavaProject project )
+ 	{
+ 		List<AnnotationProcessorFactory> factories = new ArrayList(containers.size());
+ 		ClassLoader classLoader = _createClassLoader( containers );
++        _classLoaderMap.put(project, classLoader);
+ 		for ( FactoryContainer fc : containers )
+ 		{
+ 			List<AnnotationProcessorFactory> f = loadFactoryClasses( fc, classLoader );
+@@ -105,7 +119,7 @@ public class AnnotationProcessorFactoryLoader {
+ 		return factories;
+ 	}
+ 	
+-	private static List<AnnotationProcessorFactory> loadFactoryClasses( FactoryContainer fc, ClassLoader classLoader )
++	private List<AnnotationProcessorFactory> loadFactoryClasses( FactoryContainer fc, ClassLoader classLoader )
+ 	{
+ 		List<String> factoryNames = fc.getFactoryNames();
+ 		List<AnnotationProcessorFactory> factories = new ArrayList<AnnotationProcessorFactory>( factoryNames.size() ); 
+@@ -123,9 +137,9 @@ public class AnnotationProcessorFactoryLoader {
+ 		return factories;
+ 	}
+ 	
+-	private static AnnotationProcessorFactory loadFactoryFromPlugin( String factoryName )
++	private AnnotationProcessorFactory loadFactoryFromPlugin( String factoryName )
+ 	{
+-		AnnotationProcessorFactory apf = PLUGIN_FACTORY_MAP.get( factoryName );
++		AnnotationProcessorFactory apf = _pluginFactoryMap.get( factoryName );
+ 		if ( apf == null ) 
+ 		{
+ 			String s = "could not find AnnotationProcessorFactory " +  //$NON-NLS-1$
+@@ -135,7 +149,7 @@ public class AnnotationProcessorFactoryLoader {
+ 		return apf;
+ 	}
+ 
+-	private static AnnotationProcessorFactory loadFactoryFromClassLoader( String factoryName, ClassLoader cl )
++	private AnnotationProcessorFactory loadFactoryFromClassLoader( String factoryName, ClassLoader cl )
+ 	{
+ 		AnnotationProcessorFactory f = null;
+ 		try
+@@ -157,7 +171,7 @@ public class AnnotationProcessorFactoryLoader {
+ 		return f;
+ 	}
+ 	
+-	private static ClassLoader _createClassLoader( Collection<? extends FactoryContainer> containers )
++	private ClassLoader _createClassLoader( Collection<? extends FactoryContainer> containers )
+ 	{
+ 		ArrayList<URL> urlList = new ArrayList<URL>( containers.size() );
+ 		for ( FactoryContainer fc : containers ) 
+@@ -182,7 +196,7 @@ public class AnnotationProcessorFactoryLoader {
+ 		{
+ 			URL[] urls = urlList.toArray(new URL[urlList.size()]);
+ 			cl = new URLClassLoader( urls, AnnotationProcessorFactoryLoader.class.getClassLoader() );
+-		}
++        }
+ 		return cl;
+ 	}
+ 	
+@@ -196,7 +210,7 @@ public class AnnotationProcessorFactoryLoader {
+ 	 * do a full rediscovery.
+ 	 */
+ 	private void loadPluginFactoryMap() {
+-		assert PLUGIN_FACTORY_MAP.size() == 0 : "loadPluginFactoryMap() called more than once"; //$NON-NLS-1$
++		assert _pluginFactoryMap.size() == 0 : "loadPluginFactoryMap() called more than once"; //$NON-NLS-1$
+ 
+ 		// TODO: what follows is extremely similar to FactoryPathUtil#getAllPluginFactoryContainers().
+ 		// Surely there is some way to share that code?  The main difference is that there we don't 
+@@ -223,7 +237,7 @@ public class AnnotationProcessorFactoryLoader {
+ 					try {
+ 						Object execExt = factory.createExecutableExtension("class"); //$NON-NLS-1$ - attribute name
+ 						if (execExt instanceof AnnotationProcessorFactory){
+-							PLUGIN_FACTORY_MAP.put( execExt.getClass().getName(), (AnnotationProcessorFactory)execExt );
++							_pluginFactoryMap.put( execExt.getClass().getName(), (AnnotationProcessorFactory)execExt );
+ 						}
+ 					} catch(CoreException e) {
+ 							e.printStackTrace();
+@@ -247,7 +261,7 @@ public class AnnotationProcessorFactoryLoader {
+      * @param jar the jar file.
+      * @return a list, possibly empty, of fully qualified classnames to be instantiated.
+      */
+-    private static List<String> _getServiceClassnamesFromJar(File jar)
++    private List<String> _getServiceClassnamesFromJar(File jar)
+     {
+         List<String> classNames = new ArrayList<String>();
+         JarFile jarFile = null;
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
+index bf49a5c..0d7dc6b 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
+@@ -20,11 +20,25 @@ import java.util.List;
+ import java.util.Map;
+ 
+ import org.eclipse.core.resources.IFile;
++import org.eclipse.jdt.apt.core.internal.AnnotationProcessorFactoryLoader;
+ import org.eclipse.jdt.apt.core.internal.EclipseMirrorImpl;
+ import org.eclipse.jdt.apt.core.internal.env.BaseProcessorEnv;
+ import org.eclipse.jdt.apt.core.internal.util.Factory;
+ import org.eclipse.jdt.apt.core.internal.util.SourcePositionImpl;
+-import org.eclipse.jdt.core.dom.*;
++import org.eclipse.jdt.core.IJavaProject;
++import org.eclipse.jdt.core.dom.ASTNode;
++import org.eclipse.jdt.core.dom.ArrayInitializer;
++import org.eclipse.jdt.core.dom.CompilationUnit;
++import org.eclipse.jdt.core.dom.Expression;
++import org.eclipse.jdt.core.dom.IMethodBinding;
++import org.eclipse.jdt.core.dom.IResolvedAnnotation;
++import org.eclipse.jdt.core.dom.IResolvedMemberValuePair;
++import org.eclipse.jdt.core.dom.ITypeBinding;
++import org.eclipse.jdt.core.dom.IVariableBinding;
++import org.eclipse.jdt.core.dom.MemberValuePair;
++import org.eclipse.jdt.core.dom.NormalAnnotation;
++import org.eclipse.jdt.core.dom.SingleMemberAnnotation;
++import org.eclipse.jdt.core.dom.TypeLiteral;
+ 
+ import com.sun.mirror.declaration.AnnotationMirror;
+ import com.sun.mirror.declaration.AnnotationTypeElementDeclaration;
+@@ -262,7 +276,11 @@ public class AnnotationMirrorImpl implements AnnotationMirror, EclipseMirrorImpl
+             final ITypeBinding declaringClass = varBinding.getDeclaringClass();
+             if( declaringClass != null ){
+                 final String className = new String( declaringClass.getBinaryName() );
+-                final Class clazz = value.getClass().getClassLoader().loadClass( className );
++
++                IJavaProject project = declaringClass.getJavaElement().getJavaProject();
++                ClassLoader classLoader = AnnotationProcessorFactoryLoader.getLoader().getClassLoaderForJavaProject(project);
++                Class clazz = classLoader.loadClass(className);
++         
+                 final Field returnedField = clazz.getField( varBinding.getName() );
+                 if( returnedField.getType() != targetType )
+                     throw new ClassCastException( targetType.getName() );
+commit 6a4386c4487938e1883beaf7b72ba7d470d2bd90
+Author: Jesse Garms <jgarms>
+Date:   Thu Aug 11 17:17:59 2005 +0000
+
+    Bugzilla Bug 106541: ClassLoader problem when generating code with APT
+    
+    Patch from dsomerfi@bea.com
+    
+    Keep track of processor class in order to get at the classloader to implement reflection-based methods.
+    
+    This fixes the classloader case to work for both plugins and jars.
+
+1	0	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+2	8	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
+1	4	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
+12	0	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+index ee33985..bfc62b9 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+@@ -184,6 +184,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 					if (processor != null)
+ 					{
+ 						if ( AptPlugin.DEBUG ) trace( "runAPT: invoking processor " + processor.getClass().getName() ); //$NON-NLS-1$
++                        processorEnv.setLatestProcessor(processor);
+ 						processor.process();
+ 					}
+ 				}
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
+index c8c1c9e..a0d9229 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
+@@ -50,9 +50,6 @@ public class AnnotationProcessorFactoryLoader {
+ 		new HashMap<IJavaProject, List<AnnotationProcessorFactory>>();
+ 
+ 	private final Set<IJavaProject> _projectsLoaded = new HashSet<IJavaProject>();
+-	
+-    private final Map<IJavaProject, ClassLoader> _classLoaderMap = 
+-    	new HashMap<IJavaProject, ClassLoader>();
+     
+     
+ 	/** 
+@@ -94,16 +91,13 @@ public class AnnotationProcessorFactoryLoader {
+     	
+     }
+     
+-    public ClassLoader getClassLoaderForJavaProject(IJavaProject project)
+-    {
+-        return _classLoaderMap.get(project);
+-    }
++
+     
+ 	private List<AnnotationProcessorFactory> loadFactories( List<FactoryContainer> containers, IJavaProject project )
+ 	{
+ 		List<AnnotationProcessorFactory> factories = new ArrayList(containers.size());
+ 		ClassLoader classLoader = _createClassLoader( containers );
+-        _classLoaderMap.put(project, classLoader);
++
+ 		for ( FactoryContainer fc : containers )
+ 		{
+ 			List<AnnotationProcessorFactory> f = loadFactoryClasses( fc, classLoader );
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
+index 0d7dc6b..61d9957 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
+@@ -20,12 +20,10 @@ import java.util.List;
+ import java.util.Map;
+ 
+ import org.eclipse.core.resources.IFile;
+-import org.eclipse.jdt.apt.core.internal.AnnotationProcessorFactoryLoader;
+ import org.eclipse.jdt.apt.core.internal.EclipseMirrorImpl;
+ import org.eclipse.jdt.apt.core.internal.env.BaseProcessorEnv;
+ import org.eclipse.jdt.apt.core.internal.util.Factory;
+ import org.eclipse.jdt.apt.core.internal.util.SourcePositionImpl;
+-import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.dom.ASTNode;
+ import org.eclipse.jdt.core.dom.ArrayInitializer;
+ import org.eclipse.jdt.core.dom.CompilationUnit;
+@@ -277,8 +275,7 @@ public class AnnotationMirrorImpl implements AnnotationMirror, EclipseMirrorImpl
+             if( declaringClass != null ){
+                 final String className = new String( declaringClass.getBinaryName() );
+ 
+-                IJavaProject project = declaringClass.getJavaElement().getJavaProject();
+-                ClassLoader classLoader = AnnotationProcessorFactoryLoader.getLoader().getClassLoaderForJavaProject(project);
++                ClassLoader classLoader = _env.getLatestProcessor().getClass().getClassLoader();
+                 Class clazz = classLoader.loadClass(className);
+          
+                 final Field returnedField = clazz.getField( varBinding.getName() );
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
+index 72b660d..4d61ae8 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
+@@ -58,6 +58,7 @@ import org.eclipse.jdt.core.dom.IVariableBinding;
+ import org.eclipse.jdt.core.dom.SingleVariableDeclaration;
+ import org.eclipse.jdt.core.dom.VariableDeclarationFragment;
+ 
++import com.sun.mirror.apt.AnnotationProcessor;
+ import com.sun.mirror.apt.AnnotationProcessorEnvironment;
+ import com.sun.mirror.apt.AnnotationProcessorListener;
+ import com.sun.mirror.apt.Filer;
+@@ -106,6 +107,7 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 	// is outside of the workspace.
+ 	private VoidTypeImpl _voidType;
+ 	private PrimitiveTypeImpl[] _primitives;
++    private AnnotationProcessor _latestProcessor;
+ 	
+ 	public BaseProcessorEnv(CompilationUnit astCompilationUnit,
+ 						    IFile file,
+@@ -121,6 +123,16 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 		_typeBinding2ModelCompUnit = new HashMap<ITypeBinding, ICompilationUnit>();
+ 		initPrimitives(astCompilationUnit.getAST());
+ 	}
++    
++    public AnnotationProcessor getLatestProcessor()
++    {
++        return _latestProcessor;
++    }
++    
++    public void setLatestProcessor(AnnotationProcessor latestProcessor)
++    {
++        _latestProcessor = latestProcessor;
++    }
+ 	
+ 	public Types getTypeUtils()
+     {
+commit ec85ff03c5c75e463df0a3475c7aacc7f94ca4a3
+Author: tyeung <tyeung>
+Date:   Fri Aug 12 18:57:59 2005 +0000
+
+    Bugzilla Bug 106541 (partial fix)
+    -fix IllegalArgumentException in TypesUtil.java
+    
+    test: jdt.apt
+
+4	2	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/util/TypesUtil.java
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/util/TypesUtil.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/util/TypesUtil.java
+index 0e9ec40..71317ea 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/util/TypesUtil.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/util/TypesUtil.java
+@@ -161,8 +161,10 @@ public class TypesUtil implements Types
+ 			
+ 			final ITypeBinding[] typeParams = memberBinding.getTypeParameters();
+ 			final int numTypeParams = typeParams == null ? 0 : typeParams.length;
+-			if( numTypeParams != numArgs )
+-				throw new IllegalArgumentException("type, " + memberBinding + ", require " + numTypeParams + " type arguments " + //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++			// if no argument then a raw type will be created, otherwise it's an error when the 
++			// number of type parameter and arguments don't agree.
++			if( numTypeParams != numArgs && numArgs != 0 )
++				throw new IllegalArgumentException("type, " + memberBinding.getQualifiedName() + ", require " + numTypeParams + " type arguments " + //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                         "but found " + numArgs ); //$NON-NLS-1$
+ 			
+ 			final String typeKey = BindingKey.createParameterizedTypeBindingKey(memberBinding.getKey(), argKeys);
+commit 58f39e507a64fbc080c7de9b4b928cd31c0d49f0
+Author: tyeung <tyeung>
+Date:   Fri Aug 12 18:59:24 2005 +0000
+
+    Bugzilla Bug 106541 (partial fix)
+    -fix NoSuchMethodException in $Proxy0.annotationType (AnnotationInvocationHandler.java)
+    
+    test: jdt.apt
+
+2	2	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/DeclarationImpl.java
+6	1	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/AnnotationInvocationHandler.java
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/DeclarationImpl.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/DeclarationImpl.java
+index 2b82e02..21a566a 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/DeclarationImpl.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/DeclarationImpl.java
+@@ -77,7 +77,7 @@ public abstract class DeclarationImpl implements Declaration, EclipseMirrorImpl
+                 if( annoTypeName.equals(curTypeName) ){
+                     final AnnotationMirrorImpl annoMirror =
+                         (AnnotationMirrorImpl)Factory.createAnnotationMirror(annoInstance, this, _env);
+-                    final AnnotationInvocationHandler handler = new AnnotationInvocationHandler(annoMirror);
++                    final AnnotationInvocationHandler handler = new AnnotationInvocationHandler(annoMirror, annotationClass);
+                     return (A)Proxy.newProxyInstance(annotationClass.getClassLoader(),
+                                                      new Class[]{ annotationClass }, handler );
+                 }
+@@ -98,7 +98,7 @@ public abstract class DeclarationImpl implements Declaration, EclipseMirrorImpl
+ 				if( annoTypeName.equals(curTypeName) ){
+ 				final AnnotationMirrorImpl annoMirror =
+ 				(AnnotationMirrorImpl)Factory.createAnnotationMirror(annoInstance.resolveAnnotation(), this, _env);
+-				final AnnotationInvocationHandler handler = new AnnotationInvocationHandler(annoMirror);
++				final AnnotationInvocationHandler handler = new AnnotationInvocationHandler(annoMirror, annotationClass);
+ 				return (A)Proxy.newProxyInstance(annotationClass.getClassLoader(),
+ 				                     new Class[]{ annotationClass }, handler );
+ 				}
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/AnnotationInvocationHandler.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/AnnotationInvocationHandler.java
+index 11c8292..4cfe6c8 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/AnnotationInvocationHandler.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/AnnotationInvocationHandler.java
+@@ -28,10 +28,13 @@ public class AnnotationInvocationHandler implements InvocationHandler
+ {
+ 	private static final String JAVA_LANG_CLASS = "java.lang.Class"; //$NON-NLS-1$
+     private final AnnotationMirrorImpl _instance;
++    private final Class _clazz;
+ 
+-    public AnnotationInvocationHandler(final AnnotationMirrorImpl annotation)
++    public AnnotationInvocationHandler(final AnnotationMirrorImpl annotation,
++    								   final Class clazz)
+     {
+         _instance = annotation;
++        _clazz = clazz;
+     }
+ 
+     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable
+@@ -43,6 +46,8 @@ public class AnnotationInvocationHandler implements InvocationHandler
+                 return new Integer( _instance.hashCode() );
+             if( methodName.equals("toString") ) //$NON-NLS-1$
+                 return _instance.toString();
++            if( methodName.equals("annotationType")) //$NON-NLS-1$
++            	return _clazz;
+         }
+         else if( args.length == 1 && methodName.equals("equals") ) //$NON-NLS-1$
+         {
+commit 332f2b4bbc61519d48f9e1634468f589fe6ec357
+Author: tyeung <tyeung>
+Date:   Tue Aug 16 00:45:03 2005 +0000
+
+    more bug fixes for Bugzilla Bug 106541
+    
+    test: jdt.apt
+
+1	1	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+1	0	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+index bfc62b9..0ad8407 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+@@ -232,7 +232,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 
+ 			// log unclaimed annotations.
+ 		} catch (Throwable t) {
+-			AptPlugin.log(t, "Unexpected failure running APT"); //$NON-NLS-1$
++			AptPlugin.log(t, "Unexpected failure running APT " + _file); //$NON-NLS-1$
+ 		}
+ 		return EMPTY_APT_RESULT;
+ 	}
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
+index 61d9957..eaa2d80 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/AnnotationMirrorImpl.java
+@@ -338,6 +338,7 @@ public class AnnotationMirrorImpl implements AnnotationMirror, EclipseMirrorImpl
+                     Array.set( array, i, returnObj );
+                 }
+             }
++            return array;
+ 		}
+ 		// caller should have caught this case.
+         else if( value instanceof ITypeBinding )
+commit baf433f0226e8b9036b18a28d560e5a42cb8b949
+Author: tyeung <tyeung>
+Date:   Mon Aug 22 22:33:47 2005 +0000
+
+    Bugzilla Bug 106541  - ClassLoader problem when generating code with APT
+     -- support batch APT compilation on "batch only" annotation factory.
+        (partial fix the to problem)
+
+25	19	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatch.java
+346	103	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+15	25	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptCompilationParticipant.java
+4	1	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/DeclarationImpl.java
+7	1	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/ParameterDeclarationImpl.java
+3	3	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/APTProblem.java
+123	53	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
+32	25	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/MessagerImpl.java
+512	158	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/ProcessorEnvImpl.java
+11	5	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/generatedfile/GeneratedFileManager.java
+2	0	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/util/Visitors.java
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatch.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatch.java
+index 4c0ccd4..8573836 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatch.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatch.java
+@@ -37,12 +37,14 @@ import com.sun.mirror.apt.AnnotationProcessorFactory;
+ public class APTDispatch 
+ {	
+ 	public static APTResult runAPTDuringBuild(
+-			final List<AnnotationProcessorFactory> factories, final IFile file,
+-			final IJavaProject javaProj) 
+-	{
+-		return runAPT( factories, javaProj, file, null );
++			final List<AnnotationProcessorFactory> factories,
++			final IFile[] files,
++			final IJavaProject javaProj,
++			final boolean isFullBuild)
++	{	
++		return runAPT( factories, javaProj, files, null, isFullBuild );
+ 	}
+-
++	
+ 	/**
+ 	 * Run annnotation processing.
+ 	 * @param factories the list of annotation processor factories to be run.
+@@ -52,19 +54,25 @@ public class APTDispatch
+ 			final List<AnnotationProcessorFactory> factories,
+ 			ICompilationUnit compilationUnit, IJavaProject javaProj) 
+ 	{
+-		return runAPT( factories, javaProj, null, compilationUnit );
++		return runAPT( factories, javaProj, null, compilationUnit, false /* does not matter*/ );
+ 	}
+ 		
+ 	private static APTResult runAPT(final List<AnnotationProcessorFactory> factories,
+-			IJavaProject javaProj, IFile file, 
+-			ICompilationUnit compilationUnit )
+-	{
+-		
++			IJavaProject javaProj,
++			IFile[] files,
++			ICompilationUnit compilationUnit,
++			boolean isFullBuild)
++	{	
++
++		assert ( files != null && compilationUnit == null ) ||
++		       ( files == null && compilationUnit != null ) :
++	    	"either compilation unit is null or set of files is, but not both"; //$NON-NLS-1$
++	    
+ 		APTDispatchRunnable runnable;
+ 		ISchedulingRule schedulingRule;
+-		if ( file != null )
++		if ( files != null )
+ 		{
+-			 runnable = new APTDispatchRunnable( file, javaProj, factories );
++			 runnable = new APTDispatchRunnable( files, javaProj, factories, isFullBuild );
+ 			 schedulingRule = javaProj.getResource();
+ 		}
+ 		else
+@@ -97,11 +105,11 @@ public class APTDispatch
+ 		{
+ 			_newFiles = Collections.emptySet();
+ 			_deletedFiles = Collections.emptySet();
+-			_newDependencies = Collections.emptySet();
++			_newDependencies = Collections.emptyMap();
+ 			_newProblems = Collections.emptyMap();
+ 			_sourcePathChanged = false;
+ 		}
+-		APTResult( Set<IFile> newFiles, Set<IFile> deletedFiles, Set<String> deps, Map<IFile, List<IProblem>> problems, boolean sourcePathChanged )
++		APTResult( Set<IFile> newFiles, Set<IFile> deletedFiles, Map<IFile, Set<String>> deps, Map<IFile, List<IProblem>> problems, boolean sourcePathChanged )
+ 		{
+ 			_newFiles = newFiles;
+ 			_newDependencies = deps;
+@@ -112,16 +120,14 @@ public class APTDispatch
+ 		
+ 		private final Set<IFile> _newFiles;
+ 		private final Set<IFile> _deletedFiles;
+-		private final Set<String> _newDependencies;
++		private final Map<IFile, Set<String>> _newDependencies;
+ 		private final Map<IFile, List<IProblem>> _newProblems;
+ 		private final boolean _sourcePathChanged;
+ 		
+ 		Set<IFile> getNewFiles() { return _newFiles; }
+ 		Set<IFile> getDeletedFiles() { return _deletedFiles; }
+-		Set<String> getNewDependencies() { return _newDependencies; }
++		Map<IFile, Set<String>> getNewDependencies() { return _newDependencies; }
+ 		Map<IFile, List<IProblem>> getProblems(){return _newProblems;}
+ 		boolean getSourcePathChanged() { return _sourcePathChanged; }
+-	}
+-
+-	
++	}	
+ }
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+index 0ad8407..4075278 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+@@ -1,4 +1,4 @@
+-/*******************************************************************************
++ /*******************************************************************************
+  * Copyright (c) 2005 BEA Systems, Inc.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+@@ -12,7 +12,6 @@
+ 
+ package org.eclipse.jdt.apt.core.internal;
+ 
+-import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -27,21 +26,15 @@ import org.eclipse.core.resources.IWorkspaceRunnable;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.jdt.apt.core.AptPlugin;
++import org.eclipse.jdt.apt.core.env.Phase;
+ import org.eclipse.jdt.apt.core.internal.APTDispatch.APTResult;
+-import org.eclipse.jdt.apt.core.internal.declaration.TypeDeclarationImpl;
+-import org.eclipse.jdt.apt.core.internal.env.BaseProcessorEnv;
+ import org.eclipse.jdt.apt.core.internal.env.EclipseRoundCompleteEvent;
+ import org.eclipse.jdt.apt.core.internal.env.ProcessorEnvImpl;
+ import org.eclipse.jdt.apt.core.internal.generatedfile.GeneratedFileManager;
+-import org.eclipse.jdt.apt.core.internal.util.Factory;
+-import org.eclipse.jdt.apt.core.internal.util.Visitors.AnnotationVisitor;
+ import org.eclipse.jdt.apt.core.util.ScannerUtil;
+ import org.eclipse.jdt.core.ICompilationUnit;
+ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.compiler.IProblem;
+-import org.eclipse.jdt.core.dom.Annotation;
+-import org.eclipse.jdt.core.dom.CompilationUnit;
+-import org.eclipse.jdt.core.dom.ITypeBinding;
+ 
+ import com.sun.mirror.apt.AnnotationProcessor;
+ import com.sun.mirror.apt.AnnotationProcessorFactory;
+@@ -51,47 +44,104 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 
+ /*package*/ class APTDispatchRunnable implements IWorkspaceRunnable
+ {
+-	private final IFile _file;
++	public static final IFile[] NO_FILES = new IFile[0];
++	// TODO: until we get the UI in place, we will just hard code a few known factories.
++	private static final Set<String> BATCH_FACTORY_PREFIX;
++	// The files that requires processing.
++	private IFile[] _filesToProcess = null;
++	// the original list of files before any filtering.
++	private final IFile[] _originalFiles;
+ 	private final ICompilationUnit _compilationUnit;
+ 	private final IJavaProject _javaProject;
+ 	private final List<AnnotationProcessorFactory> _factories;
+ 	private final String _phaseName;
+-	private final String _fileName;
+-	
+ 	private  APTResult _result;
+-
+-	/*package*/ APTDispatchRunnable( IFile file, IJavaProject javaProject, List<AnnotationProcessorFactory> factories)
++	private final boolean _isFullBuild;
++	
++	static{
++		BATCH_FACTORY_PREFIX = new HashSet<String>(2);
++		BATCH_FACTORY_PREFIX.add("com.sun.istack.ws"); //$NON-NLS-1$
++		BATCH_FACTORY_PREFIX.add("com.sun.tools.ws.processor.modeler.annotation"); //$NON-NLS-1$
++	}
++	
++	/*package*/ APTDispatchRunnable( 
++			IFile[] files, 
++			IJavaProject javaProject, 
++			List<AnnotationProcessorFactory> factories,
++			boolean isFullBuild)
+ 	{
++		assert files != null : "missing files"; //$NON-NLS-1$
+ 		_compilationUnit = null;
+-		_file = file;
++		_filesToProcess = getFilesToProcess(files);
++		_originalFiles = files;
+ 		_javaProject = javaProject;
+ 		_factories = factories;
+ 		_phaseName =  "build"; //$NON-NLS-1$
+-		_fileName =  _file.toString();
+-	}
+-
++		_isFullBuild = isFullBuild;
++	}	
+ 	/*package*/ APTDispatchRunnable( ICompilationUnit cu, IJavaProject javaProject, List<AnnotationProcessorFactory> factories)
+ 	{
+ 		_compilationUnit = cu;
+-		_file = null;
++		final IFile file = (IFile)cu.getResource();
++		_filesToProcess = ScannerUtil.hasAnnotationInstance(file) ?
++				new IFile[]{file} : NO_FILES;
++		_originalFiles = new IFile[]{file};
+ 		_javaProject = javaProject;
+ 		_factories = factories;
+ 		_phaseName =  "reconcile"; //$NON-NLS-1$
+-		_fileName =  _compilationUnit.getResource().toString();
++		_isFullBuild = false;
+ 	}
+ 	
+ 	public APTResult getResult() { return _result; }
+ 	
+-	public void run(IProgressMonitor monitor) 
+-	{
+-		assert( _file == null || _compilationUnit == null ) : "Either _file should be null or _compilationUnit should be null."; //$NON-NLS-1$	
++	private static IFile[] getFilesToProcess(final IFile[] orig)
++	{			
++		int numFiles = orig.length;
++		if( numFiles == 0 )
++			return NO_FILES;
++		int count = 0;
++		boolean[] needProcess = new boolean[numFiles];
++		for( int i=0; i<numFiles; i++ ){
++			if( ScannerUtil.hasAnnotationInstance(orig[i]) ){
++				count ++;
++				needProcess[i] = true;
++			}
++			else{
++				needProcess[i] = false;
++			}
++		}
++		if( count == 0 )
++			return NO_FILES;
+ 		
++		IFile[] filesToProcess = new IFile[count];
++		int index = 0;
++		for( int i=0; i<numFiles; i++ ){
++			if( needProcess[i] )
++				filesToProcess[index++] = orig[i];
++		}
++		return filesToProcess;
++	}
++	
++	/**
++	 * Determine whether there are files to be processed. 
++	 * This call also make sure that the list of files contains exactly the list of 
++	 * files to be processed. The size of the list is the number of files to 
++	 * be processed.
++	 * @return
++	 */
++	private boolean shouldProcess()
++	{
++		if(_factories == null | _factories.size() == 0 )
++			return false;
++		return _filesToProcess.length > 0;
++	}
++	
++	public void run(IProgressMonitor monitor) 
++	{	
+ 		//
+ 		//  bail-out early if there aren't factories, or if there aren't any annotation instances
+ 		// 
+-		if ( _factories == null || _factories.size() == 0 || 
+-				( _compilationUnit != null && ! ScannerUtil.hasAnnotationInstance( _compilationUnit ) ) ||
+-				( _file!= null && !  ScannerUtil.hasAnnotationInstance( _file ) ) )
++		if ( !shouldProcess() )
+ 		{
+ 			// tracing
+ 			if ( AptPlugin.DEBUG ) 
+@@ -103,22 +153,24 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 					msg = "no annotation instances in file."; //$NON-NLS-1$
+ 				trace( "run():  leaving early because there are " + msg ); //$NON-NLS-1$
+ 			}
++
++			Set<IFile> allDeletedFiles = new HashSet<IFile>();
++			if( !_isFullBuild ){
++				for( int i=0, len = _originalFiles.length; i<len; i++ ){
++					IFile f = _originalFiles[i];
++					final Set<IFile> deletedFiles = 
++						cleanupAllGeneratedFilesForParent( f, _compilationUnit );
++					if( deletedFiles != null )
++						allDeletedFiles.addAll(deletedFiles);
++				}
++			}
+ 			
+-			
+-			IFile f;
+-			if ( _file != null )
+-				f = _file;
+-			else
+-				f = (IFile)_compilationUnit.getResource();
+-			
+-			Set<IFile> deletedFiles = cleanupAllGeneratedFilesForParent( f, _compilationUnit );
+-			
+-			if ( deletedFiles.size() == 0 )
++			if ( allDeletedFiles.size() == 0 )
+ 				_result =  EMPTY_APT_RESULT;
+ 			else
+ 				_result = new APTResult( Collections.<IFile>emptySet(), 
+-										 deletedFiles, 
+-										 Collections.<String>emptySet(),
++										 allDeletedFiles, 
++										 Collections.<IFile, Set<String>>emptyMap(),
+ 										 Collections.<IFile, List<IProblem>>emptyMap(), false );
+ 		}
+ 		else
+@@ -133,49 +185,73 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 			else
+ 			{
+ 				processorEnv = ProcessorEnvImpl
+-					.newProcessorEnvironmentForBuild( _file, _javaProject);
++					.newProcessorEnvironmentForBuild( _filesToProcess, _javaProject);
+ 			}
+ 			_result = runAPT(_factories, processorEnv);
+ 		}
+ 	}
+ 	
+-	private APTResult runAPT(
+-			final List<AnnotationProcessorFactory> factories,
+-			final ProcessorEnvImpl processorEnv) 
++	/**
++	 * @param factories
++	 * @return <code>true</code> iff there are factories that can only be run in batch mode.
++	 */
++	public static boolean hasBatchFactory(List<AnnotationProcessorFactory> factories)
+ 	{
+-		try {
+-			if (factories.size() == 0)
+-			{
+-				if ( AptPlugin.DEBUG ) trace( "runAPT: leaving early because there are no factories"); //$NON-NLS-1$
+-				return EMPTY_APT_RESULT;
+-			}
+-				
+-			if ( ! processorEnv.getFile().exists() )
+-			{
+-				if ( AptPlugin.DEBUG ) trace( "runAPT: leaving early because file doesn't exist"); //$NON-NLS-1$
+-				return EMPTY_APT_RESULT;
+-			}				
+ 		
+-			final Map<String, AnnotationTypeDeclaration> annotationDecls = getAnnotationTypeDeclarations(
+-					processorEnv.getAstCompilationUnit(), processorEnv);
+-			
+-			if (annotationDecls.isEmpty())
+-			{
+-				if ( AptPlugin.DEBUG ) trace( "runAPT:  leaving early because annotationDecls is empty" ); //$NON-NLS-1$
+-				return EMPTY_APT_RESULT;
+-			}
+-
+-			GeneratedFileManager gfm = GeneratedFileManager.getGeneratedFileManager( processorEnv.getJavaProject().getProject() );
+-			Set<IFile> lastGeneratedFiles = gfm.getGeneratedFilesForParent( processorEnv.getFile() );
+-			
+-			for (int i = 0, size = factories.size(); i < size; i++) {
+-				final AnnotationProcessorFactory factory = factories.get(i);
+-				Set<AnnotationTypeDeclaration> factoryDecls = getAnnotations(factory, annotationDecls);
+-				boolean done = false;
++		for( AnnotationProcessorFactory factory : factories ){
++			if( isBatchFactory(factory) )
++				return true;
++		}
++		return false;
++		
++	}
++	
++	/**
++	 * @param factory
++	 * @return <code>true</code> iff the given factory can only be run in batch mode.
++	 */
++	public static boolean isBatchFactory(AnnotationProcessorFactory factory)
++	{
++		// TODO: (theodora)handle the switch between file-based and batch processor properly
++		//       Waiting on UI support. Default is file base.	
++		final String factoryName = factory.getClass().getName();
++		for(String prefix : BATCH_FACTORY_PREFIX ){
++			if( factoryName.startsWith(prefix) )
++				return true;
++		}
++		return false;
++	}
++	
++	/**
++	 * Batch processor should only be invoked during a clean build.
++	 * @param factories
++	 * @param processorEnv
++	 * @return <code>true</code> iff batch processors should be dispatched.
++	 * Return <code>false</code> otherwise. Return <code>false</code> if
++	 * there are no batch processors.
++	 */
++	private boolean shouldDispatchToBatchProcessor(final List<AnnotationProcessorFactory> factories,
++										 		   final ProcessorEnvImpl processorEnv )
++	{	
++		return ( _isFullBuild && processorEnv.getPhase() == Phase.BUILD && hasBatchFactory(factories) );
++	}
++	
++	private void runAPTInFileBasedMode(
++			final List<AnnotationProcessorFactory> factories,
++			final ProcessorEnvImpl processorEnv )
++	{
++		for( int fileIndex=0, numFiles=_filesToProcess.length; fileIndex<numFiles; fileIndex++ ){
++			final IFile curFile = _filesToProcess[fileIndex];
++			processorEnv.setFileProcessing(curFile);
++			Map<String, AnnotationTypeDeclaration> annotationDecls = processorEnv.getAnnotationTypesInFile();
++			for (int factoryIndex = 0, numFactories = factories.size(); factoryIndex < numFactories; factoryIndex++) {
++				final AnnotationProcessorFactory factory = factories.get(factoryIndex);
++				if( isBatchFactory(factory) ) continue;
++				Set<AnnotationTypeDeclaration> factoryDecls = getFactorySupportedAnnotations(factory, annotationDecls);
+ 				if( factoryDecls != null ){
+ 					if(factoryDecls.size() == 0 ){
+-						done = true;
+ 						factoryDecls = new HashSet(annotationDecls.values());
++						annotationDecls.clear();
+ 					}
+ 				}
+ 				if (factoryDecls != null && factoryDecls.size() > 0) {
+@@ -183,16 +259,161 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 							.getProcessorFor(factoryDecls, processorEnv);
+ 					if (processor != null)
+ 					{
+-						if ( AptPlugin.DEBUG ) trace( "runAPT: invoking processor " + processor.getClass().getName() ); //$NON-NLS-1$
+-                        processorEnv.setLatestProcessor(processor);
++						if ( AptPlugin.DEBUG ) 
++							trace( "runAPT: invoking file-based processor " + processor.getClass().getName() ); //$NON-NLS-1$
++	                    processorEnv.setLatestProcessor(processor);
+ 						processor.process();
+ 					}
+ 				}
+-
+-				if (annotationDecls.isEmpty() || done)
++	
++				if (annotationDecls.isEmpty())
++					break;
++			}
++			
++			if( ! annotationDecls.isEmpty() )
++				; // TODO: (theodora) log unclaimed annotations.
++		}	
++	}
++	
++	/**
++	 * mixed mode - allow batch processor to be run as well as filed based ones.
++	 * @param factories
++	 * @param processorEnv
++	 */
++	private void runAPTInMixedMode(
++			final List<AnnotationProcessorFactory> factories,
++			final ProcessorEnvImpl processorEnv)
++	{
++		final Map<IFile, Set<AnnotationTypeDeclaration>> file2AnnotationDecls = 
++			new HashMap<IFile, Set<AnnotationTypeDeclaration>>(_filesToProcess.length * 4/3 + 1);
++		final Map<String, AnnotationTypeDeclaration> annotationDecls = 
++			processorEnv.getAllAnnotationTypes(file2AnnotationDecls);	
++		
++		System.err.println(file2AnnotationDecls);
++		
++		if (annotationDecls.isEmpty())
++		{
++			if ( AptPlugin.DEBUG ) 
++				trace( "runAPT:  leaving early because annotationDecls is empty" ); //$NON-NLS-1$
++			return;
++		}
++		
++		// file based processing factory to the set of annotations that it 'claims'
++		final Map<AnnotationProcessorFactory, Set<AnnotationTypeDeclaration>> fileFactory2Annos =
++			new HashMap<AnnotationProcessorFactory, Set<AnnotationTypeDeclaration>>( factories.size() * 4/3 + 1 );
++		
++		// batch processing factory to the set of annotations that it 'claims'
++		final Map<AnnotationProcessorFactory, Set<AnnotationTypeDeclaration>> batchFactory2Annos =
++			new HashMap<AnnotationProcessorFactory, Set<AnnotationTypeDeclaration>>( factories.size() * 4/3 + 1 );		
++		
++		for( int i=0, size=factories.size(); i<size; i++ ){
++			final AnnotationProcessorFactory factory = factories.get(i);
++			Set<AnnotationTypeDeclaration> annotationTypes = getFactorySupportedAnnotations(factory, annotationDecls);
++			if( annotationTypes != null ){
++				
++				boolean batch = isBatchFactory(factory);
++				Map<AnnotationProcessorFactory, Set<AnnotationTypeDeclaration> > factory2Annos = 
++					batch ? batchFactory2Annos : fileFactory2Annos;
++				if( annotationTypes.size() == 0 ){
++					// this factory is claiming all (remaining) annotations. 
++					annotationTypes = new HashSet<AnnotationTypeDeclaration>(annotationDecls.values());
++					factory2Annos.put(factory, annotationTypes);
++					annotationDecls.clear();
+ 					break;
++				}
++				else{
++					factory2Annos.put(factory, annotationTypes);
++				}
++			}
++			if( annotationDecls.isEmpty() )
++				break;
++		}
++		
++		if( ! annotationDecls.isEmpty() )
++			; // TODO: (theodora) log unclaimed annotations.
++		
++		// Dispatch to the batch process factories first.
++		// Batch processors only get executed on a full/clean build.
++		if( !batchFactory2Annos.isEmpty() ){
++			processorEnv.setBatchProcessing();
++			// Once we figure out which factory claims what annotation,
++			// the order of the factory doesn't matter.
++			// But in order to make things consists between runs, will 
++			// dispatch base on factory order.
++			for( int i=0, size=factories.size(); i<size; i++ ){
++				final AnnotationProcessorFactory factory = factories.get(i);
++				final Set<AnnotationTypeDeclaration> annotationTypes = batchFactory2Annos.get(factory);
++				if( annotationTypes == null ) continue;
++				final AnnotationProcessor processor = 
++					factory.getProcessorFor(annotationTypes, processorEnv);
++				if( processor != null ){
++					if ( AptPlugin.DEBUG ) 
++						trace( "runAPT: invoking batch processor " + processor.getClass().getName() ); //$NON-NLS-1$
++                    processorEnv.setLatestProcessor(processor);
++					processor.process();
++				}
++			}
++		}
++		
++		// Now, do the file based dispatch
++		if( !fileFactory2Annos.isEmpty() ){
++			for( int fileIndex=0, numFiles=_filesToProcess.length; fileIndex<numFiles; fileIndex ++ ){
++				final Set<AnnotationTypeDeclaration> annotationTypesInFile = file2AnnotationDecls.get(_filesToProcess[fileIndex]);
++				if( annotationTypesInFile == null || annotationTypesInFile.isEmpty() )
++					continue;
++				for( int i=0, size=factories.size(); i<size; i++ ){
++					final AnnotationProcessorFactory factory = factories.get(i);
++					final Set<AnnotationTypeDeclaration> annotationTypesForFactory = fileFactory2Annos.get(factory);
++					if( annotationTypesForFactory == null || annotationTypesForFactory.isEmpty() ) 
++						continue;
++					final Set<AnnotationTypeDeclaration> intersect = setIntersect(annotationTypesInFile, annotationTypesForFactory);
++					if( intersect != null && !intersect.isEmpty() ){
++						processorEnv.setFileProcessing(_filesToProcess[fileIndex]);
++						final AnnotationProcessor processor = 
++							factory.getProcessorFor(intersect, processorEnv);
++						if( processor != null ){
++							if ( AptPlugin.DEBUG ) 
++								trace( "runAPT: invoking file-based processor " + processor.getClass().getName() ); //$NON-NLS-1$
++		                    processorEnv.setLatestProcessor(processor);
++							processor.process();
++						}
++					}
++				}
++			}
++		}
++	}
++	
++	private APTResult runAPT(
++			final List<AnnotationProcessorFactory> factories,
++			final ProcessorEnvImpl processorEnv) 
++	{
++		try {
++			if (factories.size() == 0)
++			{
++				if ( AptPlugin.DEBUG ) trace( "runAPT: leaving early because there are no factories"); //$NON-NLS-1$
++				return EMPTY_APT_RESULT;
++			}
++			// TODO: put the short circuit back in!!! (theodora)
++			/*			
++			if ( ! processorEnv.getFile().exists() )
++			{
++				if ( AptPlugin.DEBUG ) trace( "runAPT: leaving early because file doesn't exist"); //$NON-NLS-1$
++				return EMPTY_APT_RESULT;
++			}				
++		*/
++			GeneratedFileManager gfm = GeneratedFileManager.getGeneratedFileManager( processorEnv.getJavaProject().getProject() );
++			final Set<IFile> lastGeneratedFiles = new HashSet<IFile>();
++			for( int i=0, len=_filesToProcess.length; i<len; i++ ){
++				final Set<IFile> genFiles = gfm.getGeneratedFilesForParent( _filesToProcess[i] );
++				if( genFiles != null )
++					lastGeneratedFiles.addAll(genFiles);
+ 			}
+-			// TODO: (theodora) log unclaimed annotations.
++			
++			if( shouldDispatchToBatchProcessor(factories, processorEnv) )
++				runAPTInMixedMode(factories, processorEnv);
++			else
++				runAPTInFileBasedMode(factories, processorEnv);
++			
+ 
+ 			// notify the processor listeners
+ 			final Set<AnnotationProcessorListener> listeners = processorEnv
+@@ -221,10 +442,17 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 			// run, but are no longer generated should be removed
+ 			
+ 			// BUGZILLA 103183 - reconcile-path disabled until type-generation in reconcile is turned on
+-			Set<IFile> deletedFiles = cleanupNoLongerGeneratedFiles( processorEnv.getFile(), processorEnv.getCompilationUnit(), lastGeneratedFiles, allGeneratedFiles, gfm );
++			Set<IFile> allDeletedFiles = new HashSet<IFile>();
++			for( int i=0, len=_filesToProcess.length; i<len; i++ ){
++				final Set<IFile> deletedFiles = 
++					cleanupNoLongerGeneratedFiles( _filesToProcess[i], processorEnv.getCompilationUnit(), lastGeneratedFiles, allGeneratedFiles, gfm );
++				if(deletedFiles != null )
++					allDeletedFiles.addAll(deletedFiles);		
++			}
++			
+ 			
+ 			APTResult result = new APTResult( modifiedFiles, 
+-											  deletedFiles, 
++											  allDeletedFiles, 
+ 											  processorEnv.getTypeDependencies(), 
+ 											  processorEnv.getProblems(), processorEnv.getSourcePathChanged() );
+ 			processorEnv.close();
+@@ -232,10 +460,27 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 
+ 			// log unclaimed annotations.
+ 		} catch (Throwable t) {
+-			AptPlugin.log(t, "Unexpected failure running APT " + _file); //$NON-NLS-1$
++			AptPlugin.log(t, "Unexpected failure running APT " + getFileNameForPrint()); //$NON-NLS-1$
+ 		}
+ 		return EMPTY_APT_RESULT;
+ 	}
++	
++	/**
++	 * @param one
++	 * @param two
++	 * @return the set intersect of the two given sets
++	 */
++	private Set<AnnotationTypeDeclaration> setIntersect(Set<AnnotationTypeDeclaration> one, Set<AnnotationTypeDeclaration> two ){
++		Set<AnnotationTypeDeclaration> intersect = null;	
++		for( AnnotationTypeDeclaration obj : one ){
++			if( two.contains(obj) ){
++				if( intersect == null )
++					intersect = new HashSet<AnnotationTypeDeclaration>();
++				intersect.add(obj);
++			}
++		}
++		return intersect;
++	}
+ 
+ 	private Set<IFile> cleanupAllGeneratedFilesForParent( IFile parent, ICompilationUnit parentCompilationUnit )
+ 	{
+@@ -289,7 +534,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 			final ProcessorEnvImpl env) {
+ 		for (int i = 0, size = factories.size(); i < size; i++) {
+ 			final AnnotationProcessorFactory factory = factories.get(i);
+-			final Set<AnnotationTypeDeclaration> factoryDecls = getAnnotations(
++			final Set<AnnotationTypeDeclaration> factoryDecls = getFactorySupportedAnnotations(
+ 					factory, declarations);
+ 			final AnnotationProcessor processor = factory.getProcessorFor(
+ 					factoryDecls, env);
+@@ -298,27 +543,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 				return;
+ 		}
+ 		// log unclaimed annotations.
+-	}
+-
+-	private static Map<String, AnnotationTypeDeclaration> getAnnotationTypeDeclarations(
+-			CompilationUnit astCompilationUnit, BaseProcessorEnv env) {
+-		final List<Annotation> instances = new ArrayList<Annotation>();
+-		final AnnotationVisitor visitor = new AnnotationVisitor(instances);
+-		astCompilationUnit.accept(visitor);
+-		final Map<String, AnnotationTypeDeclaration> decls = new HashMap<String, AnnotationTypeDeclaration>();
+-		for (int i = 0, size = instances.size(); i < size; i++) {
+-			final Annotation instance = instances.get(i);
+-			final ITypeBinding annoType = instance.resolveTypeBinding();
+-			if (annoType == null)
+-				continue;
+-			final TypeDeclarationImpl annoDecl = Factory.createReferenceType(
+-					annoType, env);
+-			if (annoDecl.kind() == EclipseMirrorImpl.MirrorKind.TYPE_ANNOTATION)
+-				decls.put(annoDecl.getQualifiedName(),
+-						(AnnotationTypeDeclaration) annoDecl);
+-		}
+-		return decls;
+-	}
++	}	
+ 
+ 	/**
+ 	 * @return the set of {@link AnnotationTypeDeclaration} that {@link #factory} supports or null
+@@ -328,7 +553,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 	 * This method will destructively modify {@link #declarations}. Entries will be removed from
+ 	 * {@link #declarations} as the declarations are being added into the returned set.
+ 	 */
+-	private static Set<AnnotationTypeDeclaration> getAnnotations(
++	private static Set<AnnotationTypeDeclaration> getFactorySupportedAnnotations(
+ 			final AnnotationProcessorFactory factory,
+ 			final Map<String, AnnotationTypeDeclaration> declarations)
+ 
+@@ -375,11 +600,29 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 	{
+ 		if (AptPlugin.DEBUG)
+ 		{
+-			s = "[ phase = " + _phaseName + ", file = " + _fileName +" ]  " + s; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++			s = "[ phase = " + _phaseName + ", file = " + getFileNameForPrint() +" ]  " + s; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+ 			System.out.println( "[" + APTDispatch.class.getName() + "][ thread= " + Thread.currentThread().getName() + " ]"+ s ); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+ 		}
+ 	}
+ 	
++	/**
++	 * For debugging statements only!!
++	 * @return the name of the file that we are currently processing if 
++	 * we are not in batch mode. If in batch mode, return the string "batch mode". 
++	 */
++	private String getFileNameForPrint(){
++		final int len = _filesToProcess.length;
++		switch( len )
++		{
++		case 0:
++			return "no file(s)"; //$NON-NLS-1$
++		case 1:
++			return _filesToProcess[0].getName();
++		default:
++			return "batch mode";  //$NON-NLS-1$
++		}
++	}
++	
+ 	
+ 	public static final APTResult EMPTY_APT_RESULT = new APTResult();
+ 	
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptCompilationParticipant.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptCompilationParticipant.java
+index 7155b91..34fb7f7 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptCompilationParticipant.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptCompilationParticipant.java
+@@ -14,8 +14,6 @@ package org.eclipse.jdt.apt.core.internal;
+ 
+ import java.util.Collection;
+ import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -114,36 +112,28 @@ public class AptCompilationParticipant implements ICompilationParticipant
+ 		if ("1.3".equals(javaVersion) || "1.4".equals(javaVersion)) { //$NON-NLS-1$ //$NON-NLS-2$
+ 			return EMPTY_PRE_BUILD_COMPILATION_RESULT;
+ 		}
++
++	
++		List<AnnotationProcessorFactory> factories = _factoryLoader.getFactoriesForProject( javaProject );	
++	
++		APTResult result = APTDispatch.runAPTDuringBuild(factories, buildFiles, javaProject, pbce.isFullBuild());
++		Set<IFile> newFiles = result.getNewFiles();			
++		Set<IFile> deletedFiles = result.getDeletedFiles();
+ 		
+-		HashSet<IFile> newFiles = new HashSet<IFile>();
+-		HashSet<IFile> deletedFiles = new HashSet<IFile>();
+-		HashMap<IFile, Set<String>> newDependencies = new HashMap<IFile, Set<String>>();
+-		HashMap<IFile, List<IProblem>> problems = new HashMap<IFile, List<IProblem>>(4);
+-		List<AnnotationProcessorFactory> factories = _factoryLoader.getFactoriesForProject( javaProject );
+-		boolean sourcePathChanged = false;
+-		for ( int i = 0; i < buildFiles.length; i++ )
+-		{
+-			APTResult result = APTDispatch.runAPTDuringBuild( 
+-					factories, 
+-					buildFiles[i], 
+-					javaProject );
+-			
+-			// see if APT updated a project's source path
+-			sourcePathChanged |= result.getSourcePathChanged();
+-			
+-			newFiles.addAll( result.getNewFiles() );			
+-			deletedFiles.addAll( result.getDeletedFiles() );
+-			newDependencies.put( buildFiles[i], result.getNewDependencies() );	
+-			mergeMaps(result.getProblems(), problems);
+-		}
++		// see if APT updated a project's source path
++		boolean sourcePathChanged = result.getSourcePathChanged();
+ 		
+ 		// for apt, new files will always trump deleted files
+ 		for ( IFile df : deletedFiles )
+ 			if ( newFiles.contains( df ) )
+ 				deletedFiles.remove( df );
+ 
+-		return new PreBuildCompilationResult( newFiles.toArray( new IFile[ newFiles.size() ] ), deletedFiles.toArray( new IFile[ deletedFiles.size() ] ), newDependencies, problems, sourcePathChanged );
+-		
++		return new PreBuildCompilationResult( 
++				newFiles.toArray( new IFile[ newFiles.size() ] ), 
++				deletedFiles.toArray( new IFile[ deletedFiles.size() ] ), 
++				result.getNewDependencies(), 
++				result.getProblems(), 
++				sourcePathChanged );
+ 	}
+ 	
+ 	/** 
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/DeclarationImpl.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/DeclarationImpl.java
+index 21a566a..3c7b814 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/DeclarationImpl.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/DeclarationImpl.java
+@@ -61,7 +61,10 @@ public abstract class DeclarationImpl implements Declaration, EclipseMirrorImpl
+         return false;
+     }
+ 
+-    public int hashCode(){ return _binding.hashCode(); }
++    public int hashCode(){ 
++    	final String key = getDeclarationBinding().getKey();
++    	return key == null ? 0 : key.hashCode(); 
++    }
+ 
+     <A extends Annotation> A _getAnnotation(Class<A> annotationClass,
+                                             IResolvedAnnotation[] annoInstances)
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/ParameterDeclarationImpl.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/ParameterDeclarationImpl.java
+index 791696f..0f0a633 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/ParameterDeclarationImpl.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/declaration/ParameterDeclarationImpl.java
+@@ -100,7 +100,13 @@ public abstract class ParameterDeclarationImpl extends DeclarationImpl implement
+ 
+     public MirrorKind kind(){ return MirrorKind.FORMAL_PARAMETER; }
+ 
+-    public int hashCode(){ return _executable.getDeclarationBinding().hashCode() + _paramIndex; }   
++    public int hashCode(){
++    	final String methodKey = _executable.getDeclarationBinding().getKey();
++    	int hashcode = 0;
++    	if( methodKey != null )
++    		hashcode = methodKey.hashCode();
++    	return hashcode + _paramIndex; 
++    }   
+ 
+     public String toString(){		
+         final StringBuilder builder = new StringBuilder();
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/APTProblem.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/APTProblem.java
+index 9f12595..57175a0 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/APTProblem.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/APTProblem.java
+@@ -11,12 +11,12 @@
+ package org.eclipse.jdt.apt.core.internal.env;
+ 
+ import org.eclipse.core.resources.IFile;
++import org.eclipse.jdt.apt.core.internal.env.MessagerImpl.Severity;
+ import org.eclipse.jdt.apt.core.util.EclipseMessager;
+ import org.eclipse.jdt.core.compiler.IProblem;
+ 
+-public class APTProblem implements IProblem 
+-{
+-	public static enum Severity{ ERROR, WARNING, INFO};
++class APTProblem implements IProblem 
++{	
+ 	private static final String[] NO_ARGS = new String[0];
+ 	private final Severity _severity;
+ 	private int _startingOffset;
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
+index 4d61ae8..6020bff 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
+@@ -78,6 +78,7 @@ import com.sun.mirror.util.Types;
+ public class BaseProcessorEnv implements AnnotationProcessorEnvironment 
+ {
+ 	public static final ICompilationUnit[] NO_UNIT = new ICompilationUnit[0];
++
+ 	private static final int BOOLEAN_INDEX = 0;
+ 	private static final int BYTE_INDEX = 1;
+ 	private static final int CHAR_INDEX = 2;
+@@ -88,9 +89,9 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 	private static final int SHORT_INDEX = 7;
+ 	private static final int VOID_INDEX = 8;
+ 	
+-	protected final CompilationUnit _astCompilationUnit;
++	protected CompilationUnit _astRoot;
+ 	protected final Phase _phase;
+-	protected final IFile _file;
++	protected IFile _file;
+ 	protected final IJavaProject _javaProject;
+ 	
+ 	/**
+@@ -114,14 +115,13 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 						    IJavaProject javaProj,
+ 							Phase phase )
+ 	{
+-		_astCompilationUnit = astCompilationUnit;
++		_astRoot = astCompilationUnit;
+ 		_file = file;
+ 		_javaProject = javaProj;
+ 		_phase = phase;
+ 		
+ 		_modelCompUnit2astCompUnit = new HashMap<ICompilationUnit, CompilationUnit>();
+ 		_typeBinding2ModelCompUnit = new HashMap<ITypeBinding, ICompilationUnit>();
+-		initPrimitives(astCompilationUnit.getAST());
+ 	}
+     
+     public AnnotationProcessor getLatestProcessor()
+@@ -174,9 +174,14 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 		return mirrorDecls;
+     }
+     
++    protected List<AbstractTypeDeclaration> searchLocallyForTypeDeclarations()
++    {
++    	return _astRoot.types();
++    }
++    
+     private List<ITypeBinding> getTypeBindings()
+ 	{
+-    	final List<AbstractTypeDeclaration> declTypes = _astCompilationUnit.types();
++    	final List<AbstractTypeDeclaration> declTypes = searchLocallyForTypeDeclarations();    	
+ 		if( declTypes == null || declTypes.isEmpty() )
+ 			return Collections.emptyList();
+ 		final List<ITypeBinding> typeBindings = new ArrayList<ITypeBinding>(declTypes.size());
+@@ -193,7 +198,7 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 	 * @param typeBindings upon return, contains all the nested types within <code>type</code>
+ 	 *        and the type itself.
+ 	 */
+-	private void getTypeBindings(final ITypeBinding type, final List<ITypeBinding> typeBindings)
++	protected void getTypeBindings(final ITypeBinding type, final List<ITypeBinding> typeBindings)
+ 	{
+ 		if( type == null ) return;
+ 		typeBindings.add(type);
+@@ -222,11 +227,22 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+         }
+         return results;
+     }
++    
++    /**
++     * Go through the current compilation unit and look for ast nodes that has annotations.
++     * @return the map between ast node and 
++     */
++    protected Map<ASTNode, List<Annotation>> getASTNodesWithAnnotations()
++    {
++    	final Map<ASTNode, List<Annotation>> astNode2Anno = new HashMap<ASTNode, List<Annotation>>();
++        final AnnotatedNodeVisitor visitor = new AnnotatedNodeVisitor(astNode2Anno);
++        _astRoot.accept(visitor);
++        return astNode2Anno;
++    }
+ 
+     private List<IBinding> getBindingsAnnotatedWith(final ITypeBinding annotationType)
+     {
+-        final Map<ASTNode, List<Annotation>> astNode2Anno = new HashMap<ASTNode, List<Annotation>>();
+-		_astCompilationUnit.accept( new AnnotatedNodeVisitor(astNode2Anno) );
++        final Map<ASTNode, List<Annotation>> astNode2Anno = getASTNodesWithAnnotations();       
+ 		if( astNode2Anno.isEmpty() )
+ 			return Collections.emptyList();
+ 		final List<IBinding> annotatedBindings = new ArrayList<IBinding>();
+@@ -292,8 +308,6 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+         return;
+ 	}
+ 	
+-	
+-	
+ 	/**
+      * @param binding must be correspond to a type, method or field declaration.
+      * @return the ast node the corresponds to the declaration of the given binding.
+@@ -302,7 +316,8 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+     public ASTNode getASTNodeForBinding(final IBinding binding)
+     {
+     	final CompilationUnit astUnit = getCompilationUnitForBinding(binding);
+-		if( astUnit == null ) return null;
++		if( astUnit == null ) 
++			return null;
+ 		return astUnit.findDeclaringNode(binding.getKey());
+     }
+     
+@@ -318,11 +333,13 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 			name = name.substring(0, index);
+ 		
+ 		// first see if it is one of the well known types.
+-		ITypeBinding typeBinding = _astCompilationUnit.getAST().resolveWellKnownType(name);
++		// any AST is as good as the other.
++		ITypeBinding typeBinding = _astRoot.getAST().resolveWellKnownType(name);
+ 		String typeKey = BindingKey.createTypeBindingKey(name);
+ 		if(typeBinding == null){
+-			// then look into the current compilation unit			
+-			final ASTNode node = _astCompilationUnit.findDeclaringNode(typeKey);			
++			// then look into the current compilation units			
++			ASTNode node = _astRoot.findDeclaringNode(typeKey);
++						
+ 			if( node != null ){
+ 				final int nodeType = node.getNodeType();
+ 				if( nodeType == ASTNode.TYPE_DECLARATION ||
+@@ -456,6 +473,14 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 		// No classes or source files found
+ 		return new PackageDeclarationImplNoBinding(pkgFrags, this);
+     }
++	
++	protected CompilationUnit searchLocallyForBinding(final IBinding binding)
++	{
++		final ASTNode node = _astRoot.findDeclaringNode(binding);
++		if( node != null )
++			return _astRoot;
++		return null;
++	}
+     
+ 	/**
+      * @param binding must be correspond to a type, method or field declaration.
+@@ -466,8 +491,9 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+         assert binding.getKind() == IBinding.TYPE ||
+                binding.getKind() == IBinding.METHOD ||
+                binding.getKind() == IBinding.VARIABLE ;
+-        ASTNode node = getAstCompilationUnit().findDeclaringNode(binding);
+-        if( node != null ) return getAstCompilationUnit();
++        CompilationUnit domUnit = searchLocallyForBinding(binding);        
++        if( domUnit != null ) 
++        	return domUnit;
+         else{
+ 			final IMember member = (IMember)binding.getJavaElement();
+ 			final ICompilationUnit unit;
+@@ -521,7 +547,7 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 	 * @return the top-level type binding that declares <code>binding</code>
+ 	 * 	       or itself if it is already one.
+ 	 */
+-	protected ITypeBinding getDeclaringClass(final IBinding binding)
++	protected static ITypeBinding getDeclaringClass(final IBinding binding)
+ 	{
+ 		assert binding != null : "binding cannot be null"; //$NON-NLS-1$
+ 		ITypeBinding aTypeBinding = null;
+@@ -546,6 +572,14 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 		return aTypeBinding;
+ 	}
+ 	
++	protected IFile searchLocallyForIFile(final IBinding binding)
++	{
++		ASTNode node = _astRoot.findDeclaringNode(binding);
++		if( node != null )
++			return _file;
++		return null;
++	}
++	
+ 	/**
+ 	 * @param binding must be correspond to a type, method or field declaration
+ 	 * @return the file that contains the declaration of given binding.
+@@ -556,36 +590,45 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 		       binding.getKind() == IBinding.METHOD ||
+ 		       binding.getKind() == IBinding.VARIABLE ;
+ 		// check to see whether it is in the current file.
+-		ASTNode node = getAstCompilationUnit().findDeclaringNode(binding);
+-		if( node != null ) return _file;
++		IFile file = searchLocallyForIFile(binding);
++		if( file != null ) 
++			return file;
++	
++		final IMember member = (IMember)binding.getJavaElement();
++		if( member != null ){
++			final ICompilationUnit unit = member.getCompilationUnit();
++			return (IFile)unit.getResource();
++		}
+ 		else{
+-			final IMember member = (IMember)binding.getJavaElement();
+-			if( member != null ){
+-				final ICompilationUnit unit = member.getCompilationUnit();
+-				return (IFile)unit.getResource();
++			final ITypeBinding type = getDeclaringClass(binding);
++			assert type.isTopLevel() : "type must be top-level type"; //$NON-NLS-1$
++			final String qname = type.getQualifiedName();
++			final String pathname = qname.replace('.', File.separatorChar);
++			final IPath path = Path.fromOSString(pathname);
++			try{
++				// the element would be a compilation unit.
++				final IJavaElement element = _javaProject.findElement(path);
++				if( element == null ) return null;
++				return (IFile)element.getResource();
+ 			}
+-			else{
+-				final ITypeBinding type = getDeclaringClass(binding);
+-				assert type.isTopLevel() : "type must be top-level type"; //$NON-NLS-1$
+-				final String qname = type.getQualifiedName();
+-				final String pathname = qname.replace('.', File.separatorChar);
+-				final IPath path = Path.fromOSString(pathname);
+-				try{
+-					// the element would be a compilation unit.
+-					final IJavaElement element = _javaProject.findElement(path);
+-					if( element == null ) return null;
+-					return (IFile)element.getResource();
+-				}
+-				catch(JavaModelException e){
+-					throw new IllegalStateException(e);
+-				}
++			catch(JavaModelException e){
++				throw new IllegalStateException(e);
+ 			}
+ 		}
+ 	}
+ 	
+-	private void initPrimitives(final AST ast)
++	/**
++	 * @return the ast current being processed
++	 */
++	protected AST getCurrentDietAST(){
++		return _astRoot.getAST();
++	}
++	
++	private void initPrimitives()
+ 	{
+ 		if(_primitives != null ) return;
++		AST ast = getCurrentDietAST();
++		 
+ 		_primitives = new PrimitiveTypeImpl[8];
+ 		// boolean
+ 		ITypeBinding binding = ast.resolveWellKnownType(ITypeConstants.BOOLEAN);		
+@@ -634,19 +677,46 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 		_voidType = new VoidTypeImpl(binding);
+ 	}
+ 	
+-	public PrimitiveTypeImpl getBooleanType(){ return _primitives[BOOLEAN_INDEX]; }
+-	public PrimitiveTypeImpl getByteType(){ return _primitives[BYTE_INDEX]; }
+-	public PrimitiveTypeImpl getCharType(){ return _primitives[CHAR_INDEX]; }
+-	public PrimitiveTypeImpl getDoubleType(){ return _primitives[DOUBLE_INDEX]; }
+-	public PrimitiveTypeImpl getFloatType(){ return _primitives[FLOAT_INDEX]; }
+-	public PrimitiveTypeImpl getIntType(){ return _primitives[INT_INDEX]; }
+-	public PrimitiveTypeImpl getLongType(){ return _primitives[LONG_INDEX]; }
+-	public PrimitiveTypeImpl getShortType(){ return _primitives[SHORT_INDEX]; }
+-	public VoidTypeImpl getVoidType(){ return _voidType; }
++	public PrimitiveTypeImpl getBooleanType(){
++		initPrimitives();
++		return _primitives[BOOLEAN_INDEX]; 
++	}
++	public PrimitiveTypeImpl getByteType(){ 
++		initPrimitives();
++		return _primitives[BYTE_INDEX]; 
++	}
++	public PrimitiveTypeImpl getCharType(){
++		initPrimitives();
++		return _primitives[CHAR_INDEX]; 
++	}
++	public PrimitiveTypeImpl getDoubleType(){ 
++		initPrimitives();
++		return _primitives[DOUBLE_INDEX]; 
++	}
++	public PrimitiveTypeImpl getFloatType(){
++		initPrimitives();
++		return _primitives[FLOAT_INDEX]; 
++	}
++	public PrimitiveTypeImpl getIntType(){ 
++		initPrimitives();
++		return _primitives[INT_INDEX]; 
++	}
++	public PrimitiveTypeImpl getLongType(){ 
++		initPrimitives();
++		return _primitives[LONG_INDEX]; 
++	}
++	public PrimitiveTypeImpl getShortType(){ 
++		initPrimitives();
++		return _primitives[SHORT_INDEX]; 
++	}
++	public VoidTypeImpl getVoidType(){ 
++		initPrimitives();
++		return _voidType; 
++	}
+ 	
+-	public CompilationUnit  getAstCompilationUnit()    { return _astCompilationUnit; }
+-	public Phase            getPhase()                 { return _phase; }
+-    public IFile            getFile()                  { return _file; }
+-    public IProject         getProject()               { return _javaProject.getProject(); }
+-	public IJavaProject		getJavaProject()		   { return _javaProject; }
++	public CompilationUnit  getAstCompilationUnit(){ return _astRoot; }
++	public IFile            getFile() { return _file; }
++	public Phase            getPhase(){ return _phase; }
++    public IProject         getProject(){ return _javaProject.getProject(); }
++	public IJavaProject		getJavaProject(){ return _javaProject; }
+ }
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/MessagerImpl.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/MessagerImpl.java
+index 38180ec..8344435 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/MessagerImpl.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/MessagerImpl.java
+@@ -23,6 +23,7 @@ import org.eclipse.jdt.core.dom.CompilationUnit;
+ 
+ public class MessagerImpl implements Messager, EclipseMessager
+ {
++	public static enum Severity{ ERROR, WARNING, INFO};
+     private final ProcessorEnvImpl _env;
+ 
+     MessagerImpl(ProcessorEnvImpl env){
+@@ -34,9 +35,9 @@ public class MessagerImpl implements Messager, EclipseMessager
+     	if( pos == null )
+     		printError(msg);
+     	else if( pos instanceof SourcePositionImpl )
+-            print((SourcePositionImpl)pos, APTProblem.Severity.ERROR, msg, arguments);
++            print((SourcePositionImpl)pos, Severity.ERROR, msg, arguments);
+     	else
+-    		print(pos, APTProblem.Severity.ERROR, msg, arguments);
++    		print(pos, Severity.ERROR, msg, arguments);
+     }
+ 	
+ 	public void printError(ASTNode node, String msg)
+@@ -44,23 +45,25 @@ public class MessagerImpl implements Messager, EclipseMessager
+ 		if( node == null )
+ 			throw new IllegalArgumentException("'node' cannot be null"); //$NON-NLS-1$
+ 		final int start = node.getStartPosition();
++		// The only time you get a dom AST node is when you are processing in a per-file mode.
++		// _env.getAstCompilationUnit() && _env.getFile() will return an non-null value.
+ 		final int line = _env.getAstCompilationUnit().lineNumber(start);
+-		_env.addProblem(_env.getFile(), start, node.getLength() + start, APTProblem.Severity.ERROR, msg, line, null );
++		_env.addProblem(_env.getFile(), start, node.getLength() + start, Severity.ERROR, msg, line, null );
+ 	}
+ 
+     public void printError(String msg)
+     {
+-        print(APTProblem.Severity.ERROR, msg, null);
++        print(Severity.ERROR, msg, null);
+     }
+ 
+     public void printNotice(SourcePosition pos, String msg, String[] arguments)
+     {
+         if( pos instanceof SourcePositionImpl )
+-            print((SourcePositionImpl)pos, APTProblem.Severity.INFO, msg, arguments);
++            print((SourcePositionImpl)pos, Severity.INFO, msg, arguments);
+ 		else if (pos == null )
+ 			printNotice(msg);
+ 		else
+-    		print(pos, APTProblem.Severity.INFO, msg, arguments);
++    		print(pos, Severity.INFO, msg, arguments);
+     }
+ 	
+ 	public void printNotice(ASTNode node, String msg)
+@@ -68,23 +71,25 @@ public class MessagerImpl implements Messager, EclipseMessager
+ 		if( node == null )
+ 			throw new IllegalArgumentException("'node' cannot be null"); //$NON-NLS-1$
+ 		final int start = node.getStartPosition();
++		// The only time you get a dom AST node is when you are processing in a per-file mode.
++		// _env.getAstCompilationUnit() && _env.getFile() will return an non-null value.
+ 		final int line = _env.getAstCompilationUnit().lineNumber(start);
+-		_env.addProblem(_env.getFile(), start, node.getLength() + start, APTProblem.Severity.INFO, msg, line, null );
++		_env.addProblem(_env.getFile(), start, node.getLength() + start, Severity.INFO, msg, line, null );
+ 	}
+ 
+     public void printNotice(String msg)
+     {
+-       print(APTProblem.Severity.INFO, msg, null);
++       print(Severity.INFO, msg, null);
+     }
+ 
+     public void printWarning(SourcePosition pos, String msg, String[] arguments)
+     {		
+         if( pos instanceof SourcePositionImpl )
+-            print((SourcePositionImpl)pos, APTProblem.Severity.WARNING, msg, arguments);
++            print((SourcePositionImpl)pos, Severity.WARNING, msg, arguments);
+ 		else if (pos == null )
+ 			printWarning(msg); 
+ 		else
+-    		print(pos, APTProblem.Severity.WARNING, msg, arguments);
++    		print(pos, Severity.WARNING, msg, arguments);
+     }
+ 	
+ 	public void printWarning(ASTNode node, String msg)
+@@ -92,13 +97,15 @@ public class MessagerImpl implements Messager, EclipseMessager
+ 		if( node == null )
+ 			throw new IllegalArgumentException("'node' cannot be null"); //$NON-NLS-1$
+ 		final int start = node.getStartPosition();
++		// The only time you get a dom AST node is when you are processing in a per-file mode.
++		// _env.getAstCompilationUnit() && _env.getFile() will return an non-null value.
+ 		final int line = _env.getAstCompilationUnit().lineNumber(start);
+-		_env.addProblem(_env.getFile(), start, node.getLength() + start, APTProblem.Severity.WARNING, msg, line, null);
++		_env.addProblem(_env.getFile(), start, node.getLength() + start, Severity.WARNING, msg, line, null);
+ 	}
+ 
+     public void printWarning(String msg)
+     {
+-        print(APTProblem.Severity.WARNING, msg, null);
++        print(Severity.WARNING, msg, null);
+     }
+     
+     public void printError(SourcePosition pos, String msg) {
+@@ -150,7 +157,7 @@ public class MessagerImpl implements Messager, EclipseMessager
+ 		if (errorId == null) {
+ 			throw new IllegalArgumentException("errorId cannot be null"); //$NON-NLS-1$
+ 		}
+-		print(APTProblem.Severity.ERROR, msg, new String[] {pluginId, errorId});
++		print(Severity.ERROR, msg, new String[] {pluginId, errorId});
+ 	}
+ 	
+ 	public void printFixableWarning(String msg, String pluginId, String errorId) {
+@@ -160,7 +167,7 @@ public class MessagerImpl implements Messager, EclipseMessager
+ 		if (errorId == null) {
+ 			throw new IllegalArgumentException("errorId cannot be null"); //$NON-NLS-1$
+ 		}
+-		print(APTProblem.Severity.WARNING, msg, new String[] {pluginId, errorId});
++		print(Severity.WARNING, msg, new String[] {pluginId, errorId});
+ 	}
+ 	
+ 	public void printFixableNotice(String msg, String pluginId, String errorId) {
+@@ -170,11 +177,11 @@ public class MessagerImpl implements Messager, EclipseMessager
+ 		if (errorId == null) {
+ 			throw new IllegalArgumentException("errorId cannot be null"); //$NON-NLS-1$
+ 		}
+-		print(APTProblem.Severity.INFO, msg, new String[] {pluginId, errorId});
++		print(Severity.INFO, msg, new String[] {pluginId, errorId});
+ 	}
+   
+     private void print(SourcePositionImpl pos,
+-    				   APTProblem.Severity severity,
++    				   Severity severity,
+                        String msg,
+                        String[] arguments)
+     {
+@@ -189,7 +196,7 @@ public class MessagerImpl implements Messager, EclipseMessager
+     }
+     
+     private void print(SourcePosition pos,
+-    				   APTProblem.Severity severity,
++    				   Severity severity,
+     				   String msg,
+     				   String[] arguments)
+     {    	
+@@ -206,18 +213,18 @@ public class MessagerImpl implements Messager, EclipseMessager
+     	else
+     		resource = null;
+     	 
+-    	final IFile currentResource = _env.getFile();
+-    	int offset = 0;    	
+-    	if( currentResource.equals(resource) ){
+-    		final CompilationUnit unit = _env.getAstCompilationUnit();    		
+-    		offset = unit.getPosition(pos.line(), pos.column() );
+-    	}    	
++    	int offset = 0;
++    	if( resource != null ){
++    		final CompilationUnit unit = _env.getAstCompilationUnit(resource);
++    		if( unit != null )
++    			offset = unit.getPosition( pos.line(), pos.column() );
++    	}
+     	_env.addProblem(resource, offset, -1, severity, msg, pos.line(), arguments );   
+     }
+ 
+-    private void print(APTProblem.Severity severity, String msg, String[] arguments)
++    private void print(Severity severity, String msg, String[] arguments)
+     {
+-    	_env.addProblem(null, 0, -1, severity, msg, 1, arguments );  
++     	_env.addProblem(null, 0, -1, severity, msg, 1, arguments );  
+ 		
+     }
+   
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/ProcessorEnvImpl.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/ProcessorEnvImpl.java
+index da981c8..88a511b 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/ProcessorEnvImpl.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/ProcessorEnvImpl.java
+@@ -13,7 +13,6 @@ package org.eclipse.jdt.apt.core.internal.env;
+ 
+ import java.io.BufferedInputStream;
+ import java.io.CharArrayWriter;
+-import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.InputStreamReader;
+@@ -31,11 +30,16 @@ import java.util.regex.Pattern;
+ import org.eclipse.core.resources.*;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.Path;
+ import org.eclipse.jdt.apt.core.env.EclipseAnnotationProcessorEnvironment;
+ import org.eclipse.jdt.apt.core.env.Phase;
+-import org.eclipse.jdt.apt.core.internal.type.PrimitiveTypeImpl;
+-import org.eclipse.jdt.apt.core.internal.type.VoidTypeImpl;
++import org.eclipse.jdt.apt.core.internal.EclipseMirrorImpl;
++import org.eclipse.jdt.apt.core.internal.declaration.TypeDeclarationImpl;
++import org.eclipse.jdt.apt.core.internal.env.MessagerImpl.Severity;
++import org.eclipse.jdt.apt.core.internal.util.Factory;
++import org.eclipse.jdt.apt.core.internal.util.Visitors.AnnotatedNodeVisitor;
++import org.eclipse.jdt.apt.core.internal.util.Visitors.AnnotationVisitor;
+ import org.eclipse.jdt.apt.core.util.AptConfig;
+ import org.eclipse.jdt.apt.core.util.EclipseMessager;
+ import org.eclipse.jdt.core.*;
+@@ -44,19 +48,22 @@ import org.eclipse.jdt.core.dom.AST;
+ import org.eclipse.jdt.core.dom.ASTNode;
+ import org.eclipse.jdt.core.dom.ASTParser;
+ import org.eclipse.jdt.core.dom.ASTVisitor;
++import org.eclipse.jdt.core.dom.AbstractTypeDeclaration;
++import org.eclipse.jdt.core.dom.Annotation;
+ import org.eclipse.jdt.core.dom.CompilationUnit;
+ import org.eclipse.jdt.core.dom.IBinding;
+ import org.eclipse.jdt.core.dom.ITypeBinding;
+ 
+ import com.sun.mirror.apt.AnnotationProcessorListener;
+ import com.sun.mirror.apt.Filer;
++import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ import com.sun.mirror.declaration.PackageDeclaration;
+ import com.sun.mirror.declaration.TypeDeclaration;
+ 
+ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotationProcessorEnvironment
+-{	
++{
++	private static final String BUILD_MARKER = "org.eclipse.jdt.apt.core.marker"; //$NON-NLS-1$
+ 	public static final ICompilationUnit[] NO_UNIT = new ICompilationUnit[0];
+-
+ 	/** delimiter of path variables in -A values, e.g., %ROOT%/foo */
+ 	private static final char PATHVAR_DELIM = '%';
+ 	/** regex to identify substituted token in path variables */
+@@ -67,14 +74,9 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+     private final ICompilationUnit _compilationUnit;       
+     private Map<IFile, List<IProblem>> _allProblems;
+     
+-	/**
+-	 * The source code in <code>_file</code>.
+-	 * This is the exact same source code that created the dom compilation unit
+-	 */
+-	private final char[] _source;	
+ 	// Stores the generated files and whether or not they were modified. In this case,
+ 	// new files will be considered "modified".
+-    private final Map<IFile, Boolean> _generatedFiles = new HashMap<IFile, Boolean>();
++    private Map<IFile, Boolean> _generatedFiles = new HashMap<IFile, Boolean>();
+ 	private Set<AnnotationProcessorListener> _listeners = null;
+ 	private final FilerImpl _filer;
+ 	private boolean _isClosed = false;
+@@ -86,65 +88,82 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	 * Set of strings that indicate new type dependencies introduced on the file
+ 	 * each string is a fully-qualified type name.
+ 	 */
+-	private Set<String> _typeDependencies = new HashSet<String>();
+-
+-	// void type and the primitive types will be null if the '_file'
+-	// is outside of the workspace.
+-	private VoidTypeImpl _voidType;
+-	private PrimitiveTypeImpl[] _primitives;  
++	private Map<IFile, Set<String>> _typeDependencies = new HashMap<IFile, Set<String>>();
+ 	
+ 	/**
+ 	 * Processor options, including -A options.
+ 	 * Set in ctor and then not changed.
+ 	 */
+ 	private Map<String, String> _options;
++	
++	private boolean _batchMode = false; // off by default. 
++	private char[] _curSource = null;
++	private CompilationUnit[] _astUnits = null;
++	private char[][] _sources = null;
++	private IFile[] _files = null;
++	private List<Map<String,Object>> _markerInfos = null;
+ 
+ 	public static ProcessorEnvImpl newProcessorEnvironmentForReconcile(ICompilationUnit compilationUnit, IJavaProject javaProj)
+     {	
+     	String unitName =  compilationUnit.getResource().getProjectRelativePath().toString();
+ 		ASTNode node = createDietAST( unitName, javaProj, compilationUnit, null );
+-       	return new ProcessorEnvImpl( (org.eclipse.jdt.core.dom.CompilationUnit)node,
+-       								  compilationUnit, null /*source*/,        								  
+-       								  (IFile)compilationUnit.getResource(), 
+-       								  javaProj, Phase.RECONCILE );
+-    }
+-
+-    public static ProcessorEnvImpl newProcessorEnvironmentForBuild( IFile file, IJavaProject javaProj )
++       	return new ProcessorEnvImpl( 
++       			(org.eclipse.jdt.core.dom.CompilationUnit)node, 
++       			compilationUnit, null /*source*/, 
++       			(IFile)compilationUnit.getResource(), 
++       			javaProj, Phase.RECONCILE );
++    }   
++    
++    public static ProcessorEnvImpl newProcessorEnvironmentForBuild(IFile[] files, IJavaProject javaProj )
+     {
+-    	char[] source = null;
+-		try{
+-			source = getFileContents( file );
+-		}
+-		catch( Exception e ){
+-			// TODO:  propagate these exceptions out of APTDispatch
+-			e.printStackTrace();
+-		}		
+-		String unitName = file.getProjectRelativePath().toString();
+-		ASTNode node = createDietAST( unitName, javaProj, null, source );
+-    	return new ProcessorEnvImpl((org.eclipse.jdt.core.dom.CompilationUnit)node, 
+-    			  					null /*ICompilationUnit*/, 
+-    							    source, file, javaProj, Phase.BUILD );
++    	assert files != null : "missing files"; //$NON-NLS-1$    	
++    
++		// note, we are not reading any files.
++		return new ProcessorEnvImpl(files, javaProj, Phase.BUILD);
+     }
+     
+-    private ProcessorEnvImpl(final CompilationUnit astCompilationUnit,
+-			final ICompilationUnit compilationUnit, final char[] source,
+-			final IFile file, final IJavaProject javaProj, final Phase phase) {
+-		super(astCompilationUnit, file, javaProj, phase);
+-		// if we are in reconcile, compilationUnit will be valid
++    private ProcessorEnvImpl(
++    		final CompilationUnit astCompilationUnit,
++    		final ICompilationUnit compilationUnit,
++    		final char[] source,
++    		final IFile file,
++    		final IJavaProject javaProj,
++    		final Phase phase)
++    {
++    	super(  astCompilationUnit, file, javaProj, phase );
++    	
++    	// if we are in reconcile, compilationUnit will be valid
+ 		// if we are in build, file will not be null & compilationUnit will be
+ 		// null
+-		assert (phase == Phase.RECONCILE && compilationUnit != null) ||
+-				(phase == Phase.BUILD && compilationUnit == null && file != null) : 
+-				"Unexpected phase value " //$NON-NLS-1$
+-				+ phase;
+-		assert (source == null && compilationUnit != null) ||
+-				(source != null && compilationUnit == null) : 
+-				"Unexpected values for _compilationUnit and _source!"; //$NON-NLS-1$
+-		_source = source;
+-		_compilationUnit = compilationUnit;
+-		_allProblems = new HashMap<IFile, List<IProblem>>(4);
++    	assert( (phase == Phase.RECONCILE && compilationUnit != null) || 
++    			(phase == Phase.BUILD && compilationUnit == null && file != null ) ) :
++    			"Unexpected phase value " + phase ; //$NON-NLS-1$
++    	
++    	assert (source == null && compilationUnit != null) ||
++			   (source != null && compilationUnit == null) : 
++	           "Unexpected values for _compilationUnit and _source!"; //$NON-NLS-1$
++			   
++	   _compilationUnit = compilationUnit;
++	   _curSource = source;
++	   _filer = new FilerImpl(this);
++	   _allProblems = new HashMap<IFile, List<IProblem>>();
++	   initOptions(javaProj);
++    }
++    
++    private ProcessorEnvImpl(
++			final IFile[] files, 
++			final IJavaProject javaProj, 
++			final Phase phase) {
++    	
++    	super(null, null, javaProj, phase);
++    	assert( phase == Phase.BUILD && files != null  ) :
++    		"Unexpected phase value " + phase; //$NON-NLS-1$
++		
++		_compilationUnit = null;
+ 		_filer = new FilerImpl(this);
+-		initOptions(_javaProject);
++		_files = files;
++		_allProblems = new HashMap<IFile, List<IProblem>>();
++		initOptions(javaProj);
+ 	}
+     
+     
+@@ -274,11 +293,55 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+     public TypeDeclaration getTypeDeclaration(String name)
+     {
+ 		checkValid();
+-		TypeDeclaration decl = super.getTypeDeclaration(name);
+-		if( decl != null)
++		TypeDeclaration decl = null;
++		if( !_batchMode ){
++			// we are not keeping dependencies unless we are processing on a
++			// per file basis.
++			decl = super.getTypeDeclaration(name);			
+ 			addTypeDependency( name );
++		}
++		else
++			decl = getTypeDeclarationInBatch(name);
++			
+ 		return decl;
+     }
++
++    private TypeDeclaration getTypeDeclarationInBatch(String name)
++    {	
++    	if( name == null || _astUnits == null ) return null;
++		// get rid of the generics parts.
++		final int index = name.indexOf('<');
++		if( index != -1 )
++			name = name.substring(0, index);
++		
++		// first see if it is one of the well known types.
++		// any AST is as good as the other.
++		ITypeBinding typeBinding = _astUnits[0].getAST().resolveWellKnownType(name);
++		String typeKey = BindingKey.createTypeBindingKey(name);
++		if(typeBinding == null){
++			// then look into the current compilation units			
++			ASTNode node = null;
++			for( int i=0, len=_astUnits.length; i<len; i++ )
++				node = _astUnits[i].findDeclaringNode(typeKey);			
++			if( node != null ){
++				final int nodeType = node.getNodeType();
++				if( nodeType == ASTNode.TYPE_DECLARATION ||
++					nodeType == ASTNode.ANNOTATION_TYPE_DECLARATION ||
++					nodeType == ASTNode.ENUM_DECLARATION )
++				typeBinding = ((AbstractTypeDeclaration)node).resolveBinding();
++			}
++		}
++		if( typeBinding != null )
++			return Factory.createReferenceType(typeBinding, this);
++
++		// finally go search for it in the universe.
++		typeBinding = getTypeBinding(typeKey);
++		if( typeBinding != null ){			
++			return Factory.createReferenceType(typeBinding, this);
++		}
++
++		return null;
++    }
+   
+     public void addListener(AnnotationProcessorListener listener)
+     {
+@@ -302,24 +365,33 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 		return Collections.unmodifiableSet(_listeners);
+ 	}
+ 
+-	public void addGeneratedFile( IFile f, boolean contentsChanged ) {
++	public void addGeneratedFile( IFile f, boolean contentsChanged ) {		
++		if( _generatedFiles.containsKey(f) ){
++			// Could have generated the same file twice during one build.
++			// The first time, contentsChanged = true, second time, if the file
++			// is identical, contentsChanged will be false. 
++			// Overall during this process, the file has been changed.
++			boolean curValue = _generatedFiles.get(f);
++			contentsChanged |= curValue;
++		}
++		
+ 		_generatedFiles.put( f, contentsChanged );
+ 	}
+ 
+-    public ICompilationUnit getCompilationUnit()       { return _compilationUnit; }
+-    public Map<IFile, Boolean>       getGeneratedFiles()        { return _generatedFiles; }
++    public ICompilationUnit getCompilationUnit(){ return _compilationUnit; }
++    public Map<IFile, Boolean> getGeneratedFiles(){ return _generatedFiles; }
+ 
+ 	/**
+ 	 * @return true iff source files has been generated.
+ 	 *         Always return false when this environment is closed.
+ 	 */
+-	public boolean hasGeneratedSourceFiles()		   { return !_generatedFiles.isEmpty();  }
++	public boolean hasGeneratedSourceFiles(){ return !_generatedFiles.isEmpty();  }
+ 
+ 	/**
+ 	 * @return true iff class files has been generated.
+ 	 *         Always return false when this environment is closed.
+ 	 */
+-	public boolean hasGeneratedClassFiles()			   { return _filer.hasGeneratedClassFile(); }
++	public boolean hasGeneratedClassFiles(){ return _filer.hasGeneratedClassFile(); }
+ 
+ 	/**
+ 	 * @return true iff errors (markers with serverity == APTProblem.Severity.Error) has been posted
+@@ -336,56 +408,7 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 			}		
+ 		}
+ 		return false;
+-	}
+-
+-    /**
+-     * @param binding must be correspond to a type, method or field declaration.
+-     * @return the ast node the corresponds to the declaration of the given binding.
+-     *         Return null if none is found.
+-     */
+-    public ASTNode getASTNodeForBinding(final IBinding binding)
+-    {
+-		final CompilationUnit astUnit = getCompilationUnitForBinding(binding);
+-		if( astUnit == null ) return null;
+-		return astUnit.findDeclaringNode(binding.getKey());
+-    }
+-
+-	/**
+-	 * @param binding must be correspond to a type, method or field declaration
+-	 * @return the file that contains the declaration of given binding.
+-	 */
+-	public IFile getDeclaringFileForBinding(final IBinding binding)
+-	{
+-		assert binding.getKind() == IBinding.TYPE ||
+-		       binding.getKind() == IBinding.METHOD ||
+-		       binding.getKind() == IBinding.VARIABLE ;
+-		// check to see whether it is in the current file.
+-		ASTNode node = getAstCompilationUnit().findDeclaringNode(binding);
+-		if( node != null ) return _file;
+-		else{
+-			final IMember member = (IMember)binding.getJavaElement();
+-			if( member != null ){
+-				final ICompilationUnit unit = member.getCompilationUnit();
+-				return (IFile)unit.getResource();
+-			}
+-			else{
+-				final ITypeBinding type = getDeclaringClass(binding);
+-				assert type.isTopLevel() : "type must be top-level type"; //$NON-NLS-1$
+-				final String qname = type.getQualifiedName();
+-				final String pathname = qname.replace('.', File.separatorChar);
+-				final IPath path = Path.fromOSString(pathname);
+-				try{
+-					// the element would be a compilation unit.
+-					final IJavaElement element = _javaProject.findElement(path);
+-					if( element == null ) return null;
+-					return (IFile)element.getResource();
+-				}
+-				catch(JavaModelException e){
+-					throw new IllegalStateException(e);
+-				}
+-			}
+-		}
+-	}
++	}  
+ 
+ 	/**
+ 	 *
+@@ -398,8 +421,8 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	public static char[] getFileContents( IFile file )
+ 		throws CoreException, IOException
+ 	{
+-		Reader   reader   = null;
+-		CharArrayWriter      w    = null;
++		Reader reader = null;
++		CharArrayWriter w = null;
+ 
+ 		try
+ 		{
+@@ -433,9 +456,14 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	 *  4) add or remove listeners
+ 	 */
+     public void close(){
++    	_astRoot = null;
++    	_file = null;
++    	_astUnits = null;
++    	_files = null;
++    	_sources = null;
+     	_allProblems = null;
+         _modelCompUnit2astCompUnit.clear();		
+-		_generatedFiles.clear();
++		_generatedFiles = null;
+ 		if(_listeners != null)
+ 			_listeners.clear();
+ 		_isClosed = true;
+@@ -460,18 +488,18 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+     void addProblem(IFile resource, 
+        		        int start, 
+     				int end,
+-                    APTProblem.Severity severity, 
++                    Severity severity, 
+                     String msg, 
+                     int line,
+                     String[] arguments)
+     {
+     	checkValid();
++    	
++    	assert( resource != null ) : "missing resource"; //$NON-NLS-1$
+     	// not going to post any markers to resource outside of the one we are currently 
+     	// processing during reconcile phase.
+-    	if( _phase == Phase.RECONCILE && resource != null && !resource.equals(_file) )
+-    		return;
+-    	if(resource == null)
+-    		resource = _file;
++    	if( _phase == Phase.RECONCILE && resource != null && !resource.equals( getFile() ) )
++    		return;    
+     	final APTProblem newProblem = 
+         	new APTProblem(msg, severity, resource, start, end, line, arguments);
+     	List<IProblem> problems = _allProblems.get(resource);
+@@ -482,13 +510,111 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+     	problems.add(newProblem);
+     }
+     
++    void addMarker(
++    		final int start,
++    		final int end,
++    		final String msg,
++    		final Severity severity,
++    		final int line)
++    {
++    	// TODO: implement me.
++    }
++    
+     public Map<IFile, List<IProblem>> getProblems()
+     {
+     	checkValid();
+     	
+     	updateProblemLength();
+     	return Collections.unmodifiableMap(_allProblems);
+-    }   
++    }
++    
++    public Map<String, AnnotationTypeDeclaration> getAnnotationTypesInFile()
++    {
++    	checkValid();
++    	assert _astRoot != null && _file != null && !_batchMode : 
++    		"operation not available under batch mode."; //$NON-NLS-1$
++    	final List<Annotation> instances = new ArrayList<Annotation>();
++		final Map<String, AnnotationTypeDeclaration> decls = 
++			new HashMap<String, AnnotationTypeDeclaration>();
++		final AnnotationVisitor visitor = new AnnotationVisitor(instances);
++		_astRoot.accept(visitor);
++			
++		for (int instanceIndex=0, size = instances.size(); instanceIndex < size; instanceIndex++) {
++			final Annotation instance = instances.get(instanceIndex);
++			final ITypeBinding annoType = instance.resolveTypeBinding();
++			if (annoType == null)
++				continue;
++			final TypeDeclarationImpl decl = 
++				Factory.createReferenceType(annoType, this);
++			if (decl.kind() == EclipseMirrorImpl.MirrorKind.TYPE_ANNOTATION){
++				final AnnotationTypeDeclaration annoDecl = (AnnotationTypeDeclaration)decl;
++				decls.put(annoDecl.getQualifiedName(), annoDecl);
++			}
++		}
++		
++		return decls;
++    }
++    
++    /**
++	 * Return all annotations at declaration level within all compilation unit(s)
++	 * associated with this environment.
++	 * @param file2Annotations populated by this method to map files to the annotation types
++	 *        if contains. May be null.
++	 * @return the map containing all annotation types found within this environment.
++	 */
++    public Map<String, AnnotationTypeDeclaration> getAllAnnotationTypes(
++    		final Map<IFile, Set<AnnotationTypeDeclaration>> file2Annotations) {
++    	
++    	checkValid();
++    	if( _files == null )  
++    		return getAnnotationTypesInFile();
++    	readFiles();
++    	
++		final List<Annotation> instances = new ArrayList<Annotation>();
++		final Map<String, AnnotationTypeDeclaration> decls = 
++			new HashMap<String, AnnotationTypeDeclaration>();
++		final AnnotationVisitor visitor = new AnnotationVisitor(instances);
++		for( int astIndex=0, len=_astUnits.length; astIndex<len; astIndex++ ){
++			_astUnits[astIndex].accept(visitor);
++			final Set<AnnotationTypeDeclaration> perFileAnnos = new HashSet<AnnotationTypeDeclaration>(); 
++			
++			for (int instanceIndex=0, size = instances.size(); instanceIndex < size; instanceIndex++) {
++				final Annotation instance = instances.get(instanceIndex);
++				final ITypeBinding annoType = instance.resolveTypeBinding();
++				if (annoType == null)
++					continue;
++				final TypeDeclarationImpl decl = 
++					Factory.createReferenceType(annoType, this);
++				if (decl.kind() == EclipseMirrorImpl.MirrorKind.TYPE_ANNOTATION){
++					final AnnotationTypeDeclaration annoDecl = (AnnotationTypeDeclaration)decl;
++					decls.put(annoDecl.getQualifiedName(), annoDecl);
++					perFileAnnos.add(annoDecl);
++				}
++			}
++			if( file2Annotations != null && !perFileAnnos.isEmpty() )
++				file2Annotations.put(_files[astIndex], perFileAnnos);
++			visitor.reset();
++		}
++		
++		return decls;
++	}
++    
++    /**
++     * @param file
++     * @return the index of <code>file</code> from the list of files we are processing.
++     * Return -2 if no match is found.
++     */
++    private int getFileIndex(final IFile file)
++    {
++    	int index = -2;
++    	for( int i=0, len=_files.length; i<len; i++ ){
++    		if( file == _files[i] ){
++    			index = i;
++    			break;
++    		}    	
++    	}
++    	return index;
++    }
+     
+     /**
+      * Determine the ending offset of any problems on the current resource that doesn't have one by
+@@ -497,44 +623,37 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+      */
+     private void updateProblemLength()
+     {
+-    	// for those markers that doesn't have an ending offset, figure it out by
++    	// for those problems that doesn't have an ending offset, figure it out by
+     	// traversing the ast.
+     	// we do it once just before we post the marker so we only have to walk the ast 
+     	// once.
+-    	int count = 0;
+-    	for( Map.Entry<IFile, List<IProblem>> entry : _allProblems.entrySet() ){  
+-    		if( _file.equals(entry.getKey()) ){
+-    			for(IProblem problem : entry.getValue() ){
+-    				if( problem.getSourceEnd() == -1 )
++    	for( Map.Entry<IFile, List<IProblem>> entry : _allProblems.entrySet() ){
++    		int count = 0;
++    		int fileIndex = -1;
++    		final IFile file = entry.getKey();
++    		for( IProblem problem : entry.getValue() ){
++    			if( problem.getSourceEnd() == -1 ){
++    				if( fileIndex == -1 )
++    					fileIndex = getFileIndex(file);
++    				// -2 means it's not one of the files that we are processing.
++    				if( fileIndex != -2 )
+     					count ++;
+-    			}    				
+-    		}
+-    		else{
+-    			for(IProblem problem : entry.getValue() ){
+-    				if( problem.getSourceEnd() < problem.getSourceStart() )
+-    					problem.setSourceEnd(problem.getSourceStart());
+     			}
+     		}
+-    	}
+-    	if( count > 0 ){
+-	    	final int[] startingOffsets = new int[count];
+-	    	int index = 0;
+-	    	
+-	    	for( Map.Entry<IFile, List<IProblem>> entry : _allProblems.entrySet() ){  
+-	    		if( entry.getKey() == _file ){
+-	    			for(IProblem problem : entry.getValue() ){
++    		
++    		if( fileIndex != -2 ){
++    			if( count > 0 ){
++    				final int[] startingOffsets = new int[count];
++    		    	int index = 0;
++	    			for( IProblem problem : entry.getValue() ){
+ 	    				if( problem.getSourceEnd() == -1 )
+ 	    					startingOffsets[index++] = problem.getSourceStart();
+-	    			}    				
+-	    		}
+-	    	}
+-	    	
+-	    	final EndingOffsetFinder lfinder = new EndingOffsetFinder(startingOffsets);
+-	    	_astCompilationUnit.accept( lfinder );
+-	    	
+-	    	for( Map.Entry<IFile, List<IProblem>> entry : _allProblems.entrySet() ){  
+-	    		if( _file.equals(entry.getKey()) ){
+-	    			for(IProblem problem : entry.getValue() ){
++	    			}
++	    			
++	    			final EndingOffsetFinder lfinder = new EndingOffsetFinder(startingOffsets);
++	    			_astUnits[fileIndex].accept( lfinder );
++	    	    	
++	    	    	for(IProblem problem : entry.getValue() ){
+ 	    				if( problem.getSourceEnd() == -1 ){
+ 	    					int startingOffset = problem.getSourceStart();
+ 	    					int endingOffset = lfinder.getEndingOffset(startingOffset);
+@@ -542,9 +661,17 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	    	    				endingOffset = startingOffset;
+ 	    	    			problem.setSourceEnd(endingOffset);	    	    			
+ 	    				}
+-	    			}    				
+-	    		}
+-	    	}
++	    			}
++    			}
++    			// else everything is clear.
++    		}
++    		else{
++    			for(IProblem problem : entry.getValue() ){
++    				// set the -1 source end to be the same as the source start.
++    				if( problem.getSourceEnd() < problem.getSourceStart() )
++    					problem.setSourceEnd(problem.getSourceStart());
++    			}
++    		}
+     	}
+     }
+     
+@@ -639,10 +766,9 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+     }
+ 
+ 	/**
+-	 * @return - the extra type dependencies for the file under compilation
++	 * @return - the extra type dependencies for the files under compilation
+ 	 */
+-	public Set<String> getTypeDependencies()  { return _typeDependencies; }
+-    
++	public Map<IFile, Set<String>> getTypeDependencies()  { return _typeDependencies; }
+ 	
+ 	/** true value indicates that the source path for the project changed during this APT dispatch */
+ 	public boolean getSourcePathChanged() { return _sourcePathChanged; }
+@@ -650,9 +776,112 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	/** true value indicates that the source path for the project changed during this APT dispatch */
+ 	public void setSourcePathChanged( boolean b ) { _sourcePathChanged = b; }
+ 	
++	/**
++	 * Switch to batch processing mode. 
++	 * Note: Call to this method will cause all files associated with this environment to be 
++	 * read and parsed.
++	 */
++	public void setBatchProcessing(){
++		if( _phase == Phase.RECONCILE )
++			throw new IllegalStateException("No batch processing during reconcile."); //$NON-NLS-1$
++		
++		checkValid();
++		readFiles();
++		
++		_batchMode = true;
++		_file = null;
++		_astRoot = null;
++	}
++	
++	private void readFiles()
++	{
++		if( _astUnits != null || _files == null ) return;
++		final int numFiles = _files.length;
++		_astUnits = new CompilationUnit[numFiles]; 
++		_sources = new char[numFiles][];
++		for( int i=0; i<numFiles; i++){	
++			try{
++				_sources[i] = ProcessorEnvImpl.getFileContents( _files[i] );
++				_astUnits[i] = (CompilationUnit)createDietAST(_files[i].toString(), _javaProject, null, _sources[i] );
++			}
++			catch( Exception e ){
++				// TODO:  propagate these exceptions out of APTDispatch
++				e.printStackTrace();
++			}
++		}
++	}
++	
++	public void setFileProcessing(IFile file){		
++		if( file == null )
++			throw new IllegalStateException("missing file"); //$NON-NLS-1$
++		// already in per-file mode.
++		if( !_batchMode ){
++			// this is a no-op
++			if(  file.equals(_file) )
++				return;
++			
++			_astRoot = null;
++			_file = null;
++			_curSource = null;
++			
++			// need to match up the file with the ast.
++			if( _files != null ){
++				for( int i=0, len=_files.length; i<len; i++ ){
++					if( file.equals(_files[i]) ){
++						_file = file;
++						if( _astUnits != null ){
++							_astRoot = _astUnits[i];		
++							_curSource = _sources[i];
++						}
++						else{
++							try{
++								_curSource = ProcessorEnvImpl.getFileContents( _files[i] );
++							}
++							catch( Exception e ){
++								// TODO:  propagate these exceptions out of APTDispatch
++								e.printStackTrace();
++							}
++							_astRoot = (CompilationUnit)createDietAST(_files[i].toString(), _javaProject, null, _curSource );
++						}
++					}
++				}
++			}
++ 
++			if( _file == null )
++				throw new IllegalStateException(
++						"file " +  //$NON-NLS-1$
++						file.getName() + 
++						" is not in the list to be processed."); //$NON-NLS-1$
++		}
++		else{
++			_batchMode = false;
++			if( _files != null ){
++				for( int i=0, len=_files.length; i<len; i++ ){
++					if( _files[i] == file ){
++						try{
++							_curSource = ProcessorEnvImpl.getFileContents( _files[i] );
++						}
++						catch( Exception e ){
++							// TODO:  propagate these exceptions out of APTDispatch
++							e.printStackTrace();
++						}	
++						_astRoot = (CompilationUnit)createDietAST(_files[i].toString(), _javaProject, null, _curSource );
++						_file = file;
++					}
++				}
++			}
++			if( _astRoot == null )
++				throw new IllegalStateException(
++						"file " +  //$NON-NLS-1$
++						file.getName() + 
++						" is not in the list to be processed."); //$NON-NLS-1$
++		}
++	}
++	
+ 	// Implementation for EclipseAnnotationProcessorEnvironment
+ 	public CompilationUnit getAST()
+ 	{
++		if( _batchMode ) return null;
+ 		if( _compilationUnit != null )
+ 		{
+ 			final ASTParser parser =  ASTParser.newParser(AST.JLS3);
+@@ -665,10 +894,10 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 			// this is a fully-flushed out DOM/AST unlike the one that's current in the environment.
+ 			// also this copy will not contain any binding information nor pointers to java element.
+ 			ASTParser p = ASTParser.newParser( AST.JLS3 );
+-			p.setSource( _source );
++			p.setSource( _curSource );
+ 			p.setResolveBindings( false );
+ 			p.setProject( _javaProject );
+-			p.setUnitName( _file.getProjectRelativePath().toString() );
++			p.setUnitName( _files[0].getProjectRelativePath().toString() );
+ 			p.setKind( ASTParser.K_COMPILATION_UNIT );
+ 			ASTNode node = p.createAST( null );
+ 			return (CompilationUnit)node;
+@@ -677,7 +906,132 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 
+ 	public void addTypeDependency(final String fullyQualifiedTypeName )
+ 	{
+-		_typeDependencies.add( fullyQualifiedTypeName );
++		if(!_batchMode){
++			Set<String> deps = _typeDependencies.get(_file);
++			if( deps == null ){
++				deps = new HashSet<String>(4);
++				_typeDependencies.put(_file, deps);
++			}
++			deps.add( fullyQualifiedTypeName );
++		}
+ 	}
+ 	// End of implementation for EclipseAnnotationProcessorEnvironment
++	
++	protected List<AbstractTypeDeclaration> searchLocallyForTypeDeclarations()
++    {
++		if( !_batchMode )
++			return super.searchLocallyForTypeDeclarations();
++		final List<AbstractTypeDeclaration> typeDecls = new ArrayList<AbstractTypeDeclaration>();
++		for( int i=0, len=_astUnits.length; i<len; i++ )
++        	typeDecls.addAll( _astUnits[i].types() );	
++		return typeDecls;
++    }
++	
++	protected Map<ASTNode, List<Annotation>> getASTNodesWithAnnotations()
++    {
++		if( !_batchMode )
++			return super.getASTNodesWithAnnotations();
++    	final Map<ASTNode, List<Annotation>> astNode2Anno = new HashMap<ASTNode, List<Annotation>>();
++        final AnnotatedNodeVisitor visitor = new AnnotatedNodeVisitor(astNode2Anno);        
++        for( int i=0, len=_astUnits.length; i<len; i++ )
++        	_astUnits[i].accept( visitor );
++        return astNode2Anno;
++    }
++	
++	/**
++	 * Go through the list of compilation unit in this environment and looking for
++	 * the declaration node of the given binding.
++	 * @param binding 
++	 * @return the compilation unit that defines the given binding or null if no 
++	 * match is found.
++	 */
++	protected CompilationUnit searchLocallyForBinding(final IBinding binding)
++	{
++		if( !_batchMode )
++			return super.searchLocallyForBinding(binding);
++		
++		for( int i=0, len=_astUnits.length; i<len; i++ ){
++			ASTNode node = _astUnits[i].findDeclaringNode(binding);
++			if( node != null)
++				return _astUnits[i];
++		}
++		return null;
++	}
++	
++	/**
++	 * Go through the list of compilation unit in this environment and looking for
++	 * the declaration node of the given binding.
++	 * @param binding 
++	 * @return the compilation unit that defines the given binding or null if no 
++	 * match is found.
++	 */
++	protected IFile searchLocallyForIFile(final IBinding binding)
++	{
++		if( !_batchMode )
++			return super.searchLocallyForIFile(binding);
++		
++		for( int i=0, len=_astUnits.length; i<len; i++ ){
++			ASTNode node = _astUnits[i].findDeclaringNode(binding);
++			if( node != null)
++				return _files[i];
++		}
++		return null;
++	}
++	
++	public CompilationUnit getAstCompilationUnit(final IFile file)
++	{
++		for( int i=0, len=_files.length; i<len; i++ ){
++			if( _files[i] == file )
++				return _astUnits[i];
++		}
++		return null;
++	}
++	
++	/**
++	 * @return the current ast being processed if in per-file mode.
++	 * If in batch mode, one of the asts being processed (no guarantee which
++	 * one will be returned.  
++	 */
++	protected AST getCurrentDietAST(){
++		
++		if( _astRoot != null )
++			return _astRoot.getAST();
++		else{
++			if( _astUnits == null )
++				throw new IllegalStateException("no AST is available"); //$NON-NLS-1$
++			return _astUnits[0].getAST();
++		}
++	}
++	
++	void postMarkers()
++    {
++		// Posting all the markers to the workspace. Doing this in a batch process
++		// to minimize the amount of notification.
++		try{
++			// the resource of the compilation unit in the environment.
++			final IResource currentResource = _file;
++	        final IWorkspaceRunnable runnable = new IWorkspaceRunnable(){
++	            public void run(IProgressMonitor monitor)
++	            {		
++	                for( Map<String, Object> markerInfo : _markerInfos ){	                  
++						try{
++		                    final IMarker marker = _javaProject.getProject().createMarker(BUILD_MARKER);                    
++		                    marker.setAttributes(markerInfo);
++						}
++						catch(CoreException e){
++							throw new IllegalStateException(e);
++							// todo: (theodora) report the problem
++						}
++	                }
++	            };
++	        };
++			currentResource.getWorkspace().run(runnable, null);
++		}
++		catch(CoreException e){
++			// todo:(theodora) report the problem.
++		}
++		finally{
++			_markerInfos.clear();
++		}
++    }
+ }
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/generatedfile/GeneratedFileManager.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/generatedfile/GeneratedFileManager.java
+index 70af5bb..47d5472 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/generatedfile/GeneratedFileManager.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/generatedfile/GeneratedFileManager.java
+@@ -86,6 +86,10 @@ import org.eclipse.jdt.core.dom.AST;
+  * 
+  */
+ public class GeneratedFileManager {
++
++	// disable type generation during reconcile. This can cause deadlock.
++	// See radar bug #238684	
++	public static final boolean GENERATE_TYPE_DURING_RECONCILE = false;
+ 	
+ 
+ 	// Use a weak hash map to allow file managers to get GC'ed if a project
+@@ -224,7 +228,9 @@ public class GeneratedFileManager {
+ 			
+ 			makeReadOnly( file, true );
+ 			
+-			addEntryToFileMaps( parentFile, file );
++			// during a batch build
++			if( parentFile != null )
++				addEntryToFileMaps( parentFile, file );
+ 			return new FileGenerationResult(file, contentsDiffer, updatededSourcePath);
+ 		}
+ 		catch ( Throwable t )
+@@ -289,9 +295,8 @@ public class GeneratedFileManager {
+ 			String contents, WorkingCopyOwner workingCopyOwner,
+ 			IProblemRequestor problemRequestor, IProgressMonitor progressMonitor ) 
+ 	{	
+-		// disable type generation during reconcile. This can cause deadlock.
+-		// See radar bug #238684
+-		if (true)
++		
++		if (!GENERATE_TYPE_DURING_RECONCILE)
+ 			return null;
+ 		
+ 		// type-generation during reconcile only works if the generated source
+@@ -536,7 +541,8 @@ public class GeneratedFileManager {
+ 	public boolean deleteGeneratedTypeInMemory(IFile generatedFile, ICompilationUnit parentWorkingCopy, IProgressMonitor progressMonitor )
+ 		throws JavaModelException
+ 	{		
+-		
++		if( !GENERATE_TYPE_DURING_RECONCILE )
++			return false;
+ 		// see if this is the only parent for this generated file
+ 		boolean remove = false;
+ 		IFile parentFile = (IFile) parentWorkingCopy.getResource();
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/util/Visitors.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/util/Visitors.java
+index 19f847c..04374f0 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/util/Visitors.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/util/Visitors.java
+@@ -80,6 +80,8 @@ public class Visitors {
+         public boolean visit(ForStatement forStatement){ return false; }
+         public boolean visit(IfStatement ifStatement){ return false; }
+         public boolean visit(TryStatement tryStatement){ return false; }
++        
++        public void reset(){ _annotations.clear(); }
+     }
+     
+     /**
+commit c020688b25edf08bbc7d8d68981663ad78d2a9d8
+Author: tyeung <tyeung>
+Date:   Sat Oct 29 01:21:24 2005 +0000
+
+    APT: match sun's rounding and dispatch model
+    
+    Bugzilla Bug 106541
+    
+    drt: jdt.apt
+
+12	28	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatch.java
+107	62	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+20	10	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptCompilationParticipant.java
+1	16	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
+163	97	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/ProcessorEnvImpl.java
+25	1	org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/APTTestBase.java
+6	6	org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/AptBuilderTests.java
+56	4	org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/MixedModeTesting.java
+12	0	org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/annotations/aptrounding/Round1GenAnnotationProcessor.java
+2	1	org.eclipse.jdt.apt.tests/srcext/META-INF/services/com.sun.mirror.apt.AnnotationProcessorFactory
+15	0	org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchGen.java
+100	0	org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchGenAnnotationFactory.java
+34	32	org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchProcessor.java
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatch.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatch.java
+index 7ce1bb9..58ecee2 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatch.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatch.java
+@@ -38,21 +38,14 @@ import com.sun.mirror.apt.AnnotationProcessorFactory;
+  */
+ public class APTDispatch 
+ {	
+-	/**  
+-	 * This is only used for testing!
+-	 * Contains the list of names or name prefixes of annotation processor factories
+-	 * that need to be executed in batch mode. This is to separate testing configuration
+-	 * from regular execution.
+-	 */
+-	private static List<String> _batchFactoryForTestingOnly = null;
+-	
+ 	public static APTResult runAPTDuringBuild(
+ 			final Map<AnnotationProcessorFactory, FactoryPath.Attributes> factories,
++			final Set<AnnotationProcessorFactory> previousRoundsBatchFactories,
+ 			final IFile[] files,
+ 			final IJavaProject javaProj,
+ 			final boolean isFullBuild)
+ 	{	
+-		return runAPT( factories, javaProj, files, null, isFullBuild );
++		return runAPT( factories, previousRoundsBatchFactories, javaProj, files, null, isFullBuild );
+ 	}
+ 	
+ 	/**
+@@ -65,7 +58,7 @@ public class APTDispatch
+ 			final ICompilationUnit compilationUnit, 
+ 			final IJavaProject javaProj) 
+ 	{
+-		return runAPT( factories, javaProj, null, compilationUnit, false /* does not matter*/ );
++		return runAPT( factories, Collections.<AnnotationProcessorFactory>emptySet(), javaProj, null, compilationUnit, false /* does not matter*/ );
+ 	}
+ 		
+ 	/**
+@@ -73,6 +66,7 @@ public class APTDispatch
+ 	 */
+ 	private static APTResult runAPT(
+ 			Map<AnnotationProcessorFactory, FactoryPath.Attributes> factories,
++			Set<AnnotationProcessorFactory> previousRoundsFactories,
+ 			IJavaProject javaProj,
+ 			IFile[] files,
+ 			ICompilationUnit compilationUnit,
+@@ -91,7 +85,7 @@ public class APTDispatch
+ 		{
+ 			// If we're building, types can be generated, so we
+ 			// want to run this as an atomic workspace operation
+-			 runnable = new APTDispatchRunnable( files, javaProj, factories, isFullBuild );
++			 runnable = new APTDispatchRunnable( files, javaProj, factories, previousRoundsFactories, isFullBuild );
+ 			 schedulingRule = javaProj.getResource();
+ 			 IWorkspace workspace = ResourcesPlugin.getWorkspace();
+ 			 try {
+@@ -126,12 +120,14 @@ public class APTDispatch
+ 			_deletedFiles = Collections.emptySet();
+ 			_newDependencies = Collections.emptyMap();
+ 			_newProblems = Collections.emptyMap();
++			_dispatchedBatchFactories = Collections.emptySet();
+ 			_sourcePathChanged = false;
+ 			_hasGeneratedTypes = false;
+ 		}
+ 		APTResult( 
+ 				Set<IFile> newFiles, 
+-				Set<IFile> deletedFiles, 
++				Set<IFile> deletedFiles,
++				Set<AnnotationProcessorFactory> dispatchedBatchFactories,
+ 				Map<IFile, Set<String>> deps, 
+ 				Map<IFile, List<IProblem>> problems, 
+ 				boolean sourcePathChanged,
+@@ -141,6 +137,7 @@ public class APTDispatch
+ 			_newDependencies = deps;
+ 			_deletedFiles = deletedFiles;
+ 			_newProblems = problems;
++			_dispatchedBatchFactories = dispatchedBatchFactories;
+ 			_sourcePathChanged = sourcePathChanged;
+ 			_hasGeneratedTypes = hasGeneratedTypes;
+ 		}
+@@ -149,12 +146,14 @@ public class APTDispatch
+ 		private final Set<IFile> _deletedFiles;
+ 		private final Map<IFile, Set<String>> _newDependencies;
+ 		private final Map<IFile, List<IProblem>> _newProblems;
++		private final Set<AnnotationProcessorFactory> _dispatchedBatchFactories;
+ 		private boolean _sourcePathChanged;
+ 		private boolean _hasGeneratedTypes;
+ 		private boolean _mutable = true;
+ 		
+ 		Set<IFile> getNewFiles() { return Collections.unmodifiableSet(_newFiles); }
+ 		Set<IFile> getDeletedFiles() { return Collections.unmodifiableSet(_deletedFiles); }
++		Set<AnnotationProcessorFactory> getDispatchedBatchFactory(){ return Collections.unmodifiableSet(_dispatchedBatchFactories); }
+ 		Map<IFile, Set<String>> getNewDependencies() { return Collections.unmodifiableMap(_newDependencies); }
+ 		void removeDependenciesFrom(IFile file){
+ 			mutate();
+@@ -183,6 +182,7 @@ public class APTDispatch
+ 			mutate();
+ 			_newFiles.addAll(otherResult._newFiles);
+ 			_deletedFiles.addAll(otherResult._deletedFiles);
++			_dispatchedBatchFactories.addAll(otherResult._dispatchedBatchFactories);
+ 			mergeMaps(_newDependencies, otherResult._newDependencies);
+ 			mergeMaps(_newProblems, otherResult._newProblems);
+ 			_sourcePathChanged |= otherResult._sourcePathChanged;
+@@ -219,21 +219,5 @@ public class APTDispatch
+ 				}
+ 			}
+ 		}		
+-	}	
+-	
+-	/**
+-	 * This is for testing only!!!!
+-	 * Do not ever call this outside the org.eclipse.jdt.apt.test plugin.
+-	 * 
+-	 * Allow test case to change the list of factories to be executed in batch mode
+-	 * on a per test basis. 
+-	 * @param batchFactoryNames
+-	 */
+-	public static void runInBatchMode_testingOnly(final List<String> batchFactoryNames){
+-		_batchFactoryForTestingOnly = batchFactoryNames;
+-	}
+-	
+-	public static void resetBatchMode_testingOnly(){
+-		_batchFactoryForTestingOnly = null;
+ 	}
+ }
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+index ba0cc8a..9f6b73b 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/APTDispatchRunnable.java
+@@ -18,6 +18,7 @@ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -46,16 +47,17 @@ import com.sun.mirror.apt.RoundCompleteListener;
+ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 
+ /*package*/ class APTDispatchRunnable implements IWorkspaceRunnable
+-{
++{	
+ 	public static final APTResult EMPTY_APT_RESULT = new APTResult();
+ 	public static final IFile[] NO_FILES = new IFile[0];
+ 	// The files that requires processing.
+-	private IFile[] _allFilesRequireProcessing = null;
+-	// the original list of files before any filtering.
+-	private final IFile[] _originalFiles;
++	private IFile[] /*final*/ _allFilesRequireProcessing = null;
++	// The original set of files - <code>_allFilesRequireProcessing</code> 
++	private /*final*/ IFile[] _remainingFiles = null;
+ 	private final ICompilationUnit _compilationUnit;
+ 	private final IJavaProject _javaProject;
+ 	private final Map<AnnotationProcessorFactory, FactoryPath.Attributes> _factories;
++	private final Set<AnnotationProcessorFactory> _dispatchedBatchFactories;
+ 	private  APTResult _result;
+ 	private final boolean _isFullBuild;
+ 	
+@@ -63,14 +65,15 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 			IFile[] files, 
+ 			IJavaProject javaProject, 
+ 			Map<AnnotationProcessorFactory, FactoryPath.Attributes> factories,
++			Set<AnnotationProcessorFactory> dispatchedBatchFactories,
+ 			boolean isFullBuild)
+ 	{
+ 		assert files != null : "missing files"; //$NON-NLS-1$
+ 		_compilationUnit = null;
+-		_allFilesRequireProcessing = getFilesToProcess(files);
+-		_originalFiles = files;
++		filterFilesForProcessing(files);
+ 		_javaProject = javaProject;
+ 		_factories = factories;
++		_dispatchedBatchFactories = dispatchedBatchFactories;
+ 		_isFullBuild = isFullBuild;
+ 	}	
+ 	/*package*/ APTDispatchRunnable( 
+@@ -80,21 +83,28 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 	{
+ 		_compilationUnit = cu;
+ 		final IFile file = (IFile)cu.getResource();
+-		_allFilesRequireProcessing = ScannerUtil.hasAnnotationInstance(file) ?
++		final boolean hasAnnotation = ScannerUtil.hasAnnotationInstance(file);
++		_allFilesRequireProcessing = hasAnnotation ?
+ 				new IFile[]{file} : NO_FILES;
+-		_originalFiles = new IFile[]{file};
++		_remainingFiles = hasAnnotation ? NO_FILES : new IFile[]{file};
+ 		_javaProject = javaProject;
+ 		_factories = factories;
+ 		_isFullBuild = false;
++		// does not apply in reconcile case. we don't generate file during
++		// reconcile and no apt rounding ever occur as a result.
++		_dispatchedBatchFactories = Collections.emptySet();
+ 	}
+ 	
+ 	public APTResult getResult() { return _result; }
+ 	
+-	private static IFile[] getFilesToProcess(final IFile[] orig)
++	private void filterFilesForProcessing(final IFile[] orig)
+ 	{			
+ 		int numFiles = orig.length;
+-		if( numFiles == 0 )
+-			return NO_FILES;
++		if( numFiles == 0 ){
++			_allFilesRequireProcessing = NO_FILES;
++			_remainingFiles = orig;
++			return;
++		}
+ 		int count = 0;
+ 		boolean[] needProcess = new boolean[numFiles];
+ 		for( int i=0; i<numFiles; i++ ){
+@@ -106,55 +116,67 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 				needProcess[i] = false;
+ 			}
+ 		}
+-		if( count == 0 )
+-			return NO_FILES;
++		if( count == 0 ){
++			_allFilesRequireProcessing = NO_FILES;
++			_remainingFiles = orig;
++			return;
++		}
+ 		
+-		IFile[] filesToProcess = new IFile[count];
+-		int index = 0;
++		_allFilesRequireProcessing = new IFile[count];
++		_remainingFiles = count == numFiles ? NO_FILES : new IFile[numFiles-count];
++		int pIndex = 0;
++		int rIndex = 0;
+ 		for( int i=0; i<numFiles; i++ ){
+ 			if( needProcess[i] )
+-				filesToProcess[index++] = orig[i];
++				_allFilesRequireProcessing[pIndex++] = orig[i];
++			else
++				_remainingFiles[rIndex++] = orig[i];
+ 		}
+-		return filesToProcess;
+ 	}
+ 	
+ 	/**
+-	 * Determine whether there are files to be processed. 
+-	 * This call also make sure that the list of files contains exactly the list of 
+-	 * files to be processed. The size of the list is the number of files to 
+-	 * be processed.
+-	 * @return
++	 * Determine whether there are files to be processed.
++	 * @return <code>true</code> iff APT processing should occur, return <code>false</code>
++	 * otherwise.
++	 * 
++	 * APT should should run one of the following is true
++	 * 1) There are files with annotations 
++	 * 2) There are factories dispatched in an earlier round
+ 	 */
+ 	private boolean shouldProcess()
+ 	{
+-		if(_factories == null | _factories.size() == 0 )
++		if( (_factories == null || _factories.size() == 0) && _dispatchedBatchFactories.isEmpty() )
+ 			return false;
+-		return _allFilesRequireProcessing.length > 0;
++		return _allFilesRequireProcessing.length > 0 || !_dispatchedBatchFactories.isEmpty() ;
+ 	}
+ 	
+ 	public void run(IProgressMonitor monitor) 
+ 	{	
+-		//
+-		//  bail-out early if there aren't factories, or if there aren't any annotation instances
+-		// 
+ 		if ( !shouldProcess() )
+ 		{
+ 			// tracing
+ 			if ( AptPlugin.DEBUG ) 
+ 			{			
+ 				String msg;
+-				if ( _factories == null || _factories.size() == 0 )
++				if ( (_factories == null || _factories.size() == 0) && _dispatchedBatchFactories.isEmpty() )
+ 					msg = "no AnnotationProcessoryFactory instances registered."; //$NON-NLS-1$
+ 				else
+-					msg = "no annotation instances in file."; //$NON-NLS-1$
++					msg = "no files to dispatch to."; //$NON-NLS-1$
+ 				trace( "run():  leaving early because there are " + msg, //$NON-NLS-1$
+ 					   null);
+ 			}
+ 
+ 			Set<IFile> allDeletedFiles = new HashSet<IFile>();
+ 			if( !_isFullBuild ){
+-				for( int i=0, len = _originalFiles.length; i<len; i++ ){
+-					IFile f = _originalFiles[i];
++				for( int i=0, len = _allFilesRequireProcessing.length; i<len; i++ ){
++					IFile f = _allFilesRequireProcessing[i];
++					final Set<IFile> deletedFiles = 
++						cleanupAllGeneratedFilesForParent( f, _compilationUnit, null );
++					if( deletedFiles != null )
++						allDeletedFiles.addAll(deletedFiles);
++				}
++				for( int i=0, len=_remainingFiles.length; i<len; i++ ){
++					IFile f = _remainingFiles[i];
+ 					final Set<IFile> deletedFiles = 
+ 						cleanupAllGeneratedFilesForParent( f, _compilationUnit, null );
+ 					if( deletedFiles != null )
+@@ -166,7 +188,8 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 				_result =  EMPTY_APT_RESULT;
+ 			else
+ 				_result = new APTResult( Collections.<IFile>emptySet(), 
+-										 allDeletedFiles, 
++										 allDeletedFiles,
++										 Collections.<AnnotationProcessorFactory>emptySet(),
+ 										 Collections.<IFile, Set<String>>emptyMap(),
+ 										 Collections.<IFile, List<IProblem>>emptyMap(), 
+ 										 false, false );
+@@ -178,12 +201,12 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 			if ( _compilationUnit != null )
+ 			{
+ 				processorEnv = ProcessorEnvImpl
+-					.newProcessorEnvironmentForReconcile(_compilationUnit, _javaProject);
++					.newReconcileEnv(_compilationUnit, _javaProject);
+ 			}
+ 			else
+ 			{
+ 				processorEnv = ProcessorEnvImpl
+-					.newProcessorEnvironmentForBuild( _allFilesRequireProcessing, _javaProject);
++					.newBuildEnv( _allFilesRequireProcessing, _remainingFiles, _javaProject);
+ 			}
+ 			_result = runAPT(_factories, processorEnv);
+ 		}
+@@ -222,6 +245,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 				final ICompilationUnit unit = processorEnv.getICompilationUnitForFile(file);
+ 				assert unit != null : "cannot locate ICompilationUnit for file " + file.getName(); //$NON-NLS-1$
+ 				unitsForFilesWithMissingType.add(unit);
++				break;
+ 			}
+ 		}	
+ 	}
+@@ -282,9 +306,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 						if ( AptPlugin.DEBUG ) {
+ 							trace( "runAPT: invoking file-based processor " + processor.getClass().getName() + " on " + curFile, //$NON-NLS-1$ //$NON-NLS-2$ 
+ 									processorEnv); 
+-							
+ 						}
+-	                    processorEnv.setLatestProcessor(processor);
+ 						processor.process();
+ 						addFileWithMissingTypeError(curFile, filesWithMissingType, unitsForFilesWithMissingType, processorEnv);
+ 					}
+@@ -305,16 +327,19 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 	 * @param processorEnv
+ 	 * @param filesWithMissingType at return contains files (<code>IFile</code>) that has 
+ 	 * missing types.
++	 * @param currentRoundDispatchedBatchFactories output parameter. At return contains the 
++	 * set of batch factories that has been dispatched.
+ 	 * @param sourceForFilesWithMissingType at return contains source (<code>char[]</code>)
+ 	 * for files that has missing types. Parallel to entries in <code>filesWithMissingType</code> 
+-	 * @param round the current round number, 0-based.
++	 * @param internalRound the current round number, 0-based.
+ 	 */
+ 	private void runAPTInMixedMode(
+ 			final Map<AnnotationProcessorFactory, FactoryPath.Attributes> factories,
++			final Set<AnnotationProcessorFactory> currentRoundDispatchedBatchFactories,
+ 			final ProcessorEnvImpl processorEnv,
+ 			final List<IFile> filesWithMissingType,
+ 			final List<ICompilationUnit> unitsForFilesWithMissingType,
+-			final int round)
++			final int internalRound)
+ 	{
+ 		final IFile[] files = processorEnv.getFiles();
+ 		final Map<IFile, Set<AnnotationTypeDeclaration>> file2AnnotationDecls = 
+@@ -322,7 +347,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 		final Map<String, AnnotationTypeDeclaration> annotationDecls = 
+ 			processorEnv.getAllAnnotationTypes(file2AnnotationDecls);
+ 		
+-		if (annotationDecls.isEmpty())
++		if (annotationDecls.isEmpty() && _dispatchedBatchFactories.isEmpty() )
+ 		{
+ 			if ( AptPlugin.DEBUG ) 
+ 				trace( "runAPT:  leaving early because annotationDecls is empty", //$NON-NLS-1$
+@@ -330,6 +355,9 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 			return;
+ 		}
+ 		
++		if( AptPlugin.DEBUG )
++			trace( "annotations found " + annotationDecls.keySet(), processorEnv); //$NON-NLS-1$
++
+ 		// file based processing factory to the set of annotations that it 'claims'
+ 		final Map<AnnotationProcessorFactory, Set<AnnotationTypeDeclaration>> fileFactory2Annos =
+ 			new HashMap<AnnotationProcessorFactory, Set<AnnotationTypeDeclaration>>( factories.size() * 4/3 + 1 );
+@@ -368,23 +396,38 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 		
+ 		// Dispatch to the batch process factories first.
+ 		// Batch processors only get executed on a full/clean build and only get called once
+-		// within one round APT dispatch.
+-		if( !batchFactory2Annos.isEmpty() && round == 0){
++		// within one round APT dispatch.		
++		if( internalRound == 0 ){
++			if( !batchFactory2Annos.isEmpty()){
++				processorEnv.setBatchProcessing();
++				// Once we figure out which factory claims what annotation,
++				// the order of the factory doesn't matter.
++				// But in order to make things consists between runs, will 
++				// dispatch base on factory order.
++				for(AnnotationProcessorFactory factory : factories.keySet() ){			
++					final Set<AnnotationTypeDeclaration> annotationTypes = batchFactory2Annos.get(factory);
++					if( annotationTypes == null ) continue;
++					final AnnotationProcessor processor = 
++						factory.getProcessorFor(annotationTypes, processorEnv);
++					if( processor != null ){
++						if ( AptPlugin.DEBUG ) 
++							trace( "runAPT: invoking batch processor " + processor.getClass().getName(), //$NON-NLS-1$
++									processorEnv);
++						currentRoundDispatchedBatchFactories.add(factory);
++						processor.process();
++					}
++				}			
++			}
+ 			processorEnv.setBatchProcessing();
+-			// Once we figure out which factory claims what annotation,
+-			// the order of the factory doesn't matter.
+-			// But in order to make things consists between runs, will 
+-			// dispatch base on factory order.
+-			for(AnnotationProcessorFactory factory : factories.keySet() ){			
+-				final Set<AnnotationTypeDeclaration> annotationTypes = batchFactory2Annos.get(factory);
+-				if( annotationTypes == null ) continue;
++			for( AnnotationProcessorFactory prevRoundFactory : _dispatchedBatchFactories ){
++				if(currentRoundDispatchedBatchFactories.contains(prevRoundFactory))
++					continue;
+ 				final AnnotationProcessor processor = 
+-					factory.getProcessorFor(annotationTypes, processorEnv);
++					prevRoundFactory.getProcessorFor(Collections.<AnnotationTypeDeclaration>emptySet(), processorEnv);
+ 				if( processor != null ){
+ 					if ( AptPlugin.DEBUG ) 
+ 						trace( "runAPT: invoking batch processor " + processor.getClass().getName(), //$NON-NLS-1$
+-								processorEnv); 
+-                    processorEnv.setLatestProcessor(processor);
++								processorEnv);
+ 					processor.process();
+ 				}
+ 			}
+@@ -409,7 +452,6 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 							if ( AptPlugin.DEBUG ) 
+ 								trace( "runAPT: invoking file-based processor " + processor.getClass().getName(), //$NON-NLS-1$
+ 										processorEnv );
+-		                    processorEnv.setLatestProcessor(processor);
+ 							processor.process();
+ 						}
+ 					}
+@@ -430,7 +472,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 		if( processorEnv.getPhase() == Phase.BUILD )
+ 		{	
+ 			boolean generatedTypes = result.hasGeneratedTypes();
+-			int round = 1;
++			int internalRound = 1;
+ 			while( generatedTypes && !filesWithMissingType.isEmpty() ){
+ 				// compile all generated files and try to satisfy the missing generated types.
+ 				//recompileGeneratedFiles(result.getNewFiles());
+@@ -451,12 +493,12 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 					files[i] = filesWithMissingType.get(i);
+ 					units[i] = unitsForFiles.get(i);
+ 				}
+-				ProcessorEnvImpl newEnv = ProcessorEnvImpl.newProcessorEnvironmentForBuild(
++				ProcessorEnvImpl newEnv = ProcessorEnvImpl.newBuildEnvInternalRounding(
+ 						files, units, processorEnv.getJavaProject() );
+ 
+ 				filesWithMissingType.clear();
+ 				unitsForFiles.clear();
+-				APTResult newResult = runAPT(factories, newEnv, filesWithMissingType, unitsForFiles, round++);
++				APTResult newResult = runAPT(factories, newEnv, filesWithMissingType, unitsForFiles, internalRound++);
+ 				// Only have generated types if there are *new* generated files
+ 				generatedTypes = hasNewFiles(result, newResult);
+ 				
+@@ -488,7 +530,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 			final ProcessorEnvImpl processorEnv,
+ 			final List<IFile> filesWithMissingType,
+ 			final List<ICompilationUnit> unitsForFiles,
+-			final int round) 
++			final int internalRound) 
+ 	{
+ 		try {
+ 			if (factories.size() == 0)
+@@ -508,12 +550,16 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 					lastGeneratedFiles.addAll(genFiles);
+ 			}
+ 			
+-			
+ 			boolean mixedModeDispatch = shouldDispatchToBatchProcessor(factories, processorEnv);
+-			if( mixedModeDispatch )
+-				runAPTInMixedMode(factories, processorEnv, filesWithMissingType, unitsForFiles, round);
+-			else
++			final Set<AnnotationProcessorFactory> currentRoundDispatchedBatchFactories;
++			if( mixedModeDispatch ){
++				currentRoundDispatchedBatchFactories = new LinkedHashSet<AnnotationProcessorFactory>();
++				runAPTInMixedMode(factories, currentRoundDispatchedBatchFactories, processorEnv, filesWithMissingType, unitsForFiles, internalRound);
++			}
++			else{
++				currentRoundDispatchedBatchFactories = Collections.emptySet();
+ 				runAPTInFileBasedMode(factories, processorEnv, filesWithMissingType, unitsForFiles);
++			}
+ 			
+ 
+ 			// notify the processor listeners
+@@ -558,6 +604,7 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 			
+ 			APTResult result = new APTResult( modifiedFiles, 
+ 											  allDeletedFiles, 
++											  currentRoundDispatchedBatchFactories,
+ 											  processorEnv.getTypeDependencies(), 
+ 											  processorEnv.getProblems(), 
+ 											  processorEnv.getSourcePathChanged(),
+@@ -764,6 +811,4 @@ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+ 			return sb.toString();
+ 		}
+ 	}
+-	
+-	
+ }
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptCompilationParticipant.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptCompilationParticipant.java
+index a4f2891..11dcf12 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptCompilationParticipant.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptCompilationParticipant.java
+@@ -16,6 +16,7 @@ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.Iterator;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -53,6 +54,13 @@ import com.sun.mirror.apt.AnnotationProcessorFactory;
+  */
+ public class AptCompilationParticipant implements ICompilationParticipant
+ {
++	/** 
++	 * Batch factories that claimed some annotation in a previous round of APT processing.
++	 * This currently only apply to the build case since are only generating types during build
++	 * and hence cause APT rounding.
++	 * The set is an order preserving. The order is determined by their first invocation.
++	 */
++	private Set<AnnotationProcessorFactory> _previousRoundsBatchFactories = new LinkedHashSet<AnnotationProcessorFactory>();
+ 	private static AptCompilationParticipant INSTANCE;
+ 	
+ 	public static AptCompilationParticipant getInstance() {
+@@ -66,8 +74,7 @@ public class AptCompilationParticipant implements ICompilationParticipant
+ 	 */
+ 	public AptCompilationParticipant()
+ 	{
+-        _factoryLoader = AnnotationProcessorFactoryLoader.getLoader();
+-        INSTANCE = this;
++		INSTANCE = this;
+ 	}
+ 
+ 	public CompilationParticipantResult notify( CompilationParticipantEvent cpe )
+@@ -115,20 +122,23 @@ public class AptCompilationParticipant implements ICompilationParticipant
+ 		// is a possibility
+ 		if ("1.3".equals(javaVersion) || "1.4".equals(javaVersion)) { //$NON-NLS-1$ //$NON-NLS-2$
+ 			return EMPTY_PRE_BUILD_COMPILATION_RESULT;
+-		}
+-
++		}			
++	
+ 		// If we're in batch mode, we need to reset the classloaders
+ 		// for the batch processors before we begin
+ 		boolean isFullBuild = pbce.isFullBuild();
+-		if (isFullBuild) {
++		if (isFullBuild && pbce.getRound() == 0) {
+ 			AnnotationProcessorFactoryLoader.getLoader().resetBatchProcessors(pbce.getJavaProject());
++			_previousRoundsBatchFactories.clear();
+ 		}
+ 		
+-		Map<AnnotationProcessorFactory, FactoryPath.Attributes> factories = _factoryLoader.getFactoriesAndAttributesForProject( javaProject );	
++		Map<AnnotationProcessorFactory, FactoryPath.Attributes> factories =
++			AnnotationProcessorFactoryLoader.getLoader().getFactoriesAndAttributesForProject(javaProject);
+ 		
+-		APTResult result = APTDispatch.runAPTDuringBuild(factories, buildFiles, javaProject, isFullBuild);
++		APTResult result = APTDispatch.runAPTDuringBuild(factories, _previousRoundsBatchFactories, buildFiles, javaProject, isFullBuild);
+ 		Set<IFile> newFiles = result.getNewFiles();			
+ 		Set<IFile> deletedFiles = new HashSet<IFile>();
++		_previousRoundsBatchFactories.addAll(result.getDispatchedBatchFactory());
+ 		
+ 		// see if APT updated a project's source path
+ 		boolean sourcePathChanged = result.getSourcePathChanged();
+@@ -187,7 +197,7 @@ public class AptCompilationParticipant implements ICompilationParticipant
+ 				return GENERIC_COMPILATION_RESULT;
+ 			
+ 			Map<AnnotationProcessorFactory, FactoryPath.Attributes> factories = 
+-				_factoryLoader.getFactoriesAndAttributesForProject( javaProject );
++				AnnotationProcessorFactoryLoader.getLoader().getFactoriesAndAttributesForProject( javaProject );
+ 			APTResult result = APTDispatch.runAPTDuringReconcile( factories, cu, javaProject );
+ 			Map<IFile, List<IProblem>> allproblems = result.getProblems();			
+ 			
+@@ -257,11 +267,11 @@ public class AptCompilationParticipant implements ICompilationParticipant
+ 		if (!AptConfig.isEnabled(project)) {
+ 			return false;
+ 		}		
+-		return _factoryLoader.hasFactoriesForProject(project);				
++		return AnnotationProcessorFactoryLoader.getLoader().hasFactoriesForProject(project);				
+ 		//TODO: use config to decide which projects we support
+ 	}
+ 
+-    private AnnotationProcessorFactoryLoader _factoryLoader;
++    
+     private final static String DOT_JAVA = ".java"; //$NON-NLS-1$
+ 	
+ 	private final static PreBuildCompilationResult EMPTY_PRE_BUILD_COMPILATION_RESULT = 
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
+index f63f164..c198ec4 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BaseProcessorEnv.java
+@@ -58,7 +58,6 @@ import org.eclipse.jdt.core.dom.IVariableBinding;
+ import org.eclipse.jdt.core.dom.SingleVariableDeclaration;
+ import org.eclipse.jdt.core.dom.VariableDeclarationFragment;
+ 
+-import com.sun.mirror.apt.AnnotationProcessor;
+ import com.sun.mirror.apt.AnnotationProcessorEnvironment;
+ import com.sun.mirror.apt.AnnotationProcessorListener;
+ import com.sun.mirror.apt.Filer;
+@@ -111,7 +110,6 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 	// is outside of the workspace.
+ 	private VoidTypeImpl _voidType;
+ 	private PrimitiveTypeImpl[] _primitives;
+-    private AnnotationProcessor _latestProcessor;
+ 	
+ 	public BaseProcessorEnv(CompilationUnit astCompilationUnit,
+ 						    IFile file,
+@@ -126,17 +124,7 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 		_modelCompUnit2astCompUnit = new HashMap<ICompilationUnit, CompilationUnit>();
+ 		_typeBinding2ModelCompUnit = new HashMap<ITypeBinding, ICompilationUnit>();
+ 	}
+-    
+-    public AnnotationProcessor getLatestProcessor()
+-    {
+-        return _latestProcessor;
+-    }
+-    
+-    public void setLatestProcessor(AnnotationProcessor latestProcessor)
+-    {
+-        _latestProcessor = latestProcessor;
+-    }
+-	
++  
+ 	public Types getTypeUtils()
+     {
+ 		return new TypesUtil(this);
+@@ -674,9 +662,6 @@ public class BaseProcessorEnv implements AnnotationProcessorEnvironment
+ 			}
+ 		}
+ 		
+-for( int index=0; index<len; index++ )
+-	if(parseUnits[index] == null )
+-		System.err.println();
+ 		CompilationUnitsRequestor requestor = new CompilationUnitsRequestor();
+ 		ASTParser p = ASTParser.newParser( AST.JLS3 );
+ 		p.setResolveBindings( true );
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/ProcessorEnvImpl.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/ProcessorEnvImpl.java
+index fb7b719..8e97d5f 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/ProcessorEnvImpl.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/ProcessorEnvImpl.java
+@@ -66,6 +66,7 @@ import org.eclipse.jdt.core.dom.IBinding;
+ import org.eclipse.jdt.core.dom.ITypeBinding;
+ import org.eclipse.jdt.core.dom.SimpleName;
+ 
++import com.sun.corba.se.spi.activation._ServerStub;
+ import com.sun.mirror.apt.AnnotationProcessorListener;
+ import com.sun.mirror.apt.Filer;
+ import com.sun.mirror.declaration.AnnotationTypeDeclaration;
+@@ -113,19 +114,24 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	 */
+ 	private Map<String, String> _options;
+ 	
+-	private boolean _batchMode = false; // off by default.
+-	
+ 	/**
+-	 * The source of the file currently being processed.
+-	 * <code>null</code> during batch mode during build and reconcile.
++	 * Indicates whether we are in batch mode or not. This gets flipped only 
++	 * during build and could be flipped back and forth. 
+ 	 */
+-	private char[] _curSource = null;
++	private boolean _batchMode = false; // off by default.	
++
+ 	/** 
+-	 * Holds all the files that are to be processed during build.
++	 * Holds all the files that contains annotation that are to be processed during build.
+ 	 * If we are not in batch mode (reconcile time or file-based dispatch during build),
+ 	 * <code>super._file</code> holds the file being processed at the time. 
+ 	 */ 
+-	private IFile[] _files = null;
++	private IFile[] _filesWithAnnotation = null;
++	
++	/**
++	 * These are files that are part of a build but does not have annotations on it.
++	 * During batch mode processing, these files still also need to be included. 
++	 */
++	private IFile[] _additionFiles = null;
+ 	/** 
+ 	 * This is intialized when <code>_batchMode</code> is set to be <code>true</code> or
+ 	 * when batch processing is expected. @see #getAllAnnotationTypes(Map)
+@@ -138,73 +144,81 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	private ICompilationUnit[] _units = null;
+ 	private List<MarkerInfo> _markerInfos = null;
+ 
+-	public static ProcessorEnvImpl newProcessorEnvironmentForReconcile(ICompilationUnit compilationUnit, IJavaProject javaProj)
+-    {	
+-    	//String unitName =  compilationUnit.getResource().getProjectRelativePath().toString();
++	public static ProcessorEnvImpl newReconcileEnv(ICompilationUnit compilationUnit, IJavaProject javaProj)
++    {
+ 		CompilationUnit domUnit = createDietAST( javaProj, compilationUnit );
+-       	return new ProcessorEnvImpl( 
+-       			domUnit, 
+-       			compilationUnit, 
+-       			(IFile)compilationUnit.getResource(), 
+-       			javaProj, Phase.RECONCILE );
++       	return new ProcessorEnvImpl( domUnit, compilationUnit, javaProj);
+     }
+ 	
+ 	/**
+-	 * @param files 
+-	 * @param sources source from <code>files</code>
++	 * @param filesWithAnnotation files that have annotation.
++	 * @param units compilation unit associated with <code>filesWithAnnotation</code>
+ 	 * @param javaProj
+ 	 * @return a new processor environment.
+ 	 */
+-	public static ProcessorEnvImpl newProcessorEnvironmentForBuild(IFile[] files, ICompilationUnit[] units, IJavaProject javaProj)
++	public static ProcessorEnvImpl newBuildEnvInternalRounding(
++			IFile[] filesWithAnnotation,			
++			ICompilationUnit[] units, 
++			IJavaProject javaProj)
+ 	{
+-		assert files != null : "missing files"; //$NON-NLS-1$  
+-		return new ProcessorEnvImpl(files, units, javaProj, Phase.BUILD);
++		assert filesWithAnnotation != null : "missing files"; //$NON-NLS-1$
++		return new ProcessorEnvImpl(filesWithAnnotation, null, units, javaProj, Phase.BUILD);
+ 	}
+     
+-    public static ProcessorEnvImpl newProcessorEnvironmentForBuild(IFile[] files, IJavaProject javaProj )
++    public static ProcessorEnvImpl newBuildEnv(
++    		IFile[] filesWithAnnotation,
++    		IFile[] additionalFiles,
++    		IJavaProject javaProj )
+     {
+-    	assert files != null : "missing files"; //$NON-NLS-1$    	
++    	assert filesWithAnnotation != null : "missing files"; //$NON-NLS-1$    	
+     
+ 		// note, we are not reading any files.
+-		return new ProcessorEnvImpl(files, null, javaProj, Phase.BUILD);
++		return new ProcessorEnvImpl(filesWithAnnotation, additionalFiles, null, javaProj, Phase.BUILD);
+     }
+     
++    /** 
++     * Constructor for creating a processor environment used during reconcile
++     * @param astCompilationUnit
++     * @param compilationUnit
++     * @param file
++     * @param javaProj
++     * @param phase
++     */
+     private ProcessorEnvImpl(
+     		final CompilationUnit astCompilationUnit,
+     		final ICompilationUnit compilationUnit,
+-    		final IFile file,
+-    		final IJavaProject javaProj,
+-    		final Phase phase)
++    		final IJavaProject javaProj )
+     {
+-    	super(  astCompilationUnit, file, javaProj, phase );
+-    	
+-    	// if we are in reconcile, compilationUnit will be valid
+-		// if we are in build, file will not be null & compilationUnit will be
+-		// null
+-    	assert( (phase == Phase.RECONCILE && compilationUnit != null) || 
+-    			(phase == Phase.BUILD && compilationUnit == null && file != null ) ) :
+-    			"Unexpected phase value " + phase ; //$NON-NLS-1$
+-			   
++    	super(  astCompilationUnit, (IFile)compilationUnit.getResource(), javaProj, Phase.RECONCILE );
++   
+ 	   _unit = compilationUnit;	
+ 	   _filer = new FilerImpl(this);
+ 	   _allProblems = new HashMap<IFile, List<IProblem>>();	   
+ 	   initOptions(javaProj);
+     }
+     
++    /**
++     * Constructor for creating a processor environment used during build.
++     * @param filesWithAnnotations
++     * @param additionalFiles
++     * @param units
++     * @param javaProj
++     * @param phase
++     */
+     private ProcessorEnvImpl(
+-			final IFile[] files,
++			final IFile[] filesWithAnnotations,
++			final IFile[] additionalFiles, 
+ 			final ICompilationUnit[] units,
+ 			final IJavaProject javaProj,
+ 			final Phase phase) {
+     	
+     	super(null, null, javaProj, phase);
+-    	assert( phase == Phase.BUILD && files != null  ) :
+-    		"Unexpected phase value " + phase; //$NON-NLS-1$
+-		
++    
+ 		_unit = null;
+ 		_units = units;
+ 		_filer = new FilerImpl(this);
+-		_files = files;
++		_filesWithAnnotation = filesWithAnnotations;
++		_additionFiles = additionalFiles;
+ 		_allProblems = new HashMap<IFile, List<IProblem>>();
+ 		_markerInfos = new ArrayList<MarkerInfo>();
+ 		initOptions(javaProj);
+@@ -318,7 +332,7 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 
+     public TypeDeclaration getTypeDeclaration(String name)
+     {
+-		checkValid();
++		checkValid();		
+ 		TypeDeclaration decl = null;
+ 		if( !_batchMode ){
+ 			// we are not keeping dependencies unless we are processing on a
+@@ -342,23 +356,27 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 		
+ 		// first see if it is one of the well known types.
+ 		// any AST is as good as the other.
+-		ITypeBinding typeBinding = _astUnits[0].getAST().resolveWellKnownType(name);
++		ITypeBinding typeBinding = null;
+ 		String typeKey = BindingKey.createTypeBindingKey(name);
+-		if(typeBinding == null){
+-			// then look into the current compilation units			
+-			ASTNode node = null;
+-			for( int i=0, len=_astUnits.length; i<len; i++ )
+-				node = _astUnits[i].findDeclaringNode(typeKey);			
+-			if( node != null ){
+-				final int nodeType = node.getNodeType();
+-				if( nodeType == ASTNode.TYPE_DECLARATION ||
+-					nodeType == ASTNode.ANNOTATION_TYPE_DECLARATION ||
+-					nodeType == ASTNode.ENUM_DECLARATION )
+-				typeBinding = ((AbstractTypeDeclaration)node).resolveBinding();
++		if( _astUnits.length > 0 ){
++			_astUnits[0].getAST().resolveWellKnownType(name);
++			
++			if(typeBinding == null){
++				// then look into the current compilation units			
++				ASTNode node = null;
++				for( int i=0, len=_astUnits.length; i<len; i++ )
++					node = _astUnits[i].findDeclaringNode(typeKey);			
++				if( node != null ){
++					final int nodeType = node.getNodeType();
++					if( nodeType == ASTNode.TYPE_DECLARATION ||
++						nodeType == ASTNode.ANNOTATION_TYPE_DECLARATION ||
++						nodeType == ASTNode.ENUM_DECLARATION )
++					typeBinding = ((AbstractTypeDeclaration)node).resolveBinding();
++				}
+ 			}
++			if( typeBinding != null )
++				return Factory.createReferenceType(typeBinding, this);
+ 		}
+-		if( typeBinding != null )
+-			return Factory.createReferenceType(typeBinding, this);
+ 
+ 		// finally go search for it in the universe.
+ 		typeBinding = getTypeBinding(typeKey);
+@@ -496,7 +514,7 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+     	_astRoot = null;
+     	_file = null;
+     	_astUnits = null;
+-    	_files = null;
++    	_filesWithAnnotation = null;
+     	_units = null;
+     	_allProblems = null;
+         _modelCompUnit2astCompUnit.clear();		
+@@ -571,12 +589,12 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+     		AptPlugin.log(status);
+     		return;
+     	}
+-    		
++    	
+     	if( resource == null ){
+     		assert _batchMode : "not in batch mode but don't know about current resource"; //$NON-NLS-1$
+     		addMarker(start, end, severity, msg, line, arguments);
+     	}
+-    	else
++    	else    	
+     		addProblem(resource, start, end, severity, msg, line, arguments);
+     	
+     }
+@@ -662,7 +680,7 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+     		final Map<IFile, Set<AnnotationTypeDeclaration>> file2Annotations) {
+     	
+     	checkValid();
+-    	if( _files == null )  
++    	if( _filesWithAnnotation == null )  
+     		return getAnnotationTypesInFile();
+     	createDomASTs();
+     	
+@@ -671,6 +689,8 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 			new HashMap<String, AnnotationTypeDeclaration>();
+ 		final AnnotationVisitor visitor = new AnnotationVisitor(instances);
+ 		for( int astIndex=0, len=_astUnits.length; astIndex<len; astIndex++ ){
++			if( _astUnits == null || _astUnits[astIndex] == null  )
++				System.err.println();
+ 			_astUnits[astIndex].accept(visitor);
+ 			final Set<AnnotationTypeDeclaration> perFileAnnos = new HashSet<AnnotationTypeDeclaration>(); 
+ 			
+@@ -688,7 +708,7 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 				}
+ 			}
+ 			if( file2Annotations != null && !perFileAnnos.isEmpty() )
+-				file2Annotations.put(_files[astIndex], perFileAnnos);
++				file2Annotations.put(_filesWithAnnotation[astIndex], perFileAnnos);
+ 			visitor.reset();
+ 		}
+ 		
+@@ -910,10 +930,11 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	 * Note: Call to this method will cause all files associated with this environment to be 
+ 	 * read and parsed.
+ 	 */
+-	public void setBatchProcessing(){
++	public void setBatchProcessing(){		
+ 		if( _phase != Phase.BUILD )
+ 			throw new IllegalStateException("No batch processing outside build."); //$NON-NLS-1$
+ 		
++		if( _batchMode ) return;
+ 		checkValid();
+ 		createDomASTs();
+ 		
+@@ -924,7 +945,7 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	
+ 	private void createDomASTs()
+ 	{
+-		if( _astUnits != null || _files == null) return;
++		if( _astUnits != null || _filesWithAnnotation == null) return;
+ 		createICompilationUnits();		
+ 		_astUnits = createDietASTs(_javaProject, _units);
+ 	}
+@@ -941,16 +962,16 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 		_unit = null;
+ 		
+ 		// need to match up the file with the ast.
+-		if( _files != null ){
+-			for( int i=0, len=_files.length; i<len; i++ ){
+-				if( file.equals(_files[i]) ){
++		if( _filesWithAnnotation != null ){
++			for( int i=0, len=_filesWithAnnotation.length; i<len; i++ ){
++				if( file.equals(_filesWithAnnotation[i]) ){
+ 					_file = file;
+ 					if( _astUnits != null ){
+ 						_astRoot = _astUnits[i];		
+ 						_unit = _units[i];
+ 					}
+ 					else{
+-						_unit = JavaCore.createCompilationUnitFrom(_files[i]);
++						_unit = JavaCore.createCompilationUnitFrom(_filesWithAnnotation[i]);
+ 						_astRoot = createDietAST(_javaProject, _unit);
+ 					}
+ 				}
+@@ -988,16 +1009,52 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	}
+ 	// End of implementation for EclipseAnnotationProcessorEnvironment
+ 	
++	/**
++	 * Include all the types from all files, files with and without annotations on it
++	 * if we are in batch mode. Otherwise, just the types from the file that's currently
++	 * being processed.
++	 */
+ 	protected List<AbstractTypeDeclaration> searchLocallyForTypeDeclarations()
+     {
+ 		if( !_batchMode )
+ 			return super.searchLocallyForTypeDeclarations();
+ 		final List<AbstractTypeDeclaration> typeDecls = new ArrayList<AbstractTypeDeclaration>();
+ 		for( int i=0, len=_astUnits.length; i<len; i++ )
+-        	typeDecls.addAll( _astUnits[i].types() );	
++        	typeDecls.addAll( _astUnits[i].types() );
++		
++		getTypeDeclarationsFromAdditionFiles(typeDecls);
++		
+ 		return typeDecls;
+     }
+ 	
++	private void getTypeDeclarationsFromAdditionFiles(List<AbstractTypeDeclaration> typeDecls){
++		if( _additionFiles == null || _additionFiles.length == 0 ) return;
++	
++		ICompilationUnit[] units = createICUsFrom(_additionFiles);
++		final int actualLen = units.length;
++		final int numFiles = _additionFiles.length;
++		if( actualLen == 0 )
++			return;
++		
++		// We are simply silently dropping files that doesn't have a compilation unit.
++		// This most like means the file has been deleted.
++		if( numFiles != actualLen ){
++			final ICompilationUnit[] newUnits = new ICompilationUnit[actualLen];
++			int newIndex = 0;
++			for( ICompilationUnit unit : units ){
++				if( unit != null )
++					newUnits[newIndex ++] = unit;
++			}
++			units = newUnits;
++		}
++		final CompilationUnit[] domUnits = createDietASTs(_javaProject, units);
++		for( CompilationUnit domUnit : domUnits ){
++			if( domUnit != null ){
++				typeDecls.addAll( domUnit.types() );
++			}
++		}
++	}
++	
+ 	protected Map<ASTNode, List<Annotation>> getASTNodesWithAnnotations()
+     {
+ 		if( !_batchMode )
+@@ -1016,7 +1073,7 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 		final CompilationUnit curRoot = (CompilationUnit)node.getRoot();
+ 		for( int i=0, len=_astUnits.length; i<len; i++ ){
+ 			if( _astUnits[i] == curRoot )
+-				return _files[i];
++				return _filesWithAnnotation[i];
+ 		}
+ 		throw new IllegalStateException();
+ 	}
+@@ -1056,7 +1113,7 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 		for( int i=0, len=_astUnits.length; i<len; i++ ){
+ 			ASTNode node = _astUnits[i].findDeclaringNode(binding);
+ 			if( node != null)
+-				return _files[i];
++				return _filesWithAnnotation[i];
+ 		}
+ 		return null;
+ 	}
+@@ -1067,8 +1124,8 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+     	else if( file.equals(_file) )
+     		return _unit;
+     	else if( _units != null ){
+-    		for( int i=0, len=_files.length; i<len; i++ ){
+-        		if( file.equals(_files[i]) )
++    		for( int i=0, len=_filesWithAnnotation.length; i<len; i++ ){
++        		if( file.equals(_filesWithAnnotation[i]) )
+         			return _units[i];
+         	}
+     	}
+@@ -1088,8 +1145,8 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+     	else if( file.equals(_file) )
+     		return _astRoot;
+     	else if( _astUnits != null ){
+-    		for( int i=0, len=_files.length; i<len; i++ ){
+-        		if( file.equals(_files[i]) )
++    		for( int i=0, len=_filesWithAnnotation.length; i<len; i++ ){
++        		if( file.equals(_filesWithAnnotation[i]) )
+         			return _astUnits[i];
+         	}
+     	}
+@@ -1134,13 +1191,7 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	                }
+ 	            };
+ 	        };
+-	        IWorkspace ws;
+-	        if (_file != null) {
+-	        	ws = _file.getWorkspace();
+-	        }
+-	        else {
+-	        	ws = _files[0].getWorkspace(); 
+-	        }
++	        IWorkspace ws = _javaProject.getProject().getWorkspace();
+ 			ws.run(runnable, null);
+ 		}
+ 		catch(CoreException e){
+@@ -1153,43 +1204,58 @@ public class ProcessorEnvImpl extends BaseProcessorEnv implements EclipseAnnotat
+ 	
+ 	public IFile[] getFiles()
+ 	{
+-		if(_files != null)
+-			return _files;
++		if(_filesWithAnnotation != null)
++			return _filesWithAnnotation;
+ 		else
+ 			return new IFile[]{_file};
+ 	}
+ 	
++	private static ICompilationUnit[] createICUsFrom(final IFile[] files){
++		final int len = files.length;
++		if( len == 0 )
++			return NO_UNIT;
++		final ICompilationUnit[] units = new ICompilationUnit[len];
++		for( int i=0; i<len; i++ ){
++			units[i] = JavaCore.createCompilationUnitFrom(files[i]);
++		}
++		return units;
++	}
++	
++	private int getNumberNonNulls(final ICompilationUnit[] units){
++		int counter = 0;
++		for(ICompilationUnit unit : units ){
++			if( unit != null )
++				counter ++;
++		}
++		return counter;
++	}
++	
++	
+ 	/**
+-	 * Build <code>ICompilationUnit</code> from the files in this environment.
++	 * Build <code>ICompilationUnit</code> from the files with annotations in this environment.
+ 	 * If a compilation unit cannot be created from a file, the file will be 
+ 	 * dropped from the file list.
+ 	 */
+ 	private void createICompilationUnits(){
+ 		if(_units != null) 
+ 			return;
+-		final int len = _files.length;
+-		_units = new ICompilationUnit[len];		
+-		int count = 0;
+-		for( int i=0; i<len; i++ ){
+-			_units[i] = JavaCore.createCompilationUnitFrom(_files[i]);
+-			if( _units[i] != null )
+-				count ++;
+-		}
++		_units = createICUsFrom(_filesWithAnnotation);
+ 		
+ 		// drop files that doesn't have an ICompilationUnit from the list 
+ 		// and shrink the list of ICompilationUnits.
+-		if(count != len){
+-			final IFile[] newFiles = new IFile[count];
+-			final ICompilationUnit[] newUnits = new ICompilationUnit[count];
++		final int actualLen = getNumberNonNulls(_units);
++		if(actualLen != _filesWithAnnotation.length ){
++			final IFile[] newFiles = new IFile[actualLen];
++			final ICompilationUnit[] newUnits = new ICompilationUnit[actualLen];
+ 			int newIndex = 0;
+-			for( int i=0; i<len; i++ ){
++			for( int i=0; i<_filesWithAnnotation.length ; i++ ){
+ 				if( _units[i] != null ){
+-					newFiles[newIndex] = _files[i];
++					newFiles[newIndex] = _filesWithAnnotation[i];
+ 					newUnits[newIndex] = _units[i];
+ 					newIndex ++;
+ 				}
+ 			}
+-			_files = newFiles;
++			_filesWithAnnotation = newFiles;
+ 			_units = newUnits;
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/APTTestBase.java b/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/APTTestBase.java
+index 341ba6d..6e45ad3 100644
+--- a/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/APTTestBase.java
++++ b/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/APTTestBase.java
+@@ -10,6 +10,9 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.apt.tests;
+ 
++import java.util.HashSet;
++import java.util.Set;
++
+ import org.eclipse.core.resources.IFolder;
+ import org.eclipse.core.resources.IMarker;
+ import org.eclipse.core.resources.IProject;
+@@ -101,7 +104,28 @@ public abstract class APTTestBase extends Tests{
+ 	protected void expectingMarkers(String[] messages)
+ 	{	
+ 		final IMarker[] markers = getAPTBuildMarkerFor(env.getWorkspaceRootPath());
+-		assertEquals(concate(messages), concate(markers));
++		final Set<String> expectedMessages = new HashSet<String>();
++		for(String msg : messages ){
++			expectedMessages.add(msg);
++		}
++		boolean fail = false;
++		try{
++			for( IMarker marker : markers ){
++				final String markerMsg = (String)marker.getAttribute(IMarker.MESSAGE);
++				if( expectedMessages.contains(markerMsg) )
++					expectedMessages.remove(markerMsg);
++				else{
++					fail = true;
++					break;
++				}
++			}
++			if( !expectedMessages.isEmpty() )
++				fail = true;
++		}catch(CoreException ce){
++			assertTrue("unexpected core exception" + ce.getMessage(), false); //$NON-NLS-1$
++		}
++		if( fail )
++			assertEquals(concate(messages), concate(markers));
+ 	}
+ 	
+ 	protected void expectingNoMarkers() {
+diff --git a/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/AptBuilderTests.java b/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/AptBuilderTests.java
+index 7c93d67..1771a3a 100644
+--- a/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/AptBuilderTests.java
++++ b/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/AptBuilderTests.java
+@@ -533,18 +533,18 @@ public class AptBuilderTests extends Tests
+ 		IProject project = env.getProject( getProjectName() );
+ 		IPath srcRoot = getSourcePath( getProjectName()  );
+ 		
+-		String codeA = "package p1;\n"
++		String codeX = "package p1;\n"
+ 			+ "\n import org.eclipse.jdt.apt.tests.annotations.aptrounding.*;"
+ 			+ "\n@GenBean\n"
+-			+ "public class A {}\n";
++			+ "public class X {}\n";
+ 		
+-		env.addClass( srcRoot, "p1", "A", codeA );
++		env.addClass( srcRoot, "p1", "X", codeX );
+ 		
+-		String codeB = "package p1;\n"
++		String codeY = "package p1;\n"
+ 			+ "\n import org.eclipse.jdt.apt.tests.annotations.aptrounding.*;"
+-			+ "public class B { @GenBean2 test.Bean _bean = null; }\n";
++			+ "public class Y { @GenBean2 test.Bean _bean = null; }\n";
+ 		
+-		env.addClass( srcRoot, "p1", "B", codeB );
++		env.addClass( srcRoot, "p1", "Y", codeY );
+ 
+ 		fullBuild( project.getFullPath() );
+ 		
+diff --git a/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/MixedModeTesting.java b/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/MixedModeTesting.java
+index 332582f..a7a75de 100644
+--- a/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/MixedModeTesting.java
++++ b/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/MixedModeTesting.java
+@@ -56,7 +56,9 @@ public class MixedModeTesting extends APTTestBase{
+ 	
+ 	/**
+ 	 * Only one batch processor is involved 
+-	 */
++	 * This test the processor environment and that it returns the correct
++	 * set of declared types.
++	 */	
+ 	public void testSimpleBatchProcessing() throws Exception
+ 	{	
+ 		IProject project = env.getProject( getProjectName() );
+@@ -81,13 +83,22 @@ public class MixedModeTesting extends APTTestBase{
+ 			+ "public class C {}\n";
+ 		
+ 		env.addClass( srcRoot, "p1", "C", codeC );
++		
++		// This one doesn't have annotations.
++		String codeD = "package p1; public class D{}";
++		env.addClass( srcRoot, "p1", "D", codeD );
+ 
+ 		fullBuild( project.getFullPath() );		
+ 		expectingNoProblems();
+ 		expectingMarkers(new String[]{"CompletedSuccessfully"});
+ 	}
+ 	
+-	public void testAPTRoundingInMixedMode() throws CoreException
++	/**
++	 * What this tests test.
++	 * This makes sure the internal apt rounding occurs correctly in batch mode.
++	 * @throws CoreException
++	 */
++	public void testAPTRoundingInMixedMode0() throws CoreException
+ 	{
+ 		IProject project = env.getProject( getProjectName() );
+ 		IPath srcRoot = getSourcePath();
+@@ -124,16 +135,57 @@ public class MixedModeTesting extends APTTestBase{
+ 			+ "public class C {}\n";
+ 		
+ 		env.addClass( srcRoot, "p1", "C", codeC );
++		
++		// This one doesn't have annotations.
++		String codeD = "package p1; public class D{}";
++		env.addClass( srcRoot, "p1", "D", codeD );
+ 
+ 		fullBuild( project.getFullPath() );
+-		expectingMarkers(new String[]{"CompletedSuccessfully"});
++		expectingMarkers(new String[]{"CompletedSuccessfully", "Called 2 times."});
+ 		
+ 		expectingNoProblems();
+ 		
+ 		// Now run it again to verify that the classloader was successfully bounced
+ 		fullBuild( project.getFullPath() );
+-		expectingMarkers(new String[]{"CompletedSuccessfully"});
++		expectingMarkers(new String[]{"CompletedSuccessfully", "Called 2 times."});
++		
++		expectingNoProblems();
++	}
++	
++	/* 
++	 * What this test tests.
++	 * There should be a total of 3 rounds. 
++	 * -The first round starts because of the "BatchGen" annotations.
++	 *  This round creates the gen.Class0 type
++	 * -The second round starts because of a batch processor being dispatched in a previous round
++	 * and a new type is generated. 
++	 *  This round creates the gen.Class1 type
++	 * -The third round starts for the exact same reason as round 2.
++	 *  This is a no-op round.
++	 */
++
++	public void testAPTRoundingInMixedMode1() throws CoreException
++	{
++		IProject project = env.getProject( getProjectName() );
++		IPath srcRoot = getSourcePath();
+ 		
++		String codeA = "package p1;\n"
++			+ "\n import org.eclipse.jdt.apt.tests.external.annotations.batch.*;"
++			+ "\n@BatchGen\n"
++			+ "public class A {" 
++			+ "   gen.Class0 clazz0;\n"
++			+ "   gen.Class1 clazz1;\n" 
++			+ "}\n";
++		
++		env.addClass( srcRoot, "p1", "A", codeA );
++		
++		// drop something to possibily fire off an incremental build
++		String codeB = "package p1;\n"
++			+ "public class B {}\n";
++		
++		env.addClass( srcRoot, "p1", "B", codeB );
++		fullBuild( project.getFullPath() );
+ 		expectingNoProblems();
++		expectingMarkers(new String[]{"Called the third time."});
+ 	}
+ }
+diff --git a/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/annotations/aptrounding/Round1GenAnnotationProcessor.java b/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/annotations/aptrounding/Round1GenAnnotationProcessor.java
+index 27ffc33..322ea74 100644
+--- a/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/annotations/aptrounding/Round1GenAnnotationProcessor.java
++++ b/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/annotations/aptrounding/Round1GenAnnotationProcessor.java
+@@ -11,10 +11,12 @@
+ package org.eclipse.jdt.apt.tests.annotations.aptrounding;
+ import java.io.IOException;
+ import java.io.PrintWriter;
++import java.util.Collection;
+ 
+ import com.sun.mirror.apt.AnnotationProcessor;
+ import com.sun.mirror.apt.AnnotationProcessorEnvironment;
+ import com.sun.mirror.apt.Filer;
++import com.sun.mirror.apt.Messager;
+ import com.sun.mirror.declaration.TypeDeclaration;
+ 
+ public class Round1GenAnnotationProcessor implements AnnotationProcessor{
+@@ -37,5 +39,15 @@ public class Round1GenAnnotationProcessor implements AnnotationProcessor{
+ 			}
+ 			catch(IOException io){}
+ 		}
++		
++		final Collection<TypeDeclaration> typeDecls = _env.getTypeDeclarations();
++		final Messager msger = _env.getMessager();
++		if( typeDecls.size() == 1 ){
++			final TypeDeclaration type = typeDecls.iterator().next();
++			if( !type.getQualifiedName().equals( "p1.X") )
++				msger.printError("Expected to find p1.X but got " + type.getQualifiedName() ); 
++		}
++		else
++			msger.printError("expected one type declaration but got " + typeDecls );	
+ 	}
+ }
+diff --git a/org.eclipse.jdt.apt.tests/srcext/META-INF/services/com.sun.mirror.apt.AnnotationProcessorFactory b/org.eclipse.jdt.apt.tests/srcext/META-INF/services/com.sun.mirror.apt.AnnotationProcessorFactory
+index 0af0852..1a676f0 100644
+--- a/org.eclipse.jdt.apt.tests/srcext/META-INF/services/com.sun.mirror.apt.AnnotationProcessorFactory
++++ b/org.eclipse.jdt.apt.tests/srcext/META-INF/services/com.sun.mirror.apt.AnnotationProcessorFactory
+@@ -1,3 +1,4 @@
+ org.eclipse.jdt.apt.tests.external.annotations.loadertest.LoaderTestAnnotationProcessorFactory
+ org.eclipse.jdt.apt.tests.external.annotations.classloader.ColorAnnotationProcessorFactory
+-org.eclipse.jdt.apt.tests.external.annotations.batch.BatchAnnotationFactory
+\ No newline at end of file
++org.eclipse.jdt.apt.tests.external.annotations.batch.BatchAnnotationFactory
++org.eclipse.jdt.apt.tests.external.annotations.batch.BatchGenAnnotationFactory
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchGen.java b/org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchGen.java
+new file mode 100644
+index 0000000..6dc81a4
+--- /dev/null
++++ b/org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchGen.java
+@@ -0,0 +1,15 @@
++/*******************************************************************************
++ * Copyright (c) 2005 BEA Systems, Inc.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *    tyeung@bea.com - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.apt.tests.external.annotations.batch;
++
++public @interface BatchGen {
++
++}
+diff --git a/org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchGenAnnotationFactory.java b/org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchGenAnnotationFactory.java
+new file mode 100644
+index 0000000..70bc735
+--- /dev/null
++++ b/org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchGenAnnotationFactory.java
+@@ -0,0 +1,100 @@
++/*******************************************************************************
++ * Copyright (c) 2005 BEA Systems, Inc.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *    tyeung@bea.com - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.apt.tests.external.annotations.batch;
++
++import java.io.IOException;
++import java.io.PrintWriter;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
++import java.util.Set;
++
++import com.sun.mirror.apt.AnnotationProcessor;
++import com.sun.mirror.apt.AnnotationProcessorEnvironment;
++import com.sun.mirror.apt.AnnotationProcessorFactory;
++import com.sun.mirror.declaration.AnnotationTypeDeclaration;
++
++public class BatchGenAnnotationFactory implements AnnotationProcessorFactory {
++	
++	private static int ROUND = 0;
++	private static final List<String> SUPPORTED_TYPES = 
++		Collections.singletonList(BatchGen.class.getName());
++	
++	public AnnotationProcessor getProcessorFor(
++			Set<AnnotationTypeDeclaration> decls, 
++			AnnotationProcessorEnvironment env) {
++		if( ROUND == 0 ){
++			ROUND ++;
++			return new BatchGen0AnnotationProcessor(env);
++		}
++		else if( ROUND == 1){
++			ROUND ++;
++			if( !decls.isEmpty() )
++				env.getMessager().printError("Expecting empty set but got " + decls );
++				
++			return new BatchGen1AnnotationProcessor(env);
++		}
++		else if( ROUND == 2 ){ // NO-OP
++			env.getMessager().printError("Called the third time.");
++			return null; 
++		}
++		// This is to make sure we aren't bouncing the class loader without a full build.
++		else
++			env.getMessager().printError("Calling BatchGenAnnotionFactory too many times. Round=" + ROUND );
++		return null;
++	}
++	
++	public Collection<String> supportedAnnotationTypes() {
++		return SUPPORTED_TYPES;
++	}
++	public Collection<String> supportedOptions() {
++		return Collections.emptyList();
++	}
++	
++	static class BatchGen0AnnotationProcessor implements AnnotationProcessor {
++		
++		final AnnotationProcessorEnvironment _env;
++		BatchGen0AnnotationProcessor(AnnotationProcessorEnvironment env){
++			_env = env;
++		}
++		public void process() {
++			// a generated file will cause BatchGenAnnotationFactory to be 
++			// called again.
++			try{
++				final PrintWriter writer = _env.getFiler().createSourceFile("gen.Class0");
++				writer.print("package gen;\n");
++				writer.print("public class Class0{}");
++				writer.close();
++			}
++			catch(IOException e){
++				_env.getMessager().printError(e.getMessage());
++			}
++		}
++	}
++	
++	static class BatchGen1AnnotationProcessor implements AnnotationProcessor {
++		final AnnotationProcessorEnvironment _env;
++		BatchGen1AnnotationProcessor(AnnotationProcessorEnvironment env){
++			_env = env;
++		}
++		public void process(){
++			try{
++				final PrintWriter writer = _env.getFiler().createSourceFile("gen.Class1");
++				writer.print("package gen;\n");
++				writer.print("public class Class1{}");
++				writer.close();
++			}
++			catch(IOException e){
++				_env.getMessager().printError(e.getMessage());
++			}
++		}
++	}
++}
+diff --git a/org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchProcessor.java b/org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchProcessor.java
+index 8334829..1bb3ec5 100644
+--- a/org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchProcessor.java
++++ b/org.eclipse.jdt.apt.tests/srcext/org/eclipse/jdt/apt/tests/external/annotations/batch/BatchProcessor.java
+@@ -31,42 +31,44 @@ public class BatchProcessor implements AnnotationProcessor {
+ 		_env = env;
+ 	}
+ 	public void process() {
+-		TIMES_CALLED++;
+ 		
+ 		final Messager msger = _env.getMessager();
+-		
+-		// Since we're a batch processor, we should never be called more than once
+-		if (TIMES_CALLED > 1) {
+-			msger.printError("BatchProcessor called more than once: " + TIMES_CALLED);
++		if( TIMES_CALLED == 0 ){
++			
++			final Collection<String> expectedList = new HashSet<String>();
++			expectedList.add("p1.A");
++			expectedList.add("p1.B");
++			expectedList.add("p1.C");
++			expectedList.add("p1.D");
++			final Collection<TypeDeclaration> allTypes = _env.getSpecifiedTypeDeclarations();
++			for( TypeDeclaration type : allTypes ){
++				expectedList.remove(type.getQualifiedName());
++			}
++			
++			if( !expectedList.isEmpty() ){
++				msger.printError("failed to find type " + expectedList);
++			}
++			
++			final Collection<String> expectedAnnotated = new HashSet<String>();
++			expectedList.add("p1.A");
++			expectedList.add("p1.C");
++			final AnnotationTypeDeclaration batchAnnoDecl = 
++				(AnnotationTypeDeclaration)_env.getTypeDeclaration(Batch.class.getName());
++			final Collection<Declaration> decls = _env.getDeclarationsAnnotatedWith(batchAnnoDecl);
++			for( Declaration decl : decls  ){
++				if( decl instanceof TypeDeclaration )
++					expectedAnnotated.remove( ((TypeDeclaration)decl).getQualifiedName() );
++			}
++			if( !expectedAnnotated.isEmpty() ){
++				msger.printError("failed to find annotated type " + expectedAnnotated );			
++			}
++			
++			msger.printWarning("CompletedSuccessfully");
+ 		}
+-		
+-		final Collection<String> expectedList = new HashSet<String>();
+-		expectedList.add("p1.A");
+-		expectedList.add("p1.B");
+-		expectedList.add("p1.C");
+-		final Collection<TypeDeclaration> allTypes = _env.getSpecifiedTypeDeclarations();
+-		for( TypeDeclaration type : allTypes ){
+-			expectedList.remove(type.getQualifiedName());
+-		}
+-		
+-		if( !expectedList.isEmpty() ){
+-			msger.printError("failed to find type " + expectedList);
++		else{
++			msger.printWarning("Called " + (TIMES_CALLED + 1) + " times.");
+ 		}
+ 		
+-		final Collection<String> expectedAnnotated = new HashSet<String>();
+-		expectedList.add("p1.A");
+-		expectedList.add("p1.C");
+-		final AnnotationTypeDeclaration batchAnnoDecl = 
+-			(AnnotationTypeDeclaration)_env.getTypeDeclaration(Batch.class.getName());
+-		final Collection<Declaration> decls = _env.getDeclarationsAnnotatedWith(batchAnnoDecl);
+-		for( Declaration decl : decls  ){
+-			if( decl instanceof TypeDeclaration )
+-				expectedAnnotated.remove( ((TypeDeclaration)decl).getQualifiedName() );
+-		}
+-		if( !expectedAnnotated.isEmpty() ){
+-			msger.printError("failed to find annotated type " + expectedAnnotated );			
+-		}
+-		
+-		msger.printWarning("CompletedSuccessfully");
++		TIMES_CALLED++;
+ 	}
+ }

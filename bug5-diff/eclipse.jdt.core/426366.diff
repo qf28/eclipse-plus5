@@ -1,0 +1,469 @@
+commit ae0b30b76dcbe89d5bd08d53d907ae7218823168
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Jan 23 12:36:52 2014 +0100
+
+    Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple
+    candidate target types in outer overload context
+
+34	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+16	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+5	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+5	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+3	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+80	33	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+4	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+index 8a6321f..1ed82dc 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+@@ -1176,4 +1176,38 @@ public void testBug425493() {
+ 		"The method addAttribute(Test.Attribute<T>, T) in the type Test is not applicable for the arguments (Test.Attribute<capture#3-of ?>, capture#4-of ?)\n" + 
+ 		"----------\n");
+ }
++public void testBug426366() {
++	runConformTest(
++		new String[] {
++			"a/Test.java",
++			"package a;\n" + 
++			"\n" + 
++			"import java.util.Collections;\n" + 
++			"import java.util.List;\n" + 
++			"\n" + 
++			"/**\n" + 
++			" * @author tomschindl\n" + 
++			" *\n" + 
++			" */\n" + 
++			"public class Test {\n" + 
++			"	public static class A {\n" + 
++			"		public A(B newSelectedObject, String editorController) {\n" + 
++			"	    }\n" + 
++			"\n" + 
++			"	    public A(List<B> newSelectedObjects, String editorController) {\n" + 
++			"	    }\n" + 
++			"	}\n" + 
++			"	\n" + 
++			"	public static class B {\n" + 
++			"		\n" + 
++			"	}\n" + 
++			"	\n" + 
++			"	public static class C extends A {\n" + 
++			"		public C() {\n" + 
++			"			super(Collections.emptyList(), \"\");\n" + 
++			"		}\n" + 
++			"	}\n" + 
++			"}\n"
++		});
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+index b73f0c6..dd64766 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+@@ -27,6 +27,7 @@
+  *								Bug 424710 - [1.8][compiler] CCE in SingleNameReference.localVariableBinding
+  *								Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation
+  *								Bug 424415 - [1.8][compiler] Eventual resolution of ReferenceExpression is not seen to be happening.
++ *								Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple candidate target types in outer overload context
+  *     Jesper S Moller - Contributions for
+  *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *								bug 412153 - [1.8][compiler] Check validity of annotations which may be repeatable
+@@ -695,10 +696,12 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 						ParameterizedGenericMethodBinding parameterizedMethod = (ParameterizedGenericMethodBinding) binding;
+ 						InferenceContext18 innerContext = innerInvocation.getInferenceContext(parameterizedMethod);
+ 						if (innerContext != null) {
+-							if (innerContext.stepCompleted < InferenceContext18.TYPE_INFERRED) {
++							if (!innerContext.hasResultFor(parameterType)) {
+ 								argument.setExpectedType(parameterType);
+ 								MethodBinding improvedBinding = innerContext.inferInvocationType(innerInvocation, parameterizedMethod);
+-								innerInvocation.updateBindings(improvedBinding);
++								if (innerInvocation.updateBindings(improvedBinding, parameterType)) {
++									resolvePolyExpressionArguments(innerInvocation, improvedBinding);
++								}
+ 								// TODO need to report invalidMethod if !improvedBinding.isValidBinding() ?
+ 							} else if (innerContext.stepCompleted < InferenceContext18.BINDINGS_UPDATED) {
+ 								innerContext.rebindInnerPolies(parameterizedMethod, innerInvocation);
+@@ -729,6 +732,17 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 		invocation.innerUpdateDone();
+ 	}
+ 
++	public static void resolvePolyExpressionArguments(Invocation invocation, MethodBinding methodBinding) {
++		TypeBinding[] argumentTypes = null;
++		Expression[] innerArguments = invocation.arguments();
++		if (innerArguments != null) {
++			argumentTypes = new TypeBinding[innerArguments.length];
++			for (int i = 0; i < innerArguments.length; i++)
++				argumentTypes[i] = innerArguments[i].resolvedType;
++		}
++		resolvePolyExpressionArguments(invocation, methodBinding, argumentTypes);
++	}
++
+ 	public static void resolveAnnotations(BlockScope scope, Annotation[] sourceAnnotations, Binding recipient) {
+ 		resolveAnnotations(scope, sourceAnnotations, recipient, false);
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+index c57d8af..0cf03e8 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+@@ -30,6 +30,7 @@
+  *							Bug 425152 - [1.8] [compiler] Lambda Expression not resolved but flow analyzed leading to NPE.
+  *							Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation
+  *							Bug 424415 - [1.8][compiler] Eventual resolution of ReferenceExpression is not seen to be happening.
++ *							Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple candidate target types in outer overload context
+  *     Jesper S Moller <jesper@selskabet.org> - Contributions for
+  *							bug 378674 - "The method can be declared as static" is wrong
+  *     Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+@@ -706,20 +707,19 @@ public Expression[] arguments() {
+ 	return this.arguments;
+ }
+ 
+-public boolean updateBindings(MethodBinding updatedBinding) {
+-	if (this.binding == updatedBinding)
+-		return false;
++public boolean updateBindings(MethodBinding updatedBinding, TypeBinding targetType) {
++	boolean hasUpdate = this.binding != updatedBinding;
+ 	if (this.inferenceContexts != null) {
+ 		InferenceContext18 ctx = (InferenceContext18)this.inferenceContexts.removeKey(this.binding);
+ 		if (ctx != null && updatedBinding instanceof ParameterizedGenericMethodBinding) {
+ 			this.inferenceContexts.put(updatedBinding, ctx);
+ 			// solution may have come from an outer inference, mark now that this (inner) is done (but not deep inners):
+-			ctx.stepCompleted = InferenceContext18.TYPE_INFERRED;
++			hasUpdate |= ctx.registerSolution(targetType, updatedBinding);
+ 		}
+ 	}
+ 	this.binding = updatedBinding;
+ 	this.resolvedType = updatedBinding.declaringClass;
+-	return true;
++	return hasUpdate;
+ }
+ public void registerInferenceContext(ParameterizedGenericMethodBinding method, InferenceContext18 infCtx18) {
+ 	if (this.inferenceContexts == null)
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+index faee223..9de1bc3 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+@@ -23,6 +23,7 @@
+  *								Bug 425152 - [1.8] [compiler] Lambda Expression not resolved but flow analyzed leading to NPE.
+  *								Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation
+  *								Bug 424415 - [1.8][compiler] Eventual resolution of ReferenceExpression is not seen to be happening.
++ *								Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple candidate target types in outer overload context
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 409245 - [1.8][compiler] Type annotations dropped when call is routed through a synthetic bridge method
+  *******************************************************************************/
+@@ -499,19 +500,18 @@ public class ExplicitConstructorCall extends Statement implements Invocation, Ex
+ 	public Expression[] arguments() {
+ 		return this.arguments;
+ 	}
+-	public boolean updateBindings(MethodBinding updatedBinding) {
+-		if (this.binding == updatedBinding)
+-			return false;
++	public boolean updateBindings(MethodBinding updatedBinding, TypeBinding targetType) {
++		boolean hasUpdate = this.binding != updatedBinding;
+ 		if (this.inferenceContexts != null) {
+ 			InferenceContext18 ctx = (InferenceContext18)this.inferenceContexts.removeKey(this.binding);
+ 			if (ctx != null && updatedBinding instanceof ParameterizedGenericMethodBinding) {
+ 				this.inferenceContexts.put(updatedBinding, ctx);
+ 				// solution may have come from an outer inference, mark now that this (inner) is done (but not deep inners):
+-				ctx.stepCompleted = InferenceContext18.TYPE_INFERRED;
++				hasUpdate |= ctx.registerSolution(targetType, updatedBinding);
+ 			}
+ 		}
+ 		this.binding = updatedBinding;
+-		return true;
++		return hasUpdate;
+ 	}
+ 	public void registerInferenceContext(ParameterizedGenericMethodBinding method, InferenceContext18 infCtx18) {
+ 		if (this.inferenceContexts == null)
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+index c05e000..b58d07c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+@@ -62,9 +62,11 @@ public interface Invocation extends InvocationSite {
+ 	 * Where the AST node may hold references to the results of Invocation Applicability Inference,
+ 	 * this method allows to update those references to the result of Invocation Type Inference.
+ 	 * Note that potentially more than just the method binding is updated.
++	 * @param updatedBinding the final method binding after full inference
++	 * @param targetType the target type used during Invocation Type Inference
+ 	 * @return true if an update has happened
+ 	 */
+-	boolean updateBindings(MethodBinding updatedBinding);
++	boolean updateBindings(MethodBinding updatedBinding, TypeBinding targetType);
+ 	
+ 	/**
+ 	 * Answer whether the current invocation has inner expressions that still need updating after inference.
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index 1621615..e82c8e1 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -44,6 +44,7 @@
+  *								Bug 425152 - [1.8] [compiler] Lambda Expression not resolved but flow analyzed leading to NPE.
+  *								Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation
+  *								Bug 424415 - [1.8][compiler] Eventual resolution of ReferenceExpression is not seen to be happening.
++ *								Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple candidate target types in outer overload context
+  *     Jesper S Moller - Contributions for
+  *								Bug 378674 - "The method can be declared as static" is wrong
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+@@ -976,15 +977,14 @@ public boolean usesInference() {
+ 	return (this.binding instanceof ParameterizedGenericMethodBinding) 
+ 			&& getInferenceContext((ParameterizedGenericMethodBinding) this.binding) != null;
+ }
+-public boolean updateBindings(MethodBinding updatedBinding) {
++public boolean updateBindings(MethodBinding updatedBinding, TypeBinding targetType) {
+ 	boolean hasUpdate = this.binding != updatedBinding;
+ 	if (this.inferenceContexts != null) {
+ 		InferenceContext18 ctx = (InferenceContext18)this.inferenceContexts.removeKey(this.binding);
+ 		if (ctx != null && updatedBinding instanceof ParameterizedGenericMethodBinding) {
+ 			this.inferenceContexts.put(updatedBinding, ctx);
+ 			// solution may have come from an outer inference, mark now that this (inner) is done (but not deep inners):
+-			hasUpdate |= ctx.stepCompleted < InferenceContext18.TYPE_INFERRED;
+-			ctx.stepCompleted = InferenceContext18.TYPE_INFERRED;
++			hasUpdate |= ctx.registerSolution(targetType, updatedBinding);
+ 		}
+ 	}
+ 	this.binding = updatedBinding;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index d5f3a9a..0b56504 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -17,9 +17,11 @@ package org.eclipse.jdt.internal.compiler.lookup;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Comparator;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Set;
+ 
+ import org.eclipse.jdt.core.compiler.CharOperation;
+@@ -123,7 +125,7 @@ import org.eclipse.jdt.internal.compiler.ast.Wildcard;
+  *    <li>In some situations invocation arguments that are poly invocations need to be resolved in the middle of overload resolution
+  *    	to answer {@link Scope#parameterCompatibilityLevel18} (where the outer invocation did not involve any inference).<br/>
+  *    </ul>
+- *    Pushing inference results into an inner invocation happens using {@link Invocation#updateBindings(MethodBinding)}.</li>
++ *    Pushing inference results into an inner invocation happens using {@link Invocation#updateBindings(MethodBinding,TypeBinding)}.</li>
+  * <li>Decision whether or not an invocation is a <b>variable-arity</b> invocation is made by first attempting
+  * 		to solve 18.5.1 in mode {@link #CHECK_LOOSE}. Only if that fails, another attempt is made in mode {@link #CHECK_VARARG}.
+  * 		Which of these two attempts was successful is stored in {@link #inferenceKind}.
+@@ -161,18 +163,22 @@ public class InferenceContext18 {
+ 
+ 	/** solution of applicability inference, stored for use as fallback, if invocation type inference fails. */
+ 	BoundSet storedSolution;
++
++	/** For each candidate target type imposed from the outside store the solution of invocation type inference. */
++	Map/*<TypeBinding,Solution>*/ solutionsPerTargetType = new HashMap();
++
+ 	/** One of CHECK_STRICT, CHECK_LOOSE, or CHECK_VARARGS. */
+ 	int inferenceKind;
+ 	/** Marks how much work has been done so far? Used to avoid performing any of these tasks more than once. */
+ 	public int stepCompleted = NOT_INFERRED;
+ 
+-	public static int NOT_INFERRED = 0;
++	public static final int NOT_INFERRED = 0;
+ 	/** Applicability Inference (18.5.1) has been completed. */
+-	public static int APPLICABILITY_INFERRED = 1;
+-	/** Invocation Type Inference (18.5.2) has been completed. */
+-	public static int TYPE_INFERRED = 2;
++	public static final int APPLICABILITY_INFERRED = 1;
++	/** Invocation Type Inference (18.5.2) has been completed (for some target type). */
++	public static final int TYPE_INFERRED = 2;
+ 	/** All nested elements have been fully resolved. */
+-	public static int BINDINGS_UPDATED = 3;
++	public static final int BINDINGS_UPDATED = 3;
+ 	
+ 	/** Signals whether any type compatibility makes use of unchecked conversion. */
+ 	public List constraintsWithUncheckedConversion;
+@@ -206,6 +212,18 @@ public class InferenceContext18 {
+ 		}
+ 	}
+ 	
++	/** Record for a candidate solution of Invocation Type Inference for one specific target type. */
++	static class Solution {
++		TypeBinding resolvedType;
++		MethodBinding method;
++		BoundSet bounds;
++		Solution(MethodBinding method, BoundSet bounds) {
++			this.method = method;
++			this.resolvedType = method.isConstructor() ? method.declaringClass : method.returnType;
++			this.bounds = bounds;
++		}
++	}
++
+ 	/** Construct an inference context for an invocation (method/constructor). */
+ 	public InferenceContext18(Scope scope, Expression[] arguments, InvocationSite site) {
+ 		this.scope = scope;
+@@ -460,19 +478,22 @@ public class InferenceContext18 {
+ 		boolean haveProperTargetType = targetType != null && targetType.isProperType(true);
+ 		if (haveProperTargetType) {
+ 			MethodBinding original = method.originalMethod;
+-			// start over from a previous candidate but discard its type variable instantiations
+-			// TODO: should we retain any instantiations of type variables not owned by the method? 
+-			BoundSet result = null;
+-			try {
+-				result = inferInvocationType(this.currentBounds, targetType, invocation, original);
+-			} catch (InferenceFailureException e) {
+-				// no solution, but do more checks below
++			BoundSet result = (BoundSet) this.solutionsPerTargetType.get(targetType);
++			if (result == null) {
++				// start over from a previous candidate but discard its type variable instantiations
++				// TODO: should we retain any instantiations of type variables not owned by the method? 
++				try {
++					result = inferInvocationType(this.currentBounds, targetType, invocation, original);
++				} catch (InferenceFailureException e) {
++					// no solution, but do more checks below
++				}
+ 			}
+ 			if (result != null) {
+ 				TypeBinding[] solutions = getSolutions(original.typeVariables(), invocation, result);
+ 				if (solutions != null) {
+ 					finalMethod = this.environment.createParameterizedGenericMethod(original, solutions);
+ 					invocation.registerInferenceContext(finalMethod, this);
++					this.solutionsPerTargetType.put(targetType, new Solution(finalMethod, result));
+ 				}
+ 			}
+ 			if (finalMethod != null)
+@@ -518,6 +539,21 @@ public class InferenceContext18 {
+ 		return inferInvocationType(invocation, argumentTypes, method);
+ 	}
+ 
++	public boolean hasResultFor(TypeBinding targetType) {
++		if (targetType == null)
++			return this.stepCompleted >= TYPE_INFERRED;
++		else
++			return this.solutionsPerTargetType.containsKey(targetType);
++	}
++
++	public boolean registerSolution(TypeBinding targetType, MethodBinding updatedBinding) {
++		Solution solution = (Solution) this.solutionsPerTargetType.get(targetType);
++		if (solution != null)
++			return false; // no update
++		this.solutionsPerTargetType.put(targetType, new Solution(updatedBinding, null));
++		this.stepCompleted = TYPE_INFERRED;
++		return true;
++	}
+ 
+ 	// ========== Below this point: implementation of the generic algorithm: ==========
+ 
+@@ -883,15 +919,21 @@ public class InferenceContext18 {
+ 	public boolean rebindInnerPolies(MethodBinding method, InvocationSite site) {
+ 		BoundSet bounds = this.currentBounds;
+ 		TypeBinding targetType = site.invocationTargetType();
+-		if ((targetType == null || !targetType.isProperType(true)) && site.getExpressionContext() == ExpressionContext.VANILLA_CONTEXT) {
+-			// in this case we don't yet have the solution, compute it now:
+-			try {
+-				bounds = inferInvocationType(this.currentBounds, null, site, method);
+-			} catch (InferenceFailureException e) {
+-				return false;
++		if (targetType == null || !targetType.isProperType(true)) {
++			if (site.getExpressionContext() == ExpressionContext.VANILLA_CONTEXT) {
++				// in this case we don't yet have the solution, compute it now:
++				try {
++					bounds = inferInvocationType(this.currentBounds, null, site, method);
++				} catch (InferenceFailureException e) {
++					return false;
++				}
++				if (bounds == null)
++					return false;
+ 			}
+-			if (bounds == null)
+-				return false;
++		} else {
++			Solution solution = (Solution) this.solutionsPerTargetType.get(targetType);
++			if (solution != null && solution.bounds != null)
++				bounds = solution.bounds;
+ 		}
+ 		rebindInnerPolies(bounds, method.parameters);
+ 		return true;
+@@ -916,7 +958,8 @@ public class InferenceContext18 {
+ 			Expression inner = (Expression) this.innerPolies.get(i);
+ 			if (inner instanceof Invocation) {
+ 				Invocation innerMessage = (Invocation) inner;
+-				MethodBinding binding = innerMessage.binding(getParameter(parameterTypes, i, isVarargs));
++				TypeBinding innerTargetType = getParameter(parameterTypes, i, isVarargs);
++				MethodBinding binding = innerMessage.binding(innerTargetType);
+ 				if (binding == null)
+ 					continue;
+ 				MethodBinding original = binding.original();
+@@ -935,15 +978,8 @@ public class InferenceContext18 {
+ 					continue; // play safe, but shouldn't happen in a resolved context
+ 				ParameterizedGenericMethodBinding innerBinding = this.environment.createParameterizedGenericMethod(original, solutions);
+ 				
+-				if (innerMessage.updateBindings(innerBinding)) { // only if we are actually improving anything
+-					TypeBinding[] innerArgumentTypes = null;
+-					Expression[] innerArguments = innerMessage.arguments();
+-					if (innerArguments != null) {
+-						innerArgumentTypes = new TypeBinding[innerArguments.length];
+-						for (int j = 0; j < innerArguments.length; j++)
+-							innerArgumentTypes[i] = innerArguments[i].resolvedType;
+-					}
+-					ASTNode.resolvePolyExpressionArguments(innerMessage, innerBinding, innerArgumentTypes);
++				if (innerMessage.updateBindings(innerBinding, innerTargetType)) { // only if we are actually improving anything
++					ASTNode.resolvePolyExpressionArguments(innerMessage, innerBinding);
+ 				}
+ 			}
+ 		}
+@@ -1016,14 +1052,25 @@ public class InferenceContext18 {
+ 	// debugging:
+ 	public String toString() {
+ 		StringBuffer buf = new StringBuffer("Inference Context"); //$NON-NLS-1$
+-		if (isResolved(this.currentBounds))
++		switch (this.stepCompleted) {
++			case NOT_INFERRED: buf.append(" (initial)");break; //$NON-NLS-1$
++			case APPLICABILITY_INFERRED: buf.append(" (applicability inferred)");break; //$NON-NLS-1$
++			case TYPE_INFERRED: buf.append(" (type inferred)");break; //$NON-NLS-1$
++			case BINDINGS_UPDATED: buf.append(" (bindings updated)");break; //$NON-NLS-1$
++		}
++		switch (this.inferenceKind) {
++			case CHECK_STRICT: buf.append(" (strict)");break; //$NON-NLS-1$
++			case CHECK_LOOSE: buf.append(" (loose)");break; //$NON-NLS-1$
++			case CHECK_VARARG: buf.append(" (vararg)");break; //$NON-NLS-1$
++		}
++		if (this.currentBounds != null && isResolved(this.currentBounds))
+ 			buf.append(" (resolved)"); //$NON-NLS-1$
+ 		buf.append('\n');
+ 		if (this.inferenceVariables != null) {
+ 			buf.append("Inference Variables:\n"); //$NON-NLS-1$
+ 			for (int i = 0; i < this.inferenceVariables.length; i++) {
+ 				buf.append('\t').append(this.inferenceVariables[i].sourceName).append("\t:\t"); //$NON-NLS-1$
+-				if (this.currentBounds.isInstantiated(this.inferenceVariables[i]))
++				if (this.currentBounds != null && this.currentBounds.isInstantiated(this.inferenceVariables[i]))
+ 					buf.append(this.currentBounds.getInstantiation(this.inferenceVariables[i]).readableName());
+ 				else
+ 					buf.append("NOT INSTANTIATED"); //$NON-NLS-1$
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index 849cf21..3f32d0a 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -27,6 +27,7 @@
+  *								Bug 424710 - [1.8][compiler] CCE in SingleNameReference.localVariableBinding
+  *								Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation
+  *								Bug 424415 - [1.8][compiler] Eventual resolution of ReferenceExpression is not seen to be happening.
++ *								Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple candidate target types in outer overload context
+  *     Jesper S Moller - Contributions for
+  *								Bug 378674 - "The method can be declared as static" is wrong
+  *  							Bug 405066 - [1.8][compiler][codegen] Implement code generation infrastructure for JSR335
+@@ -791,12 +792,12 @@ public abstract class Scope {
+ 							if (innerBinding instanceof ParameterizedGenericMethodBinding) {
+ 								ParameterizedGenericMethodBinding innerParameterized = (ParameterizedGenericMethodBinding) innerBinding;
+ 								InferenceContext18 infCtx18 = innerPoly.getInferenceContext(innerParameterized);
+-								if (infCtx18 != null && infCtx18.stepCompleted < InferenceContext18.TYPE_INFERRED) {
++								if (infCtx18 != null && !infCtx18.hasResultFor(targetType)) {
+ 									// not detected as compatible, because inference still needs to complete?
+ 									invocArg.setExpectedType(targetType);
+ 									MethodBinding solution = infCtx18.inferInvocationType(innerPoly, innerParameterized);
+ 									if (solution != null && solution.isValidBinding()) {
+-										innerPoly.updateBindings(solution);
++										innerPoly.updateBindings(solution, targetType);
+ 										if (solution.returnType != null && solution.returnType.isCompatibleWith(targetType, this))
+ 											return isVarArgs ? VARARGS_COMPATIBLE : COMPATIBLE;
+ 									}
+@@ -4914,7 +4915,7 @@ public abstract class Scope {
+ 			if (applicable instanceof ParameterizedGenericMethodBinding) {
+ 				ParameterizedGenericMethodBinding parameterizedMethod = (ParameterizedGenericMethodBinding) applicable;
+ 				InferenceContext18 infCtx18 = invocation.getInferenceContext(parameterizedMethod);
+-				if (infCtx18 != null && infCtx18.stepCompleted < InferenceContext18.TYPE_INFERRED) {
++				if (infCtx18 != null && !infCtx18.hasResultFor(invocation.invocationTargetType())) {
+ 					return infCtx18.inferInvocationType(invocation, argumentTypes, parameterizedMethod);
+ 				}
+ 			} else {

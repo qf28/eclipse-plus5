@@ -1,0 +1,1698 @@
+commit 6ca7a78c5e5448614d50ec9902518144112d583c
+Author: toberlies <>
+Date:   Wed May 11 11:26:06 2011 +0000
+
+    bug 343329: [publisher] AdviceFileAdvice should not be in publisher.eclipse
+    
+    https://bugs.eclipse.org/bugs/show_bug.cgi?id=343329
+
+0	184	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/AdviceFileAdvice.java
+0	592	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/AdviceFileParser.java
+5	28	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/FeaturesAction.java
+0	1	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ProductAction.java
+183	0	bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AdviceFileAdvice.java
+592	0	bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AdviceFileParser.java
+2	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/AdviceFileParserTest.java
+2	1	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/PublisherUtil.java
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/AdviceFileAdvice.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/AdviceFileAdvice.java
+deleted file mode 100644
+index 60ae82d..0000000
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/AdviceFileAdvice.java
++++ /dev/null
+@@ -1,184 +0,0 @@
+-/*******************************************************************************
+- *  Copyright (c) 2008, 2011 IBM Corporation and others.
+- *  All rights reserved. This program and the accompanying materials
+- *  are made available under the terms of the Eclipse Public License v1.0
+- *  which accompanies this distribution, and is available at
+- *  http://www.eclipse.org/legal/epl-v10.html
+- * 
+- *  Contributors:
+- *      IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.p2.publisher.eclipse;
+-
+-import java.io.*;
+-import java.util.Map;
+-import java.util.zip.ZipEntry;
+-import java.util.zip.ZipFile;
+-import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.core.helpers.CollectionUtils;
+-import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+-import org.eclipse.equinox.p2.metadata.*;
+-import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitDescription;
+-import org.eclipse.equinox.p2.publisher.AbstractAdvice;
+-import org.eclipse.equinox.p2.publisher.actions.*;
+-import org.eclipse.equinox.p2.repository.artifact.IArtifactDescriptor;
+-import org.eclipse.pde.internal.publishing.Activator;
+-
+-/**
+- * Publishing advice from a p2 advice file. An advice file (p2.inf) can be embedded
+- * in the source of a bundle, feature, or product to specify additional advice to be
+- * added to the {@link IInstallableUnit} corresponding to the bundle, feature, or product.
+- */
+-public class AdviceFileAdvice extends AbstractAdvice implements ITouchpointAdvice, ICapabilityAdvice, IUpdateDescriptorAdvice, IPropertyAdvice, IAdditionalInstallableUnitAdvice {
+-
+-	/**
+-	 * The location of the bundle advice file, relative to the bundle root location.
+-	 */
+-	public static final IPath BUNDLE_ADVICE_FILE = new Path("META-INF/p2.inf"); //$NON-NLS-1$
+-
+-	private final String id;
+-	private final Version version;
+-
+-	private Map<String, ITouchpointInstruction> touchpointInstructions;
+-	private IProvidedCapability[] providedCapabilities;
+-	private IRequirement[] requiredCapabilities;
+-	private IRequirement[] metaRequiredCapabilities;
+-	private Map<String, String> iuProperties;
+-	private InstallableUnitDescription[] additionalIUs;
+-	private IUpdateDescriptor updateDescriptor;
+-	private boolean containsAdvice = false;
+-
+-	/**
+-	 * Creates advice for an advice file at the given location. If <tt>basePath</tt>
+-	 * is a directory, then <tt>adviceFilePath</tt> is appended to this location to
+-	 * obtain the location of the advice file. If <tt>basePath</tt> is a file, then
+-	 * <tt>adviceFilePath</tt> is used to 
+-	 * @param id The symbolic id of the installable unit this advice applies to
+-	 * @param version The version of the installable unit this advice applies to
+-	 * @param basePath The root location of the the advice file. This is either the location of
+-	 * the jar containing the advice, or a directory containing the advice file
+-	 * @param adviceFilePath The location of the advice file within the base path. This is
+-	 * either the path of a jar entry, or the path of the advice file within the directory
+-	 * specified by the base path.
+-	 */
+-	public AdviceFileAdvice(String id, Version version, IPath basePath, IPath adviceFilePath) {
+-		Assert.isNotNull(id);
+-		Assert.isNotNull(version);
+-		Assert.isNotNull(basePath);
+-		Assert.isNotNull(adviceFilePath);
+-		this.id = id;
+-		this.version = version;
+-
+-		Map<String, String> advice = loadAdviceMap(basePath, adviceFilePath);
+-		if (advice.isEmpty())
+-			return;
+-
+-		AdviceFileParser parser = new AdviceFileParser(id, version, advice);
+-		try {
+-			parser.parse();
+-		} catch (Exception e) {
+-			String message = "An error occured while parsing advice file: basePath=" + basePath + ", adviceFilePath=" + adviceFilePath + "."; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+-			IStatus status = new Status(IStatus.ERROR, Activator.ID, message, e);
+-			LogHelper.log(status);
+-			return;
+-		}
+-		touchpointInstructions = parser.getTouchpointInstructions();
+-		providedCapabilities = parser.getProvidedCapabilities();
+-		requiredCapabilities = parser.getRequiredCapabilities();
+-		metaRequiredCapabilities = parser.getMetaRequiredCapabilities();
+-		iuProperties = parser.getProperties();
+-		additionalIUs = parser.getAdditionalInstallableUnitDescriptions();
+-		updateDescriptor = parser.getUpdateDescriptor();
+-		containsAdvice = true;
+-	}
+-
+-	public boolean containsAdvice() {
+-		return containsAdvice;
+-	}
+-
+-	/**
+-	 * Loads the advice file and returns it in map form.
+-	 */
+-	private static Map<String, String> loadAdviceMap(IPath basePath, IPath adviceFilePath) {
+-		File location = basePath.toFile();
+-		if (location == null || !location.exists())
+-			return CollectionUtils.emptyMap();
+-
+-		ZipFile jar = null;
+-		InputStream stream = null;
+-		try {
+-			if (location.isDirectory()) {
+-				File adviceFile = new File(location, adviceFilePath.toString());
+-				if (!adviceFile.isFile())
+-					return CollectionUtils.emptyMap();
+-				stream = new BufferedInputStream(new FileInputStream(adviceFile));
+-			} else if (location.isFile()) {
+-				jar = new ZipFile(location);
+-				ZipEntry entry = jar.getEntry(adviceFilePath.toString());
+-				if (entry == null)
+-					return CollectionUtils.emptyMap();
+-
+-				stream = new BufferedInputStream(jar.getInputStream(entry));
+-			}
+-			return CollectionUtils.loadProperties(stream);
+-		} catch (IOException e) {
+-			String message = "An error occured while reading advice file: basePath=" + basePath + ", adviceFilePath=" + adviceFilePath + "."; //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$
+-			IStatus status = new Status(IStatus.ERROR, Activator.ID, message, e);
+-			LogHelper.log(status);
+-			return CollectionUtils.emptyMap();
+-		} finally {
+-			if (stream != null)
+-				try {
+-					stream.close();
+-				} catch (IOException e) {
+-					// ignore secondary failure
+-				}
+-			if (jar != null)
+-				try {
+-					jar.close();
+-				} catch (IOException e) {
+-					// ignore secondary failure
+-				}
+-		}
+-	}
+-
+-	@Override
+-	public boolean isApplicable(String configSpec, boolean includeDefault, String candidateId, Version candidateVersion) {
+-		return id.equals(candidateId) && version.equals(candidateVersion);
+-	}
+-
+-	/*(non-Javadoc)
+-	 * @see org.eclipse.equinox.p2.publisher.eclipse.ITouchpointAdvice#getTouchpointData()
+-	 */
+-	public ITouchpointData getTouchpointData(ITouchpointData existing) {
+-		return MetadataFactory.mergeTouchpointData(existing, touchpointInstructions);
+-	}
+-
+-	public IProvidedCapability[] getProvidedCapabilities(InstallableUnitDescription iu) {
+-		return providedCapabilities;
+-	}
+-
+-	public IRequirement[] getRequiredCapabilities(InstallableUnitDescription iu) {
+-		return requiredCapabilities;
+-	}
+-
+-	public IRequirement[] getMetaRequiredCapabilities(InstallableUnitDescription iu) {
+-		return metaRequiredCapabilities;
+-	}
+-
+-	public InstallableUnitDescription[] getAdditionalInstallableUnitDescriptions(IInstallableUnit iu) {
+-		return additionalIUs;
+-	}
+-
+-	public IUpdateDescriptor getUpdateDescriptor(InstallableUnitDescription iu) {
+-		return updateDescriptor;
+-	}
+-
+-	public Map<String, String> getArtifactProperties(IInstallableUnit iu, IArtifactDescriptor descriptor) {
+-		return null;
+-	}
+-
+-	public Map<String, String> getInstallableUnitProperties(InstallableUnitDescription iu) {
+-		return iuProperties;
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/AdviceFileParser.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/AdviceFileParser.java
+deleted file mode 100644
+index 7f1f47f..0000000
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/AdviceFileParser.java
++++ /dev/null
+@@ -1,592 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2009, 2011 IBM Corporation and others. All rights reserved. This
+- * program and the accompanying materials are made available under the terms of
+- * the Eclipse Public License v1.0 which accompanies this distribution, and is
+- * available at http://www.eclipse.org/legal/epl-v10.html
+- * 
+- * Contributors: IBM Corporation - initial API and implementation
+- ******************************************************************************/
+-package org.eclipse.equinox.p2.publisher.eclipse;
+-
+-import java.net.URI;
+-import java.net.URISyntaxException;
+-import java.util.*;
+-import java.util.Map.Entry;
+-import org.eclipse.equinox.internal.p2.metadata.ArtifactKey;
+-import org.eclipse.equinox.p2.metadata.*;
+-import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitDescription;
+-import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitFragmentDescription;
+-import org.eclipse.equinox.spi.p2.publisher.PublisherHelper;
+-
+-public class AdviceFileParser {
+-
+-	private static final String ADVICE_VERSION = "advice.version"; //$NON-NLS-1$
+-
+-	private static final String QUALIFIER_SUBSTITUTION = "$qualifier$"; //$NON-NLS-1$
+-	private static final String VERSION_SUBSTITUTION = "$version$"; //$NON-NLS-1$
+-
+-	private static final String UPDATE_DESCRIPTION = "update.description"; //$NON-NLS-1$
+-	private static final String UPDATE_SEVERITY = "update.severity"; //$NON-NLS-1$
+-	private static final String UPDATE_RANGE = "update.range"; //$NON-NLS-1$
+-	private static final String UPDATE_ID = "update.id"; //$NON-NLS-1$
+-	private static final String CLASSIFIER = "classifier"; //$NON-NLS-1$
+-	private static final String TOUCHPOINT_VERSION = "touchpoint.version"; //$NON-NLS-1$
+-	private static final String TOUCHPOINT_ID = "touchpoint.id"; //$NON-NLS-1$
+-	private static final String COPYRIGHT_LOCATION = "copyright.location"; //$NON-NLS-1$
+-	private static final String COPYRIGHT = "copyright"; //$NON-NLS-1$
+-	private static final String ID = "id"; //$NON-NLS-1$
+-	private static final String SINGLETON = "singleton"; //$NON-NLS-1$
+-	private static final String IMPORT = "import"; //$NON-NLS-1$
+-	private static final String RANGE = "range"; //$NON-NLS-1$
+-	private static final String FILTER = "filter"; //$NON-NLS-1$
+-	private static final String MULTIPLE = "multiple"; //$NON-NLS-1$
+-	private static final String OPTIONAL = "optional"; //$NON-NLS-1$
+-	private static final String GREEDY = "greedy"; //$NON-NLS-1$
+-	private static final String VERSION = "version"; //$NON-NLS-1$
+-	private static final String NAMESPACE = "namespace"; //$NON-NLS-1$
+-	private static final String NAME = "name"; //$NON-NLS-1$
+-	private static final String LOCATION = "location"; //$NON-NLS-1$
+-	private static final String VALUE = "value"; //$NON-NLS-1$
+-
+-	private static final String UNITS_PREFIX = "units."; //$NON-NLS-1$
+-	private static final String INSTRUCTIONS_PREFIX = "instructions."; //$NON-NLS-1$
+-	private static final String REQUIRES_PREFIX = "requires."; //$NON-NLS-1$
+-	private static final String META_REQUIREMENTS_PREFIX = "metaRequirements."; //$NON-NLS-1$
+-	private static final String PROVIDES_PREFIX = "provides."; //$NON-NLS-1$
+-	private static final String PROPERTIES_PREFIX = "properties."; //$NON-NLS-1$
+-	private static final String LICENSES_PREFIX = "licenses."; //$NON-NLS-1$
+-	private static final String ARTIFACTS_PREFIX = "artifacts."; //$NON-NLS-1$
+-	private static final String HOST_REQUIREMENTS_PREFIX = "hostRequirements."; //$NON-NLS-1$
+-	private static final String UPDATE_DESCRIPTOR_PREFIX = "update."; //$NON-NLS-1$
+-
+-	public static final Version COMPATIBLE_VERSION = Version.createOSGi(1, 0, 0);
+-	public static final VersionRange VERSION_TOLERANCE = new VersionRange(COMPATIBLE_VERSION, true, Version.createOSGi(2, 0, 0), false);
+-
+-	private Map<String, String> adviceProperties = new HashMap<String, String>();
+-	private List<IProvidedCapability> adviceProvides = new ArrayList<IProvidedCapability>();
+-	private List<IRequirement> adviceRequires = new ArrayList<IRequirement>();
+-	private List<IRequirement> adviceMetaRequires = new ArrayList<IRequirement>();
+-	private IUpdateDescriptor adviceUpdateDescriptor = null;
+-	private Map<String, ITouchpointInstruction> adviceInstructions = new HashMap<String, ITouchpointInstruction>();
+-	private List<InstallableUnitDescription> adviceOtherIUs = new ArrayList<InstallableUnitDescription>();
+-
+-	private final Map<String, String> advice;
+-	private Iterator<String> keysIterator;
+-	private String current;
+-	private String hostId;
+-	private Version hostVersion;
+-
+-	public AdviceFileParser(String id, Version version, Map<String, String> advice) {
+-		this.hostId = id;
+-		this.hostVersion = version;
+-		this.advice = advice;
+-	}
+-
+-	public void parse() {
+-		String adviceVersion = advice.get(ADVICE_VERSION);
+-		if (adviceVersion != null)
+-			checkAdviceVersion(adviceVersion);
+-
+-		List<String> keys = new ArrayList<String>(advice.keySet());
+-		Collections.sort(keys);
+-
+-		keysIterator = keys.iterator();
+-		next();
+-
+-		while (current != null) {
+-			if (current.startsWith(PROPERTIES_PREFIX))
+-				parseProperties(PROPERTIES_PREFIX, adviceProperties);
+-			else if (current.startsWith(UPDATE_DESCRIPTOR_PREFIX))
+-				this.adviceUpdateDescriptor = parseUpdateDescriptor(UPDATE_DESCRIPTOR_PREFIX, hostId);
+-			else if (current.startsWith(PROVIDES_PREFIX))
+-				parseProvides(PROVIDES_PREFIX, adviceProvides);
+-			else if (current.startsWith(REQUIRES_PREFIX))
+-				parseRequires(REQUIRES_PREFIX, adviceRequires);
+-			else if (current.startsWith(META_REQUIREMENTS_PREFIX))
+-				parseRequires(META_REQUIREMENTS_PREFIX, adviceMetaRequires);
+-			else if (current.startsWith(INSTRUCTIONS_PREFIX))
+-				parseInstructions(INSTRUCTIONS_PREFIX, adviceInstructions);
+-			else if (current.startsWith(UNITS_PREFIX))
+-				parseUnits(UNITS_PREFIX, adviceOtherIUs);
+-			else if (current.equals(ADVICE_VERSION)) {
+-				next();
+-			} else {
+-				// we ignore elements we do not understand
+-				next();
+-			}
+-		}
+-	}
+-
+-	private void checkAdviceVersion(String adviceVersion) {
+-		Version version = Version.parseVersion(adviceVersion);
+-		if (!VERSION_TOLERANCE.isIncluded(version))
+-			throw new IllegalStateException("bad version: " + version + ". Expected range was " + VERSION_TOLERANCE); //$NON-NLS-1$ //$NON-NLS-2$
+-	}
+-
+-	private void next() {
+-		current = keysIterator.hasNext() ? keysIterator.next() : null;
+-	}
+-
+-	private String currentValue() {
+-		return advice.get(current).trim();
+-	}
+-
+-	private void parseProperties(String prefix, Map<String, String> properties) {
+-		while (current != null && current.startsWith(prefix)) {
+-			int dotIndex = current.indexOf('.', prefix.length());
+-			if (dotIndex == -1)
+-				throw new IllegalStateException("bad token: " + current); //$NON-NLS-1$
+-
+-			parseProperty(current.substring(0, dotIndex + 1), properties);
+-		}
+-	}
+-
+-	private void parseProperty(String prefix, Map<String, String> properties) {
+-		String propertyName = null;
+-		String propertyValue = null;
+-		while (current != null && current.startsWith(prefix)) {
+-			String token = current.substring(prefix.length());
+-			if (token.equals(NAME)) {
+-				propertyName = currentValue();
+-			} else if (token.equals(VALUE)) {
+-				propertyValue = currentValue();
+-			} else {
+-				// we ignore elements we do not understand
+-			}
+-			next();
+-		}
+-
+-		properties.put(propertyName, propertyValue);
+-	}
+-
+-	private IUpdateDescriptor parseUpdateDescriptor(String prefix, String id) {
+-		String name = id;
+-		String description = null;
+-		String range = "[0.0.0,$version$)"; //$NON-NLS-1$ 
+-		String severity = "0"; //$NON-NLS-1$
+-
+-		while (current != null && current.startsWith(prefix)) {
+-			String token = current;
+-			if (token.equals(UPDATE_ID)) {
+-				name = currentValue();
+-			} else if (token.equals(UPDATE_DESCRIPTION)) {
+-				description = currentValue();
+-			} else if (token.equals(UPDATE_RANGE)) {
+-				range = currentValue();
+-			} else if (token.equals(UPDATE_SEVERITY)) {
+-				severity = currentValue();
+-			} else {
+-				// ignore
+-			}
+-			next();
+-		}
+-
+-		range = substituteVersionAndQualifier(range);
+-		VersionRange versionRange = new VersionRange(range);
+-		return MetadataFactory.createUpdateDescriptor(name, versionRange, Integer.valueOf(severity), description);
+-	}
+-
+-	private void parseProvides(String prefix, List<IProvidedCapability> provides) {
+-		while (current != null && current.startsWith(prefix)) {
+-			int dotIndex = current.indexOf('.', prefix.length());
+-			if (dotIndex == -1)
+-				throw new IllegalStateException("bad token: " + current); //$NON-NLS-1$
+-
+-			parseProvided(current.substring(0, dotIndex + 1), provides);
+-		}
+-	}
+-
+-	private void parseProvided(String prefix, List<IProvidedCapability> provides) {
+-		String namespace = null;
+-		String name = null;
+-		Version capabilityVersion = null;
+-		while (current != null && current.startsWith(prefix)) {
+-			String token = current.substring(prefix.length());
+-			if (token.equals(NAME)) {
+-				name = currentValue();
+-			} else if (token.equals(NAMESPACE)) {
+-				namespace = currentValue();
+-			} else if (token.equals(VERSION)) {
+-				capabilityVersion = Version.parseVersion(substituteVersionAndQualifier(currentValue()));
+-			} else {
+-				// we ignore elements we do not understand
+-			}
+-			next();
+-		}
+-
+-		IProvidedCapability capability = MetadataFactory.createProvidedCapability(namespace, name, capabilityVersion);
+-		provides.add(capability);
+-	}
+-
+-	private void parseRequires(String prefix, List<IRequirement> requires) {
+-		while (current != null && current.startsWith(prefix)) {
+-			int dotIndex = current.indexOf('.', prefix.length());
+-			if (dotIndex == -1)
+-				throw new IllegalStateException("bad token: " + current); //$NON-NLS-1$
+-
+-			parseRequired(current.substring(0, dotIndex + 1), requires);
+-		}
+-	}
+-
+-	private void parseRequired(String prefix, List<IRequirement> requires) {
+-
+-		String namespace = null;
+-		String name = null;
+-		VersionRange range = null;
+-		String filter = null;
+-		boolean optional = false;
+-		boolean multiple = false;
+-		boolean greedy = true;
+-
+-		while (current != null && current.startsWith(prefix)) {
+-			String token = current.substring(prefix.length());
+-			if (token.equals(GREEDY)) {
+-				greedy = Boolean.valueOf(currentValue()).booleanValue();
+-			} else if (token.equals(OPTIONAL)) {
+-				optional = Boolean.valueOf(currentValue()).booleanValue();
+-			} else if (token.equals(MULTIPLE)) {
+-				multiple = Boolean.valueOf(currentValue()).booleanValue();
+-			} else if (token.equals(FILTER)) {
+-				filter = currentValue();
+-			} else if (token.equals(NAME)) {
+-				name = currentValue();
+-			} else if (token.equals(NAMESPACE)) {
+-				namespace = currentValue();
+-			} else if (token.equals(RANGE)) {
+-				range = new VersionRange(substituteVersionAndQualifier(currentValue()));
+-			} else {
+-				// we ignore elements we do not understand
+-			}
+-			next();
+-		}
+-		IRequirement capability = MetadataFactory.createRequirement(namespace, name, range, filter, optional, multiple, greedy);
+-		requires.add(capability);
+-	}
+-
+-	private void parseInstructions(String prefix, Map<String, ITouchpointInstruction> instructions) {
+-		while (current != null && current.startsWith(prefix)) {
+-			int dotIndex = current.indexOf('.', prefix.length());
+-			if (dotIndex != -1)
+-				throw new IllegalStateException("bad token: " + current); //$NON-NLS-1$
+-
+-			parseInstruction(current, instructions);
+-		}
+-	}
+-
+-	private void parseInstruction(String prefix, Map<String, ITouchpointInstruction> instructions) {
+-		String phase = current.substring(current.lastIndexOf('.') + 1);
+-		String body = currentValue();
+-		next();
+-
+-		prefix += '.';
+-		String importAttribute = null;
+-		if (current != null && current.startsWith(prefix)) {
+-			if (current.substring(prefix.length()).equals(IMPORT)) {
+-				importAttribute = currentValue();
+-			} else {
+-				// we ignore elements we do not understand
+-			}
+-			next();
+-		}
+-		ITouchpointInstruction instruction = MetadataFactory.createTouchpointInstruction(body, importAttribute);
+-		instructions.put(phase, instruction);
+-	}
+-
+-	private void parseUnits(String prefix, List<InstallableUnitDescription> ius) {
+-		while (current != null && current.startsWith(prefix)) {
+-			int dotIndex = current.indexOf('.', prefix.length());
+-			if (dotIndex == -1)
+-				throw new IllegalStateException("bad token: " + current + " = " + currentValue()); //$NON-NLS-1$ //$NON-NLS-2$
+-
+-			parseUnit(current.substring(0, dotIndex + 1), ius);
+-		}
+-	}
+-
+-	private void parseUnit(String prefix, List<InstallableUnitDescription> units) {
+-		String unitId = null;
+-		Version unitVersion = null;
+-		boolean unitSingleton = false;
+-		String unitFilter = null;
+-		String unitCopyright = null;
+-		String unitCopyrightLocation = null;
+-		String unitTouchpointId = null;
+-		Version unitTouchpointVersion = null;
+-
+-		String unitUpdateId = null;
+-		VersionRange unitUpdateRange = null;
+-		int unitUpdateSeverity = 0;
+-		String unitUpdateDescription = null;
+-
+-		List<IArtifactKey> unitArtifacts = new ArrayList<IArtifactKey>();
+-		Map<String, String> unitProperties = new HashMap<String, String>();
+-		List<IRequirement> unitHostRequirements = new ArrayList<IRequirement>();
+-		List<IProvidedCapability> unitProvides = new ArrayList<IProvidedCapability>();
+-		List<IRequirement> unitRequires = new ArrayList<IRequirement>();
+-		List<IRequirement> unitMetaRequirements = new ArrayList<IRequirement>();
+-		List<ILicense> unitLicenses = new ArrayList<ILicense>();
+-		Map<String, ITouchpointInstruction> unitInstructions = new HashMap<String, ITouchpointInstruction>();
+-		//		updatedescriptor ??
+-
+-		while (current != null && current.startsWith(prefix)) {
+-			String token = current.substring(prefix.length());
+-			if (token.equals(ID)) {
+-				unitId = currentValue();
+-				next();
+-			} else if (token.equals(VERSION)) {
+-				unitVersion = Version.parseVersion(substituteVersionAndQualifier(currentValue()));
+-				next();
+-			} else if (token.equals(SINGLETON)) {
+-				unitSingleton = Boolean.valueOf(currentValue()).booleanValue();
+-				next();
+-			} else if (token.equals(FILTER)) {
+-				unitFilter = currentValue();
+-				next();
+-			} else if (token.equals(COPYRIGHT)) {
+-				unitCopyright = currentValue();
+-				next();
+-			} else if (token.equals(COPYRIGHT_LOCATION)) {
+-				unitCopyrightLocation = currentValue();
+-				next();
+-			} else if (token.equals(TOUCHPOINT_ID)) {
+-				unitTouchpointId = currentValue();
+-				next();
+-			} else if (token.equals(TOUCHPOINT_VERSION)) {
+-				unitTouchpointVersion = Version.parseVersion(substituteVersionAndQualifier(currentValue()));
+-				next();
+-			} else if (token.equals(UPDATE_ID)) {
+-				unitUpdateId = currentValue();
+-				next();
+-			} else if (token.equals(UPDATE_RANGE)) {
+-				unitUpdateRange = new VersionRange(substituteVersionAndQualifier(currentValue()));
+-				next();
+-			} else if (token.equals(UPDATE_SEVERITY)) {
+-				unitUpdateSeverity = Integer.parseInt(currentValue());
+-				next();
+-			} else if (token.equals(UPDATE_DESCRIPTION)) {
+-				unitUpdateDescription = currentValue();
+-				next();
+-			} else if (token.startsWith(HOST_REQUIREMENTS_PREFIX))
+-				parseRequires(prefix + HOST_REQUIREMENTS_PREFIX, unitHostRequirements);
+-			else if (token.startsWith(ARTIFACTS_PREFIX))
+-				parseArtifacts(prefix + ARTIFACTS_PREFIX, unitArtifacts);
+-			else if (token.startsWith(LICENSES_PREFIX))
+-				parseLicenses(prefix + LICENSES_PREFIX, unitLicenses);
+-			else if (token.startsWith(PROPERTIES_PREFIX))
+-				parseProperties(prefix + PROPERTIES_PREFIX, unitProperties);
+-			else if (token.startsWith(PROVIDES_PREFIX))
+-				parseProvides(prefix + PROVIDES_PREFIX, unitProvides);
+-			else if (token.startsWith(REQUIRES_PREFIX))
+-				parseRequires(prefix + REQUIRES_PREFIX, unitRequires);
+-			else if (token.startsWith(META_REQUIREMENTS_PREFIX))
+-				parseRequires(prefix + META_REQUIREMENTS_PREFIX, unitMetaRequirements);
+-			else if (token.startsWith(INSTRUCTIONS_PREFIX))
+-				parseInstructions(prefix + INSTRUCTIONS_PREFIX, unitInstructions);
+-			else {
+-				// we ignore elements we do not understand
+-				next();
+-			}
+-		}
+-
+-		InstallableUnitDescription description = unitHostRequirements.isEmpty() ? new InstallableUnitDescription() : new InstallableUnitFragmentDescription();
+-		description.setId(unitId);
+-		description.setVersion(unitVersion);
+-		description.setSingleton(unitSingleton);
+-		description.setFilter(unitFilter);
+-		if (unitCopyright != null || unitCopyrightLocation != null) {
+-			try {
+-				URI uri = unitCopyrightLocation != null ? new URI(unitCopyrightLocation) : null;
+-				description.setCopyright(MetadataFactory.createCopyright(uri, unitCopyright));
+-			} catch (URISyntaxException e) {
+-				throw new IllegalStateException("bad copyright URI at token: " + current + ", " + currentValue()); //$NON-NLS-1$ //$NON-NLS-2$
+-			}
+-		}
+-		if (unitTouchpointId != null)
+-			description.setTouchpointType(MetadataFactory.createTouchpointType(unitTouchpointId, unitTouchpointVersion));
+-
+-		if (unitUpdateId != null)
+-			description.setUpdateDescriptor(MetadataFactory.createUpdateDescriptor(unitUpdateId, unitUpdateRange, unitUpdateSeverity, unitUpdateDescription));
+-
+-		if (!unitLicenses.isEmpty())
+-			description.setLicenses(unitLicenses.toArray(new ILicense[unitLicenses.size()]));
+-
+-		if (!unitArtifacts.isEmpty())
+-			description.setArtifacts(unitArtifacts.toArray(new IArtifactKey[unitArtifacts.size()]));
+-
+-		if (!unitHostRequirements.isEmpty())
+-			((InstallableUnitFragmentDescription) description).setHost(unitHostRequirements.toArray(new IRequirement[unitHostRequirements.size()]));
+-
+-		if (!unitProperties.isEmpty()) {
+-			for (Entry<String, String> entry : unitProperties.entrySet()) {
+-				description.setProperty(entry.getKey(), entry.getValue());
+-			}
+-		}
+-
+-		if (!unitProvides.isEmpty())
+-			description.setCapabilities(unitProvides.toArray(new IProvidedCapability[unitProvides.size()]));
+-
+-		if (!unitRequires.isEmpty())
+-			description.setRequirements(unitRequires.toArray(new IRequirement[unitRequires.size()]));
+-
+-		if (!unitMetaRequirements.isEmpty())
+-			description.setMetaRequirements(unitMetaRequirements.toArray(new IRequirement[unitMetaRequirements.size()]));
+-
+-		if (!unitInstructions.isEmpty())
+-			description.addTouchpointData(MetadataFactory.createTouchpointData(unitInstructions));
+-
+-		adviceOtherIUs.add(description);
+-	}
+-
+-	private void parseLicenses(String prefix, List<ILicense> licenses) {
+-		while (current != null && current.startsWith(prefix)) {
+-			int dotIndex = current.indexOf('.', prefix.length());
+-			if (dotIndex != -1)
+-				throw new IllegalStateException("bad token: " + current + " = " + currentValue()); //$NON-NLS-1$ //$NON-NLS-2$
+-
+-			parseLicense(current, licenses);
+-		}
+-	}
+-
+-	private void parseLicense(String prefix, List<ILicense> licenses) {
+-		String body = currentValue();
+-		next();
+-
+-		prefix += '.';
+-		String location = null;
+-		if (current != null && current.startsWith(prefix)) {
+-			if (current.substring(prefix.length()).equals(LOCATION)) {
+-				location = currentValue();
+-			} else {
+-				// we ignore elements we do not understand
+-			}
+-			next();
+-		}
+-
+-		try {
+-			URI uri = location != null ? new URI(location) : null;
+-			ILicense license = MetadataFactory.createLicense(uri, body);
+-			licenses.add(license);
+-		} catch (URISyntaxException e) {
+-			throw new IllegalStateException("bad license URI at token: " + current + ", " + currentValue()); //$NON-NLS-1$ //$NON-NLS-2$
+-		}
+-	}
+-
+-	private void parseArtifacts(String prefix, List<IArtifactKey> artifacts) {
+-		while (current != null && current.startsWith(prefix)) {
+-			int dotIndex = current.indexOf('.', prefix.length());
+-			if (dotIndex == -1)
+-				throw new IllegalStateException("bad token: " + current + " = " + currentValue()); //$NON-NLS-1$ //$NON-NLS-2$
+-
+-			parseArtifact(current.substring(0, dotIndex + 1), artifacts);
+-		}
+-	}
+-
+-	private void parseArtifact(String prefix, List<IArtifactKey> artifacts) {
+-		String artifactClassifier = null;
+-		String artifactId = null;
+-		Version artifactVersion = null;
+-		while (current != null && current.startsWith(prefix)) {
+-			String token = current.substring(prefix.length());
+-			if (token.equals(CLASSIFIER)) {
+-				artifactClassifier = currentValue();
+-			} else if (token.equals(ID)) {
+-				artifactId = currentValue();
+-			} else if (token.equals(VERSION)) {
+-				artifactVersion = Version.parseVersion(substituteVersionAndQualifier(currentValue()));
+-			} else {
+-				// we ignore elements we do not understand
+-			}
+-
+-			next();
+-		}
+-		IArtifactKey artifactKey = new ArtifactKey(artifactClassifier, artifactId, artifactVersion);
+-		artifacts.add(artifactKey);
+-	}
+-
+-	private String substituteVersionAndQualifier(String version) {
+-		if (version.indexOf(VERSION_SUBSTITUTION) != -1) {
+-			version = replace(version, VERSION_SUBSTITUTION, hostVersion.toString());
+-		}
+-
+-		if (version.indexOf(QUALIFIER_SUBSTITUTION) != -1) {
+-			try {
+-				String qualifier = PublisherHelper.toOSGiVersion(hostVersion).getQualifier();
+-				if (qualifier == null)
+-					qualifier = ""; //$NON-NLS-1$
+-				if (qualifier.length() == 0) {
+-					// Note: this works only for OSGi versions and version ranges
+-					// where the qualifier if present must be at the end of a version string
+-					version = replace(version, "." + QUALIFIER_SUBSTITUTION, ""); //$NON-NLS-1$ //$NON-NLS-2$
+-				}
+-				version = replace(version, QUALIFIER_SUBSTITUTION, qualifier);
+-			} catch (UnsupportedOperationException e) {
+-				// Version cannot be converted to OSGi
+-			}
+-		}
+-		return version;
+-	}
+-
+-	// originally from org.eclipse.core.internal.net.StringUtil
+-	public static String replace(String source, String from, String to) {
+-		if (from.length() == 0)
+-			return source;
+-		StringBuffer buffer = new StringBuffer();
+-		int current = 0;
+-		int pos = 0;
+-		while (pos != -1) {
+-			pos = source.indexOf(from, current);
+-			if (pos == -1) {
+-				buffer.append(source.substring(current));
+-			} else {
+-				buffer.append(source.substring(current, pos));
+-				buffer.append(to);
+-				current = pos + from.length();
+-			}
+-		}
+-		return buffer.toString();
+-	}
+-
+-	public Map<String, String> getProperties() {
+-		if (adviceProperties.isEmpty())
+-			return null;
+-		return adviceProperties;
+-	}
+-
+-	public IRequirement[] getRequiredCapabilities() {
+-		if (adviceRequires.isEmpty())
+-			return null;
+-
+-		return adviceRequires.toArray(new IRequirement[adviceRequires.size()]);
+-	}
+-
+-	public IProvidedCapability[] getProvidedCapabilities() {
+-		if (adviceProvides.isEmpty())
+-			return null;
+-
+-		return adviceProvides.toArray(new IProvidedCapability[adviceProvides.size()]);
+-	}
+-
+-	public IUpdateDescriptor getUpdateDescriptor() {
+-		return adviceUpdateDescriptor;
+-	}
+-
+-	public Map<String, ITouchpointInstruction> getTouchpointInstructions() {
+-		if (adviceInstructions.isEmpty())
+-			return null;
+-
+-		return adviceInstructions;
+-	}
+-
+-	public InstallableUnitDescription[] getAdditionalInstallableUnitDescriptions() {
+-		if (adviceOtherIUs.isEmpty())
+-			return null;
+-
+-		return adviceOtherIUs.toArray(new InstallableUnitDescription[adviceOtherIUs.size()]);
+-	}
+-
+-	public IRequirement[] getMetaRequiredCapabilities() {
+-		if (adviceMetaRequires.isEmpty())
+-			return null;
+-
+-		return adviceMetaRequires.toArray(new IRequirement[adviceMetaRequires.size()]);
+-	}
+-}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/FeaturesAction.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/FeaturesAction.java
+index b20233c..f2b0120 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/FeaturesAction.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/FeaturesAction.java
+@@ -13,44 +13,21 @@ package org.eclipse.equinox.p2.publisher.eclipse;
+ import java.io.File;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+-import java.util.ArrayList;
+-import java.util.Collection;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Locale;
+-import java.util.Map;
++import java.util.*;
+ import java.util.Map.Entry;
+-import java.util.StringTokenizer;
+-import org.eclipse.core.runtime.IProgressMonitor;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Path;
+-import org.eclipse.core.runtime.Status;
+-import org.eclipse.core.runtime.URIUtil;
+-import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.FileUtils.IPathComputer;
+-import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.metadata.ArtifactKey;
+ import org.eclipse.equinox.internal.p2.metadata.InstallableUnit;
+ import org.eclipse.equinox.internal.p2.publisher.FileSetDescriptor;
+ import org.eclipse.equinox.internal.p2.publisher.Messages;
+ import org.eclipse.equinox.internal.p2.publisher.eclipse.FeatureParser;
+-import org.eclipse.equinox.p2.metadata.IArtifactKey;
+-import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+-import org.eclipse.equinox.p2.metadata.ILicense;
+-import org.eclipse.equinox.p2.metadata.IProvidedCapability;
+-import org.eclipse.equinox.p2.metadata.IRequirement;
+-import org.eclipse.equinox.p2.metadata.IRequirementChange;
+-import org.eclipse.equinox.p2.metadata.ITouchpointType;
+-import org.eclipse.equinox.p2.metadata.IUpdateDescriptor;
+-import org.eclipse.equinox.p2.metadata.MetadataFactory;
++import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitDescription;
+ import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitPatchDescription;
+-import org.eclipse.equinox.p2.metadata.Version;
+-import org.eclipse.equinox.p2.metadata.VersionRange;
+ import org.eclipse.equinox.p2.metadata.expression.IMatchExpression;
+-import org.eclipse.equinox.p2.publisher.AbstractPublisherAction;
+-import org.eclipse.equinox.p2.publisher.IPublisherInfo;
+-import org.eclipse.equinox.p2.publisher.IPublisherResult;
++import org.eclipse.equinox.p2.publisher.*;
+ import org.eclipse.equinox.p2.publisher.actions.IFeatureRootAdvice;
+ import org.eclipse.equinox.p2.repository.IRepository;
+ import org.eclipse.equinox.p2.repository.IRepositoryReference;
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ProductAction.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ProductAction.java
+index 22c696f..4e0061e 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ProductAction.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ProductAction.java
+@@ -13,7 +13,6 @@ package org.eclipse.equinox.p2.publisher.eclipse;
+ import java.io.File;
+ import java.util.*;
+ import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.p2.metadata.VersionedId;
+ import org.eclipse.equinox.internal.p2.publisher.eclipse.IProductDescriptor;
+ import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.publisher.*;
+diff --git a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AdviceFileAdvice.java b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AdviceFileAdvice.java
+new file mode 100644
+index 0000000..3e872c2
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AdviceFileAdvice.java
+@@ -0,0 +1,183 @@
++/*******************************************************************************
++ *  Copyright (c) 2008, 2011 IBM Corporation and others.
++ *  All rights reserved. This program and the accompanying materials
++ *  are made available under the terms of the Eclipse Public License v1.0
++ *  which accompanies this distribution, and is available at
++ *  http://www.eclipse.org/legal/epl-v10.html
++ * 
++ *  Contributors:
++ *      IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.p2.publisher;
++
++import java.io.*;
++import java.util.Map;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.CollectionUtils;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
++import org.eclipse.equinox.internal.p2.publisher.Activator;
++import org.eclipse.equinox.p2.metadata.*;
++import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitDescription;
++import org.eclipse.equinox.p2.publisher.actions.*;
++import org.eclipse.equinox.p2.repository.artifact.IArtifactDescriptor;
++
++/**
++ * Publishing advice from a p2 advice file. An advice file (p2.inf) can be embedded
++ * in the source of a bundle, feature, or product to specify additional advice to be
++ * added to the {@link IInstallableUnit} corresponding to the bundle, feature, or product.
++ */
++public class AdviceFileAdvice extends AbstractAdvice implements ITouchpointAdvice, ICapabilityAdvice, IUpdateDescriptorAdvice, IPropertyAdvice, IAdditionalInstallableUnitAdvice {
++
++	/**
++	 * The location of the bundle advice file, relative to the bundle root location.
++	 */
++	public static final IPath BUNDLE_ADVICE_FILE = new Path("META-INF/p2.inf"); //$NON-NLS-1$
++
++	private final String id;
++	private final Version version;
++
++	private Map<String, ITouchpointInstruction> touchpointInstructions;
++	private IProvidedCapability[] providedCapabilities;
++	private IRequirement[] requiredCapabilities;
++	private IRequirement[] metaRequiredCapabilities;
++	private Map<String, String> iuProperties;
++	private InstallableUnitDescription[] additionalIUs;
++	private IUpdateDescriptor updateDescriptor;
++	private boolean containsAdvice = false;
++
++	/**
++	 * Creates advice for an advice file at the given location. If <tt>basePath</tt>
++	 * is a directory, then <tt>adviceFilePath</tt> is appended to this location to
++	 * obtain the location of the advice file. If <tt>basePath</tt> is a file, then
++	 * <tt>adviceFilePath</tt> is used to 
++	 * @param id The symbolic id of the installable unit this advice applies to
++	 * @param version The version of the installable unit this advice applies to
++	 * @param basePath The root location of the the advice file. This is either the location of
++	 * the jar containing the advice, or a directory containing the advice file
++	 * @param adviceFilePath The location of the advice file within the base path. This is
++	 * either the path of a jar entry, or the path of the advice file within the directory
++	 * specified by the base path.
++	 */
++	public AdviceFileAdvice(String id, Version version, IPath basePath, IPath adviceFilePath) {
++		Assert.isNotNull(id);
++		Assert.isNotNull(version);
++		Assert.isNotNull(basePath);
++		Assert.isNotNull(adviceFilePath);
++		this.id = id;
++		this.version = version;
++
++		Map<String, String> advice = loadAdviceMap(basePath, adviceFilePath);
++		if (advice.isEmpty())
++			return;
++
++		AdviceFileParser parser = new AdviceFileParser(id, version, advice);
++		try {
++			parser.parse();
++		} catch (Exception e) {
++			String message = "An error occured while parsing advice file: basePath=" + basePath + ", adviceFilePath=" + adviceFilePath + "."; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++			IStatus status = new Status(IStatus.ERROR, Activator.ID, message, e);
++			LogHelper.log(status);
++			return;
++		}
++		touchpointInstructions = parser.getTouchpointInstructions();
++		providedCapabilities = parser.getProvidedCapabilities();
++		requiredCapabilities = parser.getRequiredCapabilities();
++		metaRequiredCapabilities = parser.getMetaRequiredCapabilities();
++		iuProperties = parser.getProperties();
++		additionalIUs = parser.getAdditionalInstallableUnitDescriptions();
++		updateDescriptor = parser.getUpdateDescriptor();
++		containsAdvice = true;
++	}
++
++	public boolean containsAdvice() {
++		return containsAdvice;
++	}
++
++	/**
++	 * Loads the advice file and returns it in map form.
++	 */
++	private static Map<String, String> loadAdviceMap(IPath basePath, IPath adviceFilePath) {
++		File location = basePath.toFile();
++		if (location == null || !location.exists())
++			return CollectionUtils.emptyMap();
++
++		ZipFile jar = null;
++		InputStream stream = null;
++		try {
++			if (location.isDirectory()) {
++				File adviceFile = new File(location, adviceFilePath.toString());
++				if (!adviceFile.isFile())
++					return CollectionUtils.emptyMap();
++				stream = new BufferedInputStream(new FileInputStream(adviceFile));
++			} else if (location.isFile()) {
++				jar = new ZipFile(location);
++				ZipEntry entry = jar.getEntry(adviceFilePath.toString());
++				if (entry == null)
++					return CollectionUtils.emptyMap();
++
++				stream = new BufferedInputStream(jar.getInputStream(entry));
++			}
++			return CollectionUtils.loadProperties(stream);
++		} catch (IOException e) {
++			String message = "An error occured while reading advice file: basePath=" + basePath + ", adviceFilePath=" + adviceFilePath + "."; //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$
++			IStatus status = new Status(IStatus.ERROR, Activator.ID, message, e);
++			LogHelper.log(status);
++			return CollectionUtils.emptyMap();
++		} finally {
++			if (stream != null)
++				try {
++					stream.close();
++				} catch (IOException e) {
++					// ignore secondary failure
++				}
++			if (jar != null)
++				try {
++					jar.close();
++				} catch (IOException e) {
++					// ignore secondary failure
++				}
++		}
++	}
++
++	@Override
++	public boolean isApplicable(String configSpec, boolean includeDefault, String candidateId, Version candidateVersion) {
++		return id.equals(candidateId) && version.equals(candidateVersion);
++	}
++
++	/*(non-Javadoc)
++	 * @see org.eclipse.equinox.p2.publisher.eclipse.ITouchpointAdvice#getTouchpointData()
++	 */
++	public ITouchpointData getTouchpointData(ITouchpointData existing) {
++		return MetadataFactory.mergeTouchpointData(existing, touchpointInstructions);
++	}
++
++	public IProvidedCapability[] getProvidedCapabilities(InstallableUnitDescription iu) {
++		return providedCapabilities;
++	}
++
++	public IRequirement[] getRequiredCapabilities(InstallableUnitDescription iu) {
++		return requiredCapabilities;
++	}
++
++	public IRequirement[] getMetaRequiredCapabilities(InstallableUnitDescription iu) {
++		return metaRequiredCapabilities;
++	}
++
++	public InstallableUnitDescription[] getAdditionalInstallableUnitDescriptions(IInstallableUnit iu) {
++		return additionalIUs;
++	}
++
++	public IUpdateDescriptor getUpdateDescriptor(InstallableUnitDescription iu) {
++		return updateDescriptor;
++	}
++
++	public Map<String, String> getArtifactProperties(IInstallableUnit iu, IArtifactDescriptor descriptor) {
++		return null;
++	}
++
++	public Map<String, String> getInstallableUnitProperties(InstallableUnitDescription iu) {
++		return iuProperties;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AdviceFileParser.java b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AdviceFileParser.java
+new file mode 100644
+index 0000000..7453ee6
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AdviceFileParser.java
+@@ -0,0 +1,592 @@
++/*******************************************************************************
++ * Copyright (c) 2009, 2011 IBM Corporation and others. All rights reserved. This
++ * program and the accompanying materials are made available under the terms of
++ * the Eclipse Public License v1.0 which accompanies this distribution, and is
++ * available at http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors: IBM Corporation - initial API and implementation
++ ******************************************************************************/
++package org.eclipse.equinox.p2.publisher;
++
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.util.*;
++import java.util.Map.Entry;
++import org.eclipse.equinox.internal.p2.metadata.ArtifactKey;
++import org.eclipse.equinox.p2.metadata.*;
++import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitDescription;
++import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitFragmentDescription;
++import org.eclipse.equinox.spi.p2.publisher.PublisherHelper;
++
++public class AdviceFileParser {
++
++	private static final String ADVICE_VERSION = "advice.version"; //$NON-NLS-1$
++
++	private static final String QUALIFIER_SUBSTITUTION = "$qualifier$"; //$NON-NLS-1$
++	private static final String VERSION_SUBSTITUTION = "$version$"; //$NON-NLS-1$
++
++	private static final String UPDATE_DESCRIPTION = "update.description"; //$NON-NLS-1$
++	private static final String UPDATE_SEVERITY = "update.severity"; //$NON-NLS-1$
++	private static final String UPDATE_RANGE = "update.range"; //$NON-NLS-1$
++	private static final String UPDATE_ID = "update.id"; //$NON-NLS-1$
++	private static final String CLASSIFIER = "classifier"; //$NON-NLS-1$
++	private static final String TOUCHPOINT_VERSION = "touchpoint.version"; //$NON-NLS-1$
++	private static final String TOUCHPOINT_ID = "touchpoint.id"; //$NON-NLS-1$
++	private static final String COPYRIGHT_LOCATION = "copyright.location"; //$NON-NLS-1$
++	private static final String COPYRIGHT = "copyright"; //$NON-NLS-1$
++	private static final String ID = "id"; //$NON-NLS-1$
++	private static final String SINGLETON = "singleton"; //$NON-NLS-1$
++	private static final String IMPORT = "import"; //$NON-NLS-1$
++	private static final String RANGE = "range"; //$NON-NLS-1$
++	private static final String FILTER = "filter"; //$NON-NLS-1$
++	private static final String MULTIPLE = "multiple"; //$NON-NLS-1$
++	private static final String OPTIONAL = "optional"; //$NON-NLS-1$
++	private static final String GREEDY = "greedy"; //$NON-NLS-1$
++	private static final String VERSION = "version"; //$NON-NLS-1$
++	private static final String NAMESPACE = "namespace"; //$NON-NLS-1$
++	private static final String NAME = "name"; //$NON-NLS-1$
++	private static final String LOCATION = "location"; //$NON-NLS-1$
++	private static final String VALUE = "value"; //$NON-NLS-1$
++
++	private static final String UNITS_PREFIX = "units."; //$NON-NLS-1$
++	private static final String INSTRUCTIONS_PREFIX = "instructions."; //$NON-NLS-1$
++	private static final String REQUIRES_PREFIX = "requires."; //$NON-NLS-1$
++	private static final String META_REQUIREMENTS_PREFIX = "metaRequirements."; //$NON-NLS-1$
++	private static final String PROVIDES_PREFIX = "provides."; //$NON-NLS-1$
++	private static final String PROPERTIES_PREFIX = "properties."; //$NON-NLS-1$
++	private static final String LICENSES_PREFIX = "licenses."; //$NON-NLS-1$
++	private static final String ARTIFACTS_PREFIX = "artifacts."; //$NON-NLS-1$
++	private static final String HOST_REQUIREMENTS_PREFIX = "hostRequirements."; //$NON-NLS-1$
++	private static final String UPDATE_DESCRIPTOR_PREFIX = "update."; //$NON-NLS-1$
++
++	public static final Version COMPATIBLE_VERSION = Version.createOSGi(1, 0, 0);
++	public static final VersionRange VERSION_TOLERANCE = new VersionRange(COMPATIBLE_VERSION, true, Version.createOSGi(2, 0, 0), false);
++
++	private Map<String, String> adviceProperties = new HashMap<String, String>();
++	private List<IProvidedCapability> adviceProvides = new ArrayList<IProvidedCapability>();
++	private List<IRequirement> adviceRequires = new ArrayList<IRequirement>();
++	private List<IRequirement> adviceMetaRequires = new ArrayList<IRequirement>();
++	private IUpdateDescriptor adviceUpdateDescriptor = null;
++	private Map<String, ITouchpointInstruction> adviceInstructions = new HashMap<String, ITouchpointInstruction>();
++	private List<InstallableUnitDescription> adviceOtherIUs = new ArrayList<InstallableUnitDescription>();
++
++	private final Map<String, String> advice;
++	private Iterator<String> keysIterator;
++	private String current;
++	private String hostId;
++	private Version hostVersion;
++
++	public AdviceFileParser(String id, Version version, Map<String, String> advice) {
++		this.hostId = id;
++		this.hostVersion = version;
++		this.advice = advice;
++	}
++
++	public void parse() {
++		String adviceVersion = advice.get(ADVICE_VERSION);
++		if (adviceVersion != null)
++			checkAdviceVersion(adviceVersion);
++
++		List<String> keys = new ArrayList<String>(advice.keySet());
++		Collections.sort(keys);
++
++		keysIterator = keys.iterator();
++		next();
++
++		while (current != null) {
++			if (current.startsWith(PROPERTIES_PREFIX))
++				parseProperties(PROPERTIES_PREFIX, adviceProperties);
++			else if (current.startsWith(UPDATE_DESCRIPTOR_PREFIX))
++				this.adviceUpdateDescriptor = parseUpdateDescriptor(UPDATE_DESCRIPTOR_PREFIX, hostId);
++			else if (current.startsWith(PROVIDES_PREFIX))
++				parseProvides(PROVIDES_PREFIX, adviceProvides);
++			else if (current.startsWith(REQUIRES_PREFIX))
++				parseRequires(REQUIRES_PREFIX, adviceRequires);
++			else if (current.startsWith(META_REQUIREMENTS_PREFIX))
++				parseRequires(META_REQUIREMENTS_PREFIX, adviceMetaRequires);
++			else if (current.startsWith(INSTRUCTIONS_PREFIX))
++				parseInstructions(INSTRUCTIONS_PREFIX, adviceInstructions);
++			else if (current.startsWith(UNITS_PREFIX))
++				parseUnits(UNITS_PREFIX, adviceOtherIUs);
++			else if (current.equals(ADVICE_VERSION)) {
++				next();
++			} else {
++				// we ignore elements we do not understand
++				next();
++			}
++		}
++	}
++
++	private void checkAdviceVersion(String adviceVersion) {
++		Version version = Version.parseVersion(adviceVersion);
++		if (!VERSION_TOLERANCE.isIncluded(version))
++			throw new IllegalStateException("bad version: " + version + ". Expected range was " + VERSION_TOLERANCE); //$NON-NLS-1$ //$NON-NLS-2$
++	}
++
++	private void next() {
++		current = keysIterator.hasNext() ? keysIterator.next() : null;
++	}
++
++	private String currentValue() {
++		return advice.get(current).trim();
++	}
++
++	private void parseProperties(String prefix, Map<String, String> properties) {
++		while (current != null && current.startsWith(prefix)) {
++			int dotIndex = current.indexOf('.', prefix.length());
++			if (dotIndex == -1)
++				throw new IllegalStateException("bad token: " + current); //$NON-NLS-1$
++
++			parseProperty(current.substring(0, dotIndex + 1), properties);
++		}
++	}
++
++	private void parseProperty(String prefix, Map<String, String> properties) {
++		String propertyName = null;
++		String propertyValue = null;
++		while (current != null && current.startsWith(prefix)) {
++			String token = current.substring(prefix.length());
++			if (token.equals(NAME)) {
++				propertyName = currentValue();
++			} else if (token.equals(VALUE)) {
++				propertyValue = currentValue();
++			} else {
++				// we ignore elements we do not understand
++			}
++			next();
++		}
++
++		properties.put(propertyName, propertyValue);
++	}
++
++	private IUpdateDescriptor parseUpdateDescriptor(String prefix, String id) {
++		String name = id;
++		String description = null;
++		String range = "[0.0.0,$version$)"; //$NON-NLS-1$ 
++		String severity = "0"; //$NON-NLS-1$
++
++		while (current != null && current.startsWith(prefix)) {
++			String token = current;
++			if (token.equals(UPDATE_ID)) {
++				name = currentValue();
++			} else if (token.equals(UPDATE_DESCRIPTION)) {
++				description = currentValue();
++			} else if (token.equals(UPDATE_RANGE)) {
++				range = currentValue();
++			} else if (token.equals(UPDATE_SEVERITY)) {
++				severity = currentValue();
++			} else {
++				// ignore
++			}
++			next();
++		}
++
++		range = substituteVersionAndQualifier(range);
++		VersionRange versionRange = new VersionRange(range);
++		return MetadataFactory.createUpdateDescriptor(name, versionRange, Integer.valueOf(severity), description);
++	}
++
++	private void parseProvides(String prefix, List<IProvidedCapability> provides) {
++		while (current != null && current.startsWith(prefix)) {
++			int dotIndex = current.indexOf('.', prefix.length());
++			if (dotIndex == -1)
++				throw new IllegalStateException("bad token: " + current); //$NON-NLS-1$
++
++			parseProvided(current.substring(0, dotIndex + 1), provides);
++		}
++	}
++
++	private void parseProvided(String prefix, List<IProvidedCapability> provides) {
++		String namespace = null;
++		String name = null;
++		Version capabilityVersion = null;
++		while (current != null && current.startsWith(prefix)) {
++			String token = current.substring(prefix.length());
++			if (token.equals(NAME)) {
++				name = currentValue();
++			} else if (token.equals(NAMESPACE)) {
++				namespace = currentValue();
++			} else if (token.equals(VERSION)) {
++				capabilityVersion = Version.parseVersion(substituteVersionAndQualifier(currentValue()));
++			} else {
++				// we ignore elements we do not understand
++			}
++			next();
++		}
++
++		IProvidedCapability capability = MetadataFactory.createProvidedCapability(namespace, name, capabilityVersion);
++		provides.add(capability);
++	}
++
++	private void parseRequires(String prefix, List<IRequirement> requires) {
++		while (current != null && current.startsWith(prefix)) {
++			int dotIndex = current.indexOf('.', prefix.length());
++			if (dotIndex == -1)
++				throw new IllegalStateException("bad token: " + current); //$NON-NLS-1$
++
++			parseRequired(current.substring(0, dotIndex + 1), requires);
++		}
++	}
++
++	private void parseRequired(String prefix, List<IRequirement> requires) {
++
++		String namespace = null;
++		String name = null;
++		VersionRange range = null;
++		String filter = null;
++		boolean optional = false;
++		boolean multiple = false;
++		boolean greedy = true;
++
++		while (current != null && current.startsWith(prefix)) {
++			String token = current.substring(prefix.length());
++			if (token.equals(GREEDY)) {
++				greedy = Boolean.valueOf(currentValue()).booleanValue();
++			} else if (token.equals(OPTIONAL)) {
++				optional = Boolean.valueOf(currentValue()).booleanValue();
++			} else if (token.equals(MULTIPLE)) {
++				multiple = Boolean.valueOf(currentValue()).booleanValue();
++			} else if (token.equals(FILTER)) {
++				filter = currentValue();
++			} else if (token.equals(NAME)) {
++				name = currentValue();
++			} else if (token.equals(NAMESPACE)) {
++				namespace = currentValue();
++			} else if (token.equals(RANGE)) {
++				range = new VersionRange(substituteVersionAndQualifier(currentValue()));
++			} else {
++				// we ignore elements we do not understand
++			}
++			next();
++		}
++		IRequirement capability = MetadataFactory.createRequirement(namespace, name, range, filter, optional, multiple, greedy);
++		requires.add(capability);
++	}
++
++	private void parseInstructions(String prefix, Map<String, ITouchpointInstruction> instructions) {
++		while (current != null && current.startsWith(prefix)) {
++			int dotIndex = current.indexOf('.', prefix.length());
++			if (dotIndex != -1)
++				throw new IllegalStateException("bad token: " + current); //$NON-NLS-1$
++
++			parseInstruction(current, instructions);
++		}
++	}
++
++	private void parseInstruction(String prefix, Map<String, ITouchpointInstruction> instructions) {
++		String phase = current.substring(current.lastIndexOf('.') + 1);
++		String body = currentValue();
++		next();
++
++		prefix += '.';
++		String importAttribute = null;
++		if (current != null && current.startsWith(prefix)) {
++			if (current.substring(prefix.length()).equals(IMPORT)) {
++				importAttribute = currentValue();
++			} else {
++				// we ignore elements we do not understand
++			}
++			next();
++		}
++		ITouchpointInstruction instruction = MetadataFactory.createTouchpointInstruction(body, importAttribute);
++		instructions.put(phase, instruction);
++	}
++
++	private void parseUnits(String prefix, List<InstallableUnitDescription> ius) {
++		while (current != null && current.startsWith(prefix)) {
++			int dotIndex = current.indexOf('.', prefix.length());
++			if (dotIndex == -1)
++				throw new IllegalStateException("bad token: " + current + " = " + currentValue()); //$NON-NLS-1$ //$NON-NLS-2$
++
++			parseUnit(current.substring(0, dotIndex + 1), ius);
++		}
++	}
++
++	private void parseUnit(String prefix, List<InstallableUnitDescription> units) {
++		String unitId = null;
++		Version unitVersion = null;
++		boolean unitSingleton = false;
++		String unitFilter = null;
++		String unitCopyright = null;
++		String unitCopyrightLocation = null;
++		String unitTouchpointId = null;
++		Version unitTouchpointVersion = null;
++
++		String unitUpdateId = null;
++		VersionRange unitUpdateRange = null;
++		int unitUpdateSeverity = 0;
++		String unitUpdateDescription = null;
++
++		List<IArtifactKey> unitArtifacts = new ArrayList<IArtifactKey>();
++		Map<String, String> unitProperties = new HashMap<String, String>();
++		List<IRequirement> unitHostRequirements = new ArrayList<IRequirement>();
++		List<IProvidedCapability> unitProvides = new ArrayList<IProvidedCapability>();
++		List<IRequirement> unitRequires = new ArrayList<IRequirement>();
++		List<IRequirement> unitMetaRequirements = new ArrayList<IRequirement>();
++		List<ILicense> unitLicenses = new ArrayList<ILicense>();
++		Map<String, ITouchpointInstruction> unitInstructions = new HashMap<String, ITouchpointInstruction>();
++		//		updatedescriptor ??
++
++		while (current != null && current.startsWith(prefix)) {
++			String token = current.substring(prefix.length());
++			if (token.equals(ID)) {
++				unitId = currentValue();
++				next();
++			} else if (token.equals(VERSION)) {
++				unitVersion = Version.parseVersion(substituteVersionAndQualifier(currentValue()));
++				next();
++			} else if (token.equals(SINGLETON)) {
++				unitSingleton = Boolean.valueOf(currentValue()).booleanValue();
++				next();
++			} else if (token.equals(FILTER)) {
++				unitFilter = currentValue();
++				next();
++			} else if (token.equals(COPYRIGHT)) {
++				unitCopyright = currentValue();
++				next();
++			} else if (token.equals(COPYRIGHT_LOCATION)) {
++				unitCopyrightLocation = currentValue();
++				next();
++			} else if (token.equals(TOUCHPOINT_ID)) {
++				unitTouchpointId = currentValue();
++				next();
++			} else if (token.equals(TOUCHPOINT_VERSION)) {
++				unitTouchpointVersion = Version.parseVersion(substituteVersionAndQualifier(currentValue()));
++				next();
++			} else if (token.equals(UPDATE_ID)) {
++				unitUpdateId = currentValue();
++				next();
++			} else if (token.equals(UPDATE_RANGE)) {
++				unitUpdateRange = new VersionRange(substituteVersionAndQualifier(currentValue()));
++				next();
++			} else if (token.equals(UPDATE_SEVERITY)) {
++				unitUpdateSeverity = Integer.parseInt(currentValue());
++				next();
++			} else if (token.equals(UPDATE_DESCRIPTION)) {
++				unitUpdateDescription = currentValue();
++				next();
++			} else if (token.startsWith(HOST_REQUIREMENTS_PREFIX))
++				parseRequires(prefix + HOST_REQUIREMENTS_PREFIX, unitHostRequirements);
++			else if (token.startsWith(ARTIFACTS_PREFIX))
++				parseArtifacts(prefix + ARTIFACTS_PREFIX, unitArtifacts);
++			else if (token.startsWith(LICENSES_PREFIX))
++				parseLicenses(prefix + LICENSES_PREFIX, unitLicenses);
++			else if (token.startsWith(PROPERTIES_PREFIX))
++				parseProperties(prefix + PROPERTIES_PREFIX, unitProperties);
++			else if (token.startsWith(PROVIDES_PREFIX))
++				parseProvides(prefix + PROVIDES_PREFIX, unitProvides);
++			else if (token.startsWith(REQUIRES_PREFIX))
++				parseRequires(prefix + REQUIRES_PREFIX, unitRequires);
++			else if (token.startsWith(META_REQUIREMENTS_PREFIX))
++				parseRequires(prefix + META_REQUIREMENTS_PREFIX, unitMetaRequirements);
++			else if (token.startsWith(INSTRUCTIONS_PREFIX))
++				parseInstructions(prefix + INSTRUCTIONS_PREFIX, unitInstructions);
++			else {
++				// we ignore elements we do not understand
++				next();
++			}
++		}
++
++		InstallableUnitDescription description = unitHostRequirements.isEmpty() ? new InstallableUnitDescription() : new InstallableUnitFragmentDescription();
++		description.setId(unitId);
++		description.setVersion(unitVersion);
++		description.setSingleton(unitSingleton);
++		description.setFilter(unitFilter);
++		if (unitCopyright != null || unitCopyrightLocation != null) {
++			try {
++				URI uri = unitCopyrightLocation != null ? new URI(unitCopyrightLocation) : null;
++				description.setCopyright(MetadataFactory.createCopyright(uri, unitCopyright));
++			} catch (URISyntaxException e) {
++				throw new IllegalStateException("bad copyright URI at token: " + current + ", " + currentValue()); //$NON-NLS-1$ //$NON-NLS-2$
++			}
++		}
++		if (unitTouchpointId != null)
++			description.setTouchpointType(MetadataFactory.createTouchpointType(unitTouchpointId, unitTouchpointVersion));
++
++		if (unitUpdateId != null)
++			description.setUpdateDescriptor(MetadataFactory.createUpdateDescriptor(unitUpdateId, unitUpdateRange, unitUpdateSeverity, unitUpdateDescription));
++
++		if (!unitLicenses.isEmpty())
++			description.setLicenses(unitLicenses.toArray(new ILicense[unitLicenses.size()]));
++
++		if (!unitArtifacts.isEmpty())
++			description.setArtifacts(unitArtifacts.toArray(new IArtifactKey[unitArtifacts.size()]));
++
++		if (!unitHostRequirements.isEmpty())
++			((InstallableUnitFragmentDescription) description).setHost(unitHostRequirements.toArray(new IRequirement[unitHostRequirements.size()]));
++
++		if (!unitProperties.isEmpty()) {
++			for (Entry<String, String> entry : unitProperties.entrySet()) {
++				description.setProperty(entry.getKey(), entry.getValue());
++			}
++		}
++
++		if (!unitProvides.isEmpty())
++			description.setCapabilities(unitProvides.toArray(new IProvidedCapability[unitProvides.size()]));
++
++		if (!unitRequires.isEmpty())
++			description.setRequirements(unitRequires.toArray(new IRequirement[unitRequires.size()]));
++
++		if (!unitMetaRequirements.isEmpty())
++			description.setMetaRequirements(unitMetaRequirements.toArray(new IRequirement[unitMetaRequirements.size()]));
++
++		if (!unitInstructions.isEmpty())
++			description.addTouchpointData(MetadataFactory.createTouchpointData(unitInstructions));
++
++		adviceOtherIUs.add(description);
++	}
++
++	private void parseLicenses(String prefix, List<ILicense> licenses) {
++		while (current != null && current.startsWith(prefix)) {
++			int dotIndex = current.indexOf('.', prefix.length());
++			if (dotIndex != -1)
++				throw new IllegalStateException("bad token: " + current + " = " + currentValue()); //$NON-NLS-1$ //$NON-NLS-2$
++
++			parseLicense(current, licenses);
++		}
++	}
++
++	private void parseLicense(String prefix, List<ILicense> licenses) {
++		String body = currentValue();
++		next();
++
++		prefix += '.';
++		String location = null;
++		if (current != null && current.startsWith(prefix)) {
++			if (current.substring(prefix.length()).equals(LOCATION)) {
++				location = currentValue();
++			} else {
++				// we ignore elements we do not understand
++			}
++			next();
++		}
++
++		try {
++			URI uri = location != null ? new URI(location) : null;
++			ILicense license = MetadataFactory.createLicense(uri, body);
++			licenses.add(license);
++		} catch (URISyntaxException e) {
++			throw new IllegalStateException("bad license URI at token: " + current + ", " + currentValue()); //$NON-NLS-1$ //$NON-NLS-2$
++		}
++	}
++
++	private void parseArtifacts(String prefix, List<IArtifactKey> artifacts) {
++		while (current != null && current.startsWith(prefix)) {
++			int dotIndex = current.indexOf('.', prefix.length());
++			if (dotIndex == -1)
++				throw new IllegalStateException("bad token: " + current + " = " + currentValue()); //$NON-NLS-1$ //$NON-NLS-2$
++
++			parseArtifact(current.substring(0, dotIndex + 1), artifacts);
++		}
++	}
++
++	private void parseArtifact(String prefix, List<IArtifactKey> artifacts) {
++		String artifactClassifier = null;
++		String artifactId = null;
++		Version artifactVersion = null;
++		while (current != null && current.startsWith(prefix)) {
++			String token = current.substring(prefix.length());
++			if (token.equals(CLASSIFIER)) {
++				artifactClassifier = currentValue();
++			} else if (token.equals(ID)) {
++				artifactId = currentValue();
++			} else if (token.equals(VERSION)) {
++				artifactVersion = Version.parseVersion(substituteVersionAndQualifier(currentValue()));
++			} else {
++				// we ignore elements we do not understand
++			}
++
++			next();
++		}
++		IArtifactKey artifactKey = new ArtifactKey(artifactClassifier, artifactId, artifactVersion);
++		artifacts.add(artifactKey);
++	}
++
++	private String substituteVersionAndQualifier(String version) {
++		if (version.indexOf(VERSION_SUBSTITUTION) != -1) {
++			version = replace(version, VERSION_SUBSTITUTION, hostVersion.toString());
++		}
++
++		if (version.indexOf(QUALIFIER_SUBSTITUTION) != -1) {
++			try {
++				String qualifier = PublisherHelper.toOSGiVersion(hostVersion).getQualifier();
++				if (qualifier == null)
++					qualifier = ""; //$NON-NLS-1$
++				if (qualifier.length() == 0) {
++					// Note: this works only for OSGi versions and version ranges
++					// where the qualifier if present must be at the end of a version string
++					version = replace(version, "." + QUALIFIER_SUBSTITUTION, ""); //$NON-NLS-1$ //$NON-NLS-2$
++				}
++				version = replace(version, QUALIFIER_SUBSTITUTION, qualifier);
++			} catch (UnsupportedOperationException e) {
++				// Version cannot be converted to OSGi
++			}
++		}
++		return version;
++	}
++
++	// originally from org.eclipse.core.internal.net.StringUtil
++	public static String replace(String source, String from, String to) {
++		if (from.length() == 0)
++			return source;
++		StringBuffer buffer = new StringBuffer();
++		int current = 0;
++		int pos = 0;
++		while (pos != -1) {
++			pos = source.indexOf(from, current);
++			if (pos == -1) {
++				buffer.append(source.substring(current));
++			} else {
++				buffer.append(source.substring(current, pos));
++				buffer.append(to);
++				current = pos + from.length();
++			}
++		}
++		return buffer.toString();
++	}
++
++	public Map<String, String> getProperties() {
++		if (adviceProperties.isEmpty())
++			return null;
++		return adviceProperties;
++	}
++
++	public IRequirement[] getRequiredCapabilities() {
++		if (adviceRequires.isEmpty())
++			return null;
++
++		return adviceRequires.toArray(new IRequirement[adviceRequires.size()]);
++	}
++
++	public IProvidedCapability[] getProvidedCapabilities() {
++		if (adviceProvides.isEmpty())
++			return null;
++
++		return adviceProvides.toArray(new IProvidedCapability[adviceProvides.size()]);
++	}
++
++	public IUpdateDescriptor getUpdateDescriptor() {
++		return adviceUpdateDescriptor;
++	}
++
++	public Map<String, ITouchpointInstruction> getTouchpointInstructions() {
++		if (adviceInstructions.isEmpty())
++			return null;
++
++		return adviceInstructions;
++	}
++
++	public InstallableUnitDescription[] getAdditionalInstallableUnitDescriptions() {
++		if (adviceOtherIUs.isEmpty())
++			return null;
++
++		return adviceOtherIUs.toArray(new InstallableUnitDescription[adviceOtherIUs.size()]);
++	}
++
++	public IRequirement[] getMetaRequiredCapabilities() {
++		if (adviceMetaRequires.isEmpty())
++			return null;
++
++		return adviceMetaRequires.toArray(new IRequirement[adviceMetaRequires.size()]);
++	}
++}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/AdviceFileParserTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/AdviceFileParserTest.java
+index 30a2e7b..1325f96 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/AdviceFileParserTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/AdviceFileParserTest.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2009, 2010 IBM Corporation and others.
++ * Copyright (c) 2009, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -15,7 +15,7 @@ import junit.framework.TestCase;
+ import org.eclipse.equinox.internal.p2.metadata.InstallableUnit;
+ import org.eclipse.equinox.internal.p2.metadata.RequiredCapability;
+ import org.eclipse.equinox.p2.metadata.*;
+-import org.eclipse.equinox.p2.publisher.eclipse.AdviceFileParser;
++import org.eclipse.equinox.p2.publisher.AdviceFileParser;
+ import org.eclipse.equinox.p2.query.QueryUtil;
+ 
+ public class AdviceFileParserTest extends TestCase {
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/PublisherUtil.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/PublisherUtil.java
+index e61b076..fa186ea 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/PublisherUtil.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/PublisherUtil.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- *  Copyright (c) 2009, 2010 IBM Corporation and others.
++ *  Copyright (c) 2009, 2011 IBM Corporation and others.
+  *  All rights reserved. This program and the accompanying materials
+  *  are made available under the terms of the Eclipse Public License v1.0
+  *  which accompanies this distribution, and is available at
+@@ -14,6 +14,7 @@ package org.eclipse.equinox.internal.p2.touchpoint.eclipse;
+ import java.io.File;
+ import org.eclipse.core.runtime.Path;
+ import org.eclipse.equinox.p2.metadata.*;
++import org.eclipse.equinox.p2.publisher.AdviceFileAdvice;
+ import org.eclipse.equinox.p2.publisher.PublisherInfo;
+ import org.eclipse.equinox.p2.publisher.eclipse.*;
+ import org.eclipse.osgi.service.resolver.BundleDescription;

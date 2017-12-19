@@ -1,0 +1,1036 @@
+commit e55098184b4c33aaec07948939d87700ef4831a1
+Author: Susan Franklin <sfranklin>
+Date:   Tue Nov 20 23:15:07 2007 +0000
+
+    Workaround for Bug 208251
+
+6	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/TransactionEvent.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/TransactionEvent.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/TransactionEvent.java
+index 57bf1f1..66fdded 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/TransactionEvent.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/TransactionEvent.java
+@@ -28,4 +28,10 @@ public abstract class TransactionEvent extends EventObject {
+ 	public Profile getProfile() {
+ 		return profile;
+ 	}
++
++	// TODO this was added as a workaround 
++	// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=208251
++	public PhaseSet getPhaseSet() {
++		return phaseSet;
++	}
+ }
+\ No newline at end of file
+commit 9a228c8f0e5096282189247f09eb8b4cd19a768b
+Author: Simon Kaegi <skaegi>
+Date:   Fri Dec 7 05:33:22 2007 +0000
+
+    Bug 208251 [prov] Need reliable trigger for profile modification
+
+104	18	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+2	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/installregistry/IProfileInstallRegistry.java
+59	50	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/installregistry/InstallRegistry.java
+8	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
+7	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IProfileRegistry.java
+67	28	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Profile.java
+6	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+6	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+2	2	bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
+1	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
+2	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index 0caa455..186e1f2 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -11,16 +11,18 @@ package org.eclipse.equinox.internal.p2.engine;
+ import java.io.*;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+-import java.util.LinkedHashMap;
+-import java.util.Map;
++import java.util.*;
++import java.util.Map.Entry;
+ import javax.xml.parsers.ParserConfigurationException;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.Status;
+ import org.eclipse.equinox.internal.p2.core.helpers.*;
++import org.eclipse.equinox.internal.p2.installregistry.*;
+ import org.eclipse.equinox.internal.p2.persistence.XMLWriter;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+ import org.eclipse.equinox.p2.core.location.AgentLocation;
+ import org.eclipse.equinox.p2.engine.*;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.service.datalocation.Location;
+ import org.eclipse.osgi.service.resolver.VersionRange;
+ import org.eclipse.osgi.util.NLS;
+@@ -51,7 +53,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	 * to update its install and bundle pool locations.
+ 	 */
+ 	private void updateRoamingProfile() {
+-		Profile selfProfile = getProfile(SELF);
++		Profile selfProfile = (Profile) profiles.get(self);
+ 		if (selfProfile == null)
+ 			return;
+ 		//only update if self is a roaming profile
+@@ -79,23 +81,116 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	public Profile getProfile(String id) {
+ 		if (SELF.equals(id))
+ 			id = self;
+-		return (Profile) profiles.get(id);
++		Profile profile = (Profile) profiles.get(id);
++		if (profile == null)
++			return null;
++		return copyProfile(profile);
+ 	}
+ 
+ 	public Profile[] getProfiles() {
+-		return (Profile[]) profiles.values().toArray(new Profile[profiles.size()]);
++		Profile[] result = new Profile[profiles.size()];
++		int i = 0;
++		for (Iterator it = profiles.values().iterator(); it.hasNext(); i++) {
++			Profile profile = (Profile) it.next();
++			result[i] = copyProfile(profile);
++		}
++		return result;
++	}
++
++	public void updateProfile(Profile toUpdate) {
++		String id = toUpdate.getProfileId();
++		if (SELF.equals(id))
++			id = self;
++		if (profiles.get(id) == null) {
++			throw new IllegalArgumentException("Profile to be updated does not exist:" + id);
++		}
++
++		InstallRegistry installRegistry = (InstallRegistry) ServiceHelper.getService(EngineActivator.getContext(), IInstallRegistry.class.getName());
++		if (installRegistry == null)
++			return;
++
++		installRegistry.removeProfileInstallRegistry(toUpdate);
++		//TODO: Should be using profile id not Profile object
++		IProfileInstallRegistry profileInstallRegistry = installRegistry.getProfileInstallRegistry(toUpdate);
++		for (Iterator it = toUpdate.getInstallableUnits(); it.hasNext();) {
++			IInstallableUnit iu = (IInstallableUnit) it.next();
++			profileInstallRegistry.addInstallableUnits(iu);
++			OrderedProperties properties = toUpdate.getInstallableUnitProfileProperties(iu);
++			for (Iterator propIt = properties.entrySet().iterator(); propIt.hasNext();) {
++				Entry propertyEntry = (Entry) propIt.next();
++				String key = (String) propertyEntry.getKey();
++				String value = (String) propertyEntry.getValue();
++				profileInstallRegistry.setInstallableUnitProfileProperty(iu, key, value);
++			}
++		}
++
++		profiles.put(id, copyProfile(toUpdate));
++
++		// TODO: persists should be grouped some way to ensure they are consistent
++		installRegistry.persist();
++		persist();
++		broadcastChangeEvent(toUpdate, ProfileEvent.CHANGED);
+ 	}
+ 
+ 	public void addProfile(Profile toAdd) throws IllegalArgumentException {
+ 		if (isNamedSelf(toAdd))
+ 			throw new IllegalArgumentException(NLS.bind(Messages.Profile_Not_Named_Self, toAdd.getProfileId()));
+ 		String id = toAdd.getProfileId();
+-		if (getProfile(id) == null) {
+-			profiles.put(id, toAdd);
+-		} else
++		if (SELF.equals(id))
++			id = self;
++		if (profiles.get(id) != null)
+ 			throw new IllegalArgumentException(NLS.bind(Messages.Profile_Duplicate_Root_Profile_Id, id));
++
++		InstallRegistry installRegistry = (InstallRegistry) ServiceHelper.getService(EngineActivator.getContext(), IInstallRegistry.class.getName());
++		if (installRegistry == null)
++			return;
++
++		installRegistry.removeProfileInstallRegistry(toAdd);
++		//TODO: Should be using profile id not Profile object
++		IProfileInstallRegistry profileInstallRegistry = installRegistry.getProfileInstallRegistry(toAdd);
++		for (Iterator it = toAdd.getInstallableUnits(); it.hasNext();) {
++			IInstallableUnit iu = (IInstallableUnit) it.next();
++			profileInstallRegistry.addInstallableUnits(iu);
++			OrderedProperties properties = toAdd.getInstallableUnitProfileProperties(iu);
++			for (Iterator propIt = properties.entrySet().iterator(); propIt.hasNext();) {
++				Entry propertyEntry = (Entry) propIt.next();
++				String key = (String) propertyEntry.getKey();
++				String value = (String) propertyEntry.getValue();
++				profileInstallRegistry.setInstallableUnitProfileProperty(iu, key, value);
++			}
++		}
++
++		profiles.put(id, copyProfile(toAdd));
++		// TODO: persists should be grouped some way to ensure they are consistent
++		installRegistry.persist();
++		persist();
+ 		broadcastChangeEvent(toAdd, ProfileEvent.ADDED);
+-		persist(); //TODO This is not enough to keep track of the changes that are being done in a profile. This will likely have to be based on some event like commit
++	}
++
++	public void removeProfile(Profile toRemove) {
++		if (isNamedSelf(toRemove))
++			throw new IllegalArgumentException(NLS.bind(Messages.Profile_Not_Named_Self, toRemove.getProfileId()));
++
++		InstallRegistry installRegistry = (InstallRegistry) ServiceHelper.getService(EngineActivator.getContext(), IInstallRegistry.class.getName());
++		if (installRegistry == null)
++			return;
++
++		if (profiles.remove(toRemove.getProfileId()) == null)
++			return;
++		installRegistry.removeProfileInstallRegistry(toRemove);
++
++		installRegistry.persist();
++		persist();
++		broadcastChangeEvent(toRemove, ProfileEvent.REMOVED);
++	}
++
++	private Profile copyProfile(Profile profile) {
++		Profile parent = profile.getParentProfile();
++		if (parent != null)
++			parent = copyProfile(parent);
++
++		Profile copy = new Profile(profile.getProfileId(), parent, profile.getProperties());
++		return copy;
+ 	}
+ 
+ 	private void broadcastChangeEvent(Profile profile, byte reason) {
+@@ -161,15 +256,6 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 
+ 	}
+ 
+-	public void removeProfile(Profile toRemove) {
+-		if (isNamedSelf(toRemove))
+-			throw new IllegalArgumentException(NLS.bind(Messages.Profile_Not_Named_Self, toRemove.getProfileId()));
+-		if (profiles.remove(toRemove.getProfileId()) == null)
+-			return;
+-		broadcastChangeEvent(toRemove, ProfileEvent.REMOVED);
+-		persist();
+-	}
+-
+ 	private boolean isNamedSelf(Profile p) {
+ 		if (SELF.equals(p.getParentProfile()))
+ 			return true;
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/installregistry/IProfileInstallRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/installregistry/IProfileInstallRegistry.java
+index e778b92..c8f7374 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/installregistry/IProfileInstallRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/installregistry/IProfileInstallRegistry.java
+@@ -10,6 +10,7 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.installregistry;
+ 
++import org.eclipse.equinox.internal.p2.core.helpers.OrderedProperties;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ 
+ public interface IProfileInstallRegistry {
+@@ -28,4 +29,5 @@ public interface IProfileInstallRegistry {
+ 
+ 	public String setInstallableUnitProfileProperty(IInstallableUnit iu, String key, String value);
+ 
++	public OrderedProperties getInstallableUnitProfileProperties(IInstallableUnit iu);
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/installregistry/InstallRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/installregistry/InstallRegistry.java
+index aecf312..1e5b804 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/installregistry/InstallRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/installregistry/InstallRegistry.java
+@@ -23,14 +23,13 @@ import org.eclipse.equinox.internal.p2.engine.Messages;
+ import org.eclipse.equinox.internal.p2.metadata.repository.io.MetadataParser;
+ import org.eclipse.equinox.internal.p2.metadata.repository.io.MetadataWriter;
+ import org.eclipse.equinox.internal.p2.persistence.XMLWriter;
+-import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+-import org.eclipse.equinox.p2.core.eventbus.SynchronousProvisioningListener;
+ import org.eclipse.equinox.p2.core.location.AgentLocation;
+-import org.eclipse.equinox.p2.engine.*;
++import org.eclipse.equinox.p2.engine.Profile;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.service.resolver.VersionRange;
+ import org.eclipse.osgi.util.NLS;
+-import org.osgi.framework.*;
++import org.osgi.framework.BundleContext;
++import org.osgi.framework.Version;
+ import org.xml.sax.*;
+ 
+ public class InstallRegistry implements IInstallRegistry {
+@@ -355,7 +354,7 @@ public class InstallRegistry implements IInstallRegistry {
+ 			return null;
+ 		}
+ 
+-		private OrderedProperties getInstallableUnitProfileProperties(IInstallableUnit toGet) {
++		public OrderedProperties getInstallableUnitProfileProperties(IInstallableUnit toGet) {
+ 			OrderedProperties properties = (OrderedProperties) iuPropertiesMap.get(new IUIdentity(toGet));
+ 			if (properties == null) {
+ 				properties = new OrderedProperties();
+@@ -473,8 +472,8 @@ public class InstallRegistry implements IInstallRegistry {
+ 
+ 	private static String STORAGE = "installRegistry.xml"; //$NON-NLS-1$
+ 
+-	private transient ProvisioningEventBus bus;
+-	private transient ServiceReference busReference;
++	//	private transient ProvisioningEventBus bus;
++	//	private transient ServiceReference busReference;
+ 
+ 	/**
+ 	 * What is installed in each profile. A map of String(Profile id) -> ProfileInstallRegistry.
+@@ -483,52 +482,56 @@ public class InstallRegistry implements IInstallRegistry {
+ 	Map profileRegistries = null;
+ 
+ 	public InstallRegistry() {
++		/*	
+ 		busReference = EngineActivator.getContext().getServiceReference(ProvisioningEventBus.class.getName());
+ 		bus = (ProvisioningEventBus) EngineActivator.getContext().getService(busReference);
+-		bus.addListener(new SynchronousProvisioningListener() {
+-			public void notify(EventObject o) {
+-				if (o instanceof InstallableUnitEvent) {
+-					InstallableUnitEvent event = (InstallableUnitEvent) o;
+-					if (event.isPre() || !event.getResult().isOK())
+-						return;
+-					IProfileInstallRegistry registry = getProfileInstallRegistry(event.getProfile());
+-					if (event.isInstall() && event.getOperand().second() != null) {
+-						registry.addInstallableUnits(event.getOperand().second().unresolved());
+-					} else if (event.isUninstall() && event.getOperand().first() != null) {
+-						IInstallableUnit original = event.getOperand().first().unresolved();
+-						String value = registry.getInstallableUnitProfileProperty(original, IInstallableUnit.PROP_PROFILE_ROOT_IU);
+-						boolean isRoot = value != null && value.equals(Boolean.toString(true));
+-						registry.removeInstallableUnits(original);
+-						// TODO this is odd because I'm setting up a property for something
+-						// not yet installed in the registry.  The implementation allows it and
+-						// the assumption is that the second operand will get installed or else 
+-						// this change will never be committed.  The alternative is to remember
+-						// a transitory root value that we set when the install is received.
+-						// The ideal solution is that this is handled in a profile delta by
+-						// the engine.
+-						// https://bugs.eclipse.org/bugs/show_bug.cgi?id=206077 
+-						if (isRoot && event.getOperand().second() != null) {
+-							registry.setInstallableUnitProfileProperty(event.getOperand().second().unresolved(), IInstallableUnit.PROP_PROFILE_ROOT_IU, Boolean.toString(true));
++
++		
++				bus.addListener(new SynchronousProvisioningListener() {
++					public void notify(EventObject o) {
++						if (o instanceof InstallableUnitEvent) {
++							InstallableUnitEvent event = (InstallableUnitEvent) o;
++							if (event.isPre() || !event.getResult().isOK())
++								return;
++							IProfileInstallRegistry registry = getProfileInstallRegistry(event.getProfile());
++							if (event.isInstall() && event.getOperand().second() != null) {
++								registry.addInstallableUnits(event.getOperand().second().unresolved());
++							} else if (event.isUninstall() && event.getOperand().first() != null) {
++								IInstallableUnit original = event.getOperand().first().unresolved();
++								String value = registry.getInstallableUnitProfileProperty(original, IInstallableUnit.PROP_PROFILE_ROOT_IU);
++								boolean isRoot = value != null && value.equals(Boolean.toString(true));
++								registry.removeInstallableUnits(original);
++								// TODO this is odd because I'm setting up a property for something
++								// not yet installed in the registry.  The implementation allows it and
++								// the assumption is that the second operand will get installed or else 
++								// this change will never be committed.  The alternative is to remember
++								// a transitory root value that we set when the install is received.
++								// The ideal solution is that this is handled in a profile delta by
++								// the engine.
++								// https://bugs.eclipse.org/bugs/show_bug.cgi?id=206077 
++								if (isRoot && event.getOperand().second() != null) {
++									registry.setInstallableUnitProfileProperty(event.getOperand().second().unresolved(), IInstallableUnit.PROP_PROFILE_ROOT_IU, Boolean.toString(true));
++								}
++							}
++						} else if (o instanceof CommitOperationEvent) {
++							persist();
++							return;
++						} else if (o instanceof RollbackOperationEvent) {
++							restore();
++							return;
++						} else if (o instanceof ProfileEvent) {
++							ProfileEvent pe = (ProfileEvent) o;
++							if (pe.getReason() == ProfileEvent.REMOVED) {
++								getRegistryMap().remove(pe.getProfile().getProfileId());
++								persist();
++							} else if (pe.getReason() == ProfileEvent.CHANGED) {
++								// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=197701
++								persist();
++							}
+ 						}
+ 					}
+-				} else if (o instanceof CommitOperationEvent) {
+-					persist();
+-					return;
+-				} else if (o instanceof RollbackOperationEvent) {
+-					restore();
+-					return;
+-				} else if (o instanceof ProfileEvent) {
+-					ProfileEvent pe = (ProfileEvent) o;
+-					if (pe.getReason() == ProfileEvent.REMOVED) {
+-						getRegistryMap().remove(pe.getProfile().getProfileId());
+-						persist();
+-					} else if (pe.getReason() == ProfileEvent.CHANGED) {
+-						// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=197701
+-						persist();
+-					}
+-				}
+-			}
+-		});
++				});
++				*/
+ 	}
+ 
+ 	public synchronized Collection getProfileInstallRegistries() {
+@@ -546,6 +549,12 @@ public class InstallRegistry implements IInstallRegistry {
+ 		return result;
+ 	}
+ 
++	public synchronized void removeProfileInstallRegistry(Profile profile) {
++		String profileId = profile.getProfileId();
++		Map registry = getRegistryMap();
++		registry.remove(profileId);
++	}
++
+ 	private URL getRegistryLocation() {
+ 		AgentLocation agent = (AgentLocation) ServiceHelper.getService(EngineActivator.getContext(), AgentLocation.class.getName());
+ 		try {
+@@ -575,7 +584,7 @@ public class InstallRegistry implements IInstallRegistry {
+ 		return profileRegistries;
+ 	}
+ 
+-	synchronized void persist() {
++	public synchronized void persist() {
+ 		//if we haven't restored, there is nothing to persist
+ 		if (profileRegistries == null)
+ 			return;
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
+index d936384..aa61d6b 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
+@@ -13,6 +13,7 @@ package org.eclipse.equinox.p2.engine;
+ import java.util.ArrayList;
+ import java.util.List;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+ 
+@@ -50,6 +51,13 @@ public class Engine {
+ 			EngineSession session = new EngineSession(profile);
+ 			MultiStatus result = phaseSet.perform(session, profile, operands, monitor);
+ 			if (result.isOK()) {
++				if (profile.isChanged()) {
++					IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(EngineActivator.getContext(), IProfileRegistry.class.getName());
++					if (profileRegistry.getProfile(profile.getProfileId()) == null)
++						profileRegistry.addProfile(profile);
++					else
++						profileRegistry.updateProfile(profile);
++				}
+ 				eventBus.publishEvent(new CommitOperationEvent(profile, phaseSet, operands, this));
+ 				session.commit();
+ 			} else if (result.matches(IStatus.ERROR | IStatus.CANCEL)) {
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IProfileRegistry.java
+index fa360f8..d00765c 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IProfileRegistry.java
+@@ -50,4 +50,11 @@ public interface IProfileRegistry {
+ 	 */
+ 	void removeProfile(Profile toRemove);
+ 
++	/**
++	 * Update the given profile stored in this profile registry.
++	 * 
++	 * @param toUpdate the profile to update
++	 */
++	void updateProfile(Profile toUpdate);
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Profile.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Profile.java
+index a6b30e0..e9eaaa2 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Profile.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Profile.java
+@@ -16,7 +16,6 @@ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+ import org.eclipse.equinox.internal.p2.engine.Messages;
+ import org.eclipse.equinox.internal.p2.installregistry.IInstallRegistry;
+ import org.eclipse.equinox.internal.p2.installregistry.IProfileInstallRegistry;
+-import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.query.*;
+ import org.eclipse.osgi.util.NLS;
+@@ -87,11 +86,21 @@ public class Profile implements IQueryable {
+ 	 */
+ 	private OrderedProperties storage = new OrderedProperties();
+ 
++	/**
++	 * iuProperties are stored by the install registry
++	 */
++	private Map iuProperties = new HashMap();
++	private boolean changed = false;
++
+ 	public Profile(String profileId) {
+-		this(profileId, null);
++		this(profileId, null, null);
+ 	}
+ 
+ 	public Profile(String profileId, Profile parent) {
++		this(profileId, parent, null);
++	}
++
++	public Profile(String profileId, Profile parent, Map properties) {
+ 		if (profileId == null || profileId.length() == 0) {
+ 			throw new IllegalArgumentException(NLS.bind(Messages.Profile_Null_Profile_Id, null));
+ 		}
+@@ -100,11 +109,30 @@ public class Profile implements IQueryable {
+ 		if (parent != null) {
+ 			parent.addSubprofile(this);
+ 		}
++		if (properties != null)
++			storage.putAll(properties);
++
++		populateIUs();
+ 	}
+ 
+-	public Profile(String profileId, Profile parent, Map properties) {
+-		this(profileId, parent);
+-		storage.putAll(properties);
++	private void populateIUs() {
++		IInstallRegistry installRegistry = (IInstallRegistry) ServiceHelper.getService(EngineActivator.getContext(), IInstallRegistry.class.getName());
++		if (installRegistry == null)
++			return;
++		//TODO: Should be using profile id not "this"
++		IProfileInstallRegistry profileInstallRegistry = installRegistry.getProfileInstallRegistry(this);
++		if (profileInstallRegistry == null)
++			return;
++
++		IInstallableUnit[] ius = profileInstallRegistry.getInstallableUnits();
++		if (ius == null)
++			return;
++
++		for (int i = 0; i < ius.length; i++) {
++			IInstallableUnit iu = ius[i];
++			OrderedProperties properties = profileInstallRegistry.getInstallableUnitProfileProperties(iu);
++			iuProperties.put(iu, new OrderedProperties(properties));
++		}
+ 	}
+ 
+ 	public String getProfileId() {
+@@ -178,6 +206,7 @@ public class Profile implements IQueryable {
+ 	 */
+ 	public void setValue(String key, String value) {
+ 		storage.setProperty(key, value);
++		changed = true;
+ 	}
+ 
+ 	public Dictionary getSelectionContext() {
+@@ -196,13 +225,7 @@ public class Profile implements IQueryable {
+ 	}
+ 
+ 	private IInstallableUnit[] getAllInstallableUnits() {
+-		IInstallRegistry registry = (IInstallRegistry) ServiceHelper.getService(EngineActivator.getContext(), IInstallRegistry.class.getName());
+-		if (registry == null)
+-			return null;
+-		IProfileInstallRegistry profile = registry.getProfileInstallRegistry(new Profile(profileId));
+-		if (profile == null)
+-			return null;
+-		return profile.getInstallableUnits();
++		return (IInstallableUnit[]) iuProperties.keySet().toArray(new IInstallableUnit[iuProperties.size()]);
+ 	}
+ 
+ 	public Collector query(Query query, Collector collector, IProgressMonitor monitor) {
+@@ -210,34 +233,31 @@ public class Profile implements IQueryable {
+ 	}
+ 
+ 	public Iterator getInstallableUnits() {
++		// NOTE: this is a copy
+ 		return Arrays.asList(getAllInstallableUnits()).iterator();
+ 	}
+ 
+ 	public String getInstallableUnitProfileProperty(IInstallableUnit iu, String key) {
+-		IInstallRegistry registry = (IInstallRegistry) ServiceHelper.getService(EngineActivator.getContext(), IInstallRegistry.class.getName());
+-		if (registry == null)
++		OrderedProperties properties = (OrderedProperties) iuProperties.get(iu);
++		if (properties == null)
+ 			return null;
+-		IProfileInstallRegistry profile = registry.getProfileInstallRegistry(this);
+-		if (profile == null)
+-			return null;
+-		return profile.getInstallableUnitProfileProperty(iu, key);
++
++		return properties.getProperty(key);
+ 	}
+ 
+ 	public String setInstallableUnitProfileProperty(IInstallableUnit iu, String key, String value) {
+-		IInstallRegistry registry = (IInstallRegistry) ServiceHelper.getService(EngineActivator.getContext(), IInstallRegistry.class.getName());
+-		if (registry == null)
+-			return null;
+-		IProfileInstallRegistry profile = registry.getProfileInstallRegistry(this);
+-		if (profile == null)
++		OrderedProperties properties = (OrderedProperties) iuProperties.get(iu);
++		if (properties == null)
+ 			return null;
+-		String previousValue = profile.setInstallableUnitProfileProperty(iu, key, value);
++
++		changed = true;
++		return (String) properties.setProperty(key, value);
+ 		// TODO this is not the ideal place for this.
+ 		// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=206077
+ 		// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=197701
+-		ProvisioningEventBus bus = (ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName());
+-		if (bus != null)
+-			bus.publishEvent(new ProfileEvent(this, ProfileEvent.CHANGED));
+-		return previousValue;
++		//		ProvisioningEventBus bus = (ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName());
++		//		if (bus != null)
++		//			bus.publishEvent(new ProfileEvent(this, ProfileEvent.CHANGED));
+ 	}
+ 
+ 	/**
+@@ -256,5 +276,24 @@ public class Profile implements IQueryable {
+ 	 */
+ 	public void addProperties(Map properties) {
+ 		storage.putAll(properties);
++		changed = true;
++	}
++
++	public void addInstallableUnit(IInstallableUnit iu) {
++		iuProperties.put(iu, new OrderedProperties());
++		changed = true;
++	}
++
++	public void removeInstallableUnit(IInstallableUnit iu) {
++		iuProperties.remove(iu);
++		changed = true;
++	}
++
++	public OrderedProperties getInstallableUnitProfileProperties(IInstallableUnit iu) {
++		return (OrderedProperties) iuProperties.get(iu);
++	}
++
++	public boolean isChanged() {
++		return changed;
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+index 13c2d95..d77a22f 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+@@ -16,7 +16,8 @@ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+ import org.eclipse.equinox.p2.engine.*;
+-import org.eclipse.equinox.p2.metadata.*;
++import org.eclipse.equinox.p2.metadata.IArtifactKey;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.util.NLS;
+ 
+ public class Install extends Phase {
+@@ -36,6 +37,8 @@ public class Install extends Phase {
+ 			String phaseId = (String) parameters.get("phaseId");
+ 			Touchpoint touchpoint = (Touchpoint) parameters.get("touchpoint");
+ 			Operand operand = (Operand) parameters.get("operand");
++			IInstallableUnit iu = (IInstallableUnit) parameters.get("iu");
++			profile.removeInstallableUnit(iu);
+ 			((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(phaseId, false, profile, operand, InstallableUnitEvent.UNINSTALL, touchpoint));
+ 			return null;
+ 		}
+@@ -47,6 +50,8 @@ public class Install extends Phase {
+ 			String phaseId = (String) parameters.get("phaseId");
+ 			Touchpoint touchpoint = (Touchpoint) parameters.get("touchpoint");
+ 			Operand operand = (Operand) parameters.get("operand");
++			IInstallableUnit iu = (IInstallableUnit) parameters.get("iu");
++			profile.addInstallableUnit(iu);
+ 			((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(phaseId, false, profile, operand, InstallableUnitEvent.INSTALL, touchpoint));
+ 			return null;
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+index a633cc6..b925ef3 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+@@ -16,7 +16,8 @@ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+ import org.eclipse.equinox.p2.engine.*;
+-import org.eclipse.equinox.p2.metadata.*;
++import org.eclipse.equinox.p2.metadata.IArtifactKey;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ 
+ public class Uninstall extends Phase {
+ 
+@@ -35,6 +36,8 @@ public class Uninstall extends Phase {
+ 			String phaseId = (String) parameters.get("phaseId");
+ 			Touchpoint touchpoint = (Touchpoint) parameters.get("touchpoint");
+ 			Operand operand = (Operand) parameters.get("operand");
++			IInstallableUnit iu = (IInstallableUnit) parameters.get("iu");
++			profile.addInstallableUnit(iu);
+ 			((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(phaseId, false, profile, operand, InstallableUnitEvent.INSTALL, touchpoint));
+ 			return null;
+ 		}
+@@ -46,6 +49,8 @@ public class Uninstall extends Phase {
+ 			String phaseId = (String) parameters.get("phaseId");
+ 			Touchpoint touchpoint = (Touchpoint) parameters.get("touchpoint");
+ 			Operand operand = (Operand) parameters.get("operand");
++			IInstallableUnit iu = (IInstallableUnit) parameters.get("iu");
++			profile.removeInstallableUnit(iu);
+ 			((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(phaseId, false, profile, operand, InstallableUnitEvent.UNINSTALL, touchpoint));
+ 			return null;
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java b/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
+index d501911..b77d130 100644
+--- a/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
+@@ -53,11 +53,11 @@ public class Activator implements BundleActivator {
+ 
+ 		registerEventBus();
+ 		//create the profile registry
++		registerInstallRegistry();
+ 		registerProfileRegistry();
+ 		//create metadata repositories
+ 		registerDefaultMetadataRepoManager();
+ 		registerMetadataCache();
+-		registerInstallRegistry();
+ 
+ 		//create the director and planner.  The planner must be
+ 		//registered first because the director finds it in its constructor.
+@@ -77,9 +77,9 @@ public class Activator implements BundleActivator {
+ 		//		unregisterDefaultArtifactRepoManager();
+ 		unregisterDirector();
+ 		unregisterPlanner();
+-		unregisterInstallRegistry();
+ 		unregisterDefaultMetadataRepoManager();
+ 		unregisterProfileRegistry();
++		unregisterInstallRegistry();
+ 		unregisterEventBus();
+ 		Activator.context = null;
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
+index 9277148..2001a81 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
+@@ -62,6 +62,7 @@ public class AbstractProvisioningTest extends TestCase {
+ 		boolean containsIU = false;
+ 		for (Iterator iterator = p.getInstallableUnits(); iterator.hasNext();) {
+ 			containsIU = true;
++			break;
+ 		}
+ 		if (containsIU)
+ 			fail("The profile should be empty,profileId=" + p);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
+index 73b183b..95e949f 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
+@@ -66,7 +66,7 @@ public class ProfileRegistryTest extends AbstractProvisioningTest {
+ 		assertNull(registry.getProfile(PROFILE_NAME));
+ 		Profile test = createProfile(PROFILE_NAME);
+ 		registry.addProfile(test);
+-		assertEquals(test, registry.getProfile(PROFILE_NAME));
++		assertEquals(test.getProfileId(), registry.getProfile(PROFILE_NAME).getProfileId());
+ 		registry.removeProfile(test);
+ 		assertNull(registry.getProfile(PROFILE_NAME));
+ 	}
+@@ -75,7 +75,7 @@ public class ProfileRegistryTest extends AbstractProvisioningTest {
+ 		assertNull(registry.getProfile(PROFILE_NAME));
+ 		Profile test = createProfile(PROFILE_NAME);
+ 		registry.addProfile(test);
+-		assertEquals(test, registry.getProfile(PROFILE_NAME));
++		assertEquals(test.getProfileId(), registry.getProfile(PROFILE_NAME).getProfileId());
+ 
+ 		restart();
+ 		test = registry.getProfile(PROFILE_NAME);
+commit 8a8d51c781239b9e2c6a766532aba5ede8401cad
+Author: Susan Franklin <sfranklin>
+Date:   Fri Dec 7 17:56:10 2007 +0000
+
+    Update UI listeners for Bug 208251
+
+3	6	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/ProvUIActivator.java
+19	23	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/viewers/StructuredViewerProvisioningListener.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/ProvUIActivator.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/ProvUIActivator.java
+index b872024..fe79265 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/ProvUIActivator.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/ProvUIActivator.java
+@@ -20,7 +20,6 @@ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningListener;
+ import org.eclipse.equinox.p2.engine.*;
+ import org.eclipse.equinox.p2.ui.operations.ProvisioningUtil;
+-import org.eclipse.equinox.p2.ui.operations.SizingPhaseSet;
+ import org.eclipse.equinox.p2.ui.viewers.StructuredViewerProvisioningListener;
+ import org.eclipse.jface.resource.ImageDescriptor;
+ import org.eclipse.ui.PlatformUI;
+@@ -113,14 +112,12 @@ public class ProvUIActivator extends AbstractUIPlugin {
+ 		if (profileChangeListener == null) {
+ 			profileChangeListener = new ProvisioningListener() {
+ 				public void notify(EventObject o) {
+-					if (o instanceof CommitOperationEvent) {
+-						CommitOperationEvent event = (CommitOperationEvent) o;
++					if (o instanceof ProfileEvent) {
++						ProfileEvent event = (ProfileEvent) o;
+ 						try {
+ 							Profile selfProfile = ProvisioningUtil.getProfile(IProfileRegistry.SELF);
+ 							if (selfProfile != null && (selfProfile.getProfileId().equals(event.getProfile().getProfileId()))) {
+-								// TODO checking the phase set is a workaround
+-								// https://bugs.eclipse.org/bugs/show_bug.cgi?id=208251
+-								if (!(event.getPhaseSet() instanceof SizingPhaseSet))
++								if (event.getReason() == ProfileEvent.CHANGED)
+ 									PlatformUI.getWorkbench().getDisplay().asyncExec(new Runnable() {
+ 										public void run() {
+ 											ProvUI.requestRestart(false, null);
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/viewers/StructuredViewerProvisioningListener.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/viewers/StructuredViewerProvisioningListener.java
+index 3ab7677..246fc99 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/viewers/StructuredViewerProvisioningListener.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/viewers/StructuredViewerProvisioningListener.java
+@@ -13,10 +13,9 @@ package org.eclipse.equinox.p2.ui.viewers;
+ 
+ import java.util.EventObject;
+ import org.eclipse.equinox.p2.core.eventbus.SynchronousProvisioningListener;
+-import org.eclipse.equinox.p2.engine.*;
++import org.eclipse.equinox.p2.engine.Profile;
++import org.eclipse.equinox.p2.engine.ProfileEvent;
+ import org.eclipse.equinox.p2.ui.IProvisioningListener;
+-import org.eclipse.equinox.p2.ui.model.ProfileElement;
+-import org.eclipse.equinox.p2.ui.operations.SizingPhaseSet;
+ import org.eclipse.equinox.p2.ui.query.IProvElementQueryProvider;
+ import org.eclipse.jface.viewers.StructuredViewer;
+ import org.eclipse.swt.widgets.Display;
+@@ -29,8 +28,7 @@ import org.eclipse.swt.widgets.Display;
+  */
+ public class StructuredViewerProvisioningListener implements SynchronousProvisioningListener, IProvisioningListener {
+ 
+-	// TODO this should be replaced with actual event topic ids from the event API once they are defined
+-	// TODO the IPropertyChangeListener implementation should also disappear once repo events are supported
++	// TODO the IProvisioningListener tag should also disappear once repo events are supported
+ 	public static final int PROV_EVENT_REPOSITORY = 0x0001;
+ 	public static final int PROV_EVENT_IU = 0x0002;
+ 	public static final int PROV_EVENT_PROFILE = 0x0004;
+@@ -48,17 +46,17 @@ public class StructuredViewerProvisioningListener implements SynchronousProvisio
+ 	}
+ 
+ 	public void notify(EventObject o) {
+-		// Commit operations on a profile will refresh the structure of the profile
+-		if (o instanceof CommitOperationEvent) {
+-			CommitOperationEvent event = (CommitOperationEvent) o;
+-			// TODO this is a workaround
+-			// https://bugs.eclipse.org/bugs/show_bug.cgi?id=208251
+-			if (event.getPhaseSet() instanceof SizingPhaseSet)
+-				return;
+-			if (((eventTypes & PROV_EVENT_PROFILE) == PROV_EVENT_PROFILE) || (eventTypes & PROV_EVENT_IU) == PROV_EVENT_IU) {
++		if (o instanceof ProfileEvent && (((eventTypes & PROV_EVENT_IU) == PROV_EVENT_IU) || ((eventTypes & PROV_EVENT_PROFILE) == PROV_EVENT_PROFILE))) {
++			ProfileEvent event = (ProfileEvent) o;
++			if (event.getReason() == ProfileEvent.CHANGED) {
+ 				final Profile profile = event.getProfile();
+ 				display.asyncExec(new Runnable() {
+ 					public void run() {
++						// TODO
++						/*
++						 * Below is an optimization that is not currently working.
++						 * For now we will refresh everything.
++						 
+ 						// We want to refresh the affected profile, so we
+ 						// construct a profile element on this profile.
+ 						// We can't match on the raw profile because the viewer
+@@ -66,19 +64,17 @@ public class StructuredViewerProvisioningListener implements SynchronousProvisio
+ 						ProfileElement element = new ProfileElement(profile);
+ 						element.setQueryProvider(queryProvider);
+ 						viewer.refresh(element);
++						*/
++						viewer.refresh();
++					}
++				});
++			} else {
++				display.asyncExec(new Runnable() {
++					public void run() {
++						viewer.refresh();
+ 					}
+ 				});
+ 			}
+-		} else if (o instanceof ProfileEvent && ((eventTypes & PROV_EVENT_IU) == PROV_EVENT_IU)) {
+-			// We don't respond to ProfileEvent.CHANGED because it is incomplete.
+-			// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=197701
+-			if (((ProfileEvent) o).getReason() == ProfileEvent.CHANGED)
+-				return;
+-			display.asyncExec(new Runnable() {
+-				public void run() {
+-					viewer.refresh();
+-				}
+-			});
+ 		} else if ((o.getSource() instanceof String) && (eventTypes & PROV_EVENT_REPOSITORY) == PROV_EVENT_REPOSITORY) {
+ 			String name = (String) o.getSource();
+ 			if (name.equals(IProvisioningListener.REPO_ADDED) || (name.equals(IProvisioningListener.REPO_REMOVED))) {
+commit 787faf02a942731f8b9fb024693667014ac7733b
+Author: Simon Kaegi <skaegi>
+Date:   Fri Dec 7 18:31:45 2007 +0000
+
+    Bug 208251 [prov] Need reliable trigger for profile modification
+
+3	5	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+3	5	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+index 24d6cef..ed7de9d 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+@@ -66,13 +66,11 @@ public class SimpleDirector implements IDirector {
+ 			ProvisioningPlan plan = planner.getInstallPlan(installRoots, profile, sub.newChild(PlanWork));
+ 			if (!plan.getStatus().isOK())
+ 				return plan.getStatus();
+-			IStatus engineResult = engine.perform(profile, new DefaultPhaseSet(), plan.getOperands(), sub.newChild(EngineWork));
+-			if (!engineResult.isOK())
+-				return engineResult;
+ 			// mark the roots as such
+-			for (int i = 0; i < installRoots.length; i++)
++			for (int i = 0; i < installRoots.length; i++) {
+ 				profile.setInstallableUnitProfileProperty(installRoots[i], IInstallableUnit.PROP_PROFILE_ROOT_IU, Boolean.toString(true));
+-
++			}
++			IStatus engineResult = engine.perform(profile, new DefaultPhaseSet(), plan.getOperands(), sub.newChild(EngineWork));
+ 			return engineResult;
+ 		} finally {
+ 			sub.done();
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+index 8c2f176..1d8b8a3 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+@@ -276,12 +276,10 @@ public class ProvisioningUtil {
+ 		try {
+ 			SubMonitor sub = SubMonitor.convert(monitor, 100);
+ 			sub.setTaskName(taskMessage);
+-			IStatus engineResult = performProvisioningPlan(plan, new DefaultPhaseSet(), profile, sub.newChild(100));
+-			if (engineResult.isOK()) {
+-				// mark the roots as such
+-				for (int i = 0; i < installRoots.length; i++)
+-					profile.setInstallableUnitProfileProperty(installRoots[i], IInstallableUnit.PROP_PROFILE_ROOT_IU, Boolean.toString(true));
++			for (int i = 0; i < installRoots.length; i++) {
++				profile.setInstallableUnitProfileProperty(installRoots[i], IInstallableUnit.PROP_PROFILE_ROOT_IU, Boolean.toString(true));
+ 			}
++			IStatus engineResult = performProvisioningPlan(plan, new DefaultPhaseSet(), profile, sub.newChild(100));
+ 			return engineResult;
+ 		} finally {
+ 			monitor.done();
+commit 7b154055cea38c1d98182052a4e9203e865e337e
+Author: Simon Kaegi <skaegi>
+Date:   Fri Dec 7 19:17:23 2007 +0000
+
+    Bug 208251 [prov] Need reliable trigger for profile modification
+
+2	2	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+9	4	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Profile.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index 186e1f2..409f46d 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -115,8 +115,8 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		for (Iterator it = toUpdate.getInstallableUnits(); it.hasNext();) {
+ 			IInstallableUnit iu = (IInstallableUnit) it.next();
+ 			profileInstallRegistry.addInstallableUnits(iu);
+-			OrderedProperties properties = toUpdate.getInstallableUnitProfileProperties(iu);
+-			for (Iterator propIt = properties.entrySet().iterator(); propIt.hasNext();) {
++			OrderedProperties iuProperties = toUpdate.getInstallableUnitProfileProperties(iu);
++			for (Iterator propIt = iuProperties.entrySet().iterator(); propIt.hasNext();) {
+ 				Entry propertyEntry = (Entry) propIt.next();
+ 				String key = (String) propertyEntry.getKey();
+ 				String value = (String) propertyEntry.getValue();
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Profile.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Profile.java
+index e9eaaa2..91402f1 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Profile.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Profile.java
+@@ -247,8 +247,10 @@ public class Profile implements IQueryable {
+ 
+ 	public String setInstallableUnitProfileProperty(IInstallableUnit iu, String key, String value) {
+ 		OrderedProperties properties = (OrderedProperties) iuProperties.get(iu);
+-		if (properties == null)
+-			return null;
++		if (properties == null) {
++			properties = new OrderedProperties();
++			iuProperties.put(iu, properties);
++		}
+ 
+ 		changed = true;
+ 		return (String) properties.setProperty(key, value);
+@@ -280,13 +282,16 @@ public class Profile implements IQueryable {
+ 	}
+ 
+ 	public void addInstallableUnit(IInstallableUnit iu) {
++		if (iuProperties.containsKey(iu))
++			return;
++
+ 		iuProperties.put(iu, new OrderedProperties());
+ 		changed = true;
+ 	}
+ 
+ 	public void removeInstallableUnit(IInstallableUnit iu) {
+-		iuProperties.remove(iu);
+-		changed = true;
++		if (iuProperties.remove(iu) != null)
++			changed = true;
+ 	}
+ 
+ 	public OrderedProperties getInstallableUnitProfileProperties(IInstallableUnit iu) {
+commit fb8bfaeaba2cf729f1ddaec14b3d9acf8504dd81
+Author: Susan Franklin <sfranklin>
+Date:   Fri Dec 7 21:14:21 2007 +0000
+
+    Viewer refresh workaround to deal with Bug 208251
+
+17	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/dialogs/UpdateAndInstallGroup.java
+2	4	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/model/ProfileElement.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/dialogs/UpdateAndInstallGroup.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/dialogs/UpdateAndInstallGroup.java
+index 19871df..28fd0c2 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/dialogs/UpdateAndInstallGroup.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/dialogs/UpdateAndInstallGroup.java
+@@ -13,12 +13,14 @@ package org.eclipse.equinox.p2.ui.dialogs;
+ import org.eclipse.core.runtime.Assert;
+ import org.eclipse.equinox.internal.p2.ui.PropertyDialogAction;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
++import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.engine.Profile;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.ui.*;
+ import org.eclipse.equinox.p2.ui.actions.*;
+ import org.eclipse.equinox.p2.ui.model.MetadataRepositories;
+ import org.eclipse.equinox.p2.ui.model.ProfileElement;
++import org.eclipse.equinox.p2.ui.operations.ProvisioningUtil;
+ import org.eclipse.equinox.p2.ui.query.IProvElementQueryProvider;
+ import org.eclipse.equinox.p2.ui.viewers.*;
+ import org.eclipse.jface.action.Action;
+@@ -224,7 +226,21 @@ public class UpdateAndInstallGroup {
+ 		composite.setLayout(layout);
+ 
+ 		// Table of installed IU's
+-		installedIUViewer = new TableViewer(composite, SWT.MULTI | SWT.FULL_SELECTION | SWT.H_SCROLL | SWT.V_SCROLL | SWT.BORDER);
++		installedIUViewer = new TableViewer(composite, SWT.MULTI | SWT.FULL_SELECTION | SWT.H_SCROLL | SWT.V_SCROLL | SWT.BORDER) {
++			public void refresh() {
++				// TODO this is a hack to deal with the fact that profile instances can
++				// get stale under the new profile event scheme.
++				if (this.getInput() != null)
++					try {
++						ProfileElement element = (ProfileElement) this.getInput();
++						profile = ProvisioningUtil.getProfile(profile.getProfileId());
++						element.setQueryable(profile);
++					} catch (ProvisionException e) {
++						ProvUI.handleException(e, null);
++					}
++				super.refresh();
++			}
++		};
+ 
+ 		// Filters and sorters before establishing content, so we don't refresh unnecessarily.
+ 		installedIUViewer.setComparator(new IUComparator(IUComparator.IU_NAME));
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/model/ProfileElement.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/model/ProfileElement.java
+index 0ac1ff1..a1e87b4 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/model/ProfileElement.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/model/ProfileElement.java
+@@ -22,16 +22,14 @@ import org.eclipse.equinox.p2.ui.query.IProvElementQueryProvider;
+  * @since 3.4
+  */
+ public class ProfileElement extends RemoteQueriedElement {
+-	Profile profile;
+ 
+ 	public ProfileElement(Profile profile) {
+-		this.profile = profile;
+ 		setQueryable(profile);
+ 	}
+ 
+ 	public Object getAdapter(Class adapter) {
+ 		if (adapter == Profile.class)
+-			return profile;
++			return getQueryable();
+ 		return super.getAdapter(adapter);
+ 	}
+ 
+@@ -40,7 +38,7 @@ public class ProfileElement extends RemoteQueriedElement {
+ 	}
+ 
+ 	public String getLabel(Object o) {
+-		return profile.getProfileId();
++		return ((Profile) getQueryable()).getProfileId();
+ 	}
+ 
+ 	protected int getQueryType() {

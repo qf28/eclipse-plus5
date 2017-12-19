@@ -1,0 +1,1005 @@
+commit 043f2d542a8cbc4bace66c0bfb9fa3f94b602f60
+Author: John Arthorne <johna>
+Date:   Wed Apr 9 18:57:50 2008 +0000
+
+    Bug 215927 [prov] Authentication upon connection
+
+1	0	bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+128	10	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
+23	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+6	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/ProvisionException.java
+19	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/repository/IRepository.java
+1	0	bundles/org.eclipse.equinox.p2.metadata.repository/META-INF/MANIFEST.MF
+126	8	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/ECFMetadataTransport.java
+2	2	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+9	2	bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/ProvAdminUIActivator.java
+7	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+7	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+8	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+46	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+95	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UserValidationDialog.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+index 1b2c32f..b647b77 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+@@ -25,6 +25,7 @@ Import-Package: javax.xml.parsers,
+  org.eclipse.equinox.internal.provisional.p2.core.repository,
+  org.eclipse.equinox.internal.provisional.p2.metadata,
+  org.eclipse.equinox.internal.provisional.spi.p2.core.repository,
++ org.eclipse.equinox.security.storage,
+  org.eclipse.internal.provisional.equinox.p2.jarprocessor;resolution:=optional,
+  org.eclipse.osgi.service.resolver;version="1.1.0",
+  org.eclipse.osgi.signedcontent;version="1.0.0",
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
+index 5d3f6e5..7ef7d4a 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
+@@ -11,9 +11,11 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.artifact.repository;
+ 
+-import java.io.IOException;
+-import java.io.OutputStream;
++import java.io.*;
++import java.net.ProtocolException;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.ecf.core.security.ConnectContextFactory;
++import org.eclipse.ecf.core.security.IConnectContext;
+ import org.eclipse.ecf.filetransfer.*;
+ import org.eclipse.ecf.filetransfer.events.*;
+ import org.eclipse.ecf.filetransfer.identity.FileCreateException;
+@@ -21,12 +23,26 @@ import org.eclipse.ecf.filetransfer.identity.FileIDFactory;
+ import org.eclipse.ecf.filetransfer.service.IRetrieveFileTransferFactory;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IStateful;
++import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
++import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
++import org.eclipse.equinox.security.storage.*;
++import org.eclipse.osgi.util.NLS;
+ import org.osgi.util.tracker.ServiceTracker;
+ 
+ /**
+  * A transport implementation that uses ECF file transfer API.
+  */
+ public class ECFTransport extends Transport {
++	/**
++	 * The number of password retry attempts allowed before failing.
++	 */
++	private static final int LOGIN_RETRIES = 3;
++
++	protected String username;
++	protected String password;
++	private static final String ERROR_FILENOTFOUND = "FileNotFound"; //$NON-NLS-1$
++	private static final String ERROR_401 = "401"; //$NON-NLS-1$
+ 
+ 	/**
+ 	 * The singleton transport instance.
+@@ -53,7 +69,7 @@ public class ECFTransport extends Transport {
+ 		retrievalFactoryTracker.open();
+ 	}
+ 
+-	protected IStatus convertToStatus(IFileTransferEvent event, Exception failure, long startTime) {
++	protected IStatus convertToStatus(IFileTransferEvent event, Exception failure, long startTime, String location) {
+ 		long speed = DownloadStatus.UNKNOWN_RATE;
+ 		if (event instanceof IIncomingFileTransferEvent) {
+ 			long bytes = ((IIncomingFileTransferEvent) event).getSource().getBytesReceived();
+@@ -70,20 +86,41 @@ public class ECFTransport extends Transport {
+ 		else if (failure instanceof UserCancelledException)
+ 			result = new DownloadStatus(IStatus.CANCEL, Activator.ID, failure.getMessage(), failure);
+ 		else
+-			result = new DownloadStatus(IStatus.ERROR, Activator.ID, "Error during transfer", failure);
++			result = new DownloadStatus(IStatus.ERROR, Activator.ID, NLS.bind(Messages.io_failedRead, location), failure);
+ 		result.setTransferRate(speed);
+ 		return result;
+ 	}
+ 
+-	public IStatus download(String toDownload, OutputStream target, IProgressMonitor monitor) {
++	public IStatus download(String url, OutputStream destination, IProgressMonitor monitor) {
++		try {
++			setLogin(url, false);
++			for (int i = 0; i < LOGIN_RETRIES; i++) {
++				try {
++					return performDownload(url, destination, monitor);
++				} catch (ProtocolException e) {
++					if (ERROR_401.equals(e.getMessage())) {
++						setLogin(url, true);
++					}
++				}
++			}
++		} catch (UserCancelledException e) {
++			return Status.CANCEL_STATUS;
++		} catch (ProvisionException e) {
++			return e.getStatus();
++		}
++		//reached maximum number of retries without success
++		return new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.io_failedRead, url), null);
++	}
++
++	public IStatus performDownload(String toDownload, OutputStream target, IProgressMonitor monitor) throws ProtocolException {
+ 		IRetrieveFileTransferFactory factory = (IRetrieveFileTransferFactory) retrievalFactoryTracker.getService();
+ 		if (factory == null)
+-			return statusOn(target, new Status(IStatus.ERROR, Activator.ID, "ECF Transfer manager not available"));
++			return statusOn(target, new Status(IStatus.ERROR, Activator.ID, NLS.bind(Messages.io_failedRead, toDownload)));
+ 
+ 		return transfer(factory.newInstance(), toDownload, target, monitor);
+ 	}
+ 
+-	private IStatus transfer(final IRetrieveFileTransferContainerAdapter retrievalContainer, final String toDownload, final OutputStream target, final IProgressMonitor monitor) {
++	private IStatus transfer(final IRetrieveFileTransferContainerAdapter retrievalContainer, final String toDownload, final OutputStream target, final IProgressMonitor monitor) throws ProtocolException {
+ 		final IStatus[] result = new IStatus[1];
+ 		final long startTime = System.currentTimeMillis();
+ 		IFileTransferListener listener = new IFileTransferListener() {
+@@ -95,7 +132,7 @@ public class ECFTransport extends Transport {
+ 							rse.receive(target);
+ 						}
+ 					} catch (IOException e) {
+-						IStatus status = convertToStatus(event, e, startTime);
++						IStatus status = convertToStatus(event, e, startTime, toDownload);
+ 						synchronized (result) {
+ 							result[0] = status;
+ 							result.notify();
+@@ -111,7 +148,7 @@ public class ECFTransport extends Transport {
+ 				}
+ 				if (event instanceof IIncomingFileTransferReceiveDoneEvent) {
+ 					Exception exception = ((IIncomingFileTransferReceiveDoneEvent) event).getException();
+-					IStatus status = convertToStatus(event, exception, startTime);
++					IStatus status = convertToStatus(event, exception, startTime, toDownload);
+ 					synchronized (result) {
+ 						result[0] = status;
+ 						result.notify();
+@@ -121,9 +158,23 @@ public class ECFTransport extends Transport {
+ 		};
+ 
+ 		try {
++			if (username != null && password != null) {
++				IConnectContext connectContext = ConnectContextFactory.createUsernamePasswordConnectContext(username, password);
++				retrievalContainer.setConnectContextForAuthentication(connectContext);
++			} else {
++				retrievalContainer.setConnectContextForAuthentication(null);
++			}
+ 			retrievalContainer.sendRetrieveRequest(FileIDFactory.getDefault().createFileID(retrievalContainer.getRetrieveNamespace(), toDownload), listener, null);
+ 		} catch (IncomingFileTransferException e) {
+-			return statusOn(target, e.getStatus());
++			IStatus status = e.getStatus();
++			Throwable exception = status.getException();
++			if (exception instanceof FileNotFoundException) {
++				throw new ProtocolException(ERROR_FILENOTFOUND);
++			} else if (exception instanceof IOException) {
++				//throw exception that login details are required
++				throw new ProtocolException(ERROR_401);
++			}
++			return statusOn(target, status);
+ 		} catch (FileCreateException e) {
+ 			return statusOn(target, e.getStatus());
+ 		}
+@@ -142,6 +193,73 @@ public class ECFTransport extends Transport {
+ 		return statusOn(target, result[0]);
+ 	}
+ 
++	/**
++	 * Sets the login details from the user for the specified URL. If the login
++	 * details are not available, the user is prompted.
++	 * @param xmlLocation - the file location requiring login details
++	 * @param prompt - use <code>true</code> to prompt the user instead of
++	 * looking at the secure preference store for login, use <code>false</code>
++	 * to only try the secure preference store
++	 * @throws UserCancelledException when the user cancels the login prompt 
++	 * @throws ProvisionException if the password cannot be read or saved
++	 */
++	public void setLogin(String xmlLocation, boolean prompt) throws UserCancelledException, ProvisionException {
++		ISecurePreferences securePreferences = SecurePreferencesFactory.getDefault();
++		IPath hostLocation = new Path(xmlLocation).removeLastSegments(1);
++		int repositoryHash = hostLocation.hashCode();
++		ISecurePreferences metadataNode = securePreferences.node(IRepository.PREFERENCE_NODE + "/" + repositoryHash); //$NON-NLS-1$
++		String[] loginDetails = new String[3];
++		if (!prompt) {
++			try {
++				loginDetails[0] = metadataNode.get(IRepository.PROP_USERNAME, null);
++				loginDetails[1] = metadataNode.get(IRepository.PROP_PASSWORD, null);
++			} catch (StorageException e) {
++				String msg = NLS.bind(Messages.repoMan_internalError, xmlLocation.toString());
++				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.INTERNAL_ERROR, msg, null));
++			}
++		}
++		if ((loginDetails[0] == null || loginDetails[1] == null) && prompt) {
++			ServiceTracker adminUITracker = new ServiceTracker(Activator.getContext(), IServiceUI.class.getName(), null);
++			adminUITracker.open();
++			IServiceUI adminUIService = (IServiceUI) adminUITracker.getService();
++			loginDetails = adminUIService.getUsernamePassword(hostLocation.toString());
++		}
++		if (loginDetails == null) {
++			setUsername(null);
++			setPassword(null);
++			throw new UserCancelledException();
++		}
++		if (loginDetails[2] != null && Boolean.parseBoolean(loginDetails[2])) {
++			try {
++				metadataNode.put(IRepository.PROP_USERNAME, loginDetails[0], true);
++				metadataNode.put(IRepository.PROP_PASSWORD, loginDetails[1], true);
++			} catch (StorageException e1) {
++				String msg = NLS.bind(Messages.repoMan_internalError, xmlLocation.toString());
++				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.INTERNAL_ERROR, msg, null));
++			}
++		}
++		setUsername(loginDetails[0]);
++		setPassword(loginDetails[1]);
++	}
++
++	/**
++	 * Sets the username for login purposes on the next connection. Password
++	 * must also be set.
++	 * @param username - the username, may be <code>null</code>
++	 */
++	public void setUsername(String username) {
++		this.username = username;
++	}
++
++	/**
++	 * Sets the password for login purposes on the next connection. Username
++	 * must also be set.
++	 * @param password - the password, may be <code>null</code>
++	 */
++	public void setPassword(String password) {
++		this.password = password;
++	}
++
+ 	private static IStatus statusOn(OutputStream target, IStatus status) {
+ 		if (target instanceof IStateful)
+ 			((IStateful) target).setStatus(status);
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+new file mode 100644
+index 0000000..b6c81e4
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+@@ -0,0 +1,23 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.provisional.p2.core;
++
++public interface IServiceUI {
++
++	/**
++	 * Opens a UI prompt for a username and password.
++	 * 
++	 * @param location - the location requiring login details, may be <code>null</code>.
++	 * @return A two element array containing the username and password, in that orders.
++	 * Returns <code>null</code> if the prompt was cancelled.
++	 */
++	public String[] getUsernamePassword(String location);
++}
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/ProvisionException.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/ProvisionException.java
+index 9eb14b0..c9e1399 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/ProvisionException.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/ProvisionException.java
+@@ -72,6 +72,12 @@ public class ProvisionException extends CoreException {
+ 	 */
+ 	public static final int REPOSITORY_INVALID_LOCATION = 1006;
+ 
++	/** 
++	 * Status code constant (value 1007) indicating that there was
++	 * an authentication error while reading a repository
++	 */
++	public static final int REPOSITORY_FAILED_AUTHENTICATION = 1007;
++
+ 	//Metadata repository codes [1100-1199]
+ 
+ 	//Artifact repository codes [1200-1299]
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/repository/IRepository.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/repository/IRepository.java
+index e9d247d..c323e90 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/repository/IRepository.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/repository/IRepository.java
+@@ -68,6 +68,25 @@ public interface IRepository extends IAdaptable {
+ 	public static final int TYPE_ARTIFACT = 1;
+ 
+ 	/**
++	 * The key for a string property providing the user name to an authenticated
++	 * URL.  This key is used in the secure preference store for repository data.
++	 * @see #PREFERENCE_NODE
++	 */
++	public static final String PROP_USERNAME = "username"; //$NON-NLS-1$
++
++	/**
++	 * The key for a string property providing the password to an authenticated
++	 * URL.  This key is used in the secure preference store for repository data.
++	 * @see #PREFERENCE_NODE
++	 */
++	public static final String PROP_PASSWORD = "password"; //$NON-NLS-1$
++
++	/**
++	 * The node identifier for repository secure preference store.
++	 */
++	public static final String PREFERENCE_NODE = "org.eclipse.equinox.p2.repository"; //$NON-NLS-1$
++
++	/**
+ 	 * Returns the URL of the repository.
+ 	 * TODO: Should we use URL or URI? URL requires a protocol handler
+ 	 * to be installed in Java.  Can the URL have any protocol?
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.metadata.repository/META-INF/MANIFEST.MF
+index 07dd76c..61099e9 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/META-INF/MANIFEST.MF
+@@ -21,6 +21,7 @@ Import-Package: org.eclipse.core.runtime.preferences,
+  org.eclipse.equinox.internal.provisional.p2.metadata.query,
+  org.eclipse.equinox.internal.provisional.p2.query,
+  org.eclipse.equinox.internal.provisional.spi.p2.core.repository,
++ org.eclipse.equinox.security.storage,
+  org.eclipse.osgi.service.datalocation;version="1.0.0",
+  org.eclipse.osgi.service.resolver;version="1.1.0",
+  org.eclipse.osgi.util;version="1.1.0",
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/ECFMetadataTransport.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/ECFMetadataTransport.java
+index 6ef5db4..b1c8b93 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/ECFMetadataTransport.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/ECFMetadataTransport.java
+@@ -10,19 +10,33 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.metadata.repository;
+ 
+-import java.io.IOException;
+-import java.io.OutputStream;
++import java.io.*;
++import java.net.ProtocolException;
++import java.net.URL;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.ecf.core.*;
++import org.eclipse.ecf.core.security.ConnectContextFactory;
++import org.eclipse.ecf.core.security.IConnectContext;
+ import org.eclipse.ecf.filetransfer.*;
+ import org.eclipse.ecf.filetransfer.events.*;
+ import org.eclipse.ecf.filetransfer.identity.FileCreateException;
+ import org.eclipse.ecf.filetransfer.identity.FileIDFactory;
+ import org.eclipse.ecf.filetransfer.service.IRetrieveFileTransferFactory;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
++import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
++import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
++import org.eclipse.equinox.security.storage.*;
++import org.eclipse.osgi.util.NLS;
+ import org.osgi.util.tracker.ServiceTracker;
+ 
+ public class ECFMetadataTransport {
++	/**
++	 * The number of password retry attempts allowed before failing.
++	 */
++	private static final int LOGIN_RETRIES = 3;
++	private static final String ERROR_401 = "401"; //$NON-NLS-1$
++	private static final String ERROR_FILE_NOT_FOUND = "FileNotFound"; //$NON-NLS-1$
+ 
+ 	/**
+ 	 * The singleton transport instance.
+@@ -30,6 +44,8 @@ public class ECFMetadataTransport {
+ 	private static ECFMetadataTransport instance;
+ 
+ 	private final ServiceTracker retrievalFactoryTracker;
++	private String username;
++	private String password;
+ 
+ 	public static synchronized ECFMetadataTransport getInstance() {
+ 		if (instance == null) {
+@@ -46,8 +62,7 @@ public class ECFMetadataTransport {
+ 	public IStatus download(String toDownload, OutputStream target, IProgressMonitor monitor) {
+ 		IRetrieveFileTransferFactory factory = (IRetrieveFileTransferFactory) retrievalFactoryTracker.getService();
+ 		if (factory == null)
+-			return new Status(IStatus.ERROR, Activator.ID, "ECF Transfer manager not available");
+-
++			return new Status(IStatus.ERROR, Activator.ID, NLS.bind(Messages.io_failedRead, toDownload));
+ 		return transfer(factory.newInstance(), toDownload, target, monitor);
+ 	}
+ 
+@@ -55,8 +70,35 @@ public class ECFMetadataTransport {
+ 	 * Gets the last modified date for the specified file.
+ 	 * @param location - The URL location of the file.
+ 	 * @return A <code>long</code> representing the date. Returns <code>0</code> if the file is not found or an error occurred.
++	 * @exception OperationCanceledException if the request was canceled.
+ 	 */
+-	public long getLastModified(String location) {
++	public long getLastModified(URL location) throws ProvisionException {
++		try {
++			setLogin(location, false);
++			for (int i = 0; i < LOGIN_RETRIES; i++) {
++				try {
++					return doGetLastModified(location.toExternalForm());
++				} catch (ProtocolException e) {
++					if (ERROR_401.equals(e.getMessage())) {
++						setLogin(location, true);
++					}
++					if (ERROR_FILE_NOT_FOUND.equals(e.getMessage())) {
++						return 0;
++					}
++				}
++			}
++		} catch (UserCancelledException e) {
++			throw new OperationCanceledException();
++		}
++		//too many retries, so report as failure
++		throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.io_failedRead, location), null));
++	}
++
++	/**
++	 * Perform the ECF call to get the last modified time, failing if there is any
++	 * protocol failure such as an authentication failure.
++	 */
++	private long doGetLastModified(String location) throws ProtocolException {
+ 		IContainer container;
+ 		try {
+ 			container = ContainerFactory.getDefault().createContainer();
+@@ -74,13 +116,69 @@ public class ECFMetadataTransport {
+ 		return remoteFile.getInfo().getLastModified();
+ 	}
+ 
+-	private IRemoteFile checkFile(final IRemoteFileSystemBrowserContainerAdapter retrievalContainer, final String location) {
+-		final Object[] result = new Object[1];
++	/**
++	 * Sets the login details from the user for the specified URL. If the login
++	 * details are not available, the user is prompted.
++	 * @param xmlLocation - the location requiring login details
++	 * @param prompt - use <code>true</code> to prompt the user instead of
++	 * looking at the secure preference store for login details first 
++	 * @throws UserCancelledException 
++	 * @throws ProvisionException when the user cancels the login prompt
++	 */
++	public void setLogin(URL xmlLocation, boolean prompt) throws UserCancelledException, ProvisionException {
++		ISecurePreferences securePreferences = SecurePreferencesFactory.getDefault();
++		IPath hostLocation = new Path(xmlLocation.toExternalForm()).removeLastSegments(1);
++		int repositoryHash = hostLocation.hashCode();
++		ISecurePreferences metadataNode = securePreferences.node(IRepository.PREFERENCE_NODE + "/" + repositoryHash); //$NON-NLS-1$
++		String[] loginDetails = new String[3];
++		if (!prompt) {
++			try {
++				loginDetails[0] = metadataNode.get(IRepository.PROP_USERNAME, null);
++				loginDetails[1] = metadataNode.get(IRepository.PROP_PASSWORD, null);
++			} catch (StorageException e) {
++				String msg = NLS.bind(Messages.repoMan_internalError, xmlLocation.toString());
++				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.INTERNAL_ERROR, msg, null));
++			}
++		}
++		if ((loginDetails[0] == null || loginDetails[1] == null) && prompt) {
++			ServiceTracker adminUITracker = new ServiceTracker(Activator.getContext(), IServiceUI.class.getName(), null);
++			adminUITracker.open();
++			IServiceUI adminUIService = (IServiceUI) adminUITracker.getService();
++			loginDetails = adminUIService.getUsernamePassword(hostLocation.toString());
++		}
++		if (loginDetails == null) {
++			setUsername(null);
++			setPassword(null);
++			throw new UserCancelledException();
++		}
++		if (loginDetails[2] != null && Boolean.parseBoolean(loginDetails[2])) {
++			try {
++				metadataNode.put(IRepository.PROP_USERNAME, loginDetails[0], true);
++				metadataNode.put(IRepository.PROP_PASSWORD, loginDetails[1], true);
++			} catch (StorageException e1) {
++				String msg = NLS.bind(Messages.repoMan_internalError, xmlLocation.toString());
++				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.INTERNAL_ERROR, msg, null));
++			}
++		}
++		setUsername(loginDetails[0]);
++		setPassword(loginDetails[1]);
++	}
++
++	private IRemoteFile checkFile(final IRemoteFileSystemBrowserContainerAdapter retrievalContainer, final String location) throws ProtocolException {
++		final Object[] result = new Object[2];
+ 		final Boolean[] done = new Boolean[1];
+ 		done[0] = new Boolean(false);
+ 		IRemoteFileSystemListener listener = new IRemoteFileSystemListener() {
+ 			public void handleRemoteFileEvent(IRemoteFileSystemEvent event) {
+-				if (event instanceof IRemoteFileSystemBrowseEvent) {
++				Exception exception = event.getException();
++				if (exception != null) {
++					synchronized (result) {
++						result[0] = null;
++						result[1] = exception;
++						done[0] = new Boolean(true);
++						result.notify();
++					}
++				} else if (event instanceof IRemoteFileSystemBrowseEvent) {
+ 					IRemoteFileSystemBrowseEvent fsbe = (IRemoteFileSystemBrowseEvent) event;
+ 					IRemoteFile[] remoteFiles = fsbe.getRemoteFiles();
+ 					if (remoteFiles != null && remoteFiles.length > 0) {
+@@ -100,6 +198,12 @@ public class ECFMetadataTransport {
+ 			}
+ 		};
+ 		try {
++			if (username != null && password != null) {
++				IConnectContext connectContext = ConnectContextFactory.createUsernamePasswordConnectContext(username, password);
++				retrievalContainer.setConnectContextForAuthentication(connectContext);
++			} else {
++				retrievalContainer.setConnectContextForAuthentication(null);
++			}
+ 			retrievalContainer.sendBrowseRequest(FileIDFactory.getDefault().createFileID(retrievalContainer.getBrowseNamespace(), location), listener);
+ 		} catch (RemoteFileSystemException e) {
+ 			return null;
+@@ -117,6 +221,12 @@ public class ECFMetadataTransport {
+ 				}
+ 			}
+ 		}
++		if (result[0] == null && result[1] instanceof Exception) {
++			if (result[1] instanceof FileNotFoundException)
++				throw new ProtocolException(ERROR_FILE_NOT_FOUND);
++			if (result[1] instanceof IOException)
++				throw new ProtocolException(ERROR_401);
++		}
+ 		return (IRemoteFile) result[0];
+ 	}
+ 
+@@ -185,4 +295,12 @@ public class ECFMetadataTransport {
+ 			return new Status(IStatus.CANCEL, Activator.ID, e.getMessage(), e);
+ 		return new Status(IStatus.ERROR, Activator.ID, e.getMessage(), e);
+ 	}
++
++	public void setUsername(String username) {
++		this.username = username;
++	}
++
++	public void setPassword(String password) {
++		this.password = password;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/SimpleMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+index 360ae1c..36d9208 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+@@ -63,14 +63,14 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 		File dataAreaFile = URLUtil.toFile(dataArea);
+ 		int hashCode = location.hashCode();
+ 		URL remoteLocation;
+-		long remoteTimestamp = getTransport().getLastModified(jarLocation.toExternalForm());
++		long remoteTimestamp = getTransport().getLastModified(jarLocation);
+ 		if (remoteTimestamp != 0) {
+ 			//remote file is in jar form
+ 			remoteLocation = jarLocation;
+ 			localFile = new File(dataAreaFile, CONTENT_FILENAME + hashCode + JAR_EXTENSION);
+ 		} else {
+ 			//check for remote file in xml form
+-			remoteTimestamp = getTransport().getLastModified(xmlLocation.toExternalForm());
++			remoteTimestamp = getTransport().getLastModified(xmlLocation);
+ 			if (remoteTimestamp == 0) {
+ 				//there is no remote file in either form
+ 				String msg = NLS.bind(Messages.io_failedRead, location);
+diff --git a/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/ProvAdminUIActivator.java b/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/ProvAdminUIActivator.java
+index ff8ace5..bf3fa83 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/ProvAdminUIActivator.java
++++ b/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/ProvAdminUIActivator.java
+@@ -10,9 +10,9 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.ui.admin;
+ 
++import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProvisioningPlan;
+-import org.eclipse.equinox.internal.provisional.p2.ui.SimpleLicenseManager;
+-import org.eclipse.equinox.internal.provisional.p2.ui.UpdateManagerCompatibility;
++import org.eclipse.equinox.internal.provisional.p2.ui.*;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.*;
+ import org.eclipse.jface.dialogs.IDialogConstants;
+ import org.eclipse.jface.dialogs.MessageDialog;
+@@ -21,6 +21,7 @@ import org.eclipse.swt.custom.BusyIndicator;
+ import org.eclipse.swt.widgets.Shell;
+ import org.eclipse.ui.plugin.AbstractUIPlugin;
+ import org.osgi.framework.BundleContext;
++import org.osgi.framework.ServiceRegistration;
+ 
+ /**
+  * Activator class for the admin UI.
+@@ -37,6 +38,8 @@ public class ProvAdminUIActivator extends AbstractUIPlugin {
+ 	private LicenseManager licenseManager;
+ 	private IPlanValidator planValidator;
+ 	private Policies policies;
++	private ValidationDialogServiceUI adminServiceUI;
++	private ServiceRegistration certificateUIRegistration;
+ 
+ 	public static BundleContext getContext() {
+ 		return context;
+@@ -76,10 +79,14 @@ public class ProvAdminUIActivator extends AbstractUIPlugin {
+ 		super.start(bundleContext);
+ 		plugin = this;
+ 		ProvAdminUIActivator.context = bundleContext;
++
++		adminServiceUI = new ValidationDialogServiceUI();
++		certificateUIRegistration = context.registerService(IServiceUI.class.getName(), adminServiceUI, null);
+ 	}
+ 
+ 	public void stop(BundleContext bundleContext) throws Exception {
+ 		plugin = null;
++		certificateUIRegistration.unregister();
+ 		super.stop(bundleContext);
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+index e60c62e..b42e788 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+@@ -14,6 +14,7 @@ import java.net.URL;
+ import java.util.EventObject;
+ import org.eclipse.core.runtime.FileLocator;
+ import org.eclipse.core.runtime.Path;
++import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.ProvisioningListener;
+@@ -38,6 +39,8 @@ public class ProvUIActivator extends AbstractUIPlugin {
+ 	private static ServiceReference packageAdminRef = null;
+ 	private static ProvUIActivator plugin;
+ 	private ProvisioningListener profileChangeListener;
++	private ValidationDialogServiceUI adminServiceUI;
++	private ServiceRegistration certificateUIRegistration;
+ 
+ 	public static final String PLUGIN_ID = "org.eclipse.equinox.p2.ui"; //$NON-NLS-1$
+ 
+@@ -95,6 +98,9 @@ public class ProvUIActivator extends AbstractUIPlugin {
+ 
+ 		initializeImages();
+ 		addProfileChangeListener();
++
++		adminServiceUI = new ValidationDialogServiceUI();
++		certificateUIRegistration = context.registerService(IServiceUI.class.getName(), adminServiceUI, null);
+ 	}
+ 
+ 	public void stop(BundleContext bundleContext) throws Exception {
+@@ -102,6 +108,7 @@ public class ProvUIActivator extends AbstractUIPlugin {
+ 			removeProfileChangeListener();
+ 			plugin = null;
+ 			ProvUIActivator.context = null;
++			certificateUIRegistration.unregister();
+ 		} finally {
+ 			super.stop(bundleContext);
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+index 96fd0c8..a0f38b7 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+@@ -138,6 +138,9 @@ public class ProvUIMessages extends NLS {
+ 	public static String QueryableProfileRegistry_QueryProfileProgress;
+ 	public static String QueryableUpdates_UpdateListProgress;
+ 	public static String SizingPhaseSet_PhaseSetName;
++	public static String RepositoryPropertyPage_UsernameField;
++	public static String RepositoryPropertyPage_PasswordField;
++	public static String RepositoryPropertyPage_SavePasswordField;
+ 	public static String RevertDialog_ConfigContentsLabel;
+ 	public static String RevertDialog_ConfigsLabel;
+ 	public static String RevertDialog_ConfirmRestartMessage;
+@@ -153,6 +156,10 @@ public class ProvUIMessages extends NLS {
+ 	public static String UpdateManagerCompatibility_UnableToOpenFindAndInstall;
+ 	public static String UpdateManagerCompatibility_UnableToOpenManageConfiguration;
+ 	public static String UpdateOperation_NothingToUpdate;
++	public static String ServiceUI_Cancel;
++	public static String ServiceUI_LoginDetails;
++	public static String ServiceUI_LoginRequired;
++	public static String ServiceUI_OK;
+ 	public static String UpdateOrInstallWizardPage_Size;
+ 
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index 9c24b91..ff1ea82 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -34,6 +34,10 @@ UninstallIUOperationLabel=Uninstall
+ UninstallIUCommandLabel=&Uninstall...
+ UninstallIUCommandTooltip=Uninstall the selected items
+ UninstallIUProgress=Uninstalling...
++ServiceUI_Cancel=Cancel
++ServiceUI_LoginDetails=Please provide login details for {0}
++ServiceUI_LoginRequired=Login required
++ServiceUI_OK=OK
+ UpdateIUOperationLabel=Update
+ UpdateIUCommandLabel=&Check for updates...
+ UpdateIUCommandTooltip=See if updates are available for the selected items
+@@ -127,6 +131,10 @@ QueryableProfileRegistry_QueryProfileProgress=Getting profiles
+ QueryableUpdates_UpdateListProgress=Assembling list of updates
+ SizingPhaseSet_PhaseSetName=Compute sizes
+ 
++RepositoryPropertyPage_UsernameField=Username:
++RepositoryPropertyPage_PasswordField=Password:
++RepositoryPropertyPage_SavePasswordField=Save password
++
+ RevertDialog_ConfigContentsLabel=&Configuration contents:
+ RevertDialog_ConfigsLabel=&Previous configurations:
+ RevertDialog_ConfirmRestartMessage=This operation requires restarting the workbench.  Would you like to proceed?
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+new file mode 100644
+index 0000000..c0b1402
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+@@ -0,0 +1,46 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.provisional.p2.ui;
++
++import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
++import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
++import org.eclipse.equinox.internal.provisional.p2.ui.dialogs.UserValidationDialog;
++import org.eclipse.jface.window.Window;
++import org.eclipse.osgi.util.NLS;
++import org.eclipse.swt.widgets.Shell;
++import org.eclipse.ui.PlatformUI;
++
++public class ValidationDialogServiceUI implements IServiceUI {
++
++	/*
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.provisional.p2.core.IServiceUI#getUsernamePassword(java.lang.String)
++	 */
++	public String[] getUsernamePassword(final String location) {
++
++		final Object[] result = new Object[1];
++		PlatformUI.getWorkbench().getDisplay().syncExec(new Runnable() {
++
++			public void run() {
++				Shell shell = PlatformUI.getWorkbench().getActiveWorkbenchWindow().getShell();
++
++				String[] buttonLabels = new String[] {ProvUIMessages.ServiceUI_OK, ProvUIMessages.ServiceUI_Cancel};
++				String message = NLS.bind(ProvUIMessages.ServiceUI_LoginDetails, location);
++				UserValidationDialog dialog = new UserValidationDialog(shell, ProvUIMessages.ServiceUI_LoginRequired, null, message, buttonLabels);
++				if (dialog.open() == Window.OK) {
++					result[0] = dialog.getResult();
++				}
++			}
++
++		});
++		return result[0] instanceof String[] ? (String[]) result[0] : null;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UserValidationDialog.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UserValidationDialog.java
+new file mode 100644
+index 0000000..e2ad864
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UserValidationDialog.java
+@@ -0,0 +1,95 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.provisional.p2.ui.dialogs;
++
++import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
++import org.eclipse.jface.dialogs.IDialogConstants;
++import org.eclipse.jface.dialogs.MessageDialog;
++import org.eclipse.swt.SWT;
++import org.eclipse.swt.graphics.Image;
++import org.eclipse.swt.layout.GridData;
++import org.eclipse.swt.layout.GridLayout;
++import org.eclipse.swt.widgets.*;
++
++public class UserValidationDialog extends MessageDialog {
++
++	private Text username;
++	private Text password;
++	private String[] result = null;
++
++	private Button saveButton;
++
++	public UserValidationDialog(Shell parentShell, String titleMessage, Image titleImage, String message, String[] buttonLabels) {
++		super(parentShell, titleMessage, titleImage, message, MessageDialog.QUESTION, buttonLabels, 0);
++	}
++
++	protected Control createDialogArea(Composite parent) {
++		Composite composite = (Composite) super.createDialogArea(parent);
++
++		Composite fieldContainer = new Composite(composite, SWT.NONE);
++		GridLayout layout = new GridLayout();
++		layout.numColumns = 2;
++		fieldContainer.setLayout(layout);
++		GridData layoutData = new GridData();
++		fieldContainer.setLayoutData(layoutData);
++
++		Label label = new Label(fieldContainer, SWT.NONE);
++		label.setText(ProvUIMessages.RepositoryPropertyPage_UsernameField);
++		username = new Text(fieldContainer, SWT.BORDER);
++		layoutData = new GridData(GridData.FILL_HORIZONTAL);
++		layoutData.widthHint = convertHorizontalDLUsToPixels(IDialogConstants.ENTRY_FIELD_WIDTH);
++		layoutData.horizontalAlignment = SWT.END;
++		username.setLayoutData(layoutData);
++
++		label = new Label(fieldContainer, SWT.NONE);
++		label.setText(ProvUIMessages.RepositoryPropertyPage_PasswordField);
++		password = new Text(fieldContainer, SWT.PASSWORD | SWT.BORDER);
++		layoutData = new GridData(GridData.FILL_HORIZONTAL);
++		layoutData.widthHint = convertHorizontalDLUsToPixels(IDialogConstants.ENTRY_FIELD_WIDTH);
++		layoutData.horizontalAlignment = SWT.END;
++		password.setLayoutData(layoutData);
++
++		Composite checkboxContainer = new Composite(composite, SWT.NONE);
++		layout = new GridLayout();
++		checkboxContainer.setLayout(layout);
++		layoutData = new GridData();
++		layoutData.widthHint = convertHorizontalDLUsToPixels(IDialogConstants.ENTRY_FIELD_WIDTH);
++		checkboxContainer.setLayoutData(layoutData);
++		saveButton = new Button(checkboxContainer, SWT.CHECK);
++		saveButton.setText(ProvUIMessages.RepositoryPropertyPage_SavePasswordField);
++
++		username.setFocus();
++
++		return composite;
++	}
++
++	protected void buttonPressed(int buttonId) {
++		if (buttonId == getDefaultButtonIndex()) {
++			String[] loginDetails = new String[3];
++			loginDetails[0] = username.getText();
++			loginDetails[1] = password.getText();
++			loginDetails[2] = Boolean.toString(saveButton.getSelection());
++			this.result = loginDetails;
++		}
++		super.buttonPressed(buttonId);
++	}
++
++	/**
++	 * Returns the username and password given by the user.
++	 * @return A three element {@link String} array with the username, password, 
++	 * and save state, in that order.
++	 * Returns <code>null</code> if the dialog was canceled.
++	 */
++	public Object getResult() {
++		return result;
++	}
++
++}
+commit 26baa0372c387f98f4b0204882dbc72e1443c54b
+Author: John Arthorne <johna>
+Date:   Thu Apr 10 18:30:06 2008 +0000
+
+    Bug 215927 [prov] Authentication upon connection
+
+1	4	bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/ProvAdminUIActivator.java
+5	2	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKUIActivator.java
+3	3	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/ProvAdminUIActivator.java b/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/ProvAdminUIActivator.java
+index bf3fa83..c07c2a3 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/ProvAdminUIActivator.java
++++ b/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/ProvAdminUIActivator.java
+@@ -38,7 +38,6 @@ public class ProvAdminUIActivator extends AbstractUIPlugin {
+ 	private LicenseManager licenseManager;
+ 	private IPlanValidator planValidator;
+ 	private Policies policies;
+-	private ValidationDialogServiceUI adminServiceUI;
+ 	private ServiceRegistration certificateUIRegistration;
+ 
+ 	public static BundleContext getContext() {
+@@ -79,9 +78,7 @@ public class ProvAdminUIActivator extends AbstractUIPlugin {
+ 		super.start(bundleContext);
+ 		plugin = this;
+ 		ProvAdminUIActivator.context = bundleContext;
+-
+-		adminServiceUI = new ValidationDialogServiceUI();
+-		certificateUIRegistration = context.registerService(IServiceUI.class.getName(), adminServiceUI, null);
++		certificateUIRegistration = context.registerService(IServiceUI.class.getName(), new ValidationDialogServiceUI(), null);
+ 	}
+ 
+ 	public void stop(BundleContext bundleContext) throws Exception {
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKUIActivator.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKUIActivator.java
+index 4c78303..2ad947e 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKUIActivator.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/ProvSDKUIActivator.java
+@@ -14,6 +14,7 @@ import java.io.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.ui.sdk.prefs.PreferenceConstants;
+ import org.eclipse.equinox.internal.p2.ui.sdk.updates.AutomaticUpdater;
++import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProvisioningPlan;
+@@ -29,8 +30,7 @@ import org.eclipse.swt.custom.BusyIndicator;
+ import org.eclipse.swt.widgets.Shell;
+ import org.eclipse.ui.plugin.AbstractUIPlugin;
+ import org.eclipse.ui.statushandlers.StatusManager;
+-import org.osgi.framework.BundleContext;
+-import org.osgi.framework.ServiceReference;
++import org.osgi.framework.*;
+ 
+ /**
+  * Activator class for the p2 UI.
+@@ -47,6 +47,7 @@ public class ProvSDKUIActivator extends AbstractUIPlugin {
+ 	private IQueryProvider queryProvider;
+ 	private SimpleLicenseManager licenseManager;
+ 	private IPlanValidator planValidator;
++	private ServiceRegistration certificateUIRegistration;
+ 
+ 	public static final String PLUGIN_ID = "org.eclipse.equinox.p2.ui.sdk"; //$NON-NLS-1$
+ 
+@@ -89,6 +90,7 @@ public class ProvSDKUIActivator extends AbstractUIPlugin {
+ 		plugin = this;
+ 		ProvSDKUIActivator.context = bundleContext;
+ 		readLicenseRegistry();
++		certificateUIRegistration = context.registerService(IServiceUI.class.getName(), new ValidationDialogServiceUI(), null);
+ 	}
+ 
+ 	private void readLicenseRegistry() {
+@@ -132,6 +134,7 @@ public class ProvSDKUIActivator extends AbstractUIPlugin {
+ 			updater = null;
+ 		}
+ 		plugin = null;
++		certificateUIRegistration.unregister();
+ 		super.stop(bundleContext);
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+index b42e788..ea7d4e4 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+@@ -39,7 +39,7 @@ public class ProvUIActivator extends AbstractUIPlugin {
+ 	private static ServiceReference packageAdminRef = null;
+ 	private static ProvUIActivator plugin;
+ 	private ProvisioningListener profileChangeListener;
+-	private ValidationDialogServiceUI adminServiceUI;
++	private ValidationDialogServiceUI validationServiceUI;
+ 	private ServiceRegistration certificateUIRegistration;
+ 
+ 	public static final String PLUGIN_ID = "org.eclipse.equinox.p2.ui"; //$NON-NLS-1$
+@@ -99,8 +99,8 @@ public class ProvUIActivator extends AbstractUIPlugin {
+ 		initializeImages();
+ 		addProfileChangeListener();
+ 
+-		adminServiceUI = new ValidationDialogServiceUI();
+-		certificateUIRegistration = context.registerService(IServiceUI.class.getName(), adminServiceUI, null);
++		validationServiceUI = new ValidationDialogServiceUI();
++		certificateUIRegistration = context.registerService(IServiceUI.class.getName(), validationServiceUI, null);
+ 	}
+ 
+ 	public void stop(BundleContext bundleContext) throws Exception {
+commit 4f9cffaad8e28362f7c7d919741c5cabded05bd5
+Author: Susan Franklin <sfranklin>
+Date:   Thu Apr 10 19:54:21 2008 +0000
+
+    Bug 215927 - [prov] Authentication upon connection
+
+0	7	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+index ea7d4e4..e60c62e 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+@@ -14,7 +14,6 @@ import java.net.URL;
+ import java.util.EventObject;
+ import org.eclipse.core.runtime.FileLocator;
+ import org.eclipse.core.runtime.Path;
+-import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.ProvisioningListener;
+@@ -39,8 +38,6 @@ public class ProvUIActivator extends AbstractUIPlugin {
+ 	private static ServiceReference packageAdminRef = null;
+ 	private static ProvUIActivator plugin;
+ 	private ProvisioningListener profileChangeListener;
+-	private ValidationDialogServiceUI validationServiceUI;
+-	private ServiceRegistration certificateUIRegistration;
+ 
+ 	public static final String PLUGIN_ID = "org.eclipse.equinox.p2.ui"; //$NON-NLS-1$
+ 
+@@ -98,9 +95,6 @@ public class ProvUIActivator extends AbstractUIPlugin {
+ 
+ 		initializeImages();
+ 		addProfileChangeListener();
+-
+-		validationServiceUI = new ValidationDialogServiceUI();
+-		certificateUIRegistration = context.registerService(IServiceUI.class.getName(), validationServiceUI, null);
+ 	}
+ 
+ 	public void stop(BundleContext bundleContext) throws Exception {
+@@ -108,7 +102,6 @@ public class ProvUIActivator extends AbstractUIPlugin {
+ 			removeProfileChangeListener();
+ 			plugin = null;
+ 			ProvUIActivator.context = null;
+-			certificateUIRegistration.unregister();
+ 		} finally {
+ 			super.stop(bundleContext);
+ 		}

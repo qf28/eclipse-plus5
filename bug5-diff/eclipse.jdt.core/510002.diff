@@ -1,0 +1,265 @@
+commit 947870be2f2f93b03b6f526ba03ab077f55b1941
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Fri Jan 6 12:19:06 2017 -0500
+
+    Bug 510002 - Add indexer support for caching Jar manifests
+    
+    Change-Id: Ib1822ad5645ca9c196e165d369d89240d7e26b2f
+
+12	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/util/ManifestAnalyzer.java
+52	18	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
+1	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNode.java
+12	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+3	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+19	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/util/ManifestAnalyzer.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/util/ManifestAnalyzer.java
+index ee3754c..c9817a6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/util/ManifestAnalyzer.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/util/ManifestAnalyzer.java
+@@ -31,7 +31,7 @@ public class ManifestAnalyzer {
+ 	private ArrayList calledFilesNames;
+ 	
+ 	/**
+-	 * Analyze the manifest contents. The given input stream is read using a UTF-8 encoded reader.
++	 * Analyzes the manifest contents. The given input stream is read using a UTF-8 encoded reader.
+ 	 * If the contents of the input stream is not encoded using a UTF-8 encoding, the analysis will fail.
+ 	 * 
+ 	 * @param inputStream the given input stream.
+@@ -41,6 +41,17 @@ public class ManifestAnalyzer {
+ 	 */
+ 	public boolean analyzeManifestContents(InputStream inputStream) throws IOException {
+ 		char[] chars = Util.getInputStreamAsCharArray(inputStream, -1, Util.UTF_8);
++		return analyzeManifestContents(chars);
++	}
++
++	/**
++	 * Analyzes the manifest contents.
++	 * 
++	 * @param chars the content of the manifest
++	 * 
++	 * @return <code>true</code> if the analysis is successful, <code>false</code> otherwise.
++	 */
++	public boolean analyzeManifestContents(char[] chars) {
+ 		int state = START, substate = 0;
+ 		StringBuffer currentJarToken = new StringBuffer();
+ 		int currentChar;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
+index 08acbd6..1431b93 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
+@@ -16,6 +16,9 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
++import static org.eclipse.jdt.internal.compiler.util.Util.UTF_8;
++import static org.eclipse.jdt.internal.compiler.util.Util.getInputStreamAsCharArray;
++
+ import java.io.ByteArrayOutputStream;
+ import java.io.File;
+ import java.io.IOException;
+@@ -62,6 +65,9 @@ import org.eclipse.jdt.internal.compiler.env.AccessRule;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.util.ManifestAnalyzer;
++import org.eclipse.jdt.internal.core.nd.IReader;
++import org.eclipse.jdt.internal.core.nd.java.JavaIndex;
++import org.eclipse.jdt.internal.core.nd.java.NdResourceFile;
+ import org.eclipse.jdt.internal.core.util.Messages;
+ import org.eclipse.jdt.internal.core.util.Util;
+ import org.w3c.dom.DOMException;
+@@ -965,23 +971,60 @@ public class ClasspathEntry implements IClasspathEntry {
+ 		}
+ 	}
+ 
++	private static char[] getManifestContents(IPath jarPath) throws CoreException, IOException {
++		// Try to read a cached manifest from the index
++		if (JavaIndex.isEnabled()) {
++			JavaIndex index = JavaIndex.getIndex();
++			String location = JavaModelManager.getLocalFile(jarPath).getAbsolutePath();
++			try (IReader reader = index.getNd().acquireReadLock()) {
++				NdResourceFile resourceFile = index.getResourceFile(location.toCharArray());
++				if (index.isUpToDate(resourceFile)) {
++					char[] manifestContent = resourceFile.getManifestContent().getChars();
++					if (manifestContent.length == 0) {
++						return null;
++					}
++					return manifestContent;
++				}
++			}
++		}
++
++		ZipFile zip = null;
++		InputStream inputStream = null;
++		JavaModelManager manager = JavaModelManager.getJavaModelManager();
++		try {
++			zip = manager.getZipFile(jarPath);
++			ZipEntry manifest = zip.getEntry("META-INF/MANIFEST.MF"); //$NON-NLS-1$
++			if (manifest == null) {
++				return null;
++			}
++			inputStream = zip.getInputStream(manifest);
++			char[] chars = getInputStreamAsCharArray(inputStream, -1, UTF_8);
++			return chars;
++		} finally {
++			if (inputStream != null) {
++				try {
++					inputStream.close();
++				} catch (IOException e) {
++					// best effort
++				}
++			}
++			manager.closeZipFile(zip);
++		}
++	}
++
+ 	private static List getCalledFileNames(IPath jarPath) {
+ 		Object target = JavaModel.getTarget(jarPath, true/*check existence, otherwise the manifest cannot be read*/);
+ 		if (!(target instanceof IFile || target instanceof File))
+ 			return null;
+-		JavaModelManager manager = JavaModelManager.getJavaModelManager();
+-		ZipFile zip = null;
+-		InputStream inputStream = null;
++
+ 		List calledFileNames = null;
+ 		try {
+-			zip = manager.getZipFile(jarPath);
+-			ZipEntry manifest = zip.getEntry("META-INF/MANIFEST.MF"); //$NON-NLS-1$
+-			if (manifest == null) 
++			char[] manifestContents = getManifestContents(jarPath);
++			if (manifestContents == null) 
+ 				return null;
+ 			// non-null implies regular file
+ 			ManifestAnalyzer analyzer = new ManifestAnalyzer();
+-			inputStream = zip.getInputStream(manifest);
+-			boolean success = analyzer.analyzeManifestContents(inputStream);
++			boolean success = analyzer.analyzeManifestContents(manifestContents);
+ 			calledFileNames = analyzer.getCalledFileNames();
+ 			if (!success || analyzer.getClasspathSectionsCount() == 1 && calledFileNames == null) {
+ 				if (JavaModelManager.CP_RESOLVE_VERBOSE_FAILURE) {
+@@ -1006,19 +1049,10 @@ public class ClasspathEntry implements IClasspathEntry {
+ 				Util.verbose("Could not read Class-Path header in manifest of jar file: " + jarPath.toOSString()); //$NON-NLS-1$
+ 				e.printStackTrace();
+ 			}
+-		} finally {
+-			if (inputStream != null) {
+-				try {
+-					inputStream.close();
+-				} catch (IOException e) {
+-					// best effort
+-				}
+-			}
+-			manager.closeZipFile(zip);
+ 		}
+ 		return calledFileNames;
+ 	}
+-	
++
+ 	/*
+ 	 * Resolves the ".." in the given path. Returns the given path if it contains no ".." segment.
+ 	 */
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNode.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNode.java
+index 67d039b..2fc229c 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNode.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNode.java
+@@ -100,7 +100,7 @@ public abstract class NdNode implements IDestructable {
+ 		return this.nd.getDB();
+ 	}
+ 
+-	public Nd getNd() {
++	public final Nd getNd() {
+ 		return this.nd;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+index e630ee4..2af0b42 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+@@ -10,8 +10,12 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.nd.indexer;
+ 
++import static org.eclipse.jdt.internal.compiler.util.Util.UTF_8;
++import static org.eclipse.jdt.internal.compiler.util.Util.getInputStreamAsCharArray;
++
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.util.ArrayDeque;
+ import java.util.ArrayList;
+ import java.util.Collection;
+@@ -693,6 +697,14 @@ public final class Indexer {
+ 											+ resourceFile.getLocation().getString() + " " + resourceFile.address); //$NON-NLS-1$
+ 								}
+ 								new NdZipEntry(resourceFile, fileName);
++
++								if (fileName.equals("META-INF/MANIFEST.MF")) { //$NON-NLS-1$
++									try (InputStream inputStream = zipFile.getInputStream(member)) {
++										char[] chars = getInputStreamAsCharArray(inputStream, -1, UTF_8);
++
++										resourceFile.setManifestContent(chars);
++									}
++								}
+ 							}
+ 						} finally {
+ 							this.nd.releaseWriteLock();
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+index 1e7f974..66c50b3 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+@@ -34,9 +34,9 @@ import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+ 
+ public class JavaIndex {
+ 	// Version constants
+-	static final int CURRENT_VERSION = Nd.version(1, 43);
+-	static final int MAX_SUPPORTED_VERSION = Nd.version(1, 43);
+-	static final int MIN_SUPPORTED_VERSION = Nd.version(1, 43);
++	static final int CURRENT_VERSION = Nd.version(1, 44);
++	static final int MAX_SUPPORTED_VERSION = Nd.version(1, 44);
++	static final int MIN_SUPPORTED_VERSION = Nd.version(1, 44);
+ 
+ 	// Fields for the search header
+ 	public static final FieldSearchIndex<NdResourceFile> FILES;
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+index 286180f..ddd3c13 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+@@ -44,6 +44,7 @@ public class NdResourceFile extends NdTreeNode {
+ 	public static final FieldString JAVA_ROOT;
+ 	public static final FieldLong JDK_LEVEL;
+ 	public static final FieldOneToMany<NdZipEntry> ZIP_ENTRIES;
++	public static final FieldString MANIFEST_CONTENT;
+ 
+ 	@SuppressWarnings("hiding")
+ 	public static final StructDef<NdResourceFile> type;
+@@ -60,6 +61,8 @@ public class NdResourceFile extends NdTreeNode {
+ 		JAVA_ROOT = type.addString();
+ 		JDK_LEVEL = type.addLong();
+ 		ZIP_ENTRIES = FieldOneToMany.create(type, NdZipEntry.JAR_FILE);
++		MANIFEST_CONTENT = type.addString();
++
+ 		type.done();
+ 	}
+ 
+@@ -82,6 +85,22 @@ public class NdResourceFile extends NdTreeNode {
+ 		return ZIP_ENTRIES.asList(getNd(), getAddress());
+ 	}
+ 
++	/**
++	 * Returns the content of the JAR's MANIFEST.MF file, or null if either this isn't a .JAR file or it didn't contain
++	 * a MANIFEST.MF file.
++	 */
++	public IString getManifestContent() {
++		return MANIFEST_CONTENT.get(getNd(), getAddress());
++	}
++
++	/**
++	 * Stores the content of the JAR's MANIFEST.MF file. This should only be invoked on resources that correspond to JAR
++	 * files.
++	 */
++	public void setManifestContent(char[] newContent) {
++		MANIFEST_CONTENT.put(getNd(), getAddress(), newContent);
++	}
++
+ 	public long getJdkLevel() {
+ 		if (this.jdkLevel == 0) {
+ 			this.jdkLevel = JDK_LEVEL.get(getNd(), this.address);

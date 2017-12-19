@@ -1,0 +1,399 @@
+commit bd8e681cec9618de97c498abdd0b8937a0236395
+Author: Pascal Rapicault <prapicau>
+Date:   Fri Jan 25 15:53:11 2008 +0000
+
+    Bug 216433 - [prov] polish pack200 support, ability to reuse the pack200 in place
+
+9	4	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/Mapper.java
+42	8	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+3	3	bundles/org.eclipse.equinox.p2.metadata.generator/.settings/org.eclipse.jdt.ui.prefs
+1	0	bundles/org.eclipse.equinox.p2.metadata.generator/META-INF/MANIFEST.MF
+11	1	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
+10	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/EclipseInstallGeneratorInfoProvider.java
+12	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/Generator.java
+4	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/IGeneratorInfo.java
+16	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/MetadataGeneratorHelper.java
+8	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/TestGeneratorInfo.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/Mapper.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/Mapper.java
+index 2cbc38b..3cb4038 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/Mapper.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/Mapper.java
+@@ -21,6 +21,7 @@ public class Mapper {
+ 	private static final String REPOURL = "repoUrl";
+ 	private static final String NAMESPACE = "namespace";
+ 	private static final String CLASSIFIER = "classifier";
++	private static final String FORMAT = "format";
+ 	private static final String ID = "id";
+ 	private static final String VERSION = "version";
+ 
+@@ -47,7 +48,7 @@ public class Mapper {
+ 		}
+ 	}
+ 
+-	public String map(String repoUrl, String namespace, String classifier, String id, String version) {
++	public String map(String repoUrl, String namespace, String classifier, String id, String version, String format) {
+ 		Dictionary values = new Hashtable(5);
+ 		if (repoUrl != null)
+ 			values.put(REPOURL, repoUrl);
+@@ -64,15 +65,17 @@ public class Mapper {
+ 		if (version != null)
+ 			values.put(VERSION, version);
+ 
++		if (format != null)
++			values.put(FORMAT, format);
++
+ 		for (int i = 0; i < filters.length; i++) {
+ 			if (filters[i].match(values))
+-				return doReplacement(outputStrings[i], repoUrl, namespace, classifier, id, version);
++				return doReplacement(outputStrings[i], repoUrl, namespace, classifier, id, version, format);
+ 		}
+ 		return null;
+ 	}
+ 
+-	private String doReplacement(String pattern, String repoUrl, String namespace, String classifier, String id, String version) {
+-
++	private String doReplacement(String pattern, String repoUrl, String namespace, String classifier, String id, String version, String format) {
+ 		// currently our mapping rules assume the repo URL is not "/" terminated. 
+ 		// This may be the case for repoURLs in the root of a URL space e.g. root of a jar file or file:/c:/
+ 		if (repoUrl.endsWith("/"))
+@@ -101,6 +104,8 @@ public class Mapper {
+ 				varValue = version;
+ 			} else if (varName.equalsIgnoreCase(REPOURL)) {
+ 				varValue = repoUrl;
++			} else if (varName.equalsIgnoreCase(FORMAT)) {
++				varValue = format;
+ 			}
+ 			if (varValue == null)
+ 				varValue = "";
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+index 99189bc..cf1fd16 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+@@ -143,11 +143,16 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	private static final String ARTIFACT_UUID = "artifact.uuid"; //$NON-NLS-1$
+ 	static final private String BLOBSTORE = ".blobstore/"; //$NON-NLS-1$
+ 	static final private String CONTENT_FILENAME = "artifacts"; //$NON-NLS-1$
+-	static final public String[][] DEFAULT_MAPPING_RULES = { {"(& (namespace=eclipse) (classifier=plugin))", "${repoUrl}/plugins/${id}_${version}.jar"}, //$NON-NLS-1$//$NON-NLS-2$
++	static final private String[][] PACKED_MAPPING_RULES = { {"(& (namespace=eclipse) (classifier=plugin) (format=packed))", "${repoUrl}/plugins/${id}_${version}.pack.gz"}, //$NON-NLS-1$//$NON-NLS-2$
++			{"(& (namespace=eclipse) (classifier=plugin))", "${repoUrl}/plugins/${id}_${version}.jar"}, //$NON-NLS-1$//$NON-NLS-2$
++			{"(& (namespace=eclipse) (classifier=native))", "${repoUrl}/native/${id}_${version}"}, //$NON-NLS-1$ //$NON-NLS-2$
++			{"(& (namespace=eclipse) (classifier=feature))", "${repoUrl}/features/${id}_${version}.jar"}}; //$NON-NLS-1$//$NON-NLS-2$
++
++	static final private String[][] DEFAULT_MAPPING_RULES = { {"(& (namespace=eclipse) (classifier=plugin))", "${repoUrl}/plugins/${id}_${version}.jar"}, //$NON-NLS-1$//$NON-NLS-2$
+ 			{"(& (namespace=eclipse) (classifier=native))", "${repoUrl}/native/${id}_${version}"}, //$NON-NLS-1$ //$NON-NLS-2$
+ 			{"(& (namespace=eclipse) (classifier=feature))", "${repoUrl}/features/${id}_${version}.jar"}}; //$NON-NLS-1$//$NON-NLS-2$
+ 	private static final String JAR_EXTENSION = ".jar"; //$NON-NLS-1$
+-	static final private String REPOSITORY_TYPE = IArtifactRepositoryManager.TYPE_SIMPLE_REPOSITORY; 
++	static final private String REPOSITORY_TYPE = IArtifactRepositoryManager.TYPE_SIMPLE_REPOSITORY;
+ 
+ 	static final private Integer REPOSITORY_VERSION = new Integer(1);
+ 	private static final String XML_EXTENSION = ".xml"; //$NON-NLS-1$
+@@ -155,6 +160,9 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	private transient BlobStore blobStore;
+ 	transient private Mapper mapper = new Mapper();
+ 
++	static final private String PACKED_FORMAT = "packed"; //$NON-NLS-1$
++	static final private String PUBLISH_PACK_FILES_AS_SIBLINGS = "publishPackFilesAsSiblings"; //$NON-NLS-1$
++
+ 	protected String[][] mappingRules = DEFAULT_MAPPING_RULES;
+ 
+ 	private boolean signatureVerification = false;
+@@ -300,11 +308,14 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	}
+ 
+ 	public synchronized String createLocation(ArtifactDescriptor descriptor) {
++		if (flatButPackedEnabled(descriptor)) {
++			return getLocationForPackedButFlatArtifacts(descriptor);
++		}
+ 		// if the descriptor is canonical, clear out any UUID that might be set and use the Mapper
+ 		if (descriptor.getProcessingSteps().length == 0) {
+ 			descriptor.setProperty(ARTIFACT_UUID, null);
+ 			IArtifactKey key = descriptor.getArtifactKey();
+-			String result = mapper.map(location.toExternalForm(), key.getNamespace(), key.getClassifier(), key.getId(), key.getVersion().toString());
++			String result = mapper.map(location.toExternalForm(), key.getNamespace(), key.getClassifier(), key.getId(), key.getVersion().toString(), descriptor.getProperty(IArtifactDescriptor.FORMAT));
+ 			if (result != null) {
+ 				if (isFolderBased(descriptor) && result.endsWith(JAR_EXTENSION))
+ 					return result.substring(0, result.lastIndexOf(JAR_EXTENSION));
+@@ -338,7 +349,6 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	}
+ 
+ 	protected IStatus downloadArtifact(IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
+-
+ 		if (isFolderBased(descriptor)) {
+ 			File artifactFolder = getArtifactFile(descriptor);
+ 			// TODO: optimize and ensure manifest is written first
+@@ -449,12 +459,25 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		return artifactDescriptors;
+ 	}
+ 
++	private boolean flatButPackedEnabled(IArtifactDescriptor descriptor) {
++		return Boolean.TRUE.toString().equals(getProperties().get(PUBLISH_PACK_FILES_AS_SIBLINGS)) && PACKED_FORMAT.equals(descriptor.getProperty(IArtifactDescriptor.FORMAT));
++	}
++
++	private String getLocationForPackedButFlatArtifacts(IArtifactDescriptor descriptor) {
++		IArtifactKey key = descriptor.getArtifactKey();
++		return mapper.map(location.toExternalForm(), key.getNamespace(), key.getClassifier(), key.getId(), key.getVersion().toString(), descriptor.getProperty(IArtifactDescriptor.FORMAT));
++	}
++
+ 	public synchronized String getLocation(IArtifactDescriptor descriptor) {
+ 		// if the artifact has a uuid then use it
+ 		String uuid = descriptor.getProperty(ARTIFACT_UUID);
+ 		if (uuid != null)
+ 			return blobStore.fileFor(bytesFromHexString(uuid));
+ 
++		if (flatButPackedEnabled(descriptor)) {
++			return getLocationForPackedButFlatArtifacts(descriptor);
++		}
++
+ 		// if the artifact is just a reference then return the reference location
+ 		if (descriptor instanceof ArtifactDescriptor) {
+ 			String artifactReference = ((ArtifactDescriptor) descriptor).getRepositoryProperty(ARTIFACT_REFERENCE);
+@@ -471,7 +494,7 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		// if the descriptor is complete then use the mapping rules...
+ 		if (descriptor.getProcessingSteps().length == 0) {
+ 			IArtifactKey key = descriptor.getArtifactKey();
+-			String result = mapper.map(location.toExternalForm(), key.getNamespace(), key.getClassifier(), key.getId(), key.getVersion().toString());
++			String result = mapper.map(location.toExternalForm(), key.getNamespace(), key.getClassifier(), key.getId(), key.getVersion().toString(), descriptor.getProperty(IArtifactDescriptor.FORMAT));
+ 			if (result != null) {
+ 				if (isFolderBased(descriptor) && result.endsWith(JAR_EXTENSION))
+ 					return result.substring(0, result.lastIndexOf(JAR_EXTENSION));
+@@ -562,14 +585,17 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	public synchronized void initializeAfterLoad(URL location) {
+ 		this.location = location;
+ 		blobStore = new BlobStore(getBlobStoreLocation(location), 128);
+-		if (mapper == null)
+-			mapper = new Mapper();
+-		mapper.initialize(Activator.getContext(), mappingRules);
++		initializeMapper();
+ 		for (Iterator i = artifactDescriptors.iterator(); i.hasNext();) {
+ 			((ArtifactDescriptor) i.next()).setRepository(this);
+ 		}
+ 	}
+ 
++	private synchronized void initializeMapper() {
++		mapper = new Mapper();
++		mapper.initialize(Activator.getContext(), mappingRules);
++	}
++
+ 	private boolean isFolderBased(IArtifactDescriptor descriptor) {
+ 		// if the artifact is just a reference then return the reference location
+ 		if (descriptor instanceof ArtifactDescriptor) {
+@@ -695,6 +721,14 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		String oldValue = super.setProperty(key, newValue);
+ 		if (oldValue == newValue || (oldValue != null && oldValue.equals(newValue)))
+ 			return oldValue;
++		if (PUBLISH_PACK_FILES_AS_SIBLINGS.equals(key)) {
++			if (Boolean.TRUE.toString().equals(newValue)) {
++				mappingRules = PACKED_MAPPING_RULES;
++			} else {
++				mappingRules = DEFAULT_MAPPING_RULES;
++			}
++			initializeMapper();
++		}
+ 		save();
+ 		//force repository manager to reload this repository because it caches properties
+ 		IArtifactRepositoryManager manager = (IArtifactRepositoryManager) ServiceHelper.getService(Activator.getContext(), IArtifactRepositoryManager.class.getName());
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/.settings/org.eclipse.jdt.ui.prefs b/bundles/org.eclipse.equinox.p2.metadata.generator/.settings/org.eclipse.jdt.ui.prefs
+index 0d8f9a8..f873868 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/.settings/org.eclipse.jdt.ui.prefs
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/.settings/org.eclipse.jdt.ui.prefs
+@@ -1,4 +1,4 @@
+-#Thu Nov 08 15:49:02 EST 2007
++#Thu Jan 24 12:13:40 EST 2008
+ eclipse.preferences.version=1
+ editor_save_participant_org.eclipse.jdt.ui.postsavelistener.cleanup=true
+ formatter_profile=_core
+@@ -7,7 +7,7 @@ org.eclipse.jdt.ui.ignorelowercasenames=true
+ org.eclipse.jdt.ui.importorder=;
+ org.eclipse.jdt.ui.ondemandthreshold=3
+ org.eclipse.jdt.ui.staticondemandthreshold=3
+-org.eclipse.jdt.ui.text.custom_code_templates=<?xml version\="1.0" encoding\="UTF-8"?><templates/>
++org.eclipse.jdt.ui.text.custom_code_templates=<?xml version\="1.0" encoding\="UTF-8" standalone\="no"?><templates/>
+ sp_cleanup.add_default_serial_version_id=true
+ sp_cleanup.add_generated_serial_version_id=false
+ sp_cleanup.add_missing_annotations=true
+@@ -49,7 +49,7 @@ sp_cleanup.remove_unused_private_fields=true
+ sp_cleanup.remove_unused_private_members=false
+ sp_cleanup.remove_unused_private_methods=true
+ sp_cleanup.remove_unused_private_types=true
+-sp_cleanup.sort_members=true
++sp_cleanup.sort_members=false
+ sp_cleanup.sort_members_all=false
+ sp_cleanup.use_blocks=false
+ sp_cleanup.use_blocks_only_for_return_and_throw=false
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.metadata.generator/META-INF/MANIFEST.MF
+index 0d6e888..a6de19b 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/META-INF/MANIFEST.MF
+@@ -15,6 +15,7 @@ Import-Package: javax.xml.parsers,
+  org.eclipse.equinox.internal.p2.metadata,
+  org.eclipse.equinox.internal.p2.metadata.repository,
+  org.eclipse.equinox.p2.artifact.repository,
++ org.eclipse.equinox.p2.artifact.repository.processing,
+  org.eclipse.equinox.p2.metadata,
+  org.eclipse.equinox.p2.metadata.repository,
+  org.xml.sax
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
+index 28ace3e..8f94a33 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
+@@ -36,10 +36,13 @@ public class EclipseGeneratorApplication implements IApplication {
+ 	// of an eclipse installation; in the future the default artifact mapping declared in
+ 	// SimpleArtifactRepository may change, for example, to not have a 'bundles' directory
+ 	// instead of a 'plugins' directory, so a separate constant is defined and used here.
+-	static final private String[][] INPLACE_MAPPING_RULES = { {"(& (namespace=eclipse) (classifier=feature))", "${repoUrl}/features/${id}_${version}.jar"}, //$NON-NLS-1$//$NON-NLS-2$
++	static final private String[][] INPLACE_MAPPING_RULES = { {"(& (namespace=eclipse) (classifier=plugin) (format=packed)", "${repoUrl}/features/${id}_${version}.pack.gz"}, //$NON-NLS-1$//$NON-NLS-2$
++			{"(& (namespace=eclipse) (classifier=feature))", "${repoUrl}/features/${id}_${version}.jar"}, //$NON-NLS-1$//$NON-NLS-2$
+ 			{"(& (namespace=eclipse) (classifier=plugin))", "${repoUrl}/plugins/${id}_${version}.jar"}, //$NON-NLS-1$//$NON-NLS-2$
+ 			{"(& (namespace=eclipse) (classifier=native))", "${repoUrl}/native/${id}_${version}"}}; //$NON-NLS-1$//$NON-NLS-2$
+ 
++	static final public String PUBLISH_PACK_FILES_AS_SIBLINGS = "publishPackFilesAsSiblings"; //$NON-NLS-1$
++
+ 	private ArtifactRepositoryManager defaultArtifactManager;
+ 	private ServiceRegistration registrationDefaultArtifactManager;
+ 	private MetadataRepositoryManager defaultMetadataManager;
+@@ -97,6 +100,8 @@ public class EclipseGeneratorApplication implements IApplication {
+ 			if (!repository.isModifiable())
+ 				throw new IllegalArgumentException(NLS.bind(Messages.exception_artifactRepoNotWritable, location));
+ 			provider.setArtifactRepository(repository);
++			if (provider.reuseExistingPack200Files())
++				repository.setProperty(PUBLISH_PACK_FILES_AS_SIBLINGS, "true"); //$NON-NLS-1$
+ 			if (!provider.append())
+ 				repository.removeAll();
+ 			return;
+@@ -110,6 +115,8 @@ public class EclipseGeneratorApplication implements IApplication {
+ 		IArtifactRepository result = manager.createRepository(location, repositoryName, IArtifactRepositoryManager.TYPE_SIMPLE_REPOSITORY);
+ 		provider.setArtifactRepository(result);
+ 		result.setProperty(IRepository.PROP_COMPRESSED, compress);
++		if (provider.reuseExistingPack200Files())
++			result.setProperty(PUBLISH_PACK_FILES_AS_SIBLINGS, "true"); //$NON-NLS-1$
+ 	}
+ 
+ 	public void initializeForInplace(EclipseInstallGeneratorInfoProvider provider) {
+@@ -186,6 +193,9 @@ public class EclipseGeneratorApplication implements IApplication {
+ 			if (args[i].equalsIgnoreCase("-compress")) //$NON-NLS-1$
+ 				compress = "true"; //$NON-NLS-1$
+ 
++			if (args[i].equalsIgnoreCase("-reusePack200Files")) //$NON-NLS-1$
++				provider.reuseExistingPack200Files(true);
++
+ 			// check for args with parameters. If we are at the last argument or if the next one
+ 			// has a '-' as the first character, then we can't have an arg with a parm so continue.
+ 			if (i == args.length - 1 || args[i + 1].startsWith("-")) //$NON-NLS-1$
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/EclipseInstallGeneratorInfoProvider.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/EclipseInstallGeneratorInfoProvider.java
+index f5fffe7..487bc5c 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/EclipseInstallGeneratorInfoProvider.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/EclipseInstallGeneratorInfoProvider.java
+@@ -79,6 +79,8 @@ public class EclipseInstallGeneratorInfoProvider implements IGeneratorInfo {
+ 
+ 	private URL siteLocation;
+ 
++	private boolean reuseExistingPack200Files = false;
++
+ 	public EclipseInstallGeneratorInfoProvider() {
+ 		super();
+ 	}
+@@ -350,6 +352,14 @@ public class EclipseInstallGeneratorInfoProvider implements IGeneratorInfo {
+ 		return publishArtifacts;
+ 	}
+ 
++	public boolean reuseExistingPack200Files() {
++		return reuseExistingPack200Files;
++	}
++
++	public void reuseExistingPack200Files(boolean publishPack) {
++		reuseExistingPack200Files = publishPack;
++	}
++
+ 	public void setAddDefaultIUs(boolean value) {
+ 		addDefaultIUs = value;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/Generator.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/Generator.java
+index dc657ae..0e0334c 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/Generator.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/Generator.java
+@@ -192,6 +192,18 @@ public class Generator {
+ 					publishArtifact(ad, new File(bd.getLocation()).listFiles(), destination, false);
+ 				else
+ 					publishArtifact(ad, new File[] {new File(bd.getLocation())}, destination, true);
++				if (info.reuseExistingPack200Files() && !info.publishArtifacts()) {
++					File packFile;
++					if (!isDir) {
++						packFile = new Path(bd.getLocation()).removeFileExtension().addFileExtension("pack.gz").toFile(); //$NON-NLS-1$
++					} else {
++						packFile = new Path(bd.getLocation()).addFileExtension("pack.gz").toFile(); //$NON-NLS-1$
++					}
++					if (packFile.exists()) {
++						IArtifactDescriptor ad200 = MetadataGeneratorHelper.createPack200ArtifactDescriptor(key, packFile, ad.getProperty(IArtifactDescriptor.ARTIFACT_SIZE));
++						publishArtifact(ad200, new File[] {packFile}, destination, true);
++					}
++				}
+ 				IInstallableUnit iu = MetadataGeneratorHelper.createBundleIU(bd, (Map) bd.getUserObject(), isDir, key);
+ 				resultantIUs.add(iu);
+ 			}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/IGeneratorInfo.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/IGeneratorInfo.java
+index 142d5fb..d8a556c 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/IGeneratorInfo.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/IGeneratorInfo.java
+@@ -65,6 +65,10 @@ public interface IGeneratorInfo {
+ 
+ 	public boolean publishArtifacts();
+ 
++	public boolean reuseExistingPack200Files();
++
++	public void reuseExistingPack200Files(boolean publishPack);
++
+ 	public void setArtifactRepository(IArtifactRepository value);
+ 
+ 	public void setFlavor(String value);
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/MetadataGeneratorHelper.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/MetadataGeneratorHelper.java
+index 7927c3a..f5ee54c 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/MetadataGeneratorHelper.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/p2/metadata/generator/MetadataGeneratorHelper.java
+@@ -20,6 +20,7 @@ import org.eclipse.equinox.internal.p2.metadata.generator.Activator;
+ import org.eclipse.equinox.internal.p2.metadata.generator.features.SiteCategory;
+ import org.eclipse.equinox.p2.artifact.repository.ArtifactDescriptor;
+ import org.eclipse.equinox.p2.artifact.repository.IArtifactDescriptor;
++import org.eclipse.equinox.p2.artifact.repository.processing.ProcessingStepDescriptor;
+ import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitDescription;
+ import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitFragmentDescription;
+@@ -74,6 +75,21 @@ public class MetadataGeneratorHelper {
+ 		return result;
+ 	}
+ 
++	public static IArtifactDescriptor createPack200ArtifactDescriptor(IArtifactKey key, File pathOnDisk, String installSize) {
++		final String PACKED_FORMAT = "packed"; //$NON-NLS-1$
++		//TODO this size calculation is bogus
++		ArtifactDescriptor result = new ArtifactDescriptor(key);
++		if (pathOnDisk != null) {
++			result.setProperty(IArtifactDescriptor.ARTIFACT_SIZE, installSize);
++			// TODO - this is wrong but I'm testing a work-around for bug 205842
++			result.setProperty(IArtifactDescriptor.DOWNLOAD_SIZE, Long.toString(pathOnDisk.length()));
++		}
++		ProcessingStepDescriptor[] steps = new ProcessingStepDescriptor[] {new ProcessingStepDescriptor("org.eclipse.equinox.p2.processing.Pack200Unpacker", null, true)}; //$NON-NLS-1$
++		result.setProcessingSteps(steps);
++		result.setProperty(IArtifactDescriptor.FORMAT, PACKED_FORMAT);
++		return result;
++	}
++
+ 	public static IArtifactKey createBundleArtifactKey(String bsn, String version) {
+ 		return new ArtifactKey(ECLIPSE_ARTIFACT_NAMESPACE, ECLIPSE_BUNDLE_CLASSIFIER, bsn, new Version(version));
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/TestGeneratorInfo.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/TestGeneratorInfo.java
+index 57445bf..752f8b1 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/TestGeneratorInfo.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/TestGeneratorInfo.java
+@@ -153,4 +153,12 @@ public class TestGeneratorInfo implements IGeneratorInfo {
+ 		this.launcherConfig = launcherConfig;
+ 	}
+ 
++	public boolean reuseExistingPack200Files() {
++		return false;
++	}
++
++	public void reuseExistingPack200Files(boolean publishPack) {
++		//
++	}
++
+ }

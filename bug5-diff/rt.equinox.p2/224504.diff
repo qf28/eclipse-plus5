@@ -1,0 +1,821 @@
+commit 1f605b137e71c6facd119296b8f183c28c7b070c
+Author: Susan Franklin <sfranklin>
+Date:   Wed Feb 25 23:46:08 2009 +0000
+
+    Bug 224504 - [ui] - clean up weirdness in QueryableMetadataRepositoryManager
+
+3	3	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/DefaultQueryProvider.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+26	51	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableArtifactRepositoryManager.java
+43	192	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableMetadataRepositoryManager.java
+245	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+67	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/RepositoryLocationQuery.java
+0	13	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/ArtifactRepositories.java
+3	14	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/MetadataRepositories.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/DefaultQueryProvider.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/DefaultQueryProvider.java
+index cb03f5d..048e42c 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/DefaultQueryProvider.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/DefaultQueryProvider.java
+@@ -59,8 +59,8 @@ public class DefaultQueryProvider extends QueryProvider {
+ 		}
+ 		switch (queryType) {
+ 			case QueryProvider.ARTIFACT_REPOS :
+-				queryable = new QueryableArtifactRepositoryManager(context.getArtifactRepositoryFlags());
+-				return new ElementQueryDescriptor(queryable, null, new Collector() {
++				queryable = new QueryableArtifactRepositoryManager(policy, false);
++				return new ElementQueryDescriptor(queryable, new RepositoryLocationQuery(), new Collector() {
+ 					public boolean accept(Object object) {
+ 						if (object instanceof URI)
+ 							return super.accept(new ArtifactRepositoryElement(element, (URI) object));
+@@ -168,7 +168,7 @@ public class DefaultQueryProvider extends QueryProvider {
+ 						queryable = new QueryableMetadataRepositoryManager(policy, ((MetadataRepositories) element).getIncludeDisabledRepositories());
+ 						element.setQueryable(queryable);
+ 					}
+-					return new ElementQueryDescriptor(element.getQueryable(), null, new MetadataRepositoryElementCollector(element.getQueryable(), element));
++					return new ElementQueryDescriptor(element.getQueryable(), new RepositoryLocationQuery(), new MetadataRepositoryElementCollector(element.getQueryable(), element));
+ 				}
+ 				return null;
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index 00168f4..2dd8999 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -215,7 +215,7 @@ MetadataRepositoryElement_RepositoryLoadError=Error loading repository {0}
+ QueryableArtifactRepositoryManager_RepositoryQueryProgress=Getting artifact repositories
+ QueryableMetadataRepositoryManager_LoadRepositoryProgress=Contacting {0}
+ QueryableMetadataRepositoryManager_MultipleRepositoriesNotFound=Some repositories could not be found.  Check the details.
+-QueryableMetadataRepositoryManager_RepositoryQueryProgress=Getting repositories
++QueryableMetadataRepositoryManager_RepositoryQueryProgress=Retrieving information from {0}
+ QueryableProfileRegistry_QueryProfileProgress=Getting profiles
+ QueryableUpdates_UpdateListProgress=Assembling list of updates
+ SizeComputingWizardPage_SizeJobTitle=Computing size
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableArtifactRepositoryManager.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableArtifactRepositoryManager.java
+index 6c6e532..f6bd25a 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableArtifactRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableArtifactRepositoryManager.java
+@@ -13,69 +13,44 @@ package org.eclipse.equinox.internal.provisional.p2.ui;
+ 
+ import java.net.URI;
+ import java.util.Arrays;
+-import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIActivator;
+-import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
++import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepositoryManager;
+-import org.eclipse.equinox.internal.provisional.p2.query.*;
+-import org.eclipse.ui.statushandlers.StatusManager;
++import org.eclipse.equinox.internal.provisional.p2.query.Collector;
++import org.eclipse.equinox.internal.provisional.p2.query.Query;
++import org.eclipse.equinox.internal.provisional.p2.ui.policy.Policy;
+ 
+ /**
+- * An object that adds queryable support to an artifact repository 
+- * manager.  It can be constructed to filter the repositories according to repository filter
+- * flags.  When a query is provided, the object being queried is repository URL.
+- * Callers interested in only the resulting repository URL's can specify a null query, 
+- * in which case the collector will be accepting all iterated URL's.
++ * An object that adds provides queryable support 
++ * for an artifact repository manager.  The policy determines which 
++ * repositories are included in the query.  Since artifact repositories
++ * do not support queries, the query will be performed over the repository
++ * locations.
+  */
+-public class QueryableArtifactRepositoryManager implements IQueryable {
++public class QueryableArtifactRepositoryManager extends QueryableRepositoryManager {
+ 
+-	int flags = IRepositoryManager.REPOSITORIES_ALL;
++	public QueryableArtifactRepositoryManager(Policy policy, boolean includeDisabledRepos) {
++		super(policy, includeDisabledRepos);
++	}
+ 
+-	public QueryableArtifactRepositoryManager(int flags) {
+-		this.flags = flags;
++	protected IRepositoryManager getRepositoryManager() {
++		return (IArtifactRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IArtifactRepositoryManager.class.getName());
+ 	}
+ 
+-	/**
+-	 * Iterates over the artifact repositories configured in this queryable.
+-	 * If a query is specified, the query is run on each URI, passing any URIs that satisfy the
+-	 * query to the provided collector.  If no query is specified, all repository URIs iterated are passed
+-	 * to the collector.
+-	 * <p>
+-	 * This method is long-running; progress and cancellation are provided
+-	 * by the given progress monitor. 
+-	 * </p>
+-	 * 
+-	 * @param query The query to perform on the URIs, or <code>null</code> if all URIs should
+-	 * be accepted.
+-	 * @param result Collects the repository URIs
+-	 * @param monitor a progress monitor, or <code>null</code> if progress
+-	 *    reporting is not desired
+-	 * @return The collector argument
+-	 */
+-	public Collector query(Query query, Collector result, IProgressMonitor monitor) {
+-		IArtifactRepositoryManager manager = (IArtifactRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IArtifactRepositoryManager.class.getName());
+-		if (manager == null) {
+-			ProvUI.reportStatus(new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, ProvUIMessages.ProvisioningUtil_NoRepositoryManager), StatusManager.SHOW | StatusManager.LOG);
+-			return result;
++	protected IRepository doLoadRepository(IRepositoryManager manager, URI location, IProgressMonitor monitor) throws ProvisionException {
++		if (manager instanceof IArtifactRepositoryManager) {
++			((IArtifactRepositoryManager) manager).loadRepository(location, monitor);
+ 		}
+-		URI[] repoLocations = manager.getKnownRepositories(flags);
+-		if (monitor == null)
+-			monitor = new NullProgressMonitor();
+-		monitor.beginTask(ProvUIMessages.QueryableArtifactRepositoryManager_RepositoryQueryProgress, repoLocations.length);
+-		// If the query is null, all URI's are passed to the collector.
+-		if (query == null) {
+-			for (int i = 0; i < repoLocations.length; i++) {
+-				if (!result.accept(repoLocations[i]))
+-					break;
+-				monitor.worked(1);
+-			}
+-		} else
+-			// Perform query over all of the URI's.
+-			query.perform(Arrays.asList(repoLocations).iterator(), result);
++		return null;
++	}
+ 
+-		monitor.done();
+-		return result;
++	protected Collector query(URI uri, Query query, Collector collector, IProgressMonitor monitor) {
++		// artifact repositories do not support querying, so we always use the location.
++		query.perform(Arrays.asList(new URI[] {uri}).iterator(), collector);
++		return collector;
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableMetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableMetadataRepositoryManager.java
+index 78411b3..fc68ee4 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableMetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableMetadataRepositoryManager.java
+@@ -11,227 +11,78 @@
+ package org.eclipse.equinox.internal.provisional.p2.ui;
+ 
+ import java.net.URI;
+-import java.util.*;
++import java.util.Arrays;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.metadata.repository.MetadataRepositoryManager;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIActivator;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
+-import org.eclipse.equinox.internal.provisional.p2.query.*;
++import org.eclipse.equinox.internal.provisional.p2.query.Collector;
++import org.eclipse.equinox.internal.provisional.p2.query.Query;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.Policy;
+ import org.eclipse.osgi.util.NLS;
+ import org.eclipse.ui.statushandlers.StatusManager;
+ 
+ /**
+- * An object that adds queryable support to a metadata repository 
+- * manager.  It can be constructed to iterate over a specific array
+- * of repositories named by URI, or filtered according to repository filter
+- * flags.  When a query is provided, the object being queried is the loaded
+- * repository, and collectors should be prepared to accept IInstallableUnits that
+- * meet the query criteria.  Callers interested in only the resulting repository URI 
+- * should specify a null query, in which case the collector will be accepting the URI's.
++ * An object that adds provides specialized/optimized queryable support 
++ * for a metadata repository.  The policy determines which repositories are included in 
++ * the query.  Callers interested in only the resulting repository URIs
++ * should specify a {@link RepositoryLocationQuery}, in which case the 
++ * query is performed over the URI's.  Otherwise the query is performed over
++ * the repositories themselves.
+  */
+-public class QueryableMetadataRepositoryManager implements IQueryable {
+-	/**
+-	 * List<URI> of locations of repositories that were not found
+-	 */
+-	private ArrayList notFound = new ArrayList();
+-
+-	/**
+-	 * Map<URI,IMetadataRepository> of loaded repositories.
+-	 */
+-	private HashMap loaded = new HashMap();
+-
+-	private MultiStatus accumulatedNotFound = null;
+-	private boolean includeDisabledRepos;
+-	private Policy policy;
++public class QueryableMetadataRepositoryManager extends QueryableRepositoryManager {
+ 
+ 	public QueryableMetadataRepositoryManager(Policy policy, boolean includeDisabledRepos) {
+-		this.includeDisabledRepos = includeDisabledRepos;
+-		this.policy = policy;
++		super(policy, includeDisabledRepos);
+ 	}
+ 
+-	/**
+-	 * Iterates over the metadata repositories configured in this queryable.
+-	 * If a query is specified, the query is run on each repository, passing any objects that satisfy the
+-	 * query to the provided collector.  If no query is specified, the repository URLs iterated are passed
+-	 * to the collector.
+-	 * <p>
+-	 * This method is long-running; progress and cancellation are provided
+-	 * by the given progress monitor. 
+-	 * </p>
+-	 * 
+-	 * @param query The query to perform, or <code>null</code> if the repositories
+-	 * should not be loaded and queried.
+-	 * @param result Collects either the repository URLs (when the query is null), or the results 
+-	 *    of the query on each repository
+-	 * @param monitor a progress monitor, or <code>null</code> if progress
+-	 *    reporting is not desired
+-	 * @return The collector argument
+-	 */
+-	public Collector query(Query query, Collector result, IProgressMonitor monitor) {
+-		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IMetadataRepositoryManager.class.getName());
+-		if (manager == null) {
+-			ProvUI.reportStatus(new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, ProvUIMessages.ProvisioningUtil_NoRepositoryManager), StatusManager.SHOW | StatusManager.LOG);
+-			return result;
+-		}
+-		Collection repoLocations = getRepoLocations(manager);
+-		Iterator iterator = repoLocations.iterator();
+-		SubMonitor sub = SubMonitor.convert(monitor, ProvUIMessages.QueryableMetadataRepositoryManager_RepositoryQueryProgress, repoLocations.size() * 2);
+-		if (sub.isCanceled())
+-			return result;
+-		while (iterator.hasNext()) {
+-			URI location = (URI) iterator.next();
+-			if (sub.isCanceled())
+-				return result;
+-			if (query == null) {
+-				if (!result.accept(location))
+-					break;
+-				sub.worked(2);
+-			} else {
+-				try {
+-					Object alreadyLoaded = loaded.get(location);
+-					IMetadataRepository repo;
+-					if (alreadyLoaded == null) {
+-						repo = manager.loadRepository(location, sub.newChild(1));
+-					} else
+-						repo = (IMetadataRepository) alreadyLoaded;
+-					repo.query(query, result, sub.newChild(1));
+-				} catch (ProvisionException e) {
+-					if (e.getStatus().getCode() == ProvisionException.REPOSITORY_NOT_FOUND)
+-						handleNotFound(e, location);
+-					else
+-						ProvUI.handleException(e, NLS.bind(ProvUIMessages.ProvisioningUtil_LoadRepositoryFailure, location), StatusManager.LOG);
+-				} catch (OperationCanceledException e) {
+-					break;
+-				}
+-				reportAccumulatedStatus();
+-			}
++	protected IRepository getRepository(IRepositoryManager manager, URI location) {
++		// note the use of MetadataRepositoryManager (the concrete implementation).
++		if (manager instanceof MetadataRepositoryManager) {
++			return ((MetadataRepositoryManager) manager).getRepository(location);
+ 		}
+-		return result;
++		return super.getRepository(manager, location);
+ 	}
+ 
+-	/**
+-	 * Load all of the repositories referenced by this queryable.  This is an expensive operation.
+-	 * The status of any not found repositories is accumulated and must be reported manually
+-	 * using reportAccumulatedStatus()
+-	 * 
+-	 * @param monitor the progress monitor that should be used
+-	 */
+-	public void loadAll(IProgressMonitor monitor) {
+-		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IMetadataRepositoryManager.class.getName());
+-		if (manager == null) {
+-			ProvUI.reportStatus(new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, ProvUIMessages.ProvisioningUtil_NoRepositoryManager), StatusManager.SHOW | StatusManager.LOG);
+-			return;
+-		}
+-		Collection repoLocations = getRepoLocations(manager);
+-		Iterator iter = repoLocations.iterator();
+-		SubMonitor sub = SubMonitor.convert(monitor, ProvUIMessages.QueryableMetadataRepositoryManager_RepositoryQueryProgress, repoLocations.size());
+-		if (sub.isCanceled())
+-			return;
+-		while (iter.hasNext()) {
+-			if (sub.isCanceled())
+-				return;
+-			URI location = (URI) iter.next();
+-			try {
+-				Object repo = loaded.get(location);
+-				if (repo == null) {
+-					SubMonitor mon = sub.newChild(1);
+-					mon.setTaskName(NLS.bind(ProvUIMessages.QueryableMetadataRepositoryManager_LoadRepositoryProgress, location.toString()));
+-					loaded.put(location, manager.loadRepository(location, mon));
+-				}
+-			} catch (ProvisionException e) {
+-				if (e.getStatus().getCode() == ProvisionException.REPOSITORY_NOT_FOUND)
+-					handleNotFound(e, location);
+-				else
+-					ProvUI.handleException(e, NLS.bind(ProvUIMessages.ProvisioningUtil_LoadRepositoryFailure, location), StatusManager.LOG);
+-			}
+-		}
++	protected IRepositoryManager getRepositoryManager() {
++		return (IMetadataRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IMetadataRepositoryManager.class.getName());
+ 	}
+ 
+-	/**
+-	 * Returns a Collection<URI> of repository locations.
+-	 */
+-	private Collection getRepoLocations(IMetadataRepositoryManager manager) {
+-		Set locations = new HashSet();
+-		int flags = policy.getQueryContext().getMetadataRepositoryFlags();
+-		locations.addAll(Arrays.asList(manager.getKnownRepositories(flags)));
+-		if (includeDisabledRepos) {
+-			locations.addAll(Arrays.asList(manager.getKnownRepositories(IRepositoryManager.REPOSITORIES_DISABLED | flags)));
++	protected IRepository doLoadRepository(IRepositoryManager manager, URI location, IProgressMonitor monitor) throws ProvisionException {
++		if (manager instanceof IMetadataRepositoryManager) {
++			return ((IMetadataRepositoryManager) manager).loadRepository(location, monitor);
+ 		}
+-		return locations;
++		return null;
+ 	}
+ 
+-	private void handleNotFound(ProvisionException e, URI missingRepo) {
+-		// If we thought we had loaded it, get rid of the reference
+-		loaded.remove(missingRepo);
+-		// If we've already reported a URL is not found, don't report again.
+-		if (notFound.contains(missingRepo))
+-			return;
+-		// If someone else reported a URL is not found, don't report again.
+-		if (ProvUI.hasNotFoundStatusBeenReported(missingRepo)) {
+-			notFound.add(missingRepo);
+-			return;
+-		}
+-		notFound.add(missingRepo);
+-		ProvUI.notFoundStatusReported(missingRepo);
+-		// Empty multi statuses have a severity OK.  The platform status handler doesn't handle
+-		// this well.  We correct this by recreating a status with error severity
+-		// so that the platform status handler does the right thing.
+-		IStatus status = e.getStatus();
+-		if (status instanceof MultiStatus && ((MultiStatus) status).getChildren().length == 0)
+-			status = new Status(IStatus.ERROR, status.getPlugin(), status.getCode(), status.getMessage(), status.getException());
+-		if (accumulatedNotFound == null) {
+-			accumulatedNotFound = new MultiStatus(ProvUIActivator.PLUGIN_ID, ProvisionException.REPOSITORY_NOT_FOUND, new IStatus[] {status}, ProvUIMessages.QueryableMetadataRepositoryManager_MultipleRepositoriesNotFound, null);
++	protected Collector query(URI uri, Query query, Collector collector, IProgressMonitor monitor) {
++		SubMonitor sub = SubMonitor.convert(monitor, NLS.bind(ProvUIMessages.QueryableMetadataRepositoryManager_RepositoryQueryProgress, uri.toString()), 200);
++		if (query instanceof RepositoryLocationQuery) {
++			query.perform(Arrays.asList(new URI[] {uri}).iterator(), collector);
++			sub.worked(2);
+ 		} else {
+-			accumulatedNotFound.add(status);
+-		}
+-	}
+-
+-	public void reportAccumulatedStatus() {
+-		// If we've discovered not found repos we didn't know about, report them
+-		if (accumulatedNotFound != null) {
+-			// If there is only missing repo to report, use the specific message rather than the generic.
+-			if (accumulatedNotFound.getChildren().length == 1) {
+-				ProvUI.reportStatus(accumulatedNotFound.getChildren()[0], StatusManager.SHOW);
+-			} else {
+-				ProvUI.reportStatus(accumulatedNotFound, StatusManager.SHOW);
+-			}
+-		}
+-		// Reset the accumulated status so that next time we only report the newly not found repos.
+-		accumulatedNotFound = null;
+-	}
+-
+-	/**
+-	 * Return a boolean indicating whether the repositories to be queried
+-	 * are already loaded.
+-	 * 
+-	 * @return <code>true</code> if all repositories to be queried by the
+-	 * receiver are loaded, <code>false</code> if they
+-	 * are not.
+-	 * 
+-	 * see https://bugs.eclipse.org/bugs/show_bug.cgi?id=229069
+-	 * see https://bugs.eclipse.org/bugs/show_bug.cgi?id=226343
+-	 */
+-	public boolean areRepositoriesLoaded() {
+-		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IMetadataRepositoryManager.class.getName());
+-		if (manager == null || !(manager instanceof MetadataRepositoryManager)) {
+-			return false;
+-		}
+-		MetadataRepositoryManager mgr = (MetadataRepositoryManager) manager;
+-		Iterator repoURIs = getRepoLocations(mgr).iterator();
+-		while (repoURIs.hasNext()) {
+-			Object location = repoURIs.next();
+-			if (location instanceof URI) {
+-				IMetadataRepository repo = mgr.getRepository((URI) location);
+-				if (repo == null)
+-					return false;
++			IRepository repo = null;
++			try {
++				repo = loadRepository(getRepositoryManager(), uri, sub.newChild(100));
++			} catch (ProvisionException e) {
++				if (e.getStatus().getCode() == ProvisionException.REPOSITORY_NOT_FOUND)
++					handleNotFound(e, uri);
++				else
++					ProvUI.handleException(e, NLS.bind(ProvUIMessages.ProvisioningUtil_LoadRepositoryFailure, uri), StatusManager.LOG);
++			} catch (OperationCanceledException e) {
++				// user has canceled
++				repo = null;
+ 			}
++			if (repo instanceof IMetadataRepository)
++				((IMetadataRepository) repo).query(query, collector, sub.newChild(100));
+ 		}
+-		return true;
++		monitor.done();
++		return collector;
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+new file mode 100644
+index 0000000..b0dc105
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+@@ -0,0 +1,245 @@
++/*******************************************************************************
++ * Copyright (c) 2007, 2009 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.provisional.p2.ui;
++
++import java.net.URI;
++import java.util.*;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.ui.ProvUIActivator;
++import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
++import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepositoryManager;
++import org.eclipse.equinox.internal.provisional.p2.query.*;
++import org.eclipse.equinox.internal.provisional.p2.ui.policy.Policy;
++import org.eclipse.osgi.util.NLS;
++import org.eclipse.ui.statushandlers.StatusManager;
++
++/**
++ * An object that provides specialized repository query support in place of
++ * a repository manager and its repositories.  The repositories to be included 
++ * can be specified using the repository flags defined in the UI policy.  The query
++ * itself is run on the the repositories themselves, if supported by the particular
++ * kind of repository.  If the repository doesn't support queryies, or the query is
++ * a {@link RepositoryLocationQuery}, the query is run over
++ * the repository locations instead.  
++ */
++public abstract class QueryableRepositoryManager implements IQueryable {
++	/**
++	 * List<URI> of locations of repositories that were not found
++	 */
++	private ArrayList notFound = new ArrayList();
++
++	/**
++	 * Map<URI,IRepository> of loaded repositories.
++	 */
++	private HashMap loaded = new HashMap();
++
++	private MultiStatus accumulatedNotFound = null;
++	private boolean includeDisabledRepos;
++	private Policy policy;
++
++	public QueryableRepositoryManager(Policy policy, boolean includeDisabledRepos) {
++		this.includeDisabledRepos = includeDisabledRepos;
++		this.policy = policy;
++	}
++
++	/**
++	 * Iterates over the repositories configured in this queryable.
++	 * For most queries, the query is run on each repository, passing any objects that satisfy the
++	 * query to the provided collector.  If the query is a {@link RepositoryLocationQuery}, the query
++	 * is run on the repository locations instead.
++	 * <p>
++	 * This method is long-running; progress and cancellation are provided
++	 * by the given progress monitor. 
++	 * </p>
++	 * 
++	 * @param query The query to perform..
++	 * @param result Collects the results of the query, run on either the repository URIs, or on
++	 *    the repositories themselves.
++	 * @param monitor a progress monitor, or <code>null</code> if progress
++	 *    reporting is not desired
++	 * @return The collector argument
++	 */
++	public Collector query(Query query, Collector result, IProgressMonitor monitor) {
++		IRepositoryManager manager = getRepositoryManager();
++		if (manager == null) {
++			ProvUI.reportStatus(new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, ProvUIMessages.ProvisioningUtil_NoRepositoryManager), StatusManager.SHOW | StatusManager.LOG);
++			return result;
++		}
++		Collection repoLocations = getRepoLocations(manager);
++		Iterator iterator = repoLocations.iterator();
++		SubMonitor sub = SubMonitor.convert(monitor, repoLocations.size() * 100);
++		while (iterator.hasNext()) {
++			if (sub.isCanceled())
++				return result;
++			URI location = (URI) iterator.next();
++			query(location, query, result, sub.newChild(100));
++		}
++		reportAccumulatedStatus();
++		return result;
++	}
++
++	/**
++	 * Load all of the repositories referenced by this queryable.  This is an expensive operation.
++	 * The status of any not found repositories is accumulated and must be reported manually
++	 * using reportAccumulatedStatus()
++	 * 
++	 * @param monitor the progress monitor that should be used
++	 */
++	public void loadAll(IProgressMonitor monitor) {
++		IRepositoryManager manager = getRepositoryManager();
++		if (manager == null) {
++			ProvUI.reportStatus(new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, ProvUIMessages.ProvisioningUtil_NoRepositoryManager), StatusManager.SHOW | StatusManager.LOG);
++			return;
++		}
++		Collection repoLocations = getRepoLocations(manager);
++		Iterator iter = repoLocations.iterator();
++		SubMonitor sub = SubMonitor.convert(monitor, repoLocations.size() * 100);
++		if (sub.isCanceled())
++			return;
++		while (iter.hasNext()) {
++			if (sub.isCanceled())
++				return;
++			URI location = (URI) iter.next();
++			try {
++				loadRepository(manager, location, sub.newChild(100));
++			} catch (ProvisionException e) {
++				if (e.getStatus().getCode() == ProvisionException.REPOSITORY_NOT_FOUND)
++					handleNotFound(e, location);
++				else
++					ProvUI.handleException(e, NLS.bind(ProvUIMessages.ProvisioningUtil_LoadRepositoryFailure, location), StatusManager.LOG);
++			}
++		}
++	}
++
++	/**
++	 * Returns a Collection<URI> of repository locations.
++	 */
++	private Collection getRepoLocations(IRepositoryManager manager) {
++		Set locations = new HashSet();
++		int flags = policy.getQueryContext().getMetadataRepositoryFlags();
++		locations.addAll(Arrays.asList(manager.getKnownRepositories(flags)));
++		if (includeDisabledRepos) {
++			locations.addAll(Arrays.asList(manager.getKnownRepositories(IRepositoryManager.REPOSITORIES_DISABLED | flags)));
++		}
++		return locations;
++	}
++
++	protected void handleNotFound(ProvisionException e, URI missingRepo) {
++		// If we thought we had loaded it, get rid of the reference
++		loaded.remove(missingRepo);
++		// If we've already reported a URL is not found, don't report again.
++		if (notFound.contains(missingRepo))
++			return;
++		// If someone else reported a URL is not found, don't report again.
++		if (ProvUI.hasNotFoundStatusBeenReported(missingRepo)) {
++			notFound.add(missingRepo);
++			return;
++		}
++		notFound.add(missingRepo);
++		ProvUI.notFoundStatusReported(missingRepo);
++		// Empty multi statuses have a severity OK.  The platform status handler doesn't handle
++		// this well.  We correct this by recreating a status with error severity
++		// so that the platform status handler does the right thing.
++		IStatus status = e.getStatus();
++		if (status instanceof MultiStatus && ((MultiStatus) status).getChildren().length == 0)
++			status = new Status(IStatus.ERROR, status.getPlugin(), status.getCode(), status.getMessage(), status.getException());
++		if (accumulatedNotFound == null) {
++			accumulatedNotFound = new MultiStatus(ProvUIActivator.PLUGIN_ID, ProvisionException.REPOSITORY_NOT_FOUND, new IStatus[] {status}, ProvUIMessages.QueryableMetadataRepositoryManager_MultipleRepositoriesNotFound, null);
++		} else {
++			accumulatedNotFound.add(status);
++		}
++	}
++
++	public void reportAccumulatedStatus() {
++		// If we've discovered not found repos we didn't know about, report them
++		if (accumulatedNotFound != null) {
++			// If there is only missing repo to report, use the specific message rather than the generic.
++			if (accumulatedNotFound.getChildren().length == 1) {
++				ProvUI.reportStatus(accumulatedNotFound.getChildren()[0], StatusManager.SHOW);
++			} else {
++				ProvUI.reportStatus(accumulatedNotFound, StatusManager.SHOW);
++			}
++		}
++		// Reset the accumulated status so that next time we only report the newly not found repos.
++		accumulatedNotFound = null;
++	}
++
++	/**
++	 * Return a boolean indicating whether the repositories to be queried
++	 * are already loaded.
++	 * 
++	 * @return <code>true</code> if all repositories to be queried by the
++	 * receiver are loaded, <code>false</code> if they
++	 * are not.
++	 */
++	public boolean areRepositoriesLoaded() {
++		IRepositoryManager mgr = getRepositoryManager();
++		if (mgr == null)
++			return false;
++		Iterator repoURIs = getRepoLocations(mgr).iterator();
++		while (repoURIs.hasNext()) {
++			Object location = repoURIs.next();
++			if (location instanceof URI) {
++				IRepository repo = getRepository(mgr, (URI) location);
++				if (repo == null)
++					return false;
++			}
++		}
++		return true;
++	}
++
++	protected IRepository loadRepository(IRepositoryManager manager, URI location, IProgressMonitor monitor) throws ProvisionException {
++		Object repo = loaded.get(location);
++		if (repo == null) {
++			monitor.setTaskName(NLS.bind(ProvUIMessages.QueryableMetadataRepositoryManager_LoadRepositoryProgress, location.toString()));
++			repo = doLoadRepository(manager, location, monitor);
++			if (repo != null)
++				loaded.put(location, repo);
++		} else {
++			monitor.done();
++		}
++		return (IRepository) repo;
++	}
++
++	/**
++	 * Return the appropriate repository manager, or <code>null</code> if none could be found.
++	 * @return the repository manager
++	 */
++	protected abstract IRepositoryManager getRepositoryManager();
++
++	/**
++	 * Get an already-loaded repository at the specified location.
++	 * 
++	 * @param manager the manager
++	 * @param location the repository location
++	 * @return the repository at that location, or <code>null</code> if no repository is
++	 * yet located at that location.
++	 */
++	protected IRepository getRepository(IRepositoryManager manager, URI location) {
++		return (IRepository) loaded.get(location);
++	}
++
++	/**
++	 * Load the repository located at the specified location.
++	 * 
++	 * @param manager the manager
++	 * @param location the repository location
++	 * @param monitor the progress monitor
++	 * @return the repository that was loaded, or <code>null</code> if no repository could
++	 * be found at that location.
++	 */
++	protected abstract IRepository doLoadRepository(IRepositoryManager manager, URI location, IProgressMonitor monitor) throws ProvisionException;
++
++	protected abstract Collector query(URI uri, Query query, Collector collector, IProgressMonitor monitor);
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/RepositoryLocationQuery.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/RepositoryLocationQuery.java
+new file mode 100644
+index 0000000..154fced
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/RepositoryLocationQuery.java
+@@ -0,0 +1,67 @@
++/*******************************************************************************
++ * Copyright (c) 2009 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ ******************************************************************************/
++
++package org.eclipse.equinox.internal.provisional.p2.ui;
++
++import java.net.URI;
++import java.util.Iterator;
++import org.eclipse.equinox.internal.p2.core.helpers.QueryHelpers;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
++import org.eclipse.equinox.internal.provisional.p2.query.Collector;
++import org.eclipse.equinox.internal.provisional.p2.query.Query;
++
++/**
++ * RepositoryLocationQuery is a query that gathers repository
++ * locations rather than repositories.  It is used when composing
++ * queries against a QueryableRepositoryManager to indicate that the
++ * repository need not be loaded to run the query.  
++ * 
++ * @since 3.5
++ */
++public class RepositoryLocationQuery implements Query {
++
++	/**
++	 * Gets the ID for this Query. 
++	 */
++	public String getId() {
++		return QueryHelpers.getId(this);
++	}
++
++	/**
++	 * Gets a particular property of the query.
++	 * @param property The property to retrieve 
++	 */
++	public Object getProperty(String property) {
++		return QueryHelpers.getProperty(this, property);
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.provisional.p2.query.Query#perform(java.util.Iterator, org.eclipse.equinox.internal.provisional.p2.query.Collector)
++	 */
++	public Collector perform(Iterator iterator, Collector result) {
++		while (iterator.hasNext()) {
++			Object candidate = iterator.next();
++			URI location = getLocation(candidate);
++			if (location != null)
++				if (!result.accept(location))
++					break;
++		}
++		return result;
++	}
++
++	private URI getLocation(Object o) {
++		if (o instanceof URI)
++			return (URI) o;
++		if (o instanceof IRepository)
++			return ((IRepository) o).getLocation();
++		return null;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/ArtifactRepositories.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/ArtifactRepositories.java
+index da28e53..615e3de 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/ArtifactRepositories.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/ArtifactRepositories.java
+@@ -12,7 +12,6 @@ package org.eclipse.equinox.internal.provisional.p2.ui.model;
+ 
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.p2.ui.model.RootElement;
+-import org.eclipse.equinox.internal.provisional.p2.ui.ElementQueryDescriptor;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.Policy;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.QueryProvider;
+ 
+@@ -41,16 +40,4 @@ public class ArtifactRepositories extends RootElement {
+ 	public String getLabel(Object o) {
+ 		return ProvUIMessages.Label_Repositories;
+ 	}
+-
+-	/*
+-	 * (non-Javadoc)
+-	 * Overridden because we know that the queryable artifact repo manager can handle a null query
+-	 * @see org.eclipse.equinox.internal.p2.ui.model.RemoteQueriedElement#isSufficientForQuery(org.eclipse.equinox.internal.provisional.p2.ui.query.ElementQueryDescriptor)
+-	 */
+-	// TODO this is not ideal
+-	// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=224504
+-	protected boolean isSufficientForQuery(ElementQueryDescriptor queryDescriptor) {
+-		return queryDescriptor.collector != null && queryDescriptor.queryable != null;
+-	}
+-
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/MetadataRepositories.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/MetadataRepositories.java
+index 89bc0f6..8ac40ad 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/MetadataRepositories.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/MetadataRepositories.java
+@@ -12,7 +12,6 @@ package org.eclipse.equinox.internal.provisional.p2.ui.model;
+ 
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.p2.ui.model.RootElement;
+-import org.eclipse.equinox.internal.provisional.p2.ui.ElementQueryDescriptor;
+ import org.eclipse.equinox.internal.provisional.p2.ui.QueryableMetadataRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.*;
+ 
+@@ -91,17 +90,6 @@ public class MetadataRepositories extends RootElement {
+ 	}
+ 
+ 	/*
+-	 * (non-Javadoc)
+-	 * Overridden because we know that the queryable metadata repo manager can handle a null query
+-	 * @see org.eclipse.equinox.internal.p2.ui.model.RemoteQueriedElement#isSufficientForQuery(org.eclipse.equinox.internal.provisional.p2.ui.query.ElementQueryDescriptor)
+-	 */
+-	// TODO this is not ideal
+-	// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=224504
+-	protected boolean isSufficientForQuery(ElementQueryDescriptor queryDescriptor) {
+-		return queryDescriptor.collector != null && queryDescriptor.queryable != null;
+-	}
+-
+-	/*
+ 	 * Overridden to check whether the queryable repository manager
+ 	 * has loaded all repositories or not.
+ 	 * This is necessary to prevent background loading of already loaded repositories
+@@ -114,8 +102,9 @@ public class MetadataRepositories extends RootElement {
+ 	 */
+ 	public boolean hasQueryable() {
+ 		// We use the superclass implementation if we don't have a queryable or
+-		// don't recognize it.  Also, if we are merely iterating sites rather
+-		// than loading them to obtain further results, use the superclass
++		// don't recognize it.  Also, if we are merely iterating sites 
++		// (type = METADATA_REPOSITORIES) rather than loading repos
++		// to obtain further results, use the superclass
+ 		if (queryable == null || !(queryable instanceof QueryableMetadataRepositoryManager) || getQueryType() == QueryProvider.METADATA_REPOS)
+ 			return super.hasQueryable();
+ 		return ((QueryableMetadataRepositoryManager) queryable).areRepositoriesLoaded();

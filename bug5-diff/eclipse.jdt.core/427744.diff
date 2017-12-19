@@ -1,0 +1,348 @@
+commit 4cad3f68ebca407bf91db6d03bc970a0ea223e63
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Sun Feb 9 15:15:39 2014 +0530
+
+    Fixed Bug 427744 - [1.8][compiler][regression] Issue with boxing
+    compatibility in poly conditional
+
+21	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/LambdaExpressionsTest.java
+15	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+6	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+5	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+4	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+3	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+4	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+11	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PolyTypeBinding.java
+6	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/LambdaExpressionsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/LambdaExpressionsTest.java
+index 5b6fa7a..9647468 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/LambdaExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/LambdaExpressionsTest.java
+@@ -3192,6 +3192,27 @@ public void test427627() {
+ 			"Test\n0"
+ 			);
+ }
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=427744, [1.8][compiler][regression] Issue with boxing compatibility in poly conditional
++public void test427744() {
++	this.runConformTest(
++			new String[] {
++				"X.java",
++				"public class X {   \n" +
++				"    public static void main(String argv[]) {\n" +
++				"        int i = ((I) (x) -> { return 999; }).foo(true ? 0 : (Comparable) null);\n" +
++				"        System.out.println(i);\n" +
++				"    }\n" +
++				"    interface I {\n" +
++				"        int foo (Comparable arg); \n" +
++				"        default int foo (Object arg) { \n" +
++				"            return 0;\n" +
++				"        }\n" +
++				"    }\n" +
++				"}\n"
++			},
++			"999"
++			);
++}
+ public static Class testClass() {
+ 	return LambdaExpressionsTest.class;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+index 7c29e53..951ea3b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+@@ -761,14 +761,25 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext,
+ 	}
+ 	
+ 	public boolean isCompatibleWith(TypeBinding left, Scope scope) {
+-		return this.valueIfTrue.isCompatibleWith(left, scope) && this.valueIfFalse.isCompatibleWith(left, scope);
++		return isPolyExpression() ? this.valueIfTrue.isCompatibleWith(left, scope) && this.valueIfFalse.isCompatibleWith(left, scope) :
++			super.isCompatibleWith(left, scope);
+ 	}
+ 	
+-	public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t) {
+-		if (super.sIsMoreSpecific(s, t))
++	@Override
++	public boolean isBoxingCompatibleWith(TypeBinding targetType, Scope scope) {
++		// Note: compatibility check may have failed in just one arm and we may have reached here.
++		return isPolyExpression() ? (this.valueIfTrue.isCompatibleWith(targetType, scope) || 
++				                     this.valueIfTrue.isBoxingCompatibleWith(targetType, scope)) && 
++				                    (this.valueIfFalse.isCompatibleWith(targetType, scope) || 
++				                     this.valueIfFalse.isBoxingCompatibleWith(targetType, scope)) :
++			super.isBoxingCompatibleWith(targetType, scope);
++	}	
++	
++	public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t, Scope scope) {
++		if (super.sIsMoreSpecific(s, t, scope))
+ 			return true;
+ 		return isPolyExpression() ?
+-				this.valueIfTrue.sIsMoreSpecific(s, t) && this.valueIfFalse.sIsMoreSpecific(s, t):
++				this.valueIfTrue.sIsMoreSpecific(s, t, scope) && this.valueIfFalse.sIsMoreSpecific(s, t, scope):
+ 				false;
+ 	}
+ 	
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+index d67a17a..f2b8997 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+@@ -1161,8 +1161,12 @@ public boolean isCompatibleWith(TypeBinding left, Scope scope) {
+ 	return this.resolvedType != null && this.resolvedType.isCompatibleWith(left,  scope);
+ }
+ 
+-public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t) {
+-	return s.isCompatibleWith(t);
++public boolean isBoxingCompatibleWith(TypeBinding left, Scope scope) {
++	return isBoxingCompatible(this.resolvedType, left, this, scope);
++}
++
++public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t, Scope scope) {
++	return s.isCompatibleWith(t, scope);
+ }
+ 
+ public void tagAsEllipsisArgument() {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+index 2913770..6cd0032 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+@@ -71,6 +71,11 @@ public abstract class FunctionalExpression extends Expression {
+ 		super();
+ 	}
+ 	
++	// for lambda's and reference expressions boxing compatibility is same as vanilla compatibility.
++	public boolean isBoxingCompatibleWith(TypeBinding targetType, Scope scope) {
++		return isCompatibleWith(targetType, scope);
++	}
++	
+ 	public void setCompilationResult(CompilationResult compilationResult) {
+ 		this.compilationResult = compilationResult;
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 0dd3419..74e6d46 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -853,11 +853,11 @@ public class LambdaExpression extends FunctionalExpression implements ReferenceC
+ 		return copy;
+ 	}
+ 
+-	public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t) {
++	public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t, Scope skope) {
+ 		
+ 		// 15.12.2.5 
+ 		
+-		if (super.sIsMoreSpecific(s, t))
++		if (super.sIsMoreSpecific(s, t, skope))
+ 			return true;
+ 		
+ 		if (argumentsTypeElided() || t.findSuperTypeOriginatingFrom(s) != null)
+@@ -880,7 +880,7 @@ public class LambdaExpression extends FunctionalExpression implements ReferenceC
+ 			return false;
+ 		
+ 		// r1 <: r2
+-		if (r1.isCompatibleWith(r2))
++		if (r1.isCompatibleWith(r2, skope))
+ 			return true;
+ 		
+ 		Expression [] returnExpressions = this.resultExpressions;
+@@ -907,7 +907,7 @@ public class LambdaExpression extends FunctionalExpression implements ReferenceC
+ 		if (r1.isFunctionalInterface(this.enclosingScope) && r2.isFunctionalInterface(this.enclosingScope)) {
+ 			for (i = 0; i < returnExpressionsLength; i++) {
+ 				Expression resultExpression = returnExpressions[i];
+-				if (!resultExpression.sIsMoreSpecific(r1, r2))
++				if (!resultExpression.sIsMoreSpecific(r1, r2, skope))
+ 					break;
+ 			}
+ 			if (i == returnExpressionsLength)
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index 324143a..6cc11ac 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -928,8 +928,8 @@ public boolean isPolyExpression(MethodBinding resolutionCandidate) {
+ 	return false;
+ }
+ 
+-public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t) {
+-	if (super.sIsMoreSpecific(s, t))
++public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t, Scope scope) {
++	if (super.sIsMoreSpecific(s, t, scope))
+ 		return true;
+ 	return isPolyExpression() ? !s.isBaseType() && t.isBaseType() : false;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+index 394b4eb..63507b7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+@@ -769,9 +769,9 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+ 		return isCompatible;
+ 	}
+ 	
+-	public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t) {
++	public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t, Scope scope) {
+ 		
+-		if (super.sIsMoreSpecific(s, t))
++		if (super.sIsMoreSpecific(s, t, scope))
+ 			return true;
+ 		
+ 		if (this.exactMethodBinding == null || t.findSuperTypeOriginatingFrom(s) != null)
+@@ -795,7 +795,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+ 			return false;
+ 		
+ 		// r1 <: r2
+-		if (r1.isCompatibleWith(r2))
++		if (r1.isCompatibleWith(r2, scope))
+ 			return true;
+ 		
+ 		return r1.isBaseType() != r2.isBaseType() && r1.isBaseType() == this.exactMethodBinding.returnType.isBaseType();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index 9efa94e..f495529 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -636,7 +636,7 @@ public class InferenceContext18 {
+ 	// null:  need the otherwise branch
+ 	private Boolean moreSpecificMain(TypeBinding si, TypeBinding ti, Expression expri) throws InferenceFailureException {
+ 		if (si.isProperType(true) && ti.isProperType(true)) {
+-			return expri.sIsMoreSpecific(si, ti) ? Boolean.TRUE : Boolean.FALSE;
++			return expri.sIsMoreSpecific(si, ti, this.scope) ? Boolean.TRUE : Boolean.FALSE;
+ 		}
+ 		if (si.isFunctionalInterface(this.scope)) {
+ 			TypeBinding funcI = ti.original();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+index 2c8f8d9..7a08293 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -432,6 +432,9 @@ public TypeBinding computeBoxingType(TypeBinding type) {
+ 				case TypeIds.T_JavaLangLong :
+ 					return TypeBinding.LONG;
+ 			}
++			break;
++		case Binding.POLY_TYPE:
++			return ((PolyTypeBinding) type).computeBoxingType();
+ 	}
+ 	return type;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PolyTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PolyTypeBinding.java
+index 5b81510..80086b2 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PolyTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PolyTypeBinding.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2013 IBM Corporation and others.
++ * Copyright (c) 2013, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -20,6 +20,7 @@ import org.eclipse.jdt.internal.compiler.ast.Expression;
+ public class PolyTypeBinding extends TypeBinding {
+ 
+ 	Expression expression;
++	boolean vanillaCompatibilty = true;
+ 	
+ 	public PolyTypeBinding(Expression expression) {
+ 		this.expression = expression;
+@@ -34,7 +35,7 @@ public class PolyTypeBinding extends TypeBinding {
+ 	}
+ 
+ 	public boolean isCompatibleWith(TypeBinding left, Scope scope) {
+-		return this.expression.isCompatibleWith(left, scope);
++		return this.vanillaCompatibilty ? this.expression.isCompatibleWith(left, scope) : this.expression.isBoxingCompatibleWith(left, scope);
+ 	}
+ 
+ 	public char[] qualifiedSourceName() {
+@@ -49,8 +50,8 @@ public class PolyTypeBinding extends TypeBinding {
+ 		return this.expression.printExpression(0,  new StringBuffer()).toString().toCharArray();
+ 	}
+ 	
+-	public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t) {
+-		return this.expression.sIsMoreSpecific(s, t);
++	public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t, Scope scope) {
++		return this.expression.sIsMoreSpecific(s, t, scope);
+ 	}
+ 	
+ 	public String toString() {
+@@ -61,4 +62,10 @@ public class PolyTypeBinding extends TypeBinding {
+ 	public int kind() {
+ 		return Binding.POLY_TYPE;
+ 	}
++
++	public TypeBinding computeBoxingType() {
++		PolyTypeBinding type = new PolyTypeBinding(this.expression);
++		type.vanillaCompatibilty = !this.vanillaCompatibilty;
++		return type;
++	}
+ }
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index 59236c3..505e295 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -627,7 +627,7 @@ public abstract class Scope {
+ 	 * Boxing primitive
+ 	 */
+ 	public TypeBinding boxing(TypeBinding type) {
+-		if (type.isBaseType())
++		if (type.isBaseType() || type.kind() == Binding.POLY_TYPE)
+ 			return environment().computeBoxingType(type);
+ 		return type;
+ 	}
+@@ -3568,7 +3568,7 @@ public abstract class Scope {
+ 
+ 		// check if autoboxed type is compatible
+ 		TypeBinding convertedType = environment.computeBoxingType(expressionType);
+-		return TypeBinding.equalsEquals(convertedType, targetType) || convertedType.isCompatibleWith(targetType);
++		return TypeBinding.equalsEquals(convertedType, targetType) || convertedType.isCompatibleWith(targetType, this);
+ 	}
+ 
+ 	/* Answer true if the scope is nested inside a given field declaration.
+@@ -4406,7 +4406,7 @@ public abstract class Scope {
+ 							TypeBinding t = InferenceContext18.getParameter(mbkParameters, i, levelk == VARARGS_COMPATIBLE); 
+ 							if (TypeBinding.equalsEquals(s, t))
+ 								continue;
+-							if (!argumentType.sIsMoreSpecific(s,t)) {
++							if (!argumentType.sIsMoreSpecific(s,t, this)) {
+ 								continue nextJ;
+ 							}
+ 						}
+@@ -4768,7 +4768,7 @@ public abstract class Scope {
+ 		if (arg.isCompatibleWith(param, this))
+ 			return COMPATIBLE;
+ 		
+-		if (arg.isBaseType() != param.isBaseType()) {
++		if (arg.kind() == Binding.POLY_TYPE || (arg.isBaseType() != param.isBaseType())) {
+ 			TypeBinding convertedType = environment().computeBoxingType(arg);
+ 			if (TypeBinding.equalsEquals(convertedType, param) || convertedType.isCompatibleWith(param, this))
+ 				return AUTOBOX_COMPATIBLE;
+@@ -4791,9 +4791,9 @@ public abstract class Scope {
+ 			*/
+ 			return NOT_COMPATIBLE;
+ 		}
+-		if (arg.isBaseType() != param.isBaseType()) {
++		if (arg.kind() == Binding.POLY_TYPE || (arg.isBaseType() != param.isBaseType())) {
+ 			TypeBinding convertedType = env.computeBoxingType(arg);
+-			if (TypeBinding.equalsEquals(convertedType, param) || convertedType.isCompatibleWith(param))
++			if (TypeBinding.equalsEquals(convertedType, param) || convertedType.isCompatibleWith(param, this))
+ 				return AUTOBOX_COMPATIBLE;
+ 		}
+ 		return NOT_COMPATIBLE;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
+index 1f337e0..4d3c016 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
+@@ -1527,8 +1527,8 @@ public boolean hasTypeBit(int bit) {
+ 	return false;
+ }
+ 
+-public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t) {
+-	return s.isCompatibleWith(t) && !s.needsUncheckedConversion(t);
++public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t, Scope scope) {
++	return s.isCompatibleWith(t, scope) && !s.needsUncheckedConversion(t);
+ }
+ 
+ public MethodBinding[] getMethods(char[] selector) {

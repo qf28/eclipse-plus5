@@ -1,0 +1,283 @@
+commit 31f5d8c3352dfd40743cbafcdc19d9f5e7640d54
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Sat Nov 30 19:13:38 2013 +0530
+
+    Fixed Bug 405134 - [1.8][code assist + compiler] compiler and code
+    assist problem in multilevel lambda with curly bracketed body
+
+36	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ClassFile.java
+14	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
+4	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredField.java
+6	7	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredLambdaExpression.java
+5	4	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
+5	4	org.eclipse.jdt.core/formatter/org/eclipse/jdt/internal/formatter/CodeFormatterVisitor.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+index 77d7911..2aca244 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+@@ -7610,7 +7610,42 @@ public void test422801a() {
+ 			"----------\n"
+ 		);
+ }
+-
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=405134, [1.8][code assist + compiler] compiler and code assist problem in multilevel lambda with curly bracketed body
++public void test405134a() {
++	this.runNegativeTest(
++			new String[] {
++					"X.java", 
++					"interface Foo { \n" +
++					"	int run1(int s1, int s2);\n" +
++					"	static int x2 = 0;\n" +
++					"}\n" +
++					"interface Foo1 {\n" +
++					"	Foo run2(int argFoo1);\n" +
++					"}\n" +
++					"interface X extends Foo{\n" +
++					"    static int x1 = 2;\n" +
++					"    static Foo f = (x5, x6) -> x5;\n" +
++					"    static Foo1 f1 = af1 -> (a1,b1) -> {int uniqueName = 4; return uniqueName};\n" + // missing semicolon triggers an NPE
++					"}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 11)\n" + 
++			"	static Foo1 f1 = af1 -> (a1,b1) -> {int uniqueName = 4; return uniqueName};\n" + 
++			"	                                                                         ^\n" + 
++			"Syntax error on token \"}\", delete this token\n" + 
++			"----------\n" + 
++			"2. ERROR in X.java (at line 12)\n" + 
++			"	}\n" + 
++			"	^\n" + 
++			"Syntax error, insert \";\" to complete FieldDeclaration\n" + 
++			"----------\n" + 
++			"3. ERROR in X.java (at line 12)\n" + 
++			"	}\n" + 
++			"	^\n" + 
++			"Syntax error, insert \"}\" to complete InterfaceBody\n" + 
++			"----------\n",
++			true);
++}
+ 
+ public static Class testClass() {
+ 	return NegativeLambdaExpressionsTest.class;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ClassFile.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ClassFile.java
+index f8a8d8a..da6add0 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ClassFile.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ClassFile.java
+@@ -3214,7 +3214,7 @@ public class ClassFile implements TypeConstants, TypeIds {
+ 				LambdaExpression lambda = methodBinding.sourceLambda();
+ 				if (lambda != null) {
+ 					if ((methodBinding.tagBits & TagBits.HasParameterAnnotations) != 0) {
+-						Argument[] arguments = lambda.arguments;
++						Argument[] arguments = lambda.arguments();
+ 						if (arguments != null) {
+ 							int parameterCount = methodBinding.parameters.length;
+ 							int argumentCount = arguments.length;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 3a15bc3..010aacd 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -65,10 +65,10 @@ import org.eclipse.jdt.internal.compiler.problem.AbortType;
+ import org.eclipse.jdt.internal.compiler.problem.ProblemSeverities;
+ 
+ public class LambdaExpression extends FunctionalExpression implements ReferenceContext, ProblemSeverities {
+-	public Argument [] arguments;
++	private Argument [] arguments;
+ 	private TypeBinding [] argumentTypes;
+ 	private int arrowPosition;
+-	public Statement body;
++	private Statement body;
+ 	public boolean hasParentheses;
+ 	public MethodScope scope;
+ 	private boolean voidCompatible = true;
+@@ -86,7 +86,9 @@ public class LambdaExpression extends FunctionalExpression implements ReferenceC
+ 	
+ 	public LambdaExpression(CompilationResult compilationResult, boolean shouldUnelideTypes) {
+ 		super(compilationResult);
+-		this.shouldUnelideTypes = shouldUnelideTypes; 
++		this.shouldUnelideTypes = shouldUnelideTypes;
++		setArguments(NO_ARGUMENTS);
++		setBody(new Block(0));
+ 	}
+ 	
+ 	public void setArguments(Argument [] arguments) {
+@@ -94,8 +96,16 @@ public class LambdaExpression extends FunctionalExpression implements ReferenceC
+ 		this.argumentTypes = new TypeBinding[arguments != null ? arguments.length : 0];
+ 	}
+ 	
++	public Argument [] arguments() {
++		return this.arguments;
++	}
++
+ 	public void setBody(Statement body) {
+-		this.body = body;
++		this.body = body == null ? new Block(0) : body;
++	}
++	
++	public Statement body() {
++		return this.body;
+ 	}
+ 
+ 	public void setArrowPosition(int arrowPosition) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
+index 042ce35..ff14431 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
+@@ -6409,12 +6409,12 @@ public void reset(LambdaExpression lambda, ClassFile targetClassFile) {
+ 	if (lineSeparatorPositions2 != null) {
+ 		int length = lineSeparatorPositions2.length;
+ 		int lineSeparatorPositionsEnd = length - 1;
+-		int start = Util.getLineNumber(lambda.body.sourceStart, lineSeparatorPositions2, 0, lineSeparatorPositionsEnd);
++		int start = Util.getLineNumber(lambda.body().sourceStart, lineSeparatorPositions2, 0, lineSeparatorPositionsEnd);
+ 		this.lineNumberStart = start;
+ 		if (start > lineSeparatorPositionsEnd) {
+ 			this.lineNumberEnd = start;
+ 		} else {
+-			int end = Util.getLineNumber(lambda.body.sourceEnd, lineSeparatorPositions2, start - 1, lineSeparatorPositionsEnd);
++			int end = Util.getLineNumber(lambda.body().sourceEnd, lineSeparatorPositions2, start - 1, lineSeparatorPositionsEnd);
+ 			if (end >= lineSeparatorPositionsEnd) {
+ 				end = length;
+ 			}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredField.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredField.java
+index ffc0d1c..6e724a2 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredField.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredField.java
+@@ -36,7 +36,7 @@ public class RecoveredField extends RecoveredElement {
+ 	public RecoveredAnnotation[] annotations;
+ 	public int annotationCount;
+ 
+-	public RecoveredLambdaExpression initializer;
++	public RecoveredLambdaExpression initializerLambda;
+ 	
+ 	public int modifiers;
+ 	public int modifiersStart;
+@@ -104,7 +104,7 @@ public RecoveredElement add(LambdaExpression expression, int bracketBalanceValue
+ 		this.fieldDeclaration.initialization = expression;
+ 		this.fieldDeclaration.declarationSourceEnd = expression.sourceEnd;
+ 		this.fieldDeclaration.declarationEnd = expression.sourceEnd;
+-		return this.initializer = new RecoveredLambdaExpression(expression, this, bracketBalanceValue);
++		return this.initializerLambda = new RecoveredLambdaExpression(expression, this, bracketBalanceValue);
+ 	}
+ }
+ /*
+@@ -269,8 +269,8 @@ public FieldDeclaration updatedFieldDeclaration(int depth, Set knownTypes){
+ 			}
+ 		}
+ 	}
+-	if (this.initializer != null)
+-		this.initializer.updateParseTree();
++	if (this.initializerLambda != null)
++		this.initializerLambda.updateParseTree();
+ 	
+ 	return this.fieldDeclaration;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredLambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredLambdaExpression.java
+index a838f39..5e956e0 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredLambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredLambdaExpression.java
+@@ -33,7 +33,7 @@ public class RecoveredLambdaExpression extends RecoveredBlock {
+ 	public RecoveredLambdaExpression(LambdaExpression expression, RecoveredElement parent, int bracketBalance){
+ 		super(new Block(0), parent, bracketBalance); // don't have a block yet. May never have, in that event will course correct.
+ 		this.expression = expression;
+-		this.expression.body = this.blockDeclaration;
++		this.expression.setBody(this.blockDeclaration);
+ 	}
+ 	
+ 	/*
+@@ -43,8 +43,7 @@ public class RecoveredLambdaExpression extends RecoveredBlock {
+ 		if (!this.haveBlockBody && !this.haveExpressionBody) {
+ 			this.haveBlockBody = true;
+ 			this.haveExpressionBody = false;
+-			this.blockDeclaration.sourceStart = block.sourceStart;
+-			this.blockDeclaration.sourceEnd = block.sourceEnd;
++			this.blockDeclaration = block;
+ 			return this; 
+ 		}
+ 		return super.add(block, bracketBalanceValue);
+@@ -58,7 +57,7 @@ public class RecoveredLambdaExpression extends RecoveredBlock {
+ 			this.haveBlockBody = false;
+ 			this.haveExpressionBody = true;
+ 			this.bodyExpression = new RecoveredLambdaExpression(lambda, this, bracketBalanceValue);
+-			this.expression.body = lambda;
++			this.expression.setBody(lambda);
+ 			return this.bodyExpression;
+ 		}
+ 		return super.add(lambda, bracketBalanceValue);
+@@ -79,7 +78,7 @@ public class RecoveredLambdaExpression extends RecoveredBlock {
+ 			this.haveBlockBody = false;
+ 			this.haveExpressionBody = true;
+ 			this.bodyExpression = new RecoveredStatement(stmt, this, bracketBalanceValue);
+-			this.expression.body = stmt;
++			this.expression.setBody(stmt);
+ 			return this.bodyExpression;
+ 		}
+ 		return super.add(stmt, bracketBalanceValue, delegatedByParent);
+@@ -94,9 +93,9 @@ public class RecoveredLambdaExpression extends RecoveredBlock {
+ 
+ 	public LambdaExpression updatedLambdaExpression(int depth, Set knownTypes) {
+ 		if (this.haveBlockBody)
+-			this.expression.body = super.updatedStatement(depth, knownTypes);
++			this.expression.setBody(super.updatedStatement(depth, knownTypes));
+ 		else if (this.bodyExpression != null)
+-			this.expression.body = this.bodyExpression.updatedStatement(depth, knownTypes);
++			this.expression.setBody(this.bodyExpression.updatedStatement(depth, knownTypes));
+ 		return this.expression;
+ 	}
+ 	/*
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
+index c117db5..846eabf 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
+@@ -2216,7 +2216,7 @@ class ASTConverter {
+ 		if (this.resolveBindings) {
+ 			recordNodes(lambdaExpression, lambda);
+ 		}
+-		org.eclipse.jdt.internal.compiler.ast.Argument[] arguments = lambda.arguments;
++		org.eclipse.jdt.internal.compiler.ast.Argument[] arguments = lambda.arguments();
+ 		if (arguments != null) {
+ 			int argumentsLength = arguments.length;
+ 			for (int i = 0; i < argumentsLength; i++) {
+@@ -2241,10 +2241,11 @@ class ASTConverter {
+ 				}
+ 			}
+ 		}
+-		if (lambda.body instanceof org.eclipse.jdt.internal.compiler.ast.Expression) {
+-			lambdaExpression.setBody(convert((org.eclipse.jdt.internal.compiler.ast.Expression) lambda.body));
++		final org.eclipse.jdt.internal.compiler.ast.Statement body = lambda.body();
++		if (body instanceof org.eclipse.jdt.internal.compiler.ast.Expression) {
++			lambdaExpression.setBody(convert((org.eclipse.jdt.internal.compiler.ast.Expression) body));
+ 		} else {
+-			lambdaExpression.setBody(convert((org.eclipse.jdt.internal.compiler.ast.Block) lambda.body));
++			lambdaExpression.setBody(convert((org.eclipse.jdt.internal.compiler.ast.Block) body));
+ 		}
+ 		int sourceStart = lambda.sourceStart;
+ 		lambdaExpression.setSourceRange(sourceStart, lambda.sourceEnd - sourceStart + 1);
+diff --git a/org.eclipse.jdt.core/formatter/org/eclipse/jdt/internal/formatter/CodeFormatterVisitor.java b/org.eclipse.jdt.core/formatter/org/eclipse/jdt/internal/formatter/CodeFormatterVisitor.java
+index 1c663bf..957e5e0 100644
+--- a/org.eclipse.jdt.core/formatter/org/eclipse/jdt/internal/formatter/CodeFormatterVisitor.java
++++ b/org.eclipse.jdt.core/formatter/org/eclipse/jdt/internal/formatter/CodeFormatterVisitor.java
+@@ -4372,7 +4372,7 @@ public class CodeFormatterVisitor extends ASTVisitor {
+ 			// Format arguments
+ 			formatMethodArguments(
+ 				null,
+-				lambdaExpression.arguments,
++				lambdaExpression.arguments(),
+ 				lambdaExpression.getScope(),
+ 				this.preferences.insert_space_before_opening_paren_in_method_declaration,
+ 				this.preferences.insert_space_between_empty_parens_in_method_declaration,
+@@ -4388,10 +4388,11 @@ public class CodeFormatterVisitor extends ASTVisitor {
+ 		if (this.preferences.insert_space_before_lambda_arrow) this.scribe.space();
+ 		this.scribe.printNextToken(TerminalTokens.TokenNameARROW);
+ 		if (this.preferences.insert_space_after_lambda_arrow) this.scribe.space();
+-		if (lambdaExpression.body instanceof Block) {
+-			formatBlock((Block) lambdaExpression.body, scope, this.preferences.brace_position_for_lambda_body, this.preferences.insert_space_before_opening_brace_in_block);
++		final Statement body = lambdaExpression.body();
++		if (body instanceof Block) {
++			formatBlock((Block) body, scope, this.preferences.brace_position_for_lambda_body, this.preferences.insert_space_before_opening_brace_in_block);
+ 		} else {
+-			lambdaExpression.body.traverse(this, scope);
++			body.traverse(this, scope);
+ 		}
+ 
+ 		if (numberOfParens > 0) {

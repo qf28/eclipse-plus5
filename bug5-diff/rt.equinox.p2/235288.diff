@@ -1,0 +1,267 @@
+commit 2d48fac5e541a658828f9f8f5cb12b67c986a5ff
+Author: Susan Franklin <sfranklin>
+Date:   Wed Mar 25 22:27:38 2009 +0000
+
+    Bug 235288 - [ui] Available software dialog should preserve expansion state of tree when user changes view or filtering
+
+6	3	bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/query/QueryableMetadataRepositoryManagerTest.java
+25	4	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DelayedFilterCheckboxTree.java
+35	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/CategoryElement.java
+11	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/MetadataRepositoryElement.java
+6	3	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+1	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AvailableIUGroup.java
+diff --git a/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/query/QueryableMetadataRepositoryManagerTest.java b/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/query/QueryableMetadataRepositoryManagerTest.java
+index f66cae1..5136a6c 100644
+--- a/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/query/QueryableMetadataRepositoryManagerTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/query/QueryableMetadataRepositoryManagerTest.java
+@@ -135,12 +135,15 @@ public class QueryableMetadataRepositoryManagerTest extends AbstractQueryTest {
+ 		metadataRepositoryManager.addRepository(existing);
+ 		metadataRepositoryManager.addRepository(nonExisting);
+ 		QueryableMetadataRepositoryManager manager = getQueryableManager();
+-		assertTrue("1.0", !manager.areRepositoriesLoaded());
++		// not loaded yet
++		assertFalse("1.0", manager.areRepositoriesLoaded());
+ 
+ 		manager.loadAll(getMonitor());
+ 
+-		//false because the non-existent repository is not loaded
+-		assertTrue("1.1", !manager.areRepositoriesLoaded());
++		// the repositories have been loaded.  Because the non-existent 
++		// repository has been noticed and recorded as missing, it
++		// does not count "not loaded."
++		assertTrue("1.1", manager.areRepositoriesLoaded());
+ 	}
+ 
+ 	public void testQuery() {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DelayedFilterCheckboxTree.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DelayedFilterCheckboxTree.java
+index 50e5145..42e3c0d 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DelayedFilterCheckboxTree.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DelayedFilterCheckboxTree.java
+@@ -1,7 +1,6 @@
+ package org.eclipse.equinox.internal.p2.ui.dialogs;
+ 
+-import java.util.ArrayList;
+-import java.util.Iterator;
++import java.util.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.core.runtime.jobs.*;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+@@ -22,7 +21,8 @@ import org.eclipse.ui.progress.WorkbenchJob;
+  * FilteredTree extension that creates a ContainerCheckedTreeViewer, manages the
+  * check state across filtering (working around bugs in ContainerCheckedTreeViewer),
+  * and preloads all metadata repositories before allowing filtering, in order to 
+- * coordinate background fetch and filtering.
++ * coordinate background fetch and filtering.  It also manages a cache of expanded
++ * elements that can survive a change of input.
+  * 
+  * @since 3.4
+  *
+@@ -42,6 +42,7 @@ public class DelayedFilterCheckboxTree extends FilteredTree {
+ 	boolean ignoreFiltering = true;
+ 	Object viewerInput;
+ 	ArrayList checkState = new ArrayList();
++	Set expanded = new HashSet();
+ 	ContainerCheckedTreeViewer checkboxViewer;
+ 
+ 	public DelayedFilterCheckboxTree(Composite parent, int treeStyle, PatternFilter filter) {
+@@ -103,12 +104,15 @@ public class DelayedFilterCheckboxTree extends FilteredTree {
+ 				// Cancel any filtering
+ 				cancelAndResetFilterJob();
+ 				contentProvider.setSynchronous(false);
++				// Remember any previous expansions
++				rememberExpansions();
+ 				// If there are remembered check states, try to restore them.
+ 				// Must be done in an async because we are in the middle of a buggy
+ 				// selection preserving viewer refresh.
+ 				display.asyncExec(new Runnable() {
+ 					public void run() {
+ 						restoreLeafCheckState();
++						restoreExpansions();
+ 					}
+ 				});
+ 			}
+@@ -177,7 +181,12 @@ public class DelayedFilterCheckboxTree extends FilteredTree {
+ 				if (event.getResult().isOK()) {
+ 					display.asyncExec(new Runnable() {
+ 						public void run() {
++							// remember things expanded by the filter
++							rememberExpansions();
+ 							restoreLeafCheckState();
++							// now restore expansions because we may have
++							// had others
++							restoreExpansions();
+ 						}
+ 					});
+ 				}
+@@ -244,7 +253,7 @@ public class DelayedFilterCheckboxTree extends FilteredTree {
+ 		if (checkState == null)
+ 			checkState = new ArrayList(checked.length);
+ 		for (int i = 0; i < checked.length; i++)
+-			if (!v.getGrayed(checked[i]))
++			if (!v.getGrayed(checked[i]) && contentProvider.getChildren(checked[i]).length == 0)
+ 				if (!checkState.contains(checked[i]))
+ 					checkState.add(checked[i]);
+ 	}
+@@ -272,6 +281,18 @@ public class DelayedFilterCheckboxTree extends FilteredTree {
+ 			checkboxViewer.fireCheckStateChanged(element, true);
+ 	}
+ 
++	void rememberExpansions() {
++		// The expansions are additive, but we are using a set to keep out
++		// duplicates.  In practice, this means expanded items from different
++		// inputs will remain expanded, such as categories with the same name
++		// in different repos.
++		expanded.addAll(Arrays.asList(getViewer().getExpandedElements()));
++	}
++
++	void restoreExpansions() {
++		getViewer().setExpandedElements(expanded.toArray());
++	}
++
+ 	public ContainerCheckedTreeViewer getCheckboxTreeViewer() {
+ 		return checkboxViewer;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/CategoryElement.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/CategoryElement.java
+index 3955faa..4ad1aa9 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/CategoryElement.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/CategoryElement.java
+@@ -127,4 +127,39 @@ public class CategoryElement extends RemoteQueriedElement implements IIUElement
+ 		return true;
+ 	}
+ 
++	public boolean equals(Object obj) {
++		if (this == obj)
++			return true;
++		if (obj == null)
++			return false;
++		if (!(obj instanceof CategoryElement))
++			return false;
++		IInstallableUnit myIU = getIU();
++		IInstallableUnit objIU = ((CategoryElement) obj).getIU();
++		if (myIU == null || objIU == null)
++			return false;
++		return getMergeKey(myIU).equals(getMergeKey(objIU));
++	}
++
++	public int hashCode() {
++		IInstallableUnit iu = getIU();
++		final int prime = 23;
++		int result = 1;
++		result = prime * result + ((iu == null) ? 0 : getMergeKey(iu).hashCode());
++		return result;
++	}
++
++	public String toString() {
++		IInstallableUnit iu = getIU();
++		if (iu == null)
++			return "NULL"; //$NON-NLS-1$
++		StringBuffer result = new StringBuffer();
++		result.append("Category Element - "); //$NON-NLS-1$
++		result.append(getMergeKey(iu));
++		result.append(" (merging IUs: "); //$NON-NLS-1$
++		result.append(ius.toString());
++		result.append(")"); //$NON-NLS-1$
++		return result.toString();
++	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/MetadataRepositoryElement.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/MetadataRepositoryElement.java
+index 9dddf1d..467b2c0 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/MetadataRepositoryElement.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/MetadataRepositoryElement.java
+@@ -228,4 +228,15 @@ public class MetadataRepositoryElement extends RootElement implements IRepositor
+ 			return ((QueriedElement) parent).getPolicy();
+ 		return Policy.getDefault();
+ 	}
++
++	public String toString() {
++		StringBuffer result = new StringBuffer();
++		result.append("Metadata Repository Element - "); //$NON-NLS-1$
++		result.append(URIUtil.toUnencodedString(location));
++		if (hasQueryable())
++			result.append(" (loaded)"); //$NON-NLS-1$
++		else
++			result.append(" (not loaded)"); //$NON-NLS-1$
++		return result.toString();
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+index 2162597..18b8208 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/QueryableRepositoryManager.java
+@@ -168,8 +168,10 @@ public abstract class QueryableRepositoryManager implements IQueryable {
+ 	}
+ 
+ 	/**
+-	 * Return a boolean indicating whether the repositories to be queried
+-	 * are already loaded.
++	 * Return a boolean indicating whether all the repositories that
++	 * can be queried by the receiver are already loaded.  If a repository
++	 * is not loaded because it was not found, this will not return false,
++	 * because this repository cannot be queried.
+ 	 * 
+ 	 * @return <code>true</code> if all repositories to be queried by the
+ 	 * receiver are loaded, <code>false</code> if they
+@@ -182,7 +184,8 @@ public abstract class QueryableRepositoryManager implements IQueryable {
+ 		URI[] repoURIs = getRepoLocations(mgr);
+ 		for (int i = 0; i < repoURIs.length; i++) {
+ 			IRepository repo = getRepository(mgr, repoURIs[i]);
+-			if (repo == null)
++			// A not-loaded repo doesn't count if it's considered missing (not found)
++			if (repo == null && !ProvUI.hasNotFoundStatusBeenReported(repoURIs[i]))
+ 				return false;
+ 		}
+ 		return true;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AvailableIUGroup.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AvailableIUGroup.java
+index 1396d55..d4d9bcc 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AvailableIUGroup.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/AvailableIUGroup.java
+@@ -467,6 +467,7 @@ public class AvailableIUGroup extends StructuredIUGroup {
+ 				break;
+ 			default :
+ 				repositoryFilter = repoLocation;
++				break;
+ 		}
+ 		updateAvailableViewState();
+ 		filteredTree.clearCheckStateCache();
+commit 3999dcb4965d47a6eae9c4f5c4be4a433fb2aa58
+Author: Susan Franklin <sfranklin>
+Date:   Wed Mar 25 22:39:24 2009 +0000
+
+    Bug 235288 - [ui] Available software dialog should preserve expansion state of tree when user changes view or filtering
+
+6	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DelayedFilterCheckboxTree.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DelayedFilterCheckboxTree.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DelayedFilterCheckboxTree.java
+index 42e3c0d..a8f99b3 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DelayedFilterCheckboxTree.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DelayedFilterCheckboxTree.java
+@@ -109,10 +109,14 @@ public class DelayedFilterCheckboxTree extends FilteredTree {
+ 				// If there are remembered check states, try to restore them.
+ 				// Must be done in an async because we are in the middle of a buggy
+ 				// selection preserving viewer refresh.
++				checkboxViewer.getTree().setRedraw(false);
+ 				display.asyncExec(new Runnable() {
+ 					public void run() {
++						rememberExpansions();
+ 						restoreLeafCheckState();
++						rememberExpansions();
+ 						restoreExpansions();
++						checkboxViewer.getTree().setRedraw(true);
+ 					}
+ 				});
+ 			}
+@@ -181,12 +185,14 @@ public class DelayedFilterCheckboxTree extends FilteredTree {
+ 				if (event.getResult().isOK()) {
+ 					display.asyncExec(new Runnable() {
+ 						public void run() {
++							checkboxViewer.getTree().setRedraw(false);
+ 							// remember things expanded by the filter
+ 							rememberExpansions();
+ 							restoreLeafCheckState();
+ 							// now restore expansions because we may have
+ 							// had others
+ 							restoreExpansions();
++							checkboxViewer.getTree().setRedraw(true);
+ 						}
+ 					});
+ 				}

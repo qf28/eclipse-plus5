@@ -1,0 +1,693 @@
+commit d6457925a143e0f4b260a6246b74369778f4003d
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Sat Apr 1 00:07:18 2017 -0700
+
+    Bug 512914 - Remove the MethodId structure
+    
+    Change-Id: I4c845e3b2688a340d5678f773348467eeb935927
+
+15	3	org.eclipse.jdt.core.tests.builder/src/org/eclipse/jdt/core/tests/builder/ParticipantBuildTests.java
+27	31	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/ClassFileToIndexConverter.java
+3	23	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+50	17	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethod.java
+0	107	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethodId.java
+54	12	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdType.java
+10	15	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/model/IndexBinaryType.java
+diff --git a/org.eclipse.jdt.core.tests.builder/src/org/eclipse/jdt/core/tests/builder/ParticipantBuildTests.java b/org.eclipse.jdt.core.tests.builder/src/org/eclipse/jdt/core/tests/builder/ParticipantBuildTests.java
+index 3da8163..5a448b6 100644
+--- a/org.eclipse.jdt.core.tests.builder/src/org/eclipse/jdt/core/tests/builder/ParticipantBuildTests.java
++++ b/org.eclipse.jdt.core.tests.builder/src/org/eclipse/jdt/core/tests/builder/ParticipantBuildTests.java
+@@ -432,9 +432,21 @@ public class ParticipantBuildTests extends BuilderTests {
+ 						AbstractTypeDeclaration typeDecl = (AbstractTypeDeclaration) types.get(t);
+ 						ITypeBinding typeBinding = typeDecl.resolveBinding();
+ 						if (typeBinding == null) continue;
+-						typeBinding = typeBinding.getAnnotations()[0].getAnnotationType();
+-						IAnnotationBinding targetValue = typeBinding.getAnnotations()[0];
+-						IMethodBinding method = targetValue.getDeclaredMemberValuePairs()[0].getMethodBinding();
++						IAnnotationBinding[] annotations = typeBinding.getAnnotations();
++						if (annotations == null || annotations.length == 0) {
++							throw new IllegalStateException(
++									"Expected at least one annotation in binding " + typeBinding);
++						}
++						IAnnotationBinding targetValue = annotations[0];
++						typeBinding = targetValue.getAnnotationType();
++
++						IMemberValuePairBinding[] pairs = targetValue.getAllMemberValuePairs();
++						if (pairs == null || pairs.length == 0) {
++							throw new IllegalStateException(
++									"Expected at least one member value pair in " + targetValue
++									+ ", binding was: " + typeBinding);
++						}
++						IMethodBinding method = pairs[0].getMethodBinding();
+ 						if (!"value".equals(method.getName()))
+ 							problems.add(new ParticipantProblem("method " + method.getName() + " not found", file.getName()));
+ 					}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/ClassFileToIndexConverter.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/ClassFileToIndexConverter.java
+index 2ba44b1..11259d1 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/ClassFileToIndexConverter.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/ClassFileToIndexConverter.java
+@@ -12,6 +12,7 @@ package org.eclipse.jdt.internal.core.nd.indexer;
+ 
+ import java.lang.reflect.Modifier;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.List;
+ 
+ import org.eclipse.core.runtime.CoreException;
+@@ -45,7 +46,6 @@ import org.eclipse.jdt.internal.core.nd.java.NdConstantArray;
+ import org.eclipse.jdt.internal.core.nd.java.NdConstantClass;
+ import org.eclipse.jdt.internal.core.nd.java.NdConstantEnum;
+ import org.eclipse.jdt.internal.core.nd.java.NdMethod;
+-import org.eclipse.jdt.internal.core.nd.java.NdMethodId;
+ import org.eclipse.jdt.internal.core.nd.java.NdMethodParameter;
+ import org.eclipse.jdt.internal.core.nd.java.NdResourceFile;
+ import org.eclipse.jdt.internal.core.nd.java.NdType;
+@@ -180,7 +180,7 @@ public final class ClassFileToIndexConverter {
+ 		IBinaryAnnotation[] annotations = binaryType.getAnnotations();
+ 		attachAnnotations(type, annotations);
+ 
+-		type.setDeclaringMethod(createMethodId(binaryType.getEnclosingTypeName(), binaryType.getEnclosingMethod()));
++		type.setDeclaringMethod(binaryType.getEnclosingMethod());
+ 
+ 		IBinaryField[] fields = binaryType.getFields();
+ 
+@@ -194,8 +194,26 @@ public final class ClassFileToIndexConverter {
+ 		IBinaryMethod[] methods = binaryType.getMethods();
+ 
+ 		if (methods != null) {
+-			for (IBinaryMethod next : methods) {
+-				addMethod(type, next, binaryType);
++			char[][] methodNames = new char[methods.length][];
++			Integer[] sortedElementIndices = new Integer[methods.length];
++
++			for (int idx = 0; idx < sortedElementIndices.length; idx++) {
++				sortedElementIndices[idx] = idx;
++				methodNames[idx] = getSelectorAndDescriptor(methods[idx]);
++			}
++
++			Arrays.sort(sortedElementIndices, (Integer i1, Integer i2) -> {
++				return CharArrayUtils.compare(methodNames[i1], methodNames[i2]);
++			});
++
++			type.allocateMethods(methods.length);
++			for (int idx = 0; idx < methods.length; idx++) {
++				NdMethod newMethod = type.createMethod();
++				int position = sortedElementIndices[idx];
++				newMethod.setDeclarationPosition(position);
++				newMethod.setMethodName(methodNames[position]);
++				IBinaryMethod nextMethod = methods[position];
++				addMethod(newMethod, nextMethod, binaryType);
+ 			}
+ 		}
+ 
+@@ -213,6 +231,10 @@ public final class ClassFileToIndexConverter {
+ 		return type;
+ 	}
+ 
++	private char[] getSelectorAndDescriptor(IBinaryMethod binaryMethod) {
++		return CharArrayUtils.concat(binaryMethod.getSelector(), binaryMethod.getMethodDescriptor());
++	}
++
+ 	private static char[] getMissingTypeString(char[][][] missingTypeNames) {
+ 		char[] missingTypeString = null;
+ 		if (missingTypeNames != null) {
+@@ -286,10 +308,9 @@ public final class ClassFileToIndexConverter {
+ 	 *
+ 	 * @throws CoreException
+ 	 */
+-	private void addMethod(NdType type, IBinaryMethod next, IBinaryType binaryType)
++	private void addMethod(NdMethod method, IBinaryMethod next, IBinaryType binaryType)
+ 			throws CoreException {
+ 		int flags = 0;
+-		NdMethod method = new NdMethod(type);
+ 
+ 		attachAnnotations(method, next.getAnnotations());
+ 
+@@ -421,7 +442,6 @@ public final class ClassFileToIndexConverter {
+ 			method.setDefaultValue(createConstantFromMixedType(defaultValue));
+ 		}
+ 
+-		method.setMethodId(createMethodId(binaryType.getName(), next.getSelector(), next.getMethodDescriptor()));
+ 		method.setModifiers(next.getModifiers());
+ 		method.setTagBits(next.getTagBits());
+ 		method.setFlags(flags);
+@@ -806,30 +826,6 @@ public final class ClassFileToIndexConverter {
+ 		return this.index.createTypeId(typeName);
+ 	}
+ 
+-	/**
+-	 * Creates a method ID given a method selector, method descriptor, and binary type name
+-	 */
+-	private NdMethodId createMethodId(char[] binaryTypeName, char[] methodSelector, char[] methodDescriptor) {
+-		if (methodSelector == null || binaryTypeName == null || methodDescriptor == null) {
+-			return null;
+-		}
+-
+-		char[] methodId = JavaNames.getMethodId(binaryTypeName, methodSelector, methodDescriptor);
+-		return this.index.createMethodId(methodId);
+-	}
+-
+-	/**
+-	 * Creates a method ID given a method name (which is a method selector followed by a method descriptor.
+-	 */
+-	private NdMethodId createMethodId(char[] binaryTypeName, char[] methodName) {
+-		if (methodName == null || binaryTypeName == null) {
+-			return null;
+-		}
+-
+-		char[] methodId = JavaNames.getMethodId(binaryTypeName, methodName);
+-		return this.index.createMethodId(methodId);
+-	}
+-
+ 	private void initTypeAnnotation(NdTypeAnnotation annotation, IBinaryTypeAnnotation next) {
+ 		int[] typePath = next.getTypePath();
+ 		if (typePath != null && typePath.length > 0) {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+index 9c9f94a..c398f48 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+@@ -38,16 +38,14 @@ import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+ 
+ public class JavaIndex {
+ 	// Version constants
+-	static final int CURRENT_VERSION = Nd.version(1, 48);
+-	static final int MAX_SUPPORTED_VERSION = Nd.version(1, 48);
+-	static final int MIN_SUPPORTED_VERSION = Nd.version(1, 48);
++	static final int CURRENT_VERSION = Nd.version(1, 49);
++	static final int MAX_SUPPORTED_VERSION = Nd.version(1, 49);
++	static final int MIN_SUPPORTED_VERSION = Nd.version(1, 49);
+ 
+ 	// Fields for the search header
+ 	public static final FieldSearchIndex<NdResourceFile> FILES;
+ 	public static final FieldSearchIndex<NdTypeId> SIMPLE_INDEX;
+ 	public static final FieldSearchIndex<NdTypeId> TYPES;
+-	public static final FieldSearchIndex<NdMethodId> METHODS;
+-
+ 	public static final StructDef<JavaIndex> type;
+ 
+ 	static {
+@@ -55,7 +53,6 @@ public class JavaIndex {
+ 		FILES = FieldSearchIndex.create(type, NdResourceFile.FILENAME);
+ 		SIMPLE_INDEX = FieldSearchIndex.create(type, NdTypeId.SIMPLE_NAME);
+ 		TYPES = FieldSearchIndex.create(type, NdTypeId.FIELD_DESCRIPTOR);
+-		METHODS = FieldSearchIndex.create(type, NdMethodId.METHOD_NAME);
+ 		type.done();
+ 
+ 		// This struct needs to fit within the first database chunk.
+@@ -185,22 +182,6 @@ public class JavaIndex {
+ 		return this.nd;
+ 	}
+ 
+-	public NdMethodId findMethodId(char[] methodId) {
+-		SearchCriteria searchCriteria = SearchCriteria.create(methodId);
+-
+-		return METHODS.findBest(this.nd, this.address, searchCriteria, this.anyResult);
+-	}
+-
+-	public NdMethodId createMethodId(char[] methodId) {
+-		NdMethodId existingMethod = findMethodId(methodId);
+-
+-		if (existingMethod != null) {
+-			return existingMethod;
+-		}
+-
+-		return new NdMethodId(this.nd, methodId);
+-	}
+-
+ 	/**
+ 	 * Converts a JDT-style path (which may be a resource-relative path or absolute filesystem location) into a location
+ 	 * (which is unconditionally a filesystem location) or null if none.
+@@ -308,7 +289,6 @@ public class JavaIndex {
+ 		registry.register(0x0100, NdConstantString.type.getFactory());
+ 		registry.register(0x0110, NdMethod.type.getFactory());
+ 		registry.register(0x0118, NdMethodAnnotationData.type.getFactory());
+-		registry.register(0x0130, NdMethodId.type.getFactory());
+ 		registry.register(0x0150, NdResourceFile.type.getFactory());
+ 		registry.register(0x0170, NdType.type.getFactory());
+ 		registry.register(0x0190, NdTypeArgument.type.getFactory());
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethod.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethod.java
+index 2ff6c3e..ef3dbe9 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethod.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethod.java
+@@ -14,40 +14,43 @@ import java.util.Collections;
+ import java.util.List;
+ 
+ import org.eclipse.jdt.internal.core.nd.Nd;
++import org.eclipse.jdt.internal.core.nd.db.IString;
++import org.eclipse.jdt.internal.core.nd.field.FieldInt;
+ import org.eclipse.jdt.internal.core.nd.field.FieldList;
+ import org.eclipse.jdt.internal.core.nd.field.FieldManyToOne;
+ import org.eclipse.jdt.internal.core.nd.field.FieldOneToMany;
+ import org.eclipse.jdt.internal.core.nd.field.FieldOneToOne;
+ import org.eclipse.jdt.internal.core.nd.field.FieldShort;
++import org.eclipse.jdt.internal.core.nd.field.FieldString;
+ import org.eclipse.jdt.internal.core.nd.field.StructDef;
+ import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+ import org.eclipse.jdt.internal.core.util.CharArrayBuffer;
+ 
+ public class NdMethod extends NdBinding {
+-	public static final FieldManyToOne<NdMethodId> METHOD_ID;
++	public static final FieldString METHOD_NAME;
+ 	public static final FieldShort METHOD_FLAGS;
+-	public static final FieldManyToOne<NdType> PARENT;
+ 	public static final FieldOneToMany<NdVariable> DECLARED_VARIABLES;
+ 	public static final FieldList<NdMethodParameter> PARAMETERS;
+ 	public static final FieldOneToOne<NdConstant> DEFAULT_VALUE;
+ 	public static final FieldList<NdMethodException> EXCEPTIONS;
+ 	public static final FieldManyToOne<NdTypeSignature> RETURN_TYPE;
+ 	public static final FieldOneToOne<NdMethodAnnotationData> ANNOTATION_DATA;
++	public static final FieldInt DECLARATION_POSITION;
+ 
+ 	@SuppressWarnings("hiding")
+ 	public static final StructDef<NdMethod> type;
+ 
+ 	static {
+ 		type = StructDef.create(NdMethod.class, NdBinding.type);
+-		METHOD_ID = FieldManyToOne.create(type, NdMethodId.METHODS);
++		METHOD_NAME = type.addString();
+ 		METHOD_FLAGS = type.addShort();
+-		PARENT = FieldManyToOne.createOwner(type, NdType.METHODS);
+ 		PARAMETERS = FieldList.create(type, NdMethodParameter.type);
+ 		DECLARED_VARIABLES = FieldOneToMany.create(type, NdVariable.DECLARING_METHOD);
+ 		DEFAULT_VALUE = FieldOneToOne.create(type, NdConstant.type, NdConstant.PARENT_METHOD);
+ 		EXCEPTIONS = FieldList.create(type, NdMethodException.type);
+ 		RETURN_TYPE = FieldManyToOne.create(type, NdTypeSignature.USED_AS_RETURN_TYPE);
+ 		ANNOTATION_DATA = FieldOneToOne.create(type, NdMethodAnnotationData.type, NdMethodAnnotationData.METHOD);
++		DECLARATION_POSITION = type.addInt();
+ 		type.done();
+ 	}
+ 
+@@ -58,12 +61,6 @@ public class NdMethod extends NdBinding {
+ 		super(nd, address);
+ 	}
+ 
+-	public NdMethod(NdType parent) {
+-		super(parent.getNd());
+-
+-		PARENT.put(getNd(), this.address, parent);
+-	}
+-
+ 	public NdMethodParameter createNewParameter() {
+ 		return PARAMETERS.append(getNd(), getAddress());
+ 	}
+@@ -72,8 +69,12 @@ public class NdMethod extends NdBinding {
+ 		PARAMETERS.allocate(this.nd, this.address, numParameters);
+ 	}
+ 
+-	public NdMethodId getMethodId() {
+-		return METHOD_ID.get(getNd(), this.address);
++	public IString getMethodName() {
++		return METHOD_NAME.get(getNd(), this.address);
++	}
++
++	public void setMethodName(char[] selectorAndDescriptor) {
++		METHOD_NAME.put(getNd(), getAddress(), selectorAndDescriptor);
+ 	}
+ 
+ 	/**
+@@ -119,10 +120,6 @@ public class NdMethod extends NdBinding {
+ 		RETURN_TYPE.put(getNd(), this.address, createTypeSignature);
+ 	}
+ 
+-	public void setMethodId(NdMethodId methodId) {
+-		METHOD_ID.put(getNd(), this.address, methodId);
+-	}
+-
+ 	public List<NdTypeAnnotation> getTypeAnnotations() {
+ 		NdMethodAnnotationData annotationData = getAnnotationData();
+ 		if (annotationData != null) {
+@@ -178,7 +175,7 @@ public class NdMethod extends NdBinding {
+ 	public String toString() {
+ 		try {
+ 			CharArrayBuffer arrayBuffer = new CharArrayBuffer();
+-			arrayBuffer.append(getMethodId().getSelector());
++			arrayBuffer.append(getSelector());
+ 			getGenericSignature(arrayBuffer, true);
+ 			return arrayBuffer.toString();
+ 		} catch (RuntimeException e) {
+@@ -188,6 +185,24 @@ public class NdMethod extends NdBinding {
+ 		}
+ 	}
+ 
++	public char[] getSelector() {
++		IString methodName = METHOD_NAME.get(getNd(), getAddress());
++		char[] methodNameString = methodName.getChars();
++		int bracketIndex = CharArrayUtils.indexOf('(', methodNameString);
++		if (bracketIndex == -1) {
++			bracketIndex = methodNameString.length;
++		}
++		return CharArrayUtils.subarray(methodNameString, 0, bracketIndex);
++	}
++
++	public boolean isConstructor() {
++		return org.eclipse.jdt.internal.compiler.classfmt.JavaBinaryNames.isConstructor(getSelector());
++	}
++
++	public boolean isClInit() {
++		return org.eclipse.jdt.internal.compiler.classfmt.JavaBinaryNames.isClinit(getSelector());
++	}
++
+ 	public void getGenericSignature(CharArrayBuffer result, boolean includeExceptions) {
+ 		NdTypeParameter.getSignature(result, getTypeParameters());
+ 
+@@ -259,4 +274,22 @@ public class NdMethod extends NdBinding {
+ 			createAnnotationData().allocateTypeAnnotations(length);
+ 		}
+ 	}
++
++	public void setDeclarationPosition(int position) {
++		DECLARATION_POSITION.put(getNd(), getAddress(), position);
++	}
++
++	/**
++	 * Returns the unique 0-based position of the method within the class it was
++	 * declared in.
++	 */
++	public int getDeclarationPosition() {
++		return DECLARATION_POSITION.get(getNd(), getAddress());
++	}
++
++	public char[] getMethodDescriptor() {
++		char[] name = getMethodName().getChars();
++		int descriptorStart = CharArrayUtils.indexOf('(', name, 0, name.length);
++		return CharArrayUtils.subarray(name, descriptorStart, name.length);
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethodId.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethodId.java
+deleted file mode 100644
+index d505c26..0000000
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethodId.java
++++ /dev/null
+@@ -1,107 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2015, 2016 Google, Inc and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *   Stefan Xenos (Google) - Initial implementation
+- *******************************************************************************/
+-package org.eclipse.jdt.internal.core.nd.java;
+-
+-import java.util.List;
+-
+-import org.eclipse.jdt.internal.core.nd.Nd;
+-import org.eclipse.jdt.internal.core.nd.NdNode;
+-import org.eclipse.jdt.internal.core.nd.db.IString;
+-import org.eclipse.jdt.internal.core.nd.field.FieldOneToMany;
+-import org.eclipse.jdt.internal.core.nd.field.FieldSearchKey;
+-import org.eclipse.jdt.internal.core.nd.field.StructDef;
+-import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+-
+-/**
+- * Represents the fully-qualified signature a method. Holds back-pointers to all the entities that refer to the name,
+- * along with pointers to all methods that have this fully-qualified name. Note that this isn't the class declaration
+- * itself. If there are multiple jar files containing a class of the same fully-qualified name, there may also be
+- * multiple methods with the same method ID.
+- */
+-public class NdMethodId extends NdNode {
+-	public static final FieldSearchKey<JavaIndex> METHOD_NAME;
+-	public static final FieldOneToMany<NdMethod> METHODS;
+-	public static final FieldOneToMany<NdType> DECLARED_TYPES;
+-
+-	@SuppressWarnings("hiding")
+-	public static final StructDef<NdMethodId> type;
+-
+-	static {
+-		type = StructDef.create(NdMethodId.class, NdNode.type);
+-		METHOD_NAME = FieldSearchKey.create(type, JavaIndex.METHODS);
+-		METHODS = FieldOneToMany.create(type, NdMethod.METHOD_ID, 2);
+-		DECLARED_TYPES = FieldOneToMany.create(type, NdType.DECLARING_METHOD);
+-
+-		type.useStandardRefCounting().done();
+-	}
+-
+-	public NdMethodId(Nd nd, long address) {
+-		super(nd, address);
+-	}
+-
+-	/**
+-	 *
+-	 * @param nd
+-	 * @param methodIdentifier a field descriptor for the method type followed by a "#" followed by a method selector
+-	 *  followed by method descriptor. For example, "Lorg/eclipse/MyClass#foo()Ljava/lang/Object;V"
+-	 */
+-	public NdMethodId(Nd nd, char[] methodIdentifier) {
+-		super(nd);
+-
+-		METHOD_NAME.put(nd, this.address, methodIdentifier);
+-	}
+-
+-	public List<NdType> getDeclaredTypes() {
+-		return DECLARED_TYPES.asList(getNd(), this.address);
+-	}
+-
+-	/**
+-	 * Returns the field descriptor for the type (without a trailing ';') followed by a # followed by the method
+-	 * selector followed by the method descriptor. For example, "Lorg/eclipse/MyClass#foo()Ljava/lang/Object;V"
+-	 */
+-	public IString getMethodName() {
+-		return METHOD_NAME.get(getNd(), this.address);
+-	}
+-
+-	public char[] getSelector() {
+-		char[] name = getMethodName().getChars();
+-		int selectorStart = CharArrayUtils.indexOf('#', name) + 1;
+-		int selectorEnd = CharArrayUtils.indexOf('(', name, selectorStart, name.length);
+-		if (selectorEnd == -1) {
+-			selectorEnd = name.length;
+-		}
+-		return CharArrayUtils.subarray(name, selectorStart, selectorEnd);
+-	}
+-
+-	public boolean isConstructor() {
+-		return org.eclipse.jdt.internal.compiler.classfmt.JavaBinaryNames.isConstructor(getSelector());
+-	}
+-
+-	public char[] getMethodDescriptor() {
+-		char[] name = getMethodName().getChars();
+-		int descriptorStart = CharArrayUtils.indexOf('(', name, 0, name.length);
+-		return CharArrayUtils.subarray(name, descriptorStart, name.length);
+-	}
+-
+-	public boolean isClInit() {
+-		return org.eclipse.jdt.internal.compiler.classfmt.JavaBinaryNames.isClinit(getSelector());
+-	}
+-
+-	public String toString() {
+-		try {
+-			return new String(getSelector());
+-		} catch (RuntimeException e) {
+-			// This is called most often from the debugger, so we want to return something meaningful even
+-			// if the code is buggy, the database is corrupt, or we don't have a read lock.
+-			return super.toString();
+-		}
+-	}
+-}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdType.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdType.java
+index 2594136..ddd7074 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdType.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdType.java
+@@ -10,6 +10,7 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.nd.java;
+ 
++import java.util.Arrays;
+ import java.util.List;
+ 
+ import org.eclipse.jdt.internal.core.nd.Nd;
+@@ -29,8 +30,7 @@ public class NdType extends NdBinding {
+ 	public static final FieldManyToOne<NdTypeSignature> SUPERCLASS;
+ 	public static final FieldOneToMany<NdTypeInterface> INTERFACES;
+ 	public static final FieldManyToOne<NdTypeId> DECLARING_TYPE;
+-	public static final FieldManyToOne<NdMethodId> DECLARING_METHOD;
+-	public static final FieldOneToMany<NdMethod> METHODS;
++	public static final FieldList<NdMethod> METHODS;
+ 	public static final FieldList<NdTypeAnnotation> TYPE_ANNOTATIONS;
+ 	public static final FieldList<NdAnnotation> ANNOTATIONS;
+ 	public static final FieldList<NdVariable> VARIABLES;
+@@ -39,6 +39,7 @@ public class NdType extends NdBinding {
+ 	public static final FieldString INNER_CLASS_SOURCE_NAME;
+ 	public static final FieldByte FLAGS;
+ 	public static final FieldLong TAG_BITS;
++	public static final FieldString ENCLOSING_METHOD;
+ 	/**
+ 	 * Binary name that was recorded in the .class file if different from the binary
+ 	 * name that was determined by the .class's name and location. This is only set for
+@@ -56,8 +57,7 @@ public class NdType extends NdBinding {
+ 		DECLARING_TYPE = FieldManyToOne.create(type, NdTypeId.DECLARED_TYPES);
+ 		INTERFACES = FieldOneToMany.create(type, NdTypeInterface.APPLIES_TO);
+ 		SUPERCLASS = FieldManyToOne.create(type, NdTypeSignature.SUBCLASSES);
+-		DECLARING_METHOD = FieldManyToOne.create(type, NdMethodId.DECLARED_TYPES);
+-		METHODS = FieldOneToMany.create(type, NdMethod.PARENT, 6);
++		METHODS = FieldList.create(type, NdMethod.type);
+ 		TYPE_ANNOTATIONS = FieldList.create(type, NdTypeAnnotation.type);
+ 		ANNOTATIONS = FieldList.create(type, NdAnnotation.type);
+ 		VARIABLES = FieldList.create(type, NdVariable.type);
+@@ -67,6 +67,7 @@ public class NdType extends NdBinding {
+ 		FLAGS = type.addByte();
+ 		TAG_BITS = type.addLong();
+ 		FIELD_DESCRIPTOR_FROM_CLASS = type.addString();
++		ENCLOSING_METHOD = type.addString();
+ 		type.done();
+ 	}
+ 
+@@ -135,10 +136,6 @@ public class NdType extends NdBinding {
+ 		return FILE.get(getNd(), this.address);
+ 	}
+ 
+-	public void setDeclaringMethod(NdMethodId createMethodId) {
+-		DECLARING_METHOD.put(getNd(), this.address, createMethodId);
+-	}
+-
+ 	/**
+ 	 * @param createTypeIdFromBinaryName
+ 	 */
+@@ -219,10 +216,6 @@ public class NdType extends NdBinding {
+ 		return VARIABLES.asList(getNd(), this.address);
+ 	}
+ 
+-	public NdMethodId getDeclaringMethod() {
+-		return DECLARING_METHOD.get(getNd(), this.address);
+-	}
+-
+ 	@Override
+ 	public List<NdTypeParameter> getTypeParameters() {
+ 		return TYPE_PARAMETERS.asList(getNd(), this.address);
+@@ -244,10 +237,43 @@ public class NdType extends NdBinding {
+ 		ANNOTATIONS.allocate(getNd(), getAddress(), length);
+ 	}
+ 
++	/**
++	 * Returns the list of methods, sorted by ascending method name (selector + descriptor).
++	 */
+ 	public List<NdMethod> getMethods() {
+ 		return METHODS.asList(getNd(), this.address);
+ 	}
+ 
++	/**
++	 * Returns the list of methods, in declaration order.
++	 */
++	public List<NdMethod> getMethodsInDeclarationOrder() {
++		List<NdMethod> unsorted = getMethods();
++		NdMethod[] sorted = new NdMethod[unsorted.size()];
++		for (NdMethod next : unsorted) {
++			int pos = next.getDeclarationPosition();
++
++			if (pos < 0 || pos >= sorted.length) {
++				throw getNd().describeProblem()
++					.addProblemAddress(NdMethod.DECLARATION_POSITION, next.getAddress())
++					.build("Method " + next.getMethodName().getString() + " reports invalid position of " + pos); //$NON-NLS-1$//$NON-NLS-2$
++			}
++
++			NdMethod oldMethodAtThisPosition = sorted[pos];
++			if (oldMethodAtThisPosition != null) {
++				throw getNd().describeProblem()
++					.addProblemAddress(NdMethod.DECLARATION_POSITION, next.getAddress())
++					.addProblemAddress(NdMethod.DECLARATION_POSITION, oldMethodAtThisPosition.getAddress())
++					.build("Method " + oldMethodAtThisPosition.getMethodName().getString()  //$NON-NLS-1$
++							+ " and method " + next.getMethodName().getString() + " both claim to be at position "  //$NON-NLS-1$//$NON-NLS-2$
++							+ pos);
++			}
++			sorted[pos] = next;
++		}
++
++		return Arrays.asList(sorted);
++	}
++
+ 	@Override
+ 	public String toString() {
+ 		try {
+@@ -297,4 +323,20 @@ public class NdType extends NdBinding {
+ 	public void allocateVariables(int length) {
+ 		VARIABLES.allocate(getNd(), getAddress(), length);
+ 	}
++
++	public void allocateMethods(int length) {
++		METHODS.allocate(getNd(), getAddress(), length);
++	}
++
++	public NdMethod createMethod() {
++		return METHODS.append(getNd(), getAddress());
++	}
++
++	public void setDeclaringMethod(char[] enclosingMethod) {
++		ENCLOSING_METHOD.put(getNd(), getAddress(), enclosingMethod);
++	}
++
++	public IString getDeclaringMethod() {
++		return ENCLOSING_METHOD.get(getNd(), getAddress());
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/model/IndexBinaryType.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/model/IndexBinaryType.java
+index 4d5023b..d6216d8 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/model/IndexBinaryType.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/model/IndexBinaryType.java
+@@ -42,7 +42,6 @@ import org.eclipse.jdt.internal.core.nd.java.NdConstantClass;
+ import org.eclipse.jdt.internal.core.nd.java.NdConstantEnum;
+ import org.eclipse.jdt.internal.core.nd.java.NdMethod;
+ import org.eclipse.jdt.internal.core.nd.java.NdMethodException;
+-import org.eclipse.jdt.internal.core.nd.java.NdMethodId;
+ import org.eclipse.jdt.internal.core.nd.java.NdMethodParameter;
+ import org.eclipse.jdt.internal.core.nd.java.NdResourceFile;
+ import org.eclipse.jdt.internal.core.nd.java.NdType;
+@@ -53,7 +52,6 @@ import org.eclipse.jdt.internal.core.nd.java.NdTypeParameter;
+ import org.eclipse.jdt.internal.core.nd.java.NdTypeSignature;
+ import org.eclipse.jdt.internal.core.nd.java.NdVariable;
+ import org.eclipse.jdt.internal.core.nd.java.TypeRef;
+-import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+ import org.eclipse.jdt.internal.core.util.CharArrayBuffer;
+ 
+ /**
+@@ -264,7 +262,7 @@ public class IndexBinaryType implements IBinaryType {
+ 		try (IReader rl = this.typeRef.lock()) {
+ 			NdType type = this.typeRef.get();
+ 			if (type != null) {
+-				List<NdMethod> methods = type.getMethods();
++				List<NdMethod> methods = type.getMethodsInDeclarationOrder();
+ 
+ 				if (methods.isEmpty()) {
+ 					return null;
+@@ -381,17 +379,15 @@ public class IndexBinaryType implements IBinaryType {
+ 	}
+ 
+ 	private IBinaryMethod createBinaryMethod(NdMethod ndMethod) {
+-		NdMethodId methodId = ndMethod.getMethodId();
+-
+ 		return IndexBinaryMethod.create().setAnnotations(toAnnotationArray(ndMethod.getAnnotations()))
+-				.setModifiers(ndMethod.getModifiers()).setIsConstructor(methodId.isConstructor())
++				.setModifiers(ndMethod.getModifiers()).setIsConstructor(ndMethod.isConstructor())
+ 				.setArgumentNames(getArgumentNames(ndMethod)).setDefaultValue(unpackValue(ndMethod.getDefaultValue()))
+ 				.setExceptionTypeNames(getExceptionTypeNames(ndMethod))
+ 				.setGenericSignature(getGenericSignatureFor(ndMethod))
+-				.setMethodDescriptor(methodId.getMethodDescriptor())
++				.setMethodDescriptor(ndMethod.getMethodDescriptor())
+ 				.setParameterAnnotations(getParameterAnnotations(ndMethod))
+-				.setSelector(ndMethod.getMethodId().getSelector()).setTagBits(ndMethod.getTagBits())
+-				.setIsClInit(methodId.isClInit()).setTypeAnnotations(createBinaryTypeAnnotations(ndMethod.getTypeAnnotations()));
++				.setSelector(ndMethod.getSelector()).setTagBits(ndMethod.getTagBits())
++				.setIsClInit(ndMethod.isClInit()).setTypeAnnotations(createBinaryTypeAnnotations(ndMethod.getTypeAnnotations()));
+ 	}
+ 
+ 	private static IBinaryTypeAnnotation[] createBinaryTypeAnnotations(List<? extends NdTypeAnnotation> typeAnnotations) {
+@@ -593,13 +589,12 @@ public class IndexBinaryType implements IBinaryType {
+ 			try (IReader rl = this.typeRef.lock()) {
+ 				NdType type = this.typeRef.get();
+ 				if (type != null) {
+-					NdMethodId methodId = type.getDeclaringMethod();
++					IString declaringMethod = type.getDeclaringMethod();
+ 
+-					if (methodId != null) {
+-						char[] methodName = methodId.getMethodName().getChars();
+-						int startIdx = CharArrayUtils.lastIndexOf('#', methodName);
+-						this.enclosingMethod = CharArrayUtils.subarray(methodName, startIdx + 1);
+-						this.enclosingType = CharArrayUtils.subarray(methodName, 1, startIdx);
++					if (declaringMethod.length() != 0) {
++						char[] methodName = declaringMethod.getChars();
++						this.enclosingMethod = methodName;
++						this.enclosingType = type.getDeclaringType().getBinaryName();
+ 					} else {
+ 						NdTypeId typeId = type.getDeclaringType();
+ 

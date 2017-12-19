@@ -1,0 +1,353 @@
+commit a55688033e83efa284159753f59e60d329935b8f
+Author: Susan Franklin <sfranklin>
+Date:   Thu Sep 24 19:31:27 2009 +0000
+
+    Bug 269978 -  [ui] installation history page slow to come up
+
+40	1	bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/dialogs/InstallationHistoryPageTest.java
+1	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+1	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+27	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
+8	4	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RevertProfilePage.java
+73	9	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/viewers/ProvElementContentProvider.java
+diff --git a/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/dialogs/InstallationHistoryPageTest.java b/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/dialogs/InstallationHistoryPageTest.java
+index 6e6eb6f..10d356d 100644
+--- a/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/dialogs/InstallationHistoryPageTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/dialogs/InstallationHistoryPageTest.java
+@@ -10,10 +10,15 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.ui.dialogs;
+ 
++import java.lang.reflect.Field;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.jobs.*;
+ import org.eclipse.equinox.internal.provisional.p2.ui.ProvUI;
+ import org.eclipse.equinox.internal.provisional.p2.ui.dialogs.RevertProfilePage;
++import org.eclipse.equinox.internal.provisional.p2.ui.viewers.ProvElementContentProvider;
+ import org.eclipse.equinox.p2.tests.ui.AbstractProvisioningUITest;
+ import org.eclipse.jface.dialogs.Dialog;
++import org.eclipse.jface.viewers.AbstractTableViewer;
+ import org.eclipse.swt.SWT;
+ import org.eclipse.swt.widgets.Composite;
+ import org.eclipse.swt.widgets.Control;
+@@ -24,6 +29,8 @@ import org.eclipse.swt.widgets.Control;
+  * somewhere besides the about dialog
+  */
+ public class InstallationHistoryPageTest extends AbstractProvisioningUITest {
++	int jobs;
++	int done;
+ 
+ 	class TestDialog extends Dialog {
+ 		RevertProfilePage page;
+@@ -48,7 +55,39 @@ public class InstallationHistoryPageTest extends AbstractProvisioningUITest {
+ 		dialog.setBlockOnOpen(false);
+ 		dialog.open();
+ 		try {
+-
++			Field viewerField = RevertProfilePage.class.getDeclaredField("configsViewer");
++			viewerField.setAccessible(true);
++			AbstractTableViewer viewer = (AbstractTableViewer) viewerField.get(dialog.page);
++			ProvElementContentProvider provider = (ProvElementContentProvider) viewer.getContentProvider();
++			Object input = viewer.getInput();
++			Field jobField = ProvElementContentProvider.class.getDeclaredField("fetchJob");
++			jobField.setAccessible(true);
++			jobs = 0;
++			done = 0;
++			// hammer the elements repetitively to start multiple fast running fetch jobs
++			for (int i = 0; i < 5; i++) {
++				provider.getElements(input);
++				Job job = (Job) jobField.get(provider);
++				if (job != null) {
++					jobs++;
++					job.addJobChangeListener(new JobChangeAdapter() {
++						public void done(IJobChangeEvent e) {
++							done++;
++							int status = e.getResult().getSeverity();
++							if (status != IStatus.CANCEL && status != IStatus.OK) {
++								// something unexpected happened.
++								fail("Fetch job failed unexpectedly " + e.getResult().getMessage());
++							}
++						}
++					});
++					if (i == 4 && job != null)
++						job.join();
++				}
++			}
++			assertTrue("No fetch occurred", jobs > 0);
++			assertEquals("Not all jobs finished as expected", jobs, done);
++		} catch (Exception e) {
++			fail("Failure during reflection", e);
+ 		} finally {
+ 			dialog.close();
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+index d2fd620..db11729 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+@@ -92,6 +92,7 @@ public class ProvUIMessages extends NLS {
+ 	public static String ProvDropAdapter_InvalidDropTarget;
+ 	public static String ProvDropAdapter_NoIUsToDrop;
+ 	public static String ProvDropAdapter_UnsupportedDropOperation;
++	public static String ProvElementContentProvider_FetchJobTitle;
+ 
+ 	// Provisioning operations
+ 	public static String ProvisioningOperationRunner_CannotApplyChanges;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index ac2ba13..97725d3 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -60,6 +60,7 @@ RevertIUCommandTooltip=Revert to a previously installed configuration
+ ProvDropAdapter_NoIUsToDrop=No items were available to be dropped
+ ProvDropAdapter_InvalidDropTarget=Invalid drop target
+ ProvDropAdapter_UnsupportedDropOperation=Unsupported drop operation
++ProvElementContentProvider_FetchJobTitle=Fetching Elements
+ 
+ IUCopyrightPropertyPage_NoCopyright=No copyright information has been provided.
+ IUCopyrightPropertyPage_ViewLinkLabel=View full copyright:
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
+index de66eb5..a20faf1 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
+@@ -10,16 +10,20 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.ui.model;
+ 
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.jobs.ISchedulingRule;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningUtil;
++import org.eclipse.ui.progress.IDeferredWorkbenchAdapter;
++import org.eclipse.ui.progress.IElementCollector;
+ 
+ /**
+  * Element class for profile snapshots
+  * 
+  * @since 3.5
+  */
+-public class ProfileSnapshots extends ProvElement {
++public class ProfileSnapshots extends ProvElement implements IDeferredWorkbenchAdapter {
+ 
+ 	String profileId;
+ 
+@@ -70,4 +74,26 @@ public class ProfileSnapshots extends ProvElement {
+ 	public String getLabel(Object o) {
+ 		return ProvUIMessages.ProfileSnapshots_Label;
+ 	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.ui.progress.IDeferredWorkbenchAdapter#fetchDeferredChildren(java.lang.Object, org.eclipse.ui.progress.IElementCollector, org.eclipse.core.runtime.IProgressMonitor)
++	 */
++	public void fetchDeferredChildren(Object object, IElementCollector collector, IProgressMonitor monitor) {
++		Object[] children = getChildren(object);
++		collector.add(children, monitor);
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.ui.progress.IDeferredWorkbenchAdapter#getRule(java.lang.Object)
++	 */
++	public ISchedulingRule getRule(Object object) {
++		return null;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.ui.progress.IDeferredWorkbenchAdapter#isContainer()
++	 */
++	public boolean isContainer() {
++		return false;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RevertProfilePage.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RevertProfilePage.java
+index f59a6e2..10fa978 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RevertProfilePage.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RevertProfilePage.java
+@@ -112,9 +112,6 @@ public class RevertProfilePage extends InstallationPage implements ICopyable {
+ 		// prime the selection.  The selection accesses the
+ 		// revert action, so create it also.
+ 		createRevertAction();
+-		Object element = configsViewer.getElementAt(0);
+-		if (element != null)
+-			configsViewer.setSelection(new StructuredSelection(element));
+ 	}
+ 
+ 	private void createConfigurationsSection(Composite parent) {
+@@ -129,7 +126,14 @@ public class RevertProfilePage extends InstallationPage implements ICopyable {
+ 		Label label = new Label(composite, SWT.NONE);
+ 		label.setText(ProvUIMessages.RevertDialog_ConfigsLabel);
+ 		configsViewer = new TableViewer(composite, SWT.MULTI | SWT.H_SCROLL | SWT.V_SCROLL | SWT.BORDER);
+-		configsViewer.setContentProvider(new RepositoryContentProvider());
++		ProvElementContentProvider provider = new ProvElementContentProvider() {
++			protected void finishedFetchingElements(Object o) {
++				Object element = configsViewer.getElementAt(0);
++				if (element != null)
++					configsViewer.setSelection(new StructuredSelection(element));
++			}
++		};
++		configsViewer.setContentProvider(provider);
+ 		configsViewer.setLabelProvider(new ProvElementLabelProvider());
+ 		configsViewer.setComparator(new ViewerComparator() {
+ 			// We override the ViewerComparator so that we don't get the labels of the elements
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/viewers/ProvElementContentProvider.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/viewers/ProvElementContentProvider.java
+index fe039dd..df5eb2f 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/viewers/ProvElementContentProvider.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/viewers/ProvElementContentProvider.java
+@@ -11,9 +11,15 @@
+ 
+ package org.eclipse.equinox.internal.provisional.p2.ui.viewers;
+ 
++import java.util.ArrayList;
++import java.util.Arrays;
++import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.jobs.Job;
++import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.p2.ui.model.ProvElement;
+-import org.eclipse.jface.viewers.ITreeContentProvider;
+-import org.eclipse.jface.viewers.Viewer;
++import org.eclipse.jface.viewers.*;
++import org.eclipse.swt.widgets.Display;
++import org.eclipse.ui.progress.*;
+ 
+ /**
+  * Content provider that retrieves children of a ProvElement.
+@@ -23,6 +29,9 @@ import org.eclipse.jface.viewers.Viewer;
+  */
+ public class ProvElementContentProvider implements ITreeContentProvider {
+ 
++	private Viewer viewer;
++	private Job fetchJob;
++
+ 	/**
+ 	 * 
+ 	 */
+@@ -34,11 +43,55 @@ public class ProvElementContentProvider implements ITreeContentProvider {
+ 	 * (non-Javadoc)
+ 	 * @see org.eclipse.jface.viewers.IStructuredContentProvider#getElements(java.lang.Object)
+ 	 */
+-	public Object[] getElements(Object input) {
+-		if (input instanceof ProvElement) {
+-			return getChildren(input);
++	public Object[] getElements(final Object input) {
++		// Simple deferred fetch handling for table viewers
++		if (input instanceof IDeferredWorkbenchAdapter && viewer instanceof AbstractTableViewer) {
++			final Display display = viewer.getControl().getDisplay();
++			final Object pending = new PendingUpdateAdapter();
++			if (fetchJob != null)
++				fetchJob.cancel();
++			fetchJob = new Job(ProvUIMessages.ProvElementContentProvider_FetchJobTitle) {
++				protected IStatus run(IProgressMonitor monitor) {
++					IDeferredWorkbenchAdapter parent = (IDeferredWorkbenchAdapter) input;
++					final ArrayList children = new ArrayList();
++					parent.fetchDeferredChildren(parent, new IElementCollector() {
++						public void add(Object element, IProgressMonitor mon) {
++							if (mon.isCanceled())
++								return;
++							children.add(element);
++						}
++
++						public void add(Object[] elements, IProgressMonitor mon) {
++							if (mon.isCanceled())
++								return;
++							children.addAll(Arrays.asList(elements));
++						}
++
++						public void done() {
++							// nothing special to do
++						}
++
++					}, monitor);
++					display.asyncExec(new Runnable() {
++						public void run() {
++							AbstractTableViewer tableViewer = (AbstractTableViewer) viewer;
++							tableViewer.getControl().setRedraw(false);
++							tableViewer.remove(pending);
++							tableViewer.add(children.toArray());
++							finishedFetchingElements(input);
++							tableViewer.getControl().setRedraw(true);
++						}
++					});
++					return Status.OK_STATUS;
++				}
++
++			};
++			fetchJob.schedule();
++			return new Object[] {pending};
+ 		}
+-		return new Object[0];
++		Object[] elements = getChildren(input);
++		finishedFetchingElements(input);
++		return elements;
+ 	}
+ 
+ 	/*
+@@ -77,14 +130,25 @@ public class ProvElementContentProvider implements ITreeContentProvider {
+ 	 * @see org.eclipse.jface.viewers.IContentProvider#dispose()
+ 	 */
+ 	public void dispose() {
+-		// Nothing to do
+-
++		viewer = null;
++		if (fetchJob != null) {
++			fetchJob.cancel();
++			fetchJob = null;
++		}
+ 	}
+ 
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.jface.viewers.IContentProvider#inputChanged(org.eclipse.jface.viewers.Viewer, java.lang.Object, java.lang.Object)
+ 	 */
+ 	public void inputChanged(Viewer viewer, Object oldInput, Object newInput) {
+-		// Nothing to do
++		this.viewer = viewer;
++		if (fetchJob != null) {
++			fetchJob.cancel();
++			fetchJob = null;
++		}
++	}
++
++	protected void finishedFetchingElements(Object parent) {
++		// do nothing
+ 	}
+ }
+commit d6d4a49db6794d46a7f7dd5679d62d5f9f7d4ce8
+Author: Susan Franklin <sfranklin>
+Date:   Wed Sep 30 22:54:25 2009 +0000
+
+    Bug 269978 -  [ui] installation history page slow to come up
+
+8	3	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulationPage.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulationPage.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulationPage.java
+index 6221248..8fc6a67 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulationPage.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RepositoryManipulationPage.java
+@@ -47,6 +47,7 @@ import org.eclipse.swt.layout.GridLayout;
+ import org.eclipse.swt.widgets.*;
+ import org.eclipse.ui.*;
+ import org.eclipse.ui.dialogs.PatternFilter;
++import org.eclipse.ui.progress.IElementCollector;
+ import org.eclipse.ui.progress.WorkbenchJob;
+ import org.eclipse.ui.statushandlers.StatusManager;
+ 
+@@ -117,16 +118,20 @@ public class RepositoryManipulationPage extends PreferencePage implements IWorkb
+ 			return QueryProvider.METADATA_REPOS;
+ 		}
+ 
+-		public Object[] getChildren(Object o) {
++		public void fetchDeferredChildren(Object o, IElementCollector collector, IProgressMonitor monitor) {
+ 			if (cachedElements == null) {
+-				Object[] children = super.getChildren(o);
++				super.fetchDeferredChildren(o, collector, monitor);
++				// now we know we have children
++				Object[] children = getChildren(o);
+ 				cachedElements = new Hashtable(children.length);
+ 				for (int i = 0; i < children.length; i++) {
+ 					if (children[i] instanceof MetadataRepositoryElement)
+ 						cachedElements.put(URIUtil.toUnencodedString(((MetadataRepositoryElement) children[i]).getLocation()), children[i]);
+ 				}
++				return;
+ 			}
+-			return cachedElements.values().toArray();
++			// Use the cache rather than fetching children
++			collector.add(cachedElements.values().toArray(), monitor);
+ 		}
+ 
+ 	}

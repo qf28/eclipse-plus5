@@ -1,0 +1,493 @@
+commit c66de5f5211be09c03a7a669d77a42175ada0843
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Thu Jan 19 17:19:32 2017 -0500
+
+    Bug 510053 - Optimize JavaIndex.isUpToDate using an in-memory cache
+    
+    Change-Id: If7da4123abca134ffbe446eb6b8c33d81a7c4a9a
+
+45	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+87	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/FileStateCache.java
+39	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+44	13	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+18	2	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+index 3b6694b..4d98a8e 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+@@ -15,6 +15,7 @@ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.function.Supplier;
+ 
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.OperationCanceledException;
+@@ -37,6 +38,11 @@ public final class Nd {
+ 	private final int maxVersion;
+ 	private final int minVersion;
+ 
++	/**
++	 * Stores data that has been stored via {@link #setData}. Synchronize on {@link #cookies} before accessing.
++	 */
++	private final Map<Class<?>, Object> cookies = new HashMap<>();
++
+ 	public static int version(int major, int minor) {
+ 		return (major << 16) + minor;
+ 	}
+@@ -154,6 +160,45 @@ public final class Nd {
+ 	}
+ 
+ 	/**
++	 * Inserts a cookie that can be later retrieved via getData(String). 
++	 */
++	public <T> void setData(Class<T> key, T value) {
++		synchronized (this.cookies) {
++			this.cookies.put(key, value);
++		}
++	}
++
++	/**
++	 * Returns a cookie that was previously attached using {@link #setData(Class, Object)}. If no such cookie
++	 * exists, it is computed using the given function and remembered for later. The function may return null.
++	 * If it does, this method will also return null and no cookie will be stored.
++	 */
++	@SuppressWarnings("unchecked")
++	public <T> T getData(Class<T> key, Supplier<T> defaultValue) {
++		T result;
++		synchronized (this.cookies) {
++			result = (T) this.cookies.get(key);
++		}
++
++		if (result == null) {
++			result = defaultValue.get();
++
++			if (result != null) {
++				synchronized (this.cookies) {
++					T newResult = (T) this.cookies.get(key);
++					if (newResult == null) {
++						this.cookies.put(key, result);
++					} else {
++						result = newResult;
++					}
++				}
++			}
++		}
++
++		return result;
++	}
++
++	/**
+ 	 * Returns whether this {@link Nd} can never be written to. Writable subclasses should return false.
+ 	 */
+ 	protected boolean isPermanentlyReadOnly() {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/FileStateCache.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/FileStateCache.java
+new file mode 100644
+index 0000000..3b3cc95
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/FileStateCache.java
+@@ -0,0 +1,87 @@
++/*******************************************************************************
++ * Copyright (c) 2017 Google, Inc and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *   Stefan Xenos (Google) - Initial implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core.nd.indexer;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import org.eclipse.jdt.internal.core.nd.Nd;
++
++/**
++ * Holds a cache that maps filenames (absolute paths on the local filesystem) to "up to date" states.
++ * A file is "up to date" if its content is known to be in sync with the index. A file
++ * is not up to date if there is any possibility that its content might be out of sync with the
++ * index.
++ */
++public class FileStateCache {
++	private final Map<String, Boolean> fileStateCache = new HashMap<>();
++
++	/**
++	 * Returns true if the file at the given path is in sync with the index. Returns false if the file has already
++	 * been tested and might be out-of-sync. Returns null if its status is unknown and needs to be tested.
++	 *
++	 * @param location an absolute path on the filesystem
++	 */
++	public Boolean isUpToDate(String location) {
++		synchronized (this.fileStateCache) {
++			return this.fileStateCache.get(location);
++		}
++	}
++
++	/**
++	 * Returns the cache for the given {@link Nd} instance.
++	 *
++	 * @return the cache for the given {@link Nd}. Creates one if it doesn't exist yet.
++	 */
++	public static FileStateCache getCache(Nd nd) {
++		return nd.getData(FileStateCache.class, FileStateCache::create);
++	}
++
++	/**
++	 * Creates a new instance of {@link FileStateCache}.
++	 */
++	private static FileStateCache create() {
++		return new FileStateCache();
++	}
++
++	/**
++	 * Inserts a new entry into the cache.
++	 * 
++	 * @param location absolute filesystem path to the file
++	 * @param result true if the file is definitely in sync with the index, false if there is any possibility of it
++	 * being out of sync.
++	 */
++	public void put(String location, boolean result) {
++		synchronized (this.fileStateCache) {
++			this.fileStateCache.put(location, result);
++		}
++	}
++
++	/**
++	 * Clears the entire cache.
++	 */
++	public void clear() {
++		synchronized (this.fileStateCache) {
++			this.fileStateCache.clear();
++		}
++	}
++
++	/**
++	 * Removes a single entry from the cache.
++	 * 
++	 * @param location absolute filesystem path to the file.
++	 */
++	public void remove(String location) {
++		synchronized (this.fileStateCache) {
++			this.fileStateCache.remove(location);
++		}
++	}
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+index e0af3d0..0990f58 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+@@ -100,6 +100,7 @@ public final class Indexer {
+ 	private boolean indexerDirtiedWhileDisabled = false;
+ 	private final Object automaticIndexingMutex = new Object();
+ 
++	private final FileStateCache fileStateCache;
+ 	private static final Object mutex = new Object();
+ 
+ 	private Object listenersMutex = new Object();
+@@ -206,6 +207,7 @@ public final class Indexer {
+ 			Package.logInfo("Indexer running rescan"); //$NON-NLS-1$
+ 		}
+ 
++		this.fileStateCache.clear();
+ 		WorkspaceSnapshot snapshot = WorkspaceSnapshot.create(this.root, subMonitor.split(4));
+ 		Set<IPath> locations = snapshot.allLocations();
+ 
+@@ -572,6 +574,10 @@ public final class Indexer {
+ 			if (resourceFile.isInIndex()) {
+ 				resourceFile.setFingerprint(fingerprint);
+ 				allResourcesWithThisPath = javaIndex.findResourcesWithPath(pathString);
++				// Remove this file from the file state cache, since the act of indexing it may have changed its
++				// up-to-date status. Note that it isn't necessarily up-to-date now -- it may have changed again
++				// while we were indexing it.
++				this.fileStateCache.remove(resourceFile.getLocation().getString());
+ 			}
+ 		} finally {
+ 			this.nd.releaseWriteLock();
+@@ -831,6 +837,7 @@ public final class Indexer {
+ 				this.nd.releaseWriteLock();
+ 			}
+ 		}
++
+ 		return result;
+ 	}
+ 
+@@ -841,6 +848,7 @@ public final class Indexer {
+ 		this.rescanJob.setJobGroup(this.group);
+ 		this.rebuildIndexJob.setSystem(true);
+ 		this.rebuildIndexJob.setJobGroup(this.group);
++		this.fileStateCache = FileStateCache.getCache(toPopulate);
+ 	}
+ 
+ 	public void rescanAll() {
+@@ -944,4 +952,35 @@ public final class Indexer {
+ 	public void requestRebuildIndex() {
+ 		this.rebuildIndexJob.schedule();
+ 	}
++
++	/**
++	 * Dirties the given filesystem location. This must point to a single file (not a folder) that needs to be
++	 * rescanned. The file may have been added, removed, or changed.
++	 * 
++	 * @param location an absolute filesystem location
++	 */
++	public void makeDirty(IPath location) {
++		this.fileStateCache.remove(location.toString());
++		rescanAll();
++	}
++
++	/**
++	 * Schedules a rescan of the given project.
++	 */
++	public void makeDirty(IProject project) {
++		this.fileStateCache.clear();
++		rescanAll();
++	}
++
++	/**
++	 * Schedules a rescan of the given path (which may be either a workspace path or an absolute path on the local
++	 * filesystem). This may point to either a single file or a folder that needs to be rescanned. Any resource that
++	 * has this path as a prefix will be rescanned.
++	 * 
++	 * @param pathToRescan
++	 */
++	public void makeWorkspacePathDirty(IPath pathToRescan) {
++		this.fileStateCache.clear();
++		rescanAll();
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+index dc0d730..07b1080 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+@@ -14,6 +14,8 @@ import java.io.File;
+ import java.util.List;
+ 
+ import org.eclipse.core.resources.IResource;
++import org.eclipse.core.resources.IWorkspaceRoot;
++import org.eclipse.core.resources.ResourcesPlugin;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.Path;
+@@ -21,6 +23,7 @@ import org.eclipse.core.runtime.Platform;
+ import org.eclipse.core.runtime.preferences.IPreferencesService;
+ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.JavaCore;
++import org.eclipse.jdt.internal.core.JavaModelManager;
+ import org.eclipse.jdt.internal.core.nd.Nd;
+ import org.eclipse.jdt.internal.core.nd.NdNode;
+ import org.eclipse.jdt.internal.core.nd.NdNodeTypeRegistry;
+@@ -30,6 +33,7 @@ import org.eclipse.jdt.internal.core.nd.field.FieldSearchIndex;
+ import org.eclipse.jdt.internal.core.nd.field.FieldSearchIndex.IResultRank;
+ import org.eclipse.jdt.internal.core.nd.field.FieldSearchIndex.SearchCriteria;
+ import org.eclipse.jdt.internal.core.nd.field.StructDef;
++import org.eclipse.jdt.internal.core.nd.indexer.FileStateCache;
+ import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+ 
+ public class JavaIndex {
+@@ -96,28 +100,33 @@ public class JavaIndex {
+ 
+ 	/**
+ 	 * Returns true iff the given resource file is up-to-date with the filesystem. Returns false
+-	 * if the argument is out-of-date with the file system or null.
++	 * if the argument is null or there is a possibility it being out-of-date with the file system.
+ 	 * 
+ 	 * @param file the index file to look up or null
+ 	 * @throws CoreException 
+ 	 */
+ 	public boolean isUpToDate(NdResourceFile file) throws CoreException {
+ 		if (file != null && file.isDoneIndexing()) {
+-			// TODO(sxenos): It would be much more efficient to mark files as being in one
+-			// of three states: unknown, dirty, or clean. Files would start in the unknown
+-			// state and move into the dirty state when we see them in a java model change
+-			// event. They would move into the clean state after passing this sort of
+-			// fingerprint test... but by caching the state of all tested files (in memory),
+-			// it would eliminate the vast majority of these (slow) fingerprint tests.
+-			
+-			Path locationPath = new Path(file.getLocation().getString());
+-			if (file.getFingerprint().test(locationPath, null).matches()) {
+-				return true;
++			String location = file.getLocation().getString();
++
++			FileStateCache cache = FileStateCache.getCache(getNd());
++			Boolean cachedResult = cache.isUpToDate(location);
++			if (cachedResult != null) {
++				return cachedResult;
+ 			}
++
++			Path locationPath = new Path(location);
++			boolean result = file.getFingerprint().test(locationPath, null).matches();
++			cache.put(location, result);
++			return result;
+ 		}
+ 		return false;
+ 	}
+ 
++	public void dirty(String location) {
++		FileStateCache.getCache(getNd()).clear();
++	}
++
+ 	public List<NdResourceFile> findResourcesWithPath(String thePath) {
+ 		return FILES.findAll(this.nd, this.address, FieldSearchIndex.SearchCriteria.create(thePath.toCharArray()));
+ 	}
+@@ -193,13 +202,35 @@ public class JavaIndex {
+ 	}
+ 
+ 	/**
+-	 * Returns the absolute filesystem location of the given element or null if none
++	 * Converts a JDT-style path (which may be a resource-relative path or absolute filesystem location) into a location
++	 * (which is unconditionally a filesystem location) or null if none.
++	 * <p>
++	 * The logic used in {@link #getLocationForPath(IPath)}, {@link #getLocationForElement(IJavaElement)}, and
++	 * {@link JavaModelManager#getLocalFile(IPath)} should be equivalent.
++	 */
++	public static IPath getLocationForPath(IPath path) {
++		IWorkspaceRoot root = ResourcesPlugin.getWorkspace().getRoot();
++
++		IResource resource = root.findMember(path);
++
++		if (resource != null) {
++			return resource.getLocation();
++		}
++
++		return path;
++	}
++
++	/**
++	 * Returns the absolute filesystem location of the given element or the empty path if none
++	 * <p>
++	 * The logic used in {@link #getLocationForPath(IPath)}, {@link #getLocationForElement(IJavaElement)}, and
++	 * {@link JavaModelManager#getLocalFile(IPath)} should be equivalent.
+ 	 */
+ 	public static IPath getLocationForElement(IJavaElement next) {
+ 		IResource resource = next.getResource();
+ 
+ 		if (resource != null) {
+-			return resource.getLocation() == null ? new Path("") : resource.getLocation(); //$NON-NLS-1$
++			return resource.getLocation() == null ? Path.EMPTY : resource.getLocation();
+ 		}
+ 
+ 		return next.getPath();
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+index dc72697..15cf64f 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+@@ -53,6 +53,7 @@ import org.eclipse.jdt.internal.core.index.FileIndexLocation;
+ import org.eclipse.jdt.internal.core.index.Index;
+ import org.eclipse.jdt.internal.core.index.IndexLocation;
+ import org.eclipse.jdt.internal.core.nd.indexer.Indexer;
++import org.eclipse.jdt.internal.core.nd.java.JavaIndex;
+ import org.eclipse.jdt.internal.core.search.BasicSearchEngine;
+ import org.eclipse.jdt.internal.core.search.PatternSearchJob;
+ import org.eclipse.jdt.internal.core.search.processing.IJob;
+@@ -69,6 +70,11 @@ public class IndexManager extends JobManager implements IIndexConstants {
+ 	// key = indexLocation path, value = an index
+ 	private SimpleLookupTable indexes = new SimpleLookupTable();
+ 
++	/**
++	 * The new indexer
++	 */
++	private Indexer indexer = Indexer.getInstance();
++
+ 	/* need to save ? */
+ 	private boolean needToSave = false;
+ 	private IPath javaPluginLocation = null;
+@@ -99,8 +105,6 @@ public class IndexManager extends JobManager implements IIndexConstants {
+ 
+ 
+ public synchronized void aboutToUpdateIndex(IPath containerPath, Integer newIndexState) {
+-	// TODO(sxenos): Find a more appropriate and more specific place to trigger re-indexing
+-	Indexer.getInstance().rescanAll();
+ 	// newIndexState is either UPDATING_STATE or REBUILDING_STATE
+ 	// must tag the index as inconsistent, in case we exit before the update job is started
+ 	IndexLocation indexLocation = computeIndexLocation(containerPath);
+@@ -246,6 +250,7 @@ private void deleteIndexFiles(SimpleSet pathsToKeep, IProgressMonitor monitor) {
+  * Creates an empty index at the given location, for the given container path, if none exist.
+  */
+ public synchronized void ensureIndexExists(IndexLocation indexLocation, IPath containerPath) {
++	this.indexer.makeWorkspacePathDirty(containerPath);
+ 	SimpleLookupTable states = getIndexStates();
+ 	Object state = states.get(indexLocation);
+ 	if (state == null) {
+@@ -557,6 +562,7 @@ public void indexResolvedDocument(SearchDocument searchDocument, SearchParticipa
+  * Note: the actual operation is performed in background
+  */
+ public void indexAll(IProject project) {
++	this.indexer.makeDirty(project);
+ 	if (JavaCore.getPlugin() == null) return;
+ 
+ 	// Also request indexing of binaries on the classpath
+@@ -590,6 +596,7 @@ public void indexLibrary(IPath path, IProject requestingProject, URL indexURL) {
+  * Note: the actual operation is performed in background
+  */
+ public void indexLibrary(IPath path, IProject requestingProject, URL indexURL, final boolean updateIndex) {
++	this.indexer.makeWorkspacePathDirty(path);
+ 	// requestingProject is no longer used to cancel jobs but leave it here just in case
+ 	IndexLocation indexFile = null;
+ 	boolean forceIndexUpdate = false;
+@@ -643,6 +650,7 @@ synchronized boolean addIndex(IPath containerPath, IndexLocation indexFile) {
+  */
+ public void indexSourceFolder(JavaProject javaProject, IPath sourceFolder, char[][] inclusionPatterns, char[][] exclusionPatterns) {
+ 	IProject project = javaProject.getProject();
++	this.indexer.makeWorkspacePathDirty(sourceFolder);
+ 	if (this.jobEnd > this.jobStart) {
+ 		// skip it if a job to index the project is already in the queue
+ 		IndexRequest request = new IndexAllProject(project, this);
+@@ -702,6 +710,7 @@ private void rebuildIndex(IndexLocation indexLocation, IPath containerPath) {
+ 	rebuildIndex(indexLocation, containerPath, false);
+ }
+ private void rebuildIndex(IndexLocation indexLocation, IPath containerPath, final boolean updateIndex) {
++	this.indexer.makeWorkspacePathDirty(containerPath);
+ 	Object target = JavaModel.getTarget(containerPath, true);
+ 	if (target == null) return;
+ 
+@@ -758,6 +767,7 @@ public synchronized Index recreateIndex(IPath containerPath) {
+  * Note: the actual operation is performed in background
+  */
+ public void remove(String containerRelativePath, IPath indexedContainer){
++	this.indexer.makeWorkspacePathDirty(indexedContainer);
+ 	request(new RemoveFromIndex(containerRelativePath, indexedContainer, this));
+ }
+ /**
+@@ -767,6 +777,7 @@ public void remove(String containerRelativePath, IPath indexedContainer){
+ public synchronized void removeIndex(IPath containerPath) {
+ 	if (VERBOSE || DEBUG)
+ 		Util.verbose("removing index " + containerPath); //$NON-NLS-1$
++	this.indexer.makeWorkspacePathDirty(containerPath);
+ 	IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 	Index index = getIndex(indexLocation);
+ 	File indexFile = null;
+@@ -796,6 +807,7 @@ public synchronized void removeIndex(IPath containerPath) {
+ public synchronized void removeIndexPath(IPath path) {
+ 	if (VERBOSE || DEBUG)
+ 		Util.verbose("removing index path " + path); //$NON-NLS-1$
++	this.indexer.makeWorkspacePathDirty(path);
+ 	Object[] keyTable = this.indexes.keyTable;
+ 	Object[] valueTable = this.indexes.valueTable;
+ 	IndexLocation[] locations = null;
+@@ -842,6 +854,7 @@ public synchronized void removeIndexPath(IPath path) {
+  * Removes all indexes whose paths start with (or are equal to) the given path.
+  */
+ public synchronized void removeIndexFamily(IPath path) {
++	this.indexer.makeWorkspacePathDirty(path);
+ 	// only finds cached index files... shutdown removes all non-cached index files
+ 	ArrayList toRemove = null;
+ 	Object[] containerPaths = this.indexLocations.keyTable;
+@@ -862,6 +875,7 @@ public synchronized void removeIndexFamily(IPath path) {
+  * Remove the content of the given source folder from the index.
+  */
+ public void removeSourceFolderFromIndex(JavaProject javaProject, IPath sourceFolder, char[][] inclusionPatterns, char[][] exclusionPatterns) {
++	this.indexer.makeWorkspacePathDirty(sourceFolder);
+ 	IProject project = javaProject.getProject();
+ 	if (this.jobEnd > this.jobStart) {
+ 		// skip it if a job to index the project is already in the queue
+@@ -1003,6 +1017,8 @@ public void saveIndexes() {
+ 	this.needToSave = !allSaved;
+ }
+ public void scheduleDocumentIndexing(final SearchDocument searchDocument, IPath container, final IndexLocation indexLocation, final SearchParticipant searchParticipant) {
++	IPath targetLocation = JavaIndex.getLocationForPath(new Path(searchDocument.getPath()));
++	this.indexer.makeDirty(targetLocation);
+ 	request(new IndexRequest(container, this) {
+ 		public boolean execute(IProgressMonitor progressMonitor) {
+ 			if (this.isCancelled || progressMonitor != null && progressMonitor.isCanceled()) return true;

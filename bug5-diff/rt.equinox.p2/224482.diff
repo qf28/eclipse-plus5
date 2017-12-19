@@ -1,0 +1,1604 @@
+commit 67992d96bb4304a4098a322f22f05fd7ad7bfe3b
+Author: Dave Stevenson <dstevenso>
+Date:   Thu Apr 10 18:15:49 2008 +0000
+
+    Initial delivery of platform.xml listener/synchronizer based on DJ's patch from bug 224482
+    https://bugs.eclipse.org/bugs/show_bug.cgi?id=224482.
+    
+    The creation of the listener is currently disabled by an
+    
+    	if false
+    		watchConfiguration();
+    
+    in the Activator, since there are still bugs that prevent the synchronization from working correctly. Having the patch released will allow multiple eyes to debug and work on the problems.
+
+17	13	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+86	134	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+0	101	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteDelta.java
+0	60	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteInfo.java
+17	13	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+86	134	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+0	101	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteDelta.java
+0	60	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteInfo.java
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+index 6e206f5..f52a13c 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+@@ -57,7 +57,7 @@ public class Activator implements BundleActivator {
+ 		if (reference != null)
+ 			manager = (IMetadataRepositoryManager) context.getService(reference);
+ 		if (manager == null)
+-			throw new IllegalStateException("MetadataRepositoryManager not registered.");
++			throw new IllegalStateException("MetadataRepositoryManager not registered."); //$NON-NLS-1$
+ 		try {
+ 			return manager.loadRepository(repoURL, null);
+ 		} finally {
+@@ -87,6 +87,14 @@ public class Activator implements BundleActivator {
+ 		}
+ 	}
+ 
++	protected static Collection getDropinRepositories() {
++		return Arrays.asList(dropinRepositories);
++	}
++
++	protected static Collection getConfigurationRepositories() {
++		return Arrays.asList(configurationRepositories);
++	}
++
+ 	/* (non-Javadoc)
+ 	 * @see org.osgi.framework.BundleActivator#start(org.osgi.framework.BundleContext)
+ 	 */
+@@ -115,7 +123,7 @@ public class Activator implements BundleActivator {
+ 
+ 		synchronize(new ArrayList(0), null);
+ 
+-		// we should probably be  holding on to these repos by URL
++		// we should probably be holding on to these repos by URL
+ 		// see Bug 223422
+ 		// for now explicitly nulling out these repos to allow GC to occur
+ 		dropinRepositories = null;
+@@ -184,17 +192,13 @@ public class Activator implements BundleActivator {
+ 	private void watchConfiguration() {
+ 		File configFile = new File("configuration/org.eclipse.update/platform.xml"); //$NON-NLS-1$
+ 		DirectoryWatcher watcher = new DirectoryWatcher(configFile.getParentFile());
+-		try {
+-			PlatformXmlListener listener = new PlatformXmlListener(configFile);
+-			watcher.addListener(listener);
+-			watcher.poll();
+-			List repositories = listener.getMetadataRepositories();
+-			if (repositories != null)
+-				configurationRepositories = (IMetadataRepository[]) repositories.toArray(new IMetadataRepository[0]);
+-		} catch (ProvisionException e) {
+-			// TODO proper logging
+-			e.printStackTrace();
+-		}
++		PlatformXmlListener listener = new PlatformXmlListener(configFile);
++		watcher.addListener(listener);
++		watcher.poll();
++		List repositories = listener.getMetadataRepositories();
++		if (repositories != null)
++			configurationRepositories = (IMetadataRepository[]) repositories.toArray(new IMetadataRepository[0]);
++
+ 	}
+ 
+ 	/*
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+index 6359520..889a010 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+@@ -1,22 +1,21 @@
+ /*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials 
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- * 
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
++* Copyright (c) 2007, 2008 IBM Corporation and others.
++* All rights reserved. This program and the accompanying materials 
++* are made available under the terms of the Eclipse Public License v1.0
++* which accompanies this distribution, and is available at
++* http://www.eclipse.org/legal/epl-v10.html
++* 
++* Contributors:
++*     IBM Corporation - initial API and implementation
++*******************************************************************************/
+ package org.eclipse.equinox.internal.p2.reconciler.dropins;
+ 
+ import java.io.File;
+-import java.io.IOException;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+-import org.eclipse.core.runtime.FileLocator;
+-import org.eclipse.equinox.internal.p2.reconciler.dropins.SiteDelta.Change;
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.Path;
+ import org.eclipse.equinox.internal.p2.update.*;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.directorywatcher.DirectoryChangeListener;
+@@ -29,18 +28,18 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 
+ 	private static final String PLATFORM_XML = "platform.xml"; //$NON-NLS-1$
+ 	private boolean changed = false;
+-	private Map sites = new HashMap();
+ 	private File root;
+ 	private long lastModified = -1l;
++	private Set configRepositories;
+ 
+-	public PlatformXmlListener(File file) throws ProvisionException {
++	/*
++	 * Construct a new listener based on the given platform.xml file.
++	 */
++	public PlatformXmlListener(File file) {
+ 		super();
+ 		if (!PLATFORM_XML.equals(file.getName()))
+ 			throw new IllegalArgumentException();
+ 		this.root = file;
+-		// don't need to set the "sites" variable since we will treat
+-		// everything as "added" in the delta if it is null
+-		process();
+ 	}
+ 
+ 	/* (non-Javadoc)
+@@ -66,14 +65,6 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		return new Long(0);
+ 	}
+ 
+-	/*
+-	 * Parse the platform.xml file and return the list of sites.
+-	 */
+-	private List parseConfiguration() throws ProvisionException {
+-		Configuration cfg = ConfigurationParser.parse(root, (URL) null);
+-		return cfg == null ? new ArrayList(0) : cfg.getSites();
+-	}
+-
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.directorywatcher.DirectoryChangeListener#isInterested(java.io.File)
+ 	 */
+@@ -81,113 +72,6 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		return file.getName().equals(PLATFORM_XML) && lastModified != file.lastModified();
+ 	}
+ 
+-	private List getSites() {
+-		List result = new ArrayList();
+-		for (Iterator iter = sites.values().iterator(); iter.hasNext();) {
+-			SiteInfo info = (SiteInfo) iter.next();
+-			result.add(info.getSite());
+-		}
+-		return result;
+-	}
+-
+-	/*
+-	 * This is where we reconcile the platform.xml and bundles.info.
+-	 */
+-	private void process() throws ProvisionException {
+-		lastModified = root.lastModified();
+-		SiteDelta delta = SiteDelta.create(getSites(), parseConfiguration());
+-		if (delta.isEmpty())
+-			return;
+-		added(delta.added());
+-		removed(delta.removed());
+-		changed(delta.changed());
+-		//Activator.synchronize(getMetadataRepositories(), null); // TODO proper progress monitoring?
+-	}
+-
+-	// iterate over the site listeners and collect the metadata repositories
+-	public List getMetadataRepositories() {
+-		List result = new ArrayList();
+-		for (Iterator iter = sites.values().iterator(); iter.hasNext();) {
+-			SiteInfo info = (SiteInfo) iter.next();
+-			result.add(info.getRepository());
+-		}
+-		return result;
+-	}
+-
+-	/*
+-	 * The given list of sites has been added so add directory
+-	 * watchers for each of them.
+-	 */
+-	private void added(Site[] added) throws ProvisionException {
+-		if (added == null || added.length == 0)
+-			return;
+-		for (int i = 0; i < added.length; i++) {
+-			Site site = added[i];
+-			// TODO skip for now
+-			if ("platform:/base/".equals(site.getUrl())) //$NON-NLS-1$
+-				continue;
+-			try {
+-				URL url = new URL(site.getUrl());
+-				try {
+-					url = FileLocator.resolve(url);
+-				} catch (IOException e) {
+-					throw new ProvisionException(Messages.errorProcessingConfg, e);
+-				}
+-				IMetadataRepository repo = Activator.loadMetadataRepository(url);
+-				if (repo == null) {
+-					// todo
+-				} else
+-					sites.put(site.getUrl(), new SiteInfo(site, repo));
+-			} catch (MalformedURLException e) {
+-				throw new ProvisionException(Messages.errorProcessingConfg, e);
+-			}
+-		}
+-	}
+-
+-	/*
+-	 * The given list of sites has been removed so act accordingly.
+-	 * Remove all the registered directory watchers.
+-	 */
+-	private void removed(Site[] removed) {
+-		if (removed == null || removed.length == 0)
+-			return;
+-		for (int i = 0; i < removed.length; i++) {
+-			Site site = removed[i];
+-			SiteInfo info = (SiteInfo) sites.get(site.getUrl());
+-			// TODO I think this should be an error?
+-			if (info == null) {
+-				// 
+-			}
+-
+-			sites.remove(site.getUrl());
+-		}
+-	}
+-
+-	/*
+-	 * The given set of sites has had their contents changed.
+-	 */
+-	private void changed(Change[] changes) throws ProvisionException {
+-		for (int i = 0; i < changes.length; i++) {
+-			Change change = changes[i];
+-			if (majorChange(change)) {
+-				removed(new Site[] {change.oldSite});
+-				added(new Site[] {change.newSite});
+-			}
+-		}
+-	}
+-
+-	/*
+-	 * Return true if the differences between the 2 sites should cause
+-	 * a new listener to be created.
+-	 */
+-	private boolean majorChange(Change change) {
+-		Site one = change.oldSite;
+-		Site two = change.newSite;
+-		if (!Utils.equals(one.getPolicy(), two.getPolicy()))
+-			return true;
+-		return !Utils.equals(one.getList(), two.getList());
+-	}
+-
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.directorywatcher.IDirectoryChangeListener#removed(java.io.File)
+ 	 */
+@@ -207,13 +91,81 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.directorywatcher.IDirectoryChangeListener#stopPoll()
+ 	 */
+ 	public void stopPoll() {
+-		if (changed)
++		if (changed) {
++			lastModified = root.lastModified();
+ 			try {
+-				process();
++				Configuration configuration = ConfigurationParser.parse(root, (URL) null);
++				synchronizeConfiguration(configuration);
+ 			} catch (ProvisionException e) {
++				// TODO Auto-generated catch block
+ 				e.printStackTrace();
+ 			}
++		}
+ 		changed = false;
+ 	}
+ 
++	public List getMetadataRepositories() {
++		return makeList(configRepositories);
++	}
++
++	private IMetadataRepository getMatchingRepo(Collection repositoryList, String urlString) {
++		if (repositoryList == null)
++			return null;
++		IPath urlPath = new Path(urlString).makeAbsolute();
++		for (Iterator iter = repositoryList.iterator(); iter.hasNext();) {
++			IMetadataRepository repo = (IMetadataRepository) iter.next();
++			Path repoPath = new Path(repo.getLocation().toExternalForm());
++			if (repoPath.makeAbsolute().equals(urlPath))
++				return repo;
++		}
++		return null;
++	}
++
++	protected void synchronizeConfiguration(Configuration config) {
++		List sites = config.getSites();
++		Set newRepos = new LinkedHashSet();
++		for (Iterator iter = sites.iterator(); iter.hasNext();) {
++			String siteURL = ((Site) iter.next()).getUrl();
++			// TODO: this is our way of skipping the base.
++			// we will need to change this to platform:base: at some point
++			if ("file:.".equals(siteURL) || "file:".equals(siteURL)) //$NON-NLS-1$//$NON-NLS-2$
++				continue;
++			if (siteURL.startsWith("file:") && siteURL.endsWith("/eclipse/")) //$NON-NLS-1$//$NON-NLS-2$
++				siteURL = siteURL.substring(0, siteURL.length() - 8);
++			IMetadataRepository match = getMatchingRepo(Activator.getConfigurationRepositories(), siteURL);
++			if (match == null)
++				match = getMatchingRepo(configRepositories, siteURL);
++			if (match == null) {
++				try {
++					URL repoURL = new URL(siteURL);
++					IMetadataRepository newRepo = Activator.loadMetadataRepository(repoURL);
++					Activator.loadArtifactRepository(repoURL);
++					newRepos.add(newRepo);
++				} catch (MalformedURLException e) {
++					// TODO Auto-generated catch block
++					e.printStackTrace();
++				} catch (ProvisionException e) {
++					// TODO Auto-generated catch block
++					e.printStackTrace();
++				}
++			}
++		}
++		// if we didn't add any new repos then there is no work to do
++		if (newRepos.isEmpty())
++			return;
++		configRepositories = newRepos;
++		Activator.synchronize(makeList(newRepos), null);
++	}
++
++	// TODO: this is a kludge to fix collection impedance mismatch
++	//		 between the xml listener and the activator; get rid of it!
++	private List makeList(Set set) {
++		List list = new ArrayList((set != null ? set.size() : 0));
++		if (set != null) {
++			for (Iterator iter = set.iterator(); iter.hasNext();)
++				list.add(iter.next());
++		}
++		return list;
++	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteDelta.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteDelta.java
+deleted file mode 100644
+index 42d2af9..0000000
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteDelta.java
++++ /dev/null
+@@ -1,101 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.reconciler.dropins;
+-
+-import java.util.ArrayList;
+-import java.util.List;
+-import org.eclipse.equinox.internal.p2.update.Site;
+-
+-/*
+- * Represents the changes between 2 lists of sites.
+- */
+-public class SiteDelta {
+-
+-	private static final String PLATFORM_BASE = "platform:/base/"; //$NON-NLS-1$
+-
+-	static class Change {
+-		Site oldSite;
+-		Site newSite;
+-
+-		Change(Site oldSite, Site newSite) {
+-			this.oldSite = oldSite;
+-			this.newSite = newSite;
+-		}
+-	}
+-
+-	private List added = new ArrayList();
+-	private List removed = new ArrayList();
+-	private List changed = new ArrayList();
+-
+-	/*
+-	 * Create and return a new delta object based on the two given lists of
+-	 * site objects.
+-	 */
+-	public static SiteDelta create(List oneList, List twoList) {
+-		Site[] one = (Site[]) oneList.toArray(new Site[oneList.size()]);
+-		Site[] two = (Site[]) twoList.toArray(new Site[twoList.size()]);
+-		SiteDelta result = new SiteDelta();
+-		for (int i = 0; one == null || i < one.length; i++) {
+-			boolean found = false;
+-			for (int j = 0; !found && j < two.length; j++) {
+-				if (two[j] != null && one[i].getUrl().equals(two[j].getUrl())) {
+-					found = true;
+-					// TODO
+-					if (!one[i].getUrl().equals(PLATFORM_BASE) && !one[i].equals(two[j]))
+-						result.changed.add(new Change(one[i], two[j]));
+-					one[i] = null;
+-					two[j] = null;
+-				}
+-			}
+-			// TODO
+-			if (!found && !PLATFORM_BASE.equals(one[i].getUrl()))
+-				result.removed.add(one[i]);
+-		}
+-		for (int j = 0; j < two.length; j++) {
+-			// TODO
+-			if (two[j] != null && !PLATFORM_BASE.equals(two[j].getUrl()))
+-				result.added.add(two[j]);
+-		}
+-		return result;
+-	}
+-
+-	/*
+-	 * Return a list of the sites that were added. May return an empty list
+-	 * but never returns null.
+-	 */
+-	public Site[] added() {
+-		return (Site[]) added.toArray(new Site[added.size()]);
+-	}
+-
+-	/*
+-	 * Return a list of the sites that were removed. May return an empty list
+-	 * but never returns null.
+-	 */
+-	public Site[] removed() {
+-		return (Site[]) removed.toArray(new Site[removed.size()]);
+-	}
+-
+-	/*
+-	 * Return a list of the site changes that were changed. May return an empty list
+-	 * but never returns null.
+-	 */
+-	public Change[] changed() {
+-		return (Change[]) changed.toArray(new Change[changed.size()]);
+-	}
+-
+-	/*
+-	 * Return a boolean value indicating whether or not there are any
+-	 * changes in this delta.
+-	 */
+-	public boolean isEmpty() {
+-		return added.size() == 0 && removed.size() == 0 && changed.size() == 0;
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteInfo.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteInfo.java
+deleted file mode 100644
+index d891811..0000000
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteInfo.java
++++ /dev/null
+@@ -1,60 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.reconciler.dropins;
+-
+-import org.eclipse.equinox.internal.p2.update.Site;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+-
+-/*
+- * Internal class contains information about watchers and sites. Used for caching.
+- */
+-public class SiteInfo {
+-	private IMetadataRepository repository;
+-	private Site site;
+-	private String url;
+-
+-	public SiteInfo(Site site, IMetadataRepository repository) {
+-		super();
+-		this.site = site;
+-		this.url = site.getUrl();
+-		this.repository = repository;
+-	}
+-
+-	public Site getSite() {
+-		return site;
+-	}
+-
+-	public String getUrl() {
+-		return url;
+-	}
+-
+-	public IMetadataRepository getRepository() {
+-		return repository;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see java.lang.Object#hashCode()
+-	 */
+-	public int hashCode() {
+-		return url.hashCode();
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see java.lang.Object#equals(java.lang.Object)
+-	 */
+-	public boolean equals(Object obj) {
+-		if (!(obj instanceof SiteInfo))
+-			return false;
+-		SiteInfo other = (SiteInfo) obj;
+-		// this is ok because they are strings and not real URLs
+-		return url.equals(other.getUrl());
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+index 6e206f5..f52a13c 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+@@ -57,7 +57,7 @@ public class Activator implements BundleActivator {
+ 		if (reference != null)
+ 			manager = (IMetadataRepositoryManager) context.getService(reference);
+ 		if (manager == null)
+-			throw new IllegalStateException("MetadataRepositoryManager not registered.");
++			throw new IllegalStateException("MetadataRepositoryManager not registered."); //$NON-NLS-1$
+ 		try {
+ 			return manager.loadRepository(repoURL, null);
+ 		} finally {
+@@ -87,6 +87,14 @@ public class Activator implements BundleActivator {
+ 		}
+ 	}
+ 
++	protected static Collection getDropinRepositories() {
++		return Arrays.asList(dropinRepositories);
++	}
++
++	protected static Collection getConfigurationRepositories() {
++		return Arrays.asList(configurationRepositories);
++	}
++
+ 	/* (non-Javadoc)
+ 	 * @see org.osgi.framework.BundleActivator#start(org.osgi.framework.BundleContext)
+ 	 */
+@@ -115,7 +123,7 @@ public class Activator implements BundleActivator {
+ 
+ 		synchronize(new ArrayList(0), null);
+ 
+-		// we should probably be  holding on to these repos by URL
++		// we should probably be holding on to these repos by URL
+ 		// see Bug 223422
+ 		// for now explicitly nulling out these repos to allow GC to occur
+ 		dropinRepositories = null;
+@@ -184,17 +192,13 @@ public class Activator implements BundleActivator {
+ 	private void watchConfiguration() {
+ 		File configFile = new File("configuration/org.eclipse.update/platform.xml"); //$NON-NLS-1$
+ 		DirectoryWatcher watcher = new DirectoryWatcher(configFile.getParentFile());
+-		try {
+-			PlatformXmlListener listener = new PlatformXmlListener(configFile);
+-			watcher.addListener(listener);
+-			watcher.poll();
+-			List repositories = listener.getMetadataRepositories();
+-			if (repositories != null)
+-				configurationRepositories = (IMetadataRepository[]) repositories.toArray(new IMetadataRepository[0]);
+-		} catch (ProvisionException e) {
+-			// TODO proper logging
+-			e.printStackTrace();
+-		}
++		PlatformXmlListener listener = new PlatformXmlListener(configFile);
++		watcher.addListener(listener);
++		watcher.poll();
++		List repositories = listener.getMetadataRepositories();
++		if (repositories != null)
++			configurationRepositories = (IMetadataRepository[]) repositories.toArray(new IMetadataRepository[0]);
++
+ 	}
+ 
+ 	/*
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+index 6359520..889a010 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+@@ -1,22 +1,21 @@
+ /*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials 
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- * 
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
++* Copyright (c) 2007, 2008 IBM Corporation and others.
++* All rights reserved. This program and the accompanying materials 
++* are made available under the terms of the Eclipse Public License v1.0
++* which accompanies this distribution, and is available at
++* http://www.eclipse.org/legal/epl-v10.html
++* 
++* Contributors:
++*     IBM Corporation - initial API and implementation
++*******************************************************************************/
+ package org.eclipse.equinox.internal.p2.reconciler.dropins;
+ 
+ import java.io.File;
+-import java.io.IOException;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+-import org.eclipse.core.runtime.FileLocator;
+-import org.eclipse.equinox.internal.p2.reconciler.dropins.SiteDelta.Change;
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.Path;
+ import org.eclipse.equinox.internal.p2.update.*;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.directorywatcher.DirectoryChangeListener;
+@@ -29,18 +28,18 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 
+ 	private static final String PLATFORM_XML = "platform.xml"; //$NON-NLS-1$
+ 	private boolean changed = false;
+-	private Map sites = new HashMap();
+ 	private File root;
+ 	private long lastModified = -1l;
++	private Set configRepositories;
+ 
+-	public PlatformXmlListener(File file) throws ProvisionException {
++	/*
++	 * Construct a new listener based on the given platform.xml file.
++	 */
++	public PlatformXmlListener(File file) {
+ 		super();
+ 		if (!PLATFORM_XML.equals(file.getName()))
+ 			throw new IllegalArgumentException();
+ 		this.root = file;
+-		// don't need to set the "sites" variable since we will treat
+-		// everything as "added" in the delta if it is null
+-		process();
+ 	}
+ 
+ 	/* (non-Javadoc)
+@@ -66,14 +65,6 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		return new Long(0);
+ 	}
+ 
+-	/*
+-	 * Parse the platform.xml file and return the list of sites.
+-	 */
+-	private List parseConfiguration() throws ProvisionException {
+-		Configuration cfg = ConfigurationParser.parse(root, (URL) null);
+-		return cfg == null ? new ArrayList(0) : cfg.getSites();
+-	}
+-
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.directorywatcher.DirectoryChangeListener#isInterested(java.io.File)
+ 	 */
+@@ -81,113 +72,6 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		return file.getName().equals(PLATFORM_XML) && lastModified != file.lastModified();
+ 	}
+ 
+-	private List getSites() {
+-		List result = new ArrayList();
+-		for (Iterator iter = sites.values().iterator(); iter.hasNext();) {
+-			SiteInfo info = (SiteInfo) iter.next();
+-			result.add(info.getSite());
+-		}
+-		return result;
+-	}
+-
+-	/*
+-	 * This is where we reconcile the platform.xml and bundles.info.
+-	 */
+-	private void process() throws ProvisionException {
+-		lastModified = root.lastModified();
+-		SiteDelta delta = SiteDelta.create(getSites(), parseConfiguration());
+-		if (delta.isEmpty())
+-			return;
+-		added(delta.added());
+-		removed(delta.removed());
+-		changed(delta.changed());
+-		//Activator.synchronize(getMetadataRepositories(), null); // TODO proper progress monitoring?
+-	}
+-
+-	// iterate over the site listeners and collect the metadata repositories
+-	public List getMetadataRepositories() {
+-		List result = new ArrayList();
+-		for (Iterator iter = sites.values().iterator(); iter.hasNext();) {
+-			SiteInfo info = (SiteInfo) iter.next();
+-			result.add(info.getRepository());
+-		}
+-		return result;
+-	}
+-
+-	/*
+-	 * The given list of sites has been added so add directory
+-	 * watchers for each of them.
+-	 */
+-	private void added(Site[] added) throws ProvisionException {
+-		if (added == null || added.length == 0)
+-			return;
+-		for (int i = 0; i < added.length; i++) {
+-			Site site = added[i];
+-			// TODO skip for now
+-			if ("platform:/base/".equals(site.getUrl())) //$NON-NLS-1$
+-				continue;
+-			try {
+-				URL url = new URL(site.getUrl());
+-				try {
+-					url = FileLocator.resolve(url);
+-				} catch (IOException e) {
+-					throw new ProvisionException(Messages.errorProcessingConfg, e);
+-				}
+-				IMetadataRepository repo = Activator.loadMetadataRepository(url);
+-				if (repo == null) {
+-					// todo
+-				} else
+-					sites.put(site.getUrl(), new SiteInfo(site, repo));
+-			} catch (MalformedURLException e) {
+-				throw new ProvisionException(Messages.errorProcessingConfg, e);
+-			}
+-		}
+-	}
+-
+-	/*
+-	 * The given list of sites has been removed so act accordingly.
+-	 * Remove all the registered directory watchers.
+-	 */
+-	private void removed(Site[] removed) {
+-		if (removed == null || removed.length == 0)
+-			return;
+-		for (int i = 0; i < removed.length; i++) {
+-			Site site = removed[i];
+-			SiteInfo info = (SiteInfo) sites.get(site.getUrl());
+-			// TODO I think this should be an error?
+-			if (info == null) {
+-				// 
+-			}
+-
+-			sites.remove(site.getUrl());
+-		}
+-	}
+-
+-	/*
+-	 * The given set of sites has had their contents changed.
+-	 */
+-	private void changed(Change[] changes) throws ProvisionException {
+-		for (int i = 0; i < changes.length; i++) {
+-			Change change = changes[i];
+-			if (majorChange(change)) {
+-				removed(new Site[] {change.oldSite});
+-				added(new Site[] {change.newSite});
+-			}
+-		}
+-	}
+-
+-	/*
+-	 * Return true if the differences between the 2 sites should cause
+-	 * a new listener to be created.
+-	 */
+-	private boolean majorChange(Change change) {
+-		Site one = change.oldSite;
+-		Site two = change.newSite;
+-		if (!Utils.equals(one.getPolicy(), two.getPolicy()))
+-			return true;
+-		return !Utils.equals(one.getList(), two.getList());
+-	}
+-
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.directorywatcher.IDirectoryChangeListener#removed(java.io.File)
+ 	 */
+@@ -207,13 +91,81 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.directorywatcher.IDirectoryChangeListener#stopPoll()
+ 	 */
+ 	public void stopPoll() {
+-		if (changed)
++		if (changed) {
++			lastModified = root.lastModified();
+ 			try {
+-				process();
++				Configuration configuration = ConfigurationParser.parse(root, (URL) null);
++				synchronizeConfiguration(configuration);
+ 			} catch (ProvisionException e) {
++				// TODO Auto-generated catch block
+ 				e.printStackTrace();
+ 			}
++		}
+ 		changed = false;
+ 	}
+ 
++	public List getMetadataRepositories() {
++		return makeList(configRepositories);
++	}
++
++	private IMetadataRepository getMatchingRepo(Collection repositoryList, String urlString) {
++		if (repositoryList == null)
++			return null;
++		IPath urlPath = new Path(urlString).makeAbsolute();
++		for (Iterator iter = repositoryList.iterator(); iter.hasNext();) {
++			IMetadataRepository repo = (IMetadataRepository) iter.next();
++			Path repoPath = new Path(repo.getLocation().toExternalForm());
++			if (repoPath.makeAbsolute().equals(urlPath))
++				return repo;
++		}
++		return null;
++	}
++
++	protected void synchronizeConfiguration(Configuration config) {
++		List sites = config.getSites();
++		Set newRepos = new LinkedHashSet();
++		for (Iterator iter = sites.iterator(); iter.hasNext();) {
++			String siteURL = ((Site) iter.next()).getUrl();
++			// TODO: this is our way of skipping the base.
++			// we will need to change this to platform:base: at some point
++			if ("file:.".equals(siteURL) || "file:".equals(siteURL)) //$NON-NLS-1$//$NON-NLS-2$
++				continue;
++			if (siteURL.startsWith("file:") && siteURL.endsWith("/eclipse/")) //$NON-NLS-1$//$NON-NLS-2$
++				siteURL = siteURL.substring(0, siteURL.length() - 8);
++			IMetadataRepository match = getMatchingRepo(Activator.getConfigurationRepositories(), siteURL);
++			if (match == null)
++				match = getMatchingRepo(configRepositories, siteURL);
++			if (match == null) {
++				try {
++					URL repoURL = new URL(siteURL);
++					IMetadataRepository newRepo = Activator.loadMetadataRepository(repoURL);
++					Activator.loadArtifactRepository(repoURL);
++					newRepos.add(newRepo);
++				} catch (MalformedURLException e) {
++					// TODO Auto-generated catch block
++					e.printStackTrace();
++				} catch (ProvisionException e) {
++					// TODO Auto-generated catch block
++					e.printStackTrace();
++				}
++			}
++		}
++		// if we didn't add any new repos then there is no work to do
++		if (newRepos.isEmpty())
++			return;
++		configRepositories = newRepos;
++		Activator.synchronize(makeList(newRepos), null);
++	}
++
++	// TODO: this is a kludge to fix collection impedance mismatch
++	//		 between the xml listener and the activator; get rid of it!
++	private List makeList(Set set) {
++		List list = new ArrayList((set != null ? set.size() : 0));
++		if (set != null) {
++			for (Iterator iter = set.iterator(); iter.hasNext();)
++				list.add(iter.next());
++		}
++		return list;
++	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteDelta.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteDelta.java
+deleted file mode 100644
+index 42d2af9..0000000
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteDelta.java
++++ /dev/null
+@@ -1,101 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.reconciler.dropins;
+-
+-import java.util.ArrayList;
+-import java.util.List;
+-import org.eclipse.equinox.internal.p2.update.Site;
+-
+-/*
+- * Represents the changes between 2 lists of sites.
+- */
+-public class SiteDelta {
+-
+-	private static final String PLATFORM_BASE = "platform:/base/"; //$NON-NLS-1$
+-
+-	static class Change {
+-		Site oldSite;
+-		Site newSite;
+-
+-		Change(Site oldSite, Site newSite) {
+-			this.oldSite = oldSite;
+-			this.newSite = newSite;
+-		}
+-	}
+-
+-	private List added = new ArrayList();
+-	private List removed = new ArrayList();
+-	private List changed = new ArrayList();
+-
+-	/*
+-	 * Create and return a new delta object based on the two given lists of
+-	 * site objects.
+-	 */
+-	public static SiteDelta create(List oneList, List twoList) {
+-		Site[] one = (Site[]) oneList.toArray(new Site[oneList.size()]);
+-		Site[] two = (Site[]) twoList.toArray(new Site[twoList.size()]);
+-		SiteDelta result = new SiteDelta();
+-		for (int i = 0; one == null || i < one.length; i++) {
+-			boolean found = false;
+-			for (int j = 0; !found && j < two.length; j++) {
+-				if (two[j] != null && one[i].getUrl().equals(two[j].getUrl())) {
+-					found = true;
+-					// TODO
+-					if (!one[i].getUrl().equals(PLATFORM_BASE) && !one[i].equals(two[j]))
+-						result.changed.add(new Change(one[i], two[j]));
+-					one[i] = null;
+-					two[j] = null;
+-				}
+-			}
+-			// TODO
+-			if (!found && !PLATFORM_BASE.equals(one[i].getUrl()))
+-				result.removed.add(one[i]);
+-		}
+-		for (int j = 0; j < two.length; j++) {
+-			// TODO
+-			if (two[j] != null && !PLATFORM_BASE.equals(two[j].getUrl()))
+-				result.added.add(two[j]);
+-		}
+-		return result;
+-	}
+-
+-	/*
+-	 * Return a list of the sites that were added. May return an empty list
+-	 * but never returns null.
+-	 */
+-	public Site[] added() {
+-		return (Site[]) added.toArray(new Site[added.size()]);
+-	}
+-
+-	/*
+-	 * Return a list of the sites that were removed. May return an empty list
+-	 * but never returns null.
+-	 */
+-	public Site[] removed() {
+-		return (Site[]) removed.toArray(new Site[removed.size()]);
+-	}
+-
+-	/*
+-	 * Return a list of the site changes that were changed. May return an empty list
+-	 * but never returns null.
+-	 */
+-	public Change[] changed() {
+-		return (Change[]) changed.toArray(new Change[changed.size()]);
+-	}
+-
+-	/*
+-	 * Return a boolean value indicating whether or not there are any
+-	 * changes in this delta.
+-	 */
+-	public boolean isEmpty() {
+-		return added.size() == 0 && removed.size() == 0 && changed.size() == 0;
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteInfo.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteInfo.java
+deleted file mode 100644
+index d891811..0000000
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/SiteInfo.java
++++ /dev/null
+@@ -1,60 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.reconciler.dropins;
+-
+-import org.eclipse.equinox.internal.p2.update.Site;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+-
+-/*
+- * Internal class contains information about watchers and sites. Used for caching.
+- */
+-public class SiteInfo {
+-	private IMetadataRepository repository;
+-	private Site site;
+-	private String url;
+-
+-	public SiteInfo(Site site, IMetadataRepository repository) {
+-		super();
+-		this.site = site;
+-		this.url = site.getUrl();
+-		this.repository = repository;
+-	}
+-
+-	public Site getSite() {
+-		return site;
+-	}
+-
+-	public String getUrl() {
+-		return url;
+-	}
+-
+-	public IMetadataRepository getRepository() {
+-		return repository;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see java.lang.Object#hashCode()
+-	 */
+-	public int hashCode() {
+-		return url.hashCode();
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see java.lang.Object#equals(java.lang.Object)
+-	 */
+-	public boolean equals(Object obj) {
+-		if (!(obj instanceof SiteInfo))
+-			return false;
+-		SiteInfo other = (SiteInfo) obj;
+-		// this is ok because they are strings and not real URLs
+-		return url.equals(other.getUrl());
+-	}
+-}
+commit c223124b36206e6928cb501ebd339869f5490c51
+Author: DJ Houghton <dj>
+Date:   Fri Apr 11 17:50:17 2008 +0000
+
+    Bug 224482 - [reconciler] Need to watch the platform.xml
+
+14	20	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+2	2	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/DropinsRepositoryListener.java
+1	0	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Messages.java
+25	25	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+2	1	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/messages.properties
+14	20	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+2	2	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/DropinsRepositoryListener.java
+1	0	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Messages.java
+25	25	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+2	1	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/messages.properties
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+index d06c115..858751b 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+@@ -13,8 +13,7 @@ import java.io.File;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+-import org.eclipse.core.runtime.IProgressMonitor;
+-import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
+@@ -38,8 +37,8 @@ public class Activator implements BundleActivator {
+ 	private static BundleContext bundleContext;
+ 	private ServiceReference packageAdminRef;
+ 	private List watchers = new ArrayList();
+-	private static IMetadataRepository[] dropinRepositories;
+-	private static IMetadataRepository[] configurationRepositories;
++	private static Collection dropinRepositories;
++	private static Collection configurationRepositories;
+ 	private static IMetadataRepository[] linksRepositories;
+ 	private static IMetadataRepository eclipseProductRepository;
+ 
+@@ -88,11 +87,11 @@ public class Activator implements BundleActivator {
+ 	}
+ 
+ 	protected static Collection getDropinRepositories() {
+-		return (dropinRepositories != null ? Arrays.asList(dropinRepositories) : new ArrayList(0));
++		return dropinRepositories == null ? new ArrayList(0) : dropinRepositories;
+ 	}
+ 
+ 	protected static Collection getConfigurationRepositories() {
+-		return (configurationRepositories != null ? Arrays.asList(configurationRepositories) : new ArrayList(0));
++		return configurationRepositories == null ? new ArrayList(0) : configurationRepositories;
+ 	}
+ 
+ 	/* (non-Javadoc)
+@@ -119,7 +118,7 @@ public class Activator implements BundleActivator {
+ 		watchDropins(profile);
+ 		// keep an eye on the platform.xml
+ 		if (false)
+-			watchConfiguration();
++		watchConfiguration();
+ 
+ 		synchronize(new ArrayList(0), null);
+ 
+@@ -133,21 +132,16 @@ public class Activator implements BundleActivator {
+ 	}
+ 
+ 	private void watchEclipseProduct() {
+-
+-		URL baseURL;
+ 		try {
+-			baseURL = new URL(bundleContext.getProperty(OSGI_CONFIGURATION_AREA));
++			URL baseURL = new URL(bundleContext.getProperty(OSGI_CONFIGURATION_AREA));
+ 			URL pooledURL = new URL(baseURL, "../.pooled"); //$NON-NLS-1$
+ 			loadArtifactRepository(pooledURL);
+ 			eclipseProductRepository = loadMetadataRepository(pooledURL);
+ 		} catch (MalformedURLException e) {
+-			// TODO proper logging
+-			e.printStackTrace();
++			LogHelper.log(new Status(IStatus.ERROR, ID, "Error occurred while loading repository.", e));
+ 		} catch (ProvisionException e) {
+-			// TODO proper logging
+-			e.printStackTrace();
++			LogHelper.log(new Status(IStatus.ERROR, ID, "Error occurred while loading repository.", e));
+ 		}
+-
+ 	}
+ 
+ 	private boolean startEarly(String bundleName) throws BundleException {
+@@ -161,17 +155,17 @@ public class Activator implements BundleActivator {
+ 	/*
+ 	 * Synchronize the profile.
+ 	 */
+-	public static synchronized void synchronize(List extraRepositories, IProgressMonitor monitor) {
++	public static synchronized void synchronize(Collection extraRepositories, IProgressMonitor monitor) {
+ 		IProfile profile = getCurrentProfile(bundleContext);
+ 		if (profile == null)
+ 			return;
+ 		// create the profile synchronizer on all available repositories
+ 		Set repositories = new HashSet(extraRepositories);
+ 		if (dropinRepositories != null)
+-			repositories.addAll(Arrays.asList(dropinRepositories));
++			repositories.addAll(dropinRepositories);
+ 
+ 		if (configurationRepositories != null)
+-			repositories.addAll(Arrays.asList(configurationRepositories));
++			repositories.addAll(configurationRepositories);
+ 
+ 		if (linksRepositories != null)
+ 			repositories.addAll(Arrays.asList(linksRepositories));
+@@ -195,9 +189,9 @@ public class Activator implements BundleActivator {
+ 		PlatformXmlListener listener = new PlatformXmlListener(configFile);
+ 		watcher.addListener(listener);
+ 		watcher.poll();
+-		List repositories = listener.getMetadataRepositories();
++		Collection repositories = listener.getMetadataRepositories();
+ 		if (repositories != null)
+-			configurationRepositories = (IMetadataRepository[]) repositories.toArray(new IMetadataRepository[0]);
++			configurationRepositories = repositories;
+ 
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/DropinsRepositoryListener.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/DropinsRepositoryListener.java
+index fdc3157..6256907 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/DropinsRepositoryListener.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/DropinsRepositoryListener.java
+@@ -249,10 +249,10 @@ public class DropinsRepositoryListener extends RepositoryListener {
+ 		repository.setProperty(key, value);
+ 	}
+ 
+-	public IMetadataRepository[] getMetadataRepositories() {
++	public Collection getMetadataRepositories() {
+ 		List result = new ArrayList(metadataRepositories);
+ 		result.add(getMetadataRepository());
+-		return (IMetadataRepository[]) result.toArray(new IMetadataRepository[0]);
++		return result;
+ 	}
+ 
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Messages.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Messages.java
+index aa0e61b..d207742 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Messages.java
+@@ -18,6 +18,7 @@ import org.eclipse.osgi.util.NLS;
+ public class Messages extends NLS {
+ 	private static final String BUNDLE_NAME = "org.eclipse.equinox.internal.p2.reconciler.dropins.messages"; //$NON-NLS-1$
+ 	public static String artifact_repo_manager_not_registered;
++	public static String errorLoadingRepository;
+ 	public static String errorProcessingConfg;
+ 	public static String metadata_repo_manager_not_registered;
+ 	static {
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+index 889a010..e11924a 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+@@ -14,12 +14,15 @@ import java.io.File;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+-import org.eclipse.core.runtime.IPath;
+-import org.eclipse.core.runtime.Path;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.update.*;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.directorywatcher.DirectoryChangeListener;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
++import org.eclipse.osgi.service.datalocation.Location;
++import org.eclipse.osgi.util.NLS;
+ 
+ /**
+  * @since 1.0
+@@ -42,6 +45,18 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		this.root = file;
+ 	}
+ 
++	/*
++	 * Do a look-up and return the OSGi install area if it is set.
++	 */
++	private static URL getOSGiInstallArea() {
++		Location location = (Location) ServiceHelper.getService(Activator.getContext(), Location.class.getName(), Location.INSTALL_FILTER);
++		if (location == null)
++			return null;
++		if (!location.isSet())
++			return null;
++		return location.getURL();
++	}
++
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.directorywatcher.IDirectoryChangeListener#added(java.io.File)
+ 	 */
+@@ -94,18 +109,17 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		if (changed) {
+ 			lastModified = root.lastModified();
+ 			try {
+-				Configuration configuration = ConfigurationParser.parse(root, (URL) null);
++				Configuration configuration = ConfigurationParser.parse(root, getOSGiInstallArea());
+ 				synchronizeConfiguration(configuration);
+ 			} catch (ProvisionException e) {
+-				// TODO Auto-generated catch block
+-				e.printStackTrace();
++				LogHelper.log(new Status(IStatus.ERROR, Activator.ID, Messages.errorProcessingConfg, e));
+ 			}
+ 		}
+ 		changed = false;
+ 	}
+ 
+-	public List getMetadataRepositories() {
+-		return makeList(configRepositories);
++	public Collection getMetadataRepositories() {
++		return configRepositories;
+ 	}
+ 
+ 	private IMetadataRepository getMatchingRepo(Collection repositoryList, String urlString) {
+@@ -127,7 +141,7 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		for (Iterator iter = sites.iterator(); iter.hasNext();) {
+ 			String siteURL = ((Site) iter.next()).getUrl();
+ 			// TODO: this is our way of skipping the base.
+-			// we will need to change this to platform:base: at some point
++			// we will need to change this to platform:/base/ at some point
+ 			if ("file:.".equals(siteURL) || "file:".equals(siteURL)) //$NON-NLS-1$//$NON-NLS-2$
+ 				continue;
+ 			if (siteURL.startsWith("file:") && siteURL.endsWith("/eclipse/")) //$NON-NLS-1$//$NON-NLS-2$
+@@ -142,11 +156,9 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 					Activator.loadArtifactRepository(repoURL);
+ 					newRepos.add(newRepo);
+ 				} catch (MalformedURLException e) {
+-					// TODO Auto-generated catch block
+-					e.printStackTrace();
++					LogHelper.log(new Status(IStatus.ERROR, Activator.ID, NLS.bind(Messages.errorLoadingRepository, siteURL), e));
+ 				} catch (ProvisionException e) {
+-					// TODO Auto-generated catch block
+-					e.printStackTrace();
++					LogHelper.log(new Status(IStatus.ERROR, Activator.ID, NLS.bind(Messages.errorLoadingRepository, siteURL), e));
+ 				}
+ 			}
+ 		}
+@@ -154,18 +166,6 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		if (newRepos.isEmpty())
+ 			return;
+ 		configRepositories = newRepos;
+-		Activator.synchronize(makeList(newRepos), null);
++		Activator.synchronize(newRepos, null);
+ 	}
+-
+-	// TODO: this is a kludge to fix collection impedance mismatch
+-	//		 between the xml listener and the activator; get rid of it!
+-	private List makeList(Set set) {
+-		List list = new ArrayList((set != null ? set.size() : 0));
+-		if (set != null) {
+-			for (Iterator iter = set.iterator(); iter.hasNext();)
+-				list.add(iter.next());
+-		}
+-		return list;
+-	}
+-
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/messages.properties b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/messages.properties
+index 063c543..d8066d0 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/messages.properties
+@@ -9,5 +9,6 @@
+ #     IBM Corporation - initial API and implementation
+ ###############################################################################
+ artifact_repo_manager_not_registered=ArtifactRepositoryManager not registered.
++errorLoadingRepository=Error occurred while loading repository at {0}.
+ errorProcessingConfg=Exception while processing configuration.
+-metadata_repo_manager_not_registered=MetadataRepositoryManager not registered.
++metadata_repo_manager_not_registered=MetadataRepositoryManager not registered.
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+index d06c115..858751b 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+@@ -13,8 +13,7 @@ import java.io.File;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+-import org.eclipse.core.runtime.IProgressMonitor;
+-import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
+@@ -38,8 +37,8 @@ public class Activator implements BundleActivator {
+ 	private static BundleContext bundleContext;
+ 	private ServiceReference packageAdminRef;
+ 	private List watchers = new ArrayList();
+-	private static IMetadataRepository[] dropinRepositories;
+-	private static IMetadataRepository[] configurationRepositories;
++	private static Collection dropinRepositories;
++	private static Collection configurationRepositories;
+ 	private static IMetadataRepository[] linksRepositories;
+ 	private static IMetadataRepository eclipseProductRepository;
+ 
+@@ -88,11 +87,11 @@ public class Activator implements BundleActivator {
+ 	}
+ 
+ 	protected static Collection getDropinRepositories() {
+-		return (dropinRepositories != null ? Arrays.asList(dropinRepositories) : new ArrayList(0));
++		return dropinRepositories == null ? new ArrayList(0) : dropinRepositories;
+ 	}
+ 
+ 	protected static Collection getConfigurationRepositories() {
+-		return (configurationRepositories != null ? Arrays.asList(configurationRepositories) : new ArrayList(0));
++		return configurationRepositories == null ? new ArrayList(0) : configurationRepositories;
+ 	}
+ 
+ 	/* (non-Javadoc)
+@@ -119,7 +118,7 @@ public class Activator implements BundleActivator {
+ 		watchDropins(profile);
+ 		// keep an eye on the platform.xml
+ 		if (false)
+-			watchConfiguration();
++		watchConfiguration();
+ 
+ 		synchronize(new ArrayList(0), null);
+ 
+@@ -133,21 +132,16 @@ public class Activator implements BundleActivator {
+ 	}
+ 
+ 	private void watchEclipseProduct() {
+-
+-		URL baseURL;
+ 		try {
+-			baseURL = new URL(bundleContext.getProperty(OSGI_CONFIGURATION_AREA));
++			URL baseURL = new URL(bundleContext.getProperty(OSGI_CONFIGURATION_AREA));
+ 			URL pooledURL = new URL(baseURL, "../.pooled"); //$NON-NLS-1$
+ 			loadArtifactRepository(pooledURL);
+ 			eclipseProductRepository = loadMetadataRepository(pooledURL);
+ 		} catch (MalformedURLException e) {
+-			// TODO proper logging
+-			e.printStackTrace();
++			LogHelper.log(new Status(IStatus.ERROR, ID, "Error occurred while loading repository.", e));
+ 		} catch (ProvisionException e) {
+-			// TODO proper logging
+-			e.printStackTrace();
++			LogHelper.log(new Status(IStatus.ERROR, ID, "Error occurred while loading repository.", e));
+ 		}
+-
+ 	}
+ 
+ 	private boolean startEarly(String bundleName) throws BundleException {
+@@ -161,17 +155,17 @@ public class Activator implements BundleActivator {
+ 	/*
+ 	 * Synchronize the profile.
+ 	 */
+-	public static synchronized void synchronize(List extraRepositories, IProgressMonitor monitor) {
++	public static synchronized void synchronize(Collection extraRepositories, IProgressMonitor monitor) {
+ 		IProfile profile = getCurrentProfile(bundleContext);
+ 		if (profile == null)
+ 			return;
+ 		// create the profile synchronizer on all available repositories
+ 		Set repositories = new HashSet(extraRepositories);
+ 		if (dropinRepositories != null)
+-			repositories.addAll(Arrays.asList(dropinRepositories));
++			repositories.addAll(dropinRepositories);
+ 
+ 		if (configurationRepositories != null)
+-			repositories.addAll(Arrays.asList(configurationRepositories));
++			repositories.addAll(configurationRepositories);
+ 
+ 		if (linksRepositories != null)
+ 			repositories.addAll(Arrays.asList(linksRepositories));
+@@ -195,9 +189,9 @@ public class Activator implements BundleActivator {
+ 		PlatformXmlListener listener = new PlatformXmlListener(configFile);
+ 		watcher.addListener(listener);
+ 		watcher.poll();
+-		List repositories = listener.getMetadataRepositories();
++		Collection repositories = listener.getMetadataRepositories();
+ 		if (repositories != null)
+-			configurationRepositories = (IMetadataRepository[]) repositories.toArray(new IMetadataRepository[0]);
++			configurationRepositories = repositories;
+ 
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/DropinsRepositoryListener.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/DropinsRepositoryListener.java
+index fdc3157..6256907 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/DropinsRepositoryListener.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/DropinsRepositoryListener.java
+@@ -249,10 +249,10 @@ public class DropinsRepositoryListener extends RepositoryListener {
+ 		repository.setProperty(key, value);
+ 	}
+ 
+-	public IMetadataRepository[] getMetadataRepositories() {
++	public Collection getMetadataRepositories() {
+ 		List result = new ArrayList(metadataRepositories);
+ 		result.add(getMetadataRepository());
+-		return (IMetadataRepository[]) result.toArray(new IMetadataRepository[0]);
++		return result;
+ 	}
+ 
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Messages.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Messages.java
+index aa0e61b..d207742 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Messages.java
+@@ -18,6 +18,7 @@ import org.eclipse.osgi.util.NLS;
+ public class Messages extends NLS {
+ 	private static final String BUNDLE_NAME = "org.eclipse.equinox.internal.p2.reconciler.dropins.messages"; //$NON-NLS-1$
+ 	public static String artifact_repo_manager_not_registered;
++	public static String errorLoadingRepository;
+ 	public static String errorProcessingConfg;
+ 	public static String metadata_repo_manager_not_registered;
+ 	static {
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+index 889a010..e11924a 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/PlatformXmlListener.java
+@@ -14,12 +14,15 @@ import java.io.File;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+-import org.eclipse.core.runtime.IPath;
+-import org.eclipse.core.runtime.Path;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.update.*;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.directorywatcher.DirectoryChangeListener;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
++import org.eclipse.osgi.service.datalocation.Location;
++import org.eclipse.osgi.util.NLS;
+ 
+ /**
+  * @since 1.0
+@@ -42,6 +45,18 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		this.root = file;
+ 	}
+ 
++	/*
++	 * Do a look-up and return the OSGi install area if it is set.
++	 */
++	private static URL getOSGiInstallArea() {
++		Location location = (Location) ServiceHelper.getService(Activator.getContext(), Location.class.getName(), Location.INSTALL_FILTER);
++		if (location == null)
++			return null;
++		if (!location.isSet())
++			return null;
++		return location.getURL();
++	}
++
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.directorywatcher.IDirectoryChangeListener#added(java.io.File)
+ 	 */
+@@ -94,18 +109,17 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		if (changed) {
+ 			lastModified = root.lastModified();
+ 			try {
+-				Configuration configuration = ConfigurationParser.parse(root, (URL) null);
++				Configuration configuration = ConfigurationParser.parse(root, getOSGiInstallArea());
+ 				synchronizeConfiguration(configuration);
+ 			} catch (ProvisionException e) {
+-				// TODO Auto-generated catch block
+-				e.printStackTrace();
++				LogHelper.log(new Status(IStatus.ERROR, Activator.ID, Messages.errorProcessingConfg, e));
+ 			}
+ 		}
+ 		changed = false;
+ 	}
+ 
+-	public List getMetadataRepositories() {
+-		return makeList(configRepositories);
++	public Collection getMetadataRepositories() {
++		return configRepositories;
+ 	}
+ 
+ 	private IMetadataRepository getMatchingRepo(Collection repositoryList, String urlString) {
+@@ -127,7 +141,7 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		for (Iterator iter = sites.iterator(); iter.hasNext();) {
+ 			String siteURL = ((Site) iter.next()).getUrl();
+ 			// TODO: this is our way of skipping the base.
+-			// we will need to change this to platform:base: at some point
++			// we will need to change this to platform:/base/ at some point
+ 			if ("file:.".equals(siteURL) || "file:".equals(siteURL)) //$NON-NLS-1$//$NON-NLS-2$
+ 				continue;
+ 			if (siteURL.startsWith("file:") && siteURL.endsWith("/eclipse/")) //$NON-NLS-1$//$NON-NLS-2$
+@@ -142,11 +156,9 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 					Activator.loadArtifactRepository(repoURL);
+ 					newRepos.add(newRepo);
+ 				} catch (MalformedURLException e) {
+-					// TODO Auto-generated catch block
+-					e.printStackTrace();
++					LogHelper.log(new Status(IStatus.ERROR, Activator.ID, NLS.bind(Messages.errorLoadingRepository, siteURL), e));
+ 				} catch (ProvisionException e) {
+-					// TODO Auto-generated catch block
+-					e.printStackTrace();
++					LogHelper.log(new Status(IStatus.ERROR, Activator.ID, NLS.bind(Messages.errorLoadingRepository, siteURL), e));
+ 				}
+ 			}
+ 		}
+@@ -154,18 +166,6 @@ public class PlatformXmlListener extends DirectoryChangeListener {
+ 		if (newRepos.isEmpty())
+ 			return;
+ 		configRepositories = newRepos;
+-		Activator.synchronize(makeList(newRepos), null);
++		Activator.synchronize(newRepos, null);
+ 	}
+-
+-	// TODO: this is a kludge to fix collection impedance mismatch
+-	//		 between the xml listener and the activator; get rid of it!
+-	private List makeList(Set set) {
+-		List list = new ArrayList((set != null ? set.size() : 0));
+-		if (set != null) {
+-			for (Iterator iter = set.iterator(); iter.hasNext();)
+-				list.add(iter.next());
+-		}
+-		return list;
+-	}
+-
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/messages.properties b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/messages.properties
+index 063c543..d8066d0 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/messages.properties
+@@ -9,5 +9,6 @@
+ #     IBM Corporation - initial API and implementation
+ ###############################################################################
+ artifact_repo_manager_not_registered=ArtifactRepositoryManager not registered.
++errorLoadingRepository=Error occurred while loading repository at {0}.
+ errorProcessingConfg=Exception while processing configuration.
+-metadata_repo_manager_not_registered=MetadataRepositoryManager not registered.
++metadata_repo_manager_not_registered=MetadataRepositoryManager not registered.
+\ No newline at end of file
+commit 050c6ff8fe98bb13cb6e88075c96b339aeb6223e
+Author: DJ Houghton <dj>
+Date:   Wed Apr 16 23:01:06 2008 +0000
+
+    Bug 224482 - [reconciler] Need to watch the platform.xml
+
+1	2	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+1	2	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+index 9e16d78..c31efdc 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+@@ -119,8 +119,7 @@ public class Activator implements BundleActivator {
+ 		// create the watcher for the "drop-ins" folder
+ 		watchDropins(profile);
+ 		// keep an eye on the platform.xml
+-		if (false)
+-			watchConfiguration();
++		watchConfiguration();
+ 
+ 		synchronize(new ArrayList(0), null);
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+index 9e16d78..c31efdc 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+@@ -119,8 +119,7 @@ public class Activator implements BundleActivator {
+ 		// create the watcher for the "drop-ins" folder
+ 		watchDropins(profile);
+ 		// keep an eye on the platform.xml
+-		if (false)
+-			watchConfiguration();
++		watchConfiguration();
+ 
+ 		synchronize(new ArrayList(0), null);
+ 

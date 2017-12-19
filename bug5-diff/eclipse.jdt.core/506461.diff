@@ -1,0 +1,1234 @@
+commit 288a70caf87a5129f236aa9b79387a30d5a666f8
+Author: Jay Arthanareeswaran <jarthana@in.ibm.com>
+Date:   Tue Oct 25 00:33:33 2016 +0530
+
+    Bug 506461 - [9] Full build fails when there multiple source folders in
+    a Java project
+
+14	4	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/AbstractImageBuilder.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/AbstractImageBuilder.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/AbstractImageBuilder.java
+index c11e270..a4129ab 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/AbstractImageBuilder.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/AbstractImageBuilder.java
+@@ -23,6 +23,7 @@ import org.eclipse.jdt.internal.compiler.*;
+ import org.eclipse.jdt.internal.compiler.Compiler;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
++import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.IModuleLocation;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+@@ -62,6 +63,7 @@ private boolean inCompiler;
+ 
+ protected boolean keepStoringProblemMarkers;
+ protected SimpleSet filesWithAnnotations = null;
++IModule module = null;
+ 
+ //2000 is best compromise between space used and speed
+ public static int MAX_AT_ONCE = Integer.getInteger(JavaModelManager.MAX_COMPILED_UNITS_AT_ONCE, 2000).intValue();
+@@ -214,7 +216,10 @@ public void acceptResult(CompilationResult result) {
+ protected void acceptSecondaryType(ClassFile classFile) {
+ 	// noop
+ }
+-
++public void acceptModule(IModule mod) {
++	//TODO: If module was already part of another source folder, flag an error?
++	this.module = mod;
++}
+ protected void addAllSourceFiles(final ArrayList sourceFiles) throws CoreException {
+ 	for (int i = 0, l = this.sourceLocations.length; i < l; i++) {
+ 		final ClasspathMultiDirectory sourceLocation = this.sourceLocations[i];
+@@ -236,9 +241,14 @@ protected void addAllSourceFiles(final ArrayList sourceFiles) throws CoreExcepti
+ 										return false;
+ 								SourceFile unit = new SourceFile((IFile) resource, sourceLocation);
+ 								String complianceLevel = AbstractImageBuilder.this.javaBuilder.javaProject.getOption(JavaCore.COMPILER_COMPLIANCE, true);
+-								if (CompilerOptions.versionToJdkLevel(complianceLevel) >= ClassFileConstants.JDK9 &&
+-										resource.getName().equalsIgnoreCase(IModuleLocation.MODULE_INFO_JAVA)) {
+-									sourceLocation.acceptModuleInfo(unit, AbstractImageBuilder.this.compiler.parser);
++								if (AbstractImageBuilder.this.module != null && sourceLocation.getModule() == null) {
++									sourceLocation.resetModule(AbstractImageBuilder.this.module);
++								} else {
++									if (CompilerOptions.versionToJdkLevel(complianceLevel) >= ClassFileConstants.JDK9 &&
++											resource.getName().equalsIgnoreCase(IModuleLocation.MODULE_INFO_JAVA)) {
++										sourceLocation.acceptModuleInfo(unit, AbstractImageBuilder.this.compiler.parser);
++										acceptModule(sourceLocation.getModule());
++									}
+ 								}
+ 								sourceFiles.add(unit);
+ 							}
+commit 75c83fee1def803bd86d5ae889b845d131a1b5e5
+Author: Sasikanth Bharadwaj <sasikanth.bharadwaj@in.ibm.com>
+Date:   Mon Nov 7 12:31:09 2016 +0530
+
+    Bug 506461: [9] Full build fails when there multiple source folders in a
+    Java project
+    
+    Change-Id: I7c537f5aa5aa22df0299691ac2440c835fc72656
+
+223	4	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+7	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+33	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+1	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModulePathContainer.java
+33	5	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
+0	17	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/AbstractImageBuilder.java
+1	28	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+2	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+8	4	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathMultiDirectory.java
+0	10	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/IncrementalImageBuilder.java
+93	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
+38	23	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+1	20	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 1d24205..4de123d 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -17,6 +17,7 @@ package org.eclipse.jdt.core.tests.model;
+ import java.io.ByteArrayInputStream;
+ import java.io.File;
+ import java.io.IOException;
++import java.util.Arrays;
+ import java.util.Hashtable;
+ 
+ import org.eclipse.core.resources.IFile;
+@@ -31,12 +32,15 @@ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.NullProgressMonitor;
+ import org.eclipse.core.runtime.Path;
+ import org.eclipse.jdt.core.IClasspathEntry;
++import org.eclipse.jdt.core.IJavaModelMarker;
+ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IPackageFragmentRoot;
+ import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
++import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.core.JrtPackageFragmentRoot;
++import org.eclipse.jdt.internal.core.util.Messages;
+ 
+ import junit.framework.Test;
+ 
+@@ -72,9 +76,12 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 		waitForAutoBuild();
+ 	}
+ 	private IJavaProject createJava9Project(String name) throws CoreException {
++		return createJava9Project(name, new String[]{"src"});
++	}
++	private IJavaProject createJava9Project(String name, String[] srcFolders) throws CoreException {
+ 		String bootModPath = System.getProperty("java.home") + File.separator +"jrt-fs.jar";
+ 		IClasspathEntry jrtEntry = JavaCore.newLibraryEntry(new Path(bootModPath), null, null, null, null, false);
+-		IJavaProject project = this.createJavaProject(name, new String[] { "src" }, new String[0],
++		IJavaProject project = this.createJavaProject(name, srcFolders, new String[0],
+ 				new String[0], "bin", "9");
+ 		IClasspathEntry[] old = project.getRawClasspath();
+ 		IClasspathEntry[] newPath = new IClasspathEntry[old.length +1];
+@@ -158,6 +165,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			waitForManualRefresh();
+ 			this.currentProject.getProject().build(IncrementalProjectBuilder.FULL_BUILD, null);
+ 			IMarker[] markers = this.currentProject.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers", 
+ 					"The import java.sql cannot be resolved\n" + 
+ 					"Connection cannot be resolved to a type", markers);
+@@ -263,6 +271,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			waitForManualRefresh();
+ 			project.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
+ 			IMarker[] markers = project.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers", 
+ 					"The import com cannot be resolved\n" + 
+ 					"Main cannot be resolved", 
+@@ -294,9 +303,10 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			waitForManualRefresh();
+ 			project.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
+ 			IMarker[] markers = project.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers", 
+-					"Main cannot be resolved\n" + 
+-					"The import com cannot be resolved", 
++					"The import com cannot be resolved\n" + 
++					"Main cannot be resolved", 
+ 					markers);
+ 		} finally {
+ 			deleteProject("P2");
+@@ -350,6 +360,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			waitForManualRefresh();
+ 			project.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
+ 			IMarker[] markers = project.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers", 
+ 					"The import com.greetings.Main cannot be resolved\n" + 
+ 					"Main cannot be resolved", 
+@@ -400,6 +411,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			waitForManualRefresh();
+ 			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
+ 			IMarker[] markers = p3.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers",
+ 					"The import com cannot be resolved\n" +
+ 					"Main cannot be resolved",
+@@ -433,6 +445,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
+ 			assertMarkers("Unexpected markers", "",  markers);
+ 			markers = p3.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers", 
+ 					"The import com cannot be resolved\n" + 
+ 					"Main cannot be resolved", 
+@@ -558,6 +571,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			waitForManualRefresh();
+ 			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.AUTO_BUILD, null);
+ 			markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers",
+ 					"The import com cannot be resolved\n" + 
+ 					"Main cannot be resolved",  markers);
+@@ -590,6 +604,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			waitForManualRefresh();
+ 			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.AUTO_BUILD, null);
+ 			markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers",
+ 					"The import com cannot be resolved\n" + 
+ 					"Main cannot be resolved",  markers);
+@@ -1212,6 +1227,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			IJavaProject p2 = setupModuleProject("com.greetings", src, new IClasspathEntry[] { dep });
+ 			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
+ 			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers",	
+ 					"The import org cannot be resolved\n" +
+ 					"World cannot be resolved to a type",
+@@ -1471,6 +1487,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 				"}");
+ 			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
+ 			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers", 
+ 					"The import org cannot be resolved\n" +
+ 					"World cannot be resolved to a type",  markers);
+@@ -1645,11 +1662,209 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			deleteProject("org.astro");
+ 		}
+ 	}
++	public void test_Multiple_SourceFolders() throws CoreException {
++		if (!isJRE9) return;
++		try {
++			String[] sources = new String[] {
++				"src/module-info.java",
++				"module org.astro {\n" +
++				"	exports org.astro;\n" + 
++				"}",
++				"src/org/astro/World.java",
++				"package org.astro;\n" +
++				"public interface World {\n" +
++				"	public String name();\n" +
++				"}",
++				"othersrc/org/astro/OtherWorld.java",
++				"package org.astro;\n" +
++				"import org.astro.World;\n" +
++				"public interface OtherWorld {\n" +
++				"	default public String name() {\n" +
++				"		return \" Other World!!\";\n" +
++				"	}\n" +
++				"}"
++			};
++			setupModuleProject("org.astro", new String[]{"src", "othersrc"}, sources, null);
++			String[] src = new String[] {
++				"src/module-info.java",
++				"module com.greetings {\n" +
++				"	requires org.astro;\n" +
++				"	exports com.greetings;\n" +
++				"}",
++				"src/com/greetings/MyWorld.java",
++				"package com.greetings;\n" +
++				"import org.astro.World;\n" +
++				"public class MyWorld implements World {\n" +
++				"	public String name() {\n" +
++				"		return \" My World!!\";\n" +
++				"	}\n" +
++				"}",
++				"othersrc/com/greetings/AnotherWorld.java",
++				"package com.greetings;\n" +
++				"import org.astro.OtherWorld;\n" +
++				"public class AnotherWorld implements OtherWorld {\n" +
++				"	public String name() {\n" +
++				"		return \" Another World!!\";\n" +
++				"	}\n" +
++				"}"
++			};
++			IClasspathEntry dep = JavaCore.newContainerEntry(new Path(JavaCore.MODULE_PATH_CONTAINER_ID));
++			IJavaProject p2 = setupModuleProject("com.greetings", new String[]{"src", "othersrc"}, src, new IClasspathEntry[] { dep });
++			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers", "",  markers);
++		} finally {
++			deleteProject("org.astro");
++			deleteProject("com.greetings");
++		}
++	}
++	public void test_Multiple_SourceFolders_WithModuleInfo() throws CoreException {
++		if (!isJRE9) return;
++		try {
++			String[] sources = new String[] {
++				"src/module-info.java",
++				"module org.astro {\n" +
++				"	exports org.astro;\n" + 
++				"}",
++				"src/org/astro/World.java",
++				"package org.astro;\n" +
++				"public interface World {\n" +
++				"	public String name();\n" +
++				"}",
++				"othersrc/org/astro/OtherWorld.java",
++				"package org.astro;\n" +
++				"import org.astro.World;\n" +
++				"public interface OtherWorld {\n" +
++				"	default public String name() {\n" +
++				"		return \" Other World!!\";\n" +
++				"	}\n" +
++				"}"
++			};
++			setupModuleProject("org.astro", new String[]{"src", "othersrc"}, sources, null);
++			String[] src = new String[] {
++				"src/module-info.java",
++				"module com.greetings {\n" +
++				"	requires org.astro;\n" +
++				"	exports com.greetings;\n" +
++				"}",
++				"src/com/greetings/MyWorld.java",
++				"package com.greetings;\n" +
++				"import org.astro.World;\n" +
++				"public class MyWorld implements World {\n" +
++				"	public String name() {\n" +
++				"		return \" My World!!\";\n" +
++				"	}\n" +
++				"}",
++				"othersrc/module-info.java",
++				"module com.greetings1 {\n" +
++				"	requires org.astro;\n" +
++				"	exports com.greetings;\n" +
++				"}",
++				"othersrc/com/greetings/AnotherWorld.java",
++				"package com.greetings;\n" +
++				"import org.astro.OtherWorld;\n" +
++				"public class AnotherWorld implements OtherWorld {\n" +
++				"	public String name() {\n" +
++				"		return \" Another World!!\";\n" +
++				"	}\n" +
++				"}"
++			};
++			IClasspathEntry dep = JavaCore.newContainerEntry(new Path(JavaCore.MODULE_PATH_CONTAINER_ID));
++			IJavaProject p2 = setupModuleProject("com.greetings", new String[]{"src", "othersrc"}, src, new IClasspathEntry[] { dep });
++			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = p2.getProject().findMarkers(IJavaModelMarker.JAVA_MODEL_PROBLEM_MARKER, true, IResource.DEPTH_ZERO);
++			assertEquals(1, markers.length);
++			String msg = markers[0].getAttribute(IMarker.MESSAGE, "");
++			String expected = Messages.bind(Messages.classpath_duplicateEntryPath, TypeConstants.MODULE_INFO_FILE_NAME_STRING, p2.getElementName());
++			assertTrue("Unexpected result", msg.indexOf(expected) != -1);
++		} finally {
++			deleteProject("org.astro");
++			deleteProject("com.greetings");
++		}
++	}
++	public void test_Multiple_SourceFolders_addModuleInfo() throws CoreException {
++		if (!isJRE9) return;
++		try {
++			String[] sources = new String[] {
++				"src/module-info.java",
++				"module org.astro {\n" +
++				"	exports org.astro;\n" + 
++				"}",
++				"src/org/astro/World.java",
++				"package org.astro;\n" +
++				"public interface World {\n" +
++				"	public String name();\n" +
++				"}",
++				"othersrc/org/astro/OtherWorld.java",
++				"package org.astro;\n" +
++				"import org.astro.World;\n" +
++				"public interface OtherWorld {\n" +
++				"	default public String name() {\n" +
++				"		return \" Other World!!\";\n" +
++				"	}\n" +
++				"}"
++			};
++			IJavaProject p1 = setupModuleProject("org.astro", new String[]{"src", "othersrc"}, sources, null);
++			this.createFile("org.astro/othersrc/module-info.java", 
++					"module org.astro1 {\n" +
++					"	exports org.astro;\n" + 
++					"}");
++			waitForAutoBuild();
++			p1.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = p1.getProject().findMarkers(IJavaModelMarker.JAVA_MODEL_PROBLEM_MARKER, true, IResource.DEPTH_ZERO);
++			assertEquals(1, markers.length);
++			String msg = markers[0].getAttribute(IMarker.MESSAGE, "");
++			String expected = Messages.bind(Messages.classpath_duplicateEntryPath, TypeConstants.MODULE_INFO_FILE_NAME_STRING, p1.getElementName());
++			assertTrue("Unexpected result", msg.indexOf(expected) != -1);
++		} finally {
++			deleteProject("org.astro");
++		}
++	}
++	public void test_Multiple_SourceFolders_removeModuleInfo() throws CoreException {
++		if (!isJRE9) return;
++		try {
++			String[] sources = new String[] {
++				"src/module-info.java",
++				"module org.astro {\n" +
++				"	exports org.astro;\n" + 
++				"}",
++				"src/org/astro/World.java",
++				"package org.astro;\n" +
++				"public interface World {\n" +
++				"	public String name();\n" +
++				"}",
++				"othersrc/module-info.java",
++				"module org.astro1 {\n" +
++				"	exports org.astro;\n" + 
++				"}",
++				"othersrc/org/astro/OtherWorld.java",
++				"package org.astro;\n" +
++				"import org.astro.World;\n" +
++				"public interface OtherWorld {\n" +
++				"	default public String name() {\n" +
++				"		return \" Other World!!\";\n" +
++				"	}\n" +
++				"}"
++			};
++			IJavaProject p1 = setupModuleProject("org.astro", new String[]{"src", "othersrc"}, sources, null);
++			waitForAutoBuild();
++			this.deleteFile("org.astro/othersrc/module-info.java");
++			waitForAutoBuild();
++			p1.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = p1.getProject().findMarkers(IJavaModelMarker.JAVA_MODEL_PROBLEM_MARKER, true, IResource.DEPTH_ZERO);
++			assertEquals(0, markers.length);
++		} finally {
++			deleteProject("org.astro");
++		}
++	}
+ 	private IJavaProject setupModuleProject(String name, String[] sources) throws CoreException {
+ 		return setupModuleProject(name, sources, null);
+ 	}
+ 	private IJavaProject setupModuleProject(String name, String[] sources, IClasspathEntry[] deps) throws CoreException {
+-		IJavaProject project = createJava9Project(name);
++		return setupModuleProject(name, new String[]{"src"}, sources, deps);
++	}
++	private IJavaProject setupModuleProject(String name, String[] srcFolders, String[] sources, IClasspathEntry[] deps) throws CoreException {
++		IJavaProject project = createJava9Project(name, srcFolders);
+ 		IProgressMonitor monitor = new NullProgressMonitor();
+ 		for (int i = 0; i < sources.length; i+= 2) {
+ 			IPath path = new Path(sources[i]);
+@@ -1669,6 +1884,10 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 		}
+ 		return project;
+ 	}
++	// sort by line number
++	protected void sortMarkers(IMarker[] markers) {
++		Arrays.sort(markers, (a,b) -> a.getAttribute(IMarker.LINE_NUMBER, 0) - b.getAttribute(IMarker.LINE_NUMBER, 0)); 
++	}
+ 	public void tearDownSuite() throws Exception {
+ 		super.tearDownSuite();
+ 		deleteProject("P1");
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+index 6acb5fc..e103ed6 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+@@ -803,7 +803,7 @@ public void exitType(int declarationEnd) {
+ 				info.setSourceRangeEnd(declarationEnd);
+ 				info.children = getChildren(info);
+ 				this.unitInfo.setModule(moduleDecl);
+-				((JavaProjectElementInfo)(proj.getElementInfo())).setModule(moduleDecl);
++				proj.setModuleDescription(moduleDecl);
+ 			} catch (JavaModelException e) {
+ 				// Unexpected while creating
+ 			}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+index 8de86e8..22d836b 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+@@ -567,6 +567,13 @@ public class DeltaProcessor {
+ 							//$FALL-THROUGH$
+ 						case IResourceDelta.ADDED :
+ 						case IResourceDelta.REMOVED :
++							javaProject = (JavaProject)JavaCore.create(file.getProject());
++							try {
++								// Make sure module description is read
++								javaProject.close();
++							} catch (JavaModelException e) {
++								// do nothing
++							}
+ 							break;
+ 					}
+ 				}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+index f461c51..68caa94 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+@@ -52,6 +52,7 @@ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.Path;
+ import org.eclipse.core.runtime.Platform;
+ import org.eclipse.core.runtime.QualifiedName;
++import org.eclipse.core.runtime.Status;
+ import org.eclipse.core.runtime.content.IContentDescription;
+ import org.eclipse.core.runtime.preferences.IEclipsePreferences;
+ import org.eclipse.core.runtime.preferences.IScopeContext;
+@@ -79,6 +80,7 @@ import org.eclipse.jdt.core.eval.IEvaluationContext;
+ import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+ import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
++import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.compiler.util.JRTUtil;
+ import org.eclipse.jdt.internal.compiler.util.ObjectVector;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+@@ -478,18 +480,35 @@ public class JavaProject
+ 		IPackageFragmentRoot[] roots = computePackageFragmentRoots(resolvedClasspath, false, null /*no reverse map*/);
+ 		info.setChildren(roots);
+ 		IModuleDescription module = null;
++		IModuleDescription current = null;
+ 		for (IPackageFragmentRoot root : roots) {
+ 			if (root.getKind() != IPackageFragmentRoot.K_SOURCE)
+ 				continue;
+ 			module = root.getModuleDescription();
+ 			if (module != null) {
++				if (current != null) {
++					throw new JavaModelException(new Status(IStatus.ERROR, JavaCore.PLUGIN_ID, 
++							Messages.bind(Messages.classpath_duplicateEntryPath, TypeConstants.MODULE_INFO_FILE_NAME_STRING, getElementName())));
++				}
++				current = module;
+ 				JavaModelManager.getModulePathManager().addEntry(module, this);
+-				break;
++				//break; continue looking, there may be other roots containing module-info
++				info.setModule(module);
+ 			}
+ 		}
+ 		return true;
+ 	}
+ 
++	public boolean isModuleProject() throws JavaModelException {
++		IPackageFragmentRoot[] roots = getPackageFragmentRoots();
++		for (IPackageFragmentRoot root : roots) {
++			if (root.getKind() != IPackageFragmentRoot.K_SOURCE)
++				continue;
++			if (((PackageFragmentRoot)root).isModuleDescriptionRoot())
++				return true;
++		}
++		return false;
++	}
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.jdt.internal.core.JavaElement#close()
+ 	 */
+@@ -3346,10 +3365,22 @@ public class JavaProject
+ 	}
+ 
+ 	public IModuleDescription getModuleDescription() throws JavaModelException {
+-		JavaProjectElementInfo info = (JavaProjectElementInfo) getElementInfo();	
++		JavaProjectElementInfo info = (JavaProjectElementInfo) getElementInfo();
+ 		return info.getModule();
+ 	}
+ 
++	public void setModuleDescription(IModuleDescription module) throws JavaModelException {
++		JavaProjectElementInfo info = (JavaProjectElementInfo) getElementInfo();	
++		IModuleDescription current = info.getModule();
++		if (current != null) {
++			IPackageFragmentRoot root = (IPackageFragmentRoot) current.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT);
++			IPackageFragmentRoot newRoot = (IPackageFragmentRoot) module.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT);
++			if (!root.equals(newRoot))
++				throw new JavaModelException(new Status(IStatus.ERROR, JavaCore.PLUGIN_ID,
++						Messages.bind(Messages.classpath_duplicateEntryPath, TypeConstants.MODULE_INFO_FILE_NAME_STRING, getElementName())));
++		}
++		info.setModule(module);
++	}
+ 	@Override
+ 	public ITypeLookup typeLookup() {
+ 		// No direct way to lookup, use the java model APIs instead
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModulePathContainer.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModulePathContainer.java
+index 7a16805..5503b9c 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModulePathContainer.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModulePathContainer.java
+@@ -56,8 +56,7 @@ public class ModulePathContainer implements IClasspathContainer{
+ 				entries.add(JavaCore.newProjectEntry(path, ref.isPublic()));
+ 			}
+ 		} catch (JavaModelException e) {
+-			// TODO Auto-generated catch block
+-			e.printStackTrace();
++			// ignore
+ 		}
+ 		return entries.toArray(new IClasspathEntry[entries.size()]);
+ 	}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
+index 76196f4..eaec4a8 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
+@@ -841,13 +841,41 @@ protected void verifyAttachSource(IPath sourcePath) throws JavaModelException {
+ 		throw new JavaModelException(new JavaModelStatus(IJavaModelStatusConstants.RELATIVE_PATH, sourcePath));
+ 	}
+ }
+-
++/**
++ * return true if this package fragment root contains a module description, false otherwise
++ *
++ */
++boolean isModuleDescriptionRoot() {
++	// TODO: Ideally, for source roots, we should get this information from the raw classpath
++	// by marking the entry that contains module-info as such. For binary roots, the implementation
++	// should go into the respective sub classes
++	try {
++		IJavaElement[] pkgs = getChildren();
++		for (int j = 0, length = pkgs.length; j < length; j++) {
++			// only look in the default package
++			if (pkgs[j].getElementName().length() == 0) {
++				if (getKind() == IPackageFragmentRoot.K_SOURCE) {
++					ICompilationUnit unit = ((PackageFragment) pkgs[j])
++							.getCompilationUnit(TypeConstants.MODULE_INFO_FILE_NAME_STRING);
++					if (unit instanceof CompilationUnit && unit.exists()) {
++						return true;
++					}
++				} else {
++					IClassFile classFile = ((IPackageFragment)pkgs[j]).getClassFile(TypeConstants.MODULE_INFO_CLASS_NAME_STRING);
++					if (classFile instanceof ClassFile && classFile.exists()) {
++						return true;
++					}
++				}
++				break;
++			}
++		}
++	} catch (JavaModelException e) {
++		//
++	}
++	return false;
++}
+ public IModuleDescription getModuleDescription() {
+ 	try {
+-		PackageFragmentRootInfo rootInfo = (PackageFragmentRootInfo) getElementInfo();
+-		IModuleDescription module = rootInfo.getModule();
+-		if (module != null)
+-			return module;
+ 		IJavaElement[] pkgs = getChildren();
+ 		for (int j = 0, length = pkgs.length; j < length; j++) {
+ 			// only look in the default package
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/AbstractImageBuilder.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/AbstractImageBuilder.java
+index a4129ab..72a3443 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/AbstractImageBuilder.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/AbstractImageBuilder.java
+@@ -23,8 +23,6 @@ import org.eclipse.jdt.internal.compiler.*;
+ import org.eclipse.jdt.internal.compiler.Compiler;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+-import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleLocation;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.compiler.problem.*;
+@@ -63,7 +61,6 @@ private boolean inCompiler;
+ 
+ protected boolean keepStoringProblemMarkers;
+ protected SimpleSet filesWithAnnotations = null;
+-IModule module = null;
+ 
+ //2000 is best compromise between space used and speed
+ public static int MAX_AT_ONCE = Integer.getInteger(JavaModelManager.MAX_COMPILED_UNITS_AT_ONCE, 2000).intValue();
+@@ -216,10 +213,6 @@ public void acceptResult(CompilationResult result) {
+ protected void acceptSecondaryType(ClassFile classFile) {
+ 	// noop
+ }
+-public void acceptModule(IModule mod) {
+-	//TODO: If module was already part of another source folder, flag an error?
+-	this.module = mod;
+-}
+ protected void addAllSourceFiles(final ArrayList sourceFiles) throws CoreException {
+ 	for (int i = 0, l = this.sourceLocations.length; i < l; i++) {
+ 		final ClasspathMultiDirectory sourceLocation = this.sourceLocations[i];
+@@ -240,16 +233,6 @@ protected void addAllSourceFiles(final ArrayList sourceFiles) throws CoreExcepti
+ 									if (Util.isExcluded(resource.getFullPath(), inclusionPatterns, exclusionPatterns, false))
+ 										return false;
+ 								SourceFile unit = new SourceFile((IFile) resource, sourceLocation);
+-								String complianceLevel = AbstractImageBuilder.this.javaBuilder.javaProject.getOption(JavaCore.COMPILER_COMPLIANCE, true);
+-								if (AbstractImageBuilder.this.module != null && sourceLocation.getModule() == null) {
+-									sourceLocation.resetModule(AbstractImageBuilder.this.module);
+-								} else {
+-									if (CompilerOptions.versionToJdkLevel(complianceLevel) >= ClassFileConstants.JDK9 &&
+-											resource.getName().equalsIgnoreCase(IModuleLocation.MODULE_INFO_JAVA)) {
+-										sourceLocation.acceptModuleInfo(unit, AbstractImageBuilder.this.compiler.parser);
+-										acceptModule(sourceLocation.getModule());
+-									}
+-								}
+ 								sourceFiles.add(unit);
+ 							}
+ 							return false;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+index b0b651a..025e5a4 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+@@ -28,19 +28,17 @@ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IModuleLocation;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+ import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+-import org.eclipse.jdt.internal.compiler.lookup.ModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+ 
+-public class ClasspathDirectory extends ClasspathLocation implements IModuleEnvironment {
++public class ClasspathDirectory extends ClasspathLocation {
+ 
+ IContainer binaryFolder; // includes .class files for a single directory
+ boolean isOutputFolder;
+@@ -237,25 +235,6 @@ public String debugPathString() {
+ 	return this.binaryFolder.getFullPath().toString();
+ }
+ 
+-//@Override
+-public boolean servesModule(IModule mod) {
+-	if (mod == null)
+-		return this.module == null || this.module == ModuleEnvironment.UNNAMED_MODULE;
+-	return this.module == null ? mod == ModuleEnvironment.UNNAMED_MODULE : this.module.equals(mod);
+-}
+-
+-@Override
+-public IModule getModule() {
+-	// 
+-	return this.module;
+-}
+-
+-@Override
+-public IModuleEnvironment getLookupEnvironment() {
+-	// 
+-	return this;
+-}
+-
+ @Override
+ public ITypeLookup typeLookup() {
+ 	//
+@@ -268,12 +247,6 @@ public IPackageLookup packageLookup() {
+ }
+ 
+ @Override
+-public IModuleEnvironment getLookupEnvironmentFor(IModule mod) {
+-	//
+-	return this.module == mod ? this : null;
+-}
+-
+-@Override
+ public NameEnvironmentAnswer findClass(String typeName, String qualifiedPackageName, String qualifiedBinaryFileName) {
+ 	// 
+ 	return findClass(typeName, qualifiedPackageName, qualifiedBinaryFileName, false);
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+index b7a5f47..10d3cbb 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+@@ -35,6 +35,7 @@ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IModuleLocation;
++import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+ import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+@@ -45,7 +46,7 @@ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+ @SuppressWarnings("rawtypes")
+-public class ClasspathJar extends ClasspathLocation implements IModuleEnvironment {
++public class ClasspathJar extends ClasspathLocation implements IModulePathEntry {
+ 
+ static class PackageCacheEntry {
+ 	long lastModified;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+index a30692d..b4fdd92 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+@@ -47,7 +47,7 @@ import org.eclipse.jdt.internal.compiler.util.JRTUtil;
+ import org.eclipse.jdt.internal.compiler.util.SimpleSet;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ 
+-public class ClasspathJrt extends ClasspathLocation implements IMultiModuleEntry, IModuleEnvironment {
++public class ClasspathJrt extends ClasspathLocation implements IMultiModuleEntry {
+ 
+ //private HashMap<String, SimpleSet> packagesInModule = null;
+ private static HashMap<String, HashMap<String, SimpleSet>> PackageCache = new HashMap<>();
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
+index ed479c1..50076f6 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
+@@ -20,12 +20,13 @@ import org.eclipse.core.resources.IContainer;
+ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+-import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
++import org.eclipse.jdt.internal.compiler.env.IModule;
++import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.util.Util;
+ 
+-public abstract class ClasspathLocation implements IModulePathEntry {
++public abstract class ClasspathLocation implements IModuleEnvironment {
+ 
+ 	abstract public NameEnvironmentAnswer findClass(String typeName, String qualifiedPackageName, String qualifiedBinaryFileName);
+ 	abstract public NameEnvironmentAnswer findClass(String typeName, String qualifiedPackageName, String qualifiedBinaryFileName, boolean asBinaryOnly);
+@@ -34,14 +35,17 @@ public abstract class ClasspathLocation implements IModulePathEntry {
+ 		String fileName = new String(typeName);
+ 		return findClass(fileName, qualifiedPackageName, qualifiedBinaryFileName, asBinaryOnly);
+ 	}
++	public void setModule (IModule mod) {
++		// do nothing
++	}
+ 	static ClasspathLocation forSourceFolder(IContainer sourceFolder, IContainer outputFolder,
+ 			char[][] inclusionPatterns, char[][] exclusionPatterns, boolean ignoreOptionalProblems,
+ 			INameEnvironment env) {
+ 		return new ClasspathMultiDirectory(sourceFolder, outputFolder, inclusionPatterns, exclusionPatterns,
+-				ignoreOptionalProblems, env).initializeModule();
++				ignoreOptionalProblems, env);
+ 	}
+ public static ClasspathLocation forBinaryFolder(IContainer binaryFolder, boolean isOutputFolder, AccessRuleSet accessRuleSet, IPath externalAnnotationPath, INameEnvironment env) {
+-	return new ClasspathDirectory(binaryFolder, isOutputFolder, accessRuleSet, externalAnnotationPath, env).initializeModule();
++	return new ClasspathDirectory(binaryFolder, isOutputFolder, accessRuleSet, externalAnnotationPath, env);
+ }
+ 
+ static ClasspathLocation forLibrary(String libraryPathname, 
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathMultiDirectory.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathMultiDirectory.java
+index 86201ac..c90bdfd 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathMultiDirectory.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathMultiDirectory.java
+@@ -87,7 +87,7 @@ public void acceptModuleInfo(ICompilationUnit cu, Parser parser) {
+ 		}
+ 	}
+ }
+-public void resetModule(IModule mod) {
++public void setModule(IModule mod) {
+ 	this.module = mod;
+ }
+ 
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/IncrementalImageBuilder.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/IncrementalImageBuilder.java
+index 1036da3..4dfe3d3 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/IncrementalImageBuilder.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/IncrementalImageBuilder.java
+@@ -21,7 +21,6 @@ import org.eclipse.jdt.core.*;
+ import org.eclipse.jdt.core.compiler.*;
+ import org.eclipse.jdt.internal.compiler.*;
+ import org.eclipse.jdt.internal.compiler.classfmt.*;
+-import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.compiler.problem.*;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+@@ -604,10 +603,6 @@ protected boolean findSourceFiles(IResourceDelta sourceDelta, ClasspathMultiDire
+ 							System.out.println("Compile this added source file " + typeLocator); //$NON-NLS-1$
+ 						this.sourceFiles.add(new SourceFile((IFile) resource, md, true));
+ 						this.sourceFiles.add(new SourceFile((IFile) resource, md, true));
+-						String complianceLevel = IncrementalImageBuilder.this.javaBuilder.javaProject.getOption(JavaCore.COMPILER_COMPLIANCE, true);
+-//						if (CompilerOptions.versionToJdkLevel(complianceLevel) >= ClassFileConstants.JDK9) {
+-//							md.resetModule(this.nameEnvironment.getModule(md));
+-//						}
+ 						String typeName = typePath.toString();
+ 						if (!this.newState.isDuplicateLocator(typeName, typeLocator)) { // adding dependents results in 2 duplicate errors
+ 							if (JavaBuilder.DEBUG)
+@@ -647,11 +642,6 @@ protected boolean findSourceFiles(IResourceDelta sourceDelta, ClasspathMultiDire
+ 							System.out.println("Compile this changed source file " + typeLocator); //$NON-NLS-1$
+ 						SourceFile unit = new SourceFile((IFile) resource, md, true);
+ 						this.sourceFiles.add(unit);
+-						complianceLevel = IncrementalImageBuilder.this.javaBuilder.javaProject.getOption(JavaCore.COMPILER_COMPLIANCE, true);
+-						if (CompilerOptions.versionToJdkLevel(complianceLevel) >= ClassFileConstants.JDK9) {
+-							//md.resetModule(this.nameEnvironment.getModule(md)); TODO: revisit why this is needed
+-							md.acceptModuleInfo(unit, this.compiler.parser);
+-						}
+ 				}
+ 				return true;
+ 			} else if (org.eclipse.jdt.internal.compiler.util.Util.isClassFileName(resourceName)) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
+new file mode 100644
+index 0000000..66cb934
+--- /dev/null
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
+@@ -0,0 +1,93 @@
++/*******************************************************************************
++ * Copyright (c) 2016 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core.builder;
++
++import java.util.stream.Stream;
++
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.jdt.internal.compiler.env.IModule;
++import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
++import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
++import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
++import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
++
++/**
++ * Represents a project on the module path.
++ */
++public class ModulePathEntry implements IModulePathEntry {
++
++	private IPath path;
++	/*private*/ ClasspathLocation[] locations;
++	IModule module;
++	IModuleEnvironment env = null;
++
++	class ModuleEnvironment implements IModuleEnvironment {
++		@Override
++		public ITypeLookup typeLookup() {
++			//
++			return Stream.of(ModulePathEntry.this.locations).map(loc -> loc.typeLookup()).reduce(ITypeLookup::chain).orElse(ITypeLookup.Dummy);
++		}
++
++		@Override
++		public IPackageLookup packageLookup() {
++			// 
++			return name -> Stream.of(ModulePathEntry.this.locations).map(loc -> loc.packageLookup()).anyMatch(p -> p.isPackage(name));
++		}
++	}
++
++	ModulePathEntry(IPath path, IModule module, ClasspathLocation[] locations) {
++		this.path = path;
++		this.locations = locations;
++		this.module = module;
++		initializeModule();
++	}
++	public IPath getPath() {
++		return this.path;
++	}
++	public ClasspathLocation[] getClasspathLocations() {
++		return this.locations;
++	}
++
++	@Override
++	public IModule getModule() {
++		//
++		return this.module;
++	}
++
++	@Override
++	public IModuleEnvironment getLookupEnvironment() {
++		//
++		if (this.env == null)
++			this.env = new ModuleEnvironment();
++		return this.env;
++	}
++
++	@Override
++	public IModuleEnvironment getLookupEnvironmentFor(IModule mod) {
++		//
++		if (this.module.equals(mod)) {
++			return getLookupEnvironment();
++		}
++		return null;
++	}
++	// TODO: This is only needed because SourceFile.module() uses the module set on the location
++	// Once we have a mechanism to map a folder to a module path entry, this should no longer be
++	// needed
++	private void initializeModule() {
++		for (int i = 0; i < this.locations.length; i++) {
++			this.locations[i].setModule(this.module);
++		}
++	}
++}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+index be82217..2ac5481 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+@@ -26,7 +26,6 @@ import org.eclipse.core.runtime.*;
+ import org.eclipse.jdt.core.*;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.env.*;
+-import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.lookup.ModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+@@ -45,6 +44,7 @@ public class NameEnvironment extends ModuleEnvironment implements SuffixConstant
+ boolean isIncrementalBuild;
+ ClasspathMultiDirectory[] sourceLocations;
+ ClasspathLocation[] binaryLocations;
++IModulePathEntry[] modulePathEntries;
+ BuildNotifier notifier;
+ 
+ SimpleSet initialTypeNames; // assumed that each name is of the form "a/b/ClassName"
+@@ -108,6 +108,9 @@ private void computeClasspathLocations(
+ 	IClasspathEntry[] classpathEntries = javaProject.getExpandedClasspath();
+ 	ArrayList sLocations = new ArrayList(classpathEntries.length);
+ 	ArrayList bLocations = new ArrayList(classpathEntries.length);
++	List<IModulePathEntry> entries = new ArrayList<>(classpathEntries.length);
++	IModuleDescription mod = null;
++	
+ 	nextEntry : for (int i = 0, l = classpathEntries.length; i < l; i++) {
+ 		ClasspathEntry entry = (ClasspathEntry) classpathEntries[i];
+ 		IPath path = entry.getPath();
+@@ -146,6 +149,7 @@ private void computeClasspathLocations(
+ 				JavaProject prereqJavaProject = (JavaProject) JavaCore.create(prereqProject);
+ 				IClasspathEntry[] prereqClasspathEntries = prereqJavaProject.getRawClasspath();
+ 				ArrayList seen = new ArrayList();
++				List<ClasspathLocation> projectLocations = new ArrayList<ClasspathLocation>();
+ 				nextPrereqEntry: for (int j = 0, m = prereqClasspathEntries.length; j < m; j++) {
+ 					IClasspathEntry prereqEntry = prereqClasspathEntries[j];
+ 					if (prereqEntry.getEntryKind() == IClasspathEntry.CPE_SOURCE) {
+@@ -161,6 +165,7 @@ private void computeClasspathLocations(
+ 							seen.add(binaryFolder);
+ 							ClasspathLocation bLocation = ClasspathLocation.forBinaryFolder(binaryFolder, true, entry.getAccessRuleSet(), externalAnnotationPath, this);
+ 							bLocations.add(bLocation);
++							projectLocations.add(bLocation);
+ 							if (binaryLocationsPerProject != null) { // normal builder mode
+ 								ClasspathLocation[] existingLocations = (ClasspathLocation[]) binaryLocationsPerProject.get(prereqProject);
+ 								if (existingLocations == null) {
+@@ -175,6 +180,11 @@ private void computeClasspathLocations(
+ 						}
+ 					}
+ 				}
++				if ((mod = prereqJavaProject.getModuleDescription()) != null && projectLocations.size() > 0) {
++					ModuleDescriptionInfo info = (ModuleDescriptionInfo) ((SourceModule)mod).getElementInfo();
++					ModulePathEntry projectEntry = new ModulePathEntry(prereqJavaProject.getPath(), info, projectLocations.toArray(new ClasspathLocation[projectLocations.size()]));
++					entries.add(projectEntry);
++				}
+ 				continue nextEntry;
+ 
+ 			case IClasspathEntry.CPE_LIBRARY :
+@@ -197,6 +207,11 @@ private void computeClasspathLocations(
+ 						bLocation = ClasspathLocation.forBinaryFolder((IContainer) target, false, accessRuleSet, externalAnnotationPath, this);	 // is library folder not output folder
+ 					}
+ 					bLocations.add(bLocation);
++					// TODO: Ideally we need to do something like mapToModulePathEntry using the path and if it is indeed
++					// a module path entry, then add the corresponding entry here, but that would need the target platform
++					if (bLocation instanceof IModulePathEntry) {
++						entries.add((IModulePathEntry) bLocation);
++					}
+ 					if (binaryLocationsPerProject != null) { // normal builder mode
+ 						IProject p = resource.getProject(); // can be the project being built
+ 						ClasspathLocation[] existingLocations = (ClasspathLocation[]) binaryLocationsPerProject.get(p);
+@@ -215,7 +230,13 @@ private void computeClasspathLocations(
+ 							&& JavaCore.IGNORE.equals(javaProject.getOption(JavaCore.COMPILER_PB_DISCOURAGED_REFERENCE, true)))
+ 								? null
+ 								: entry.getAccessRuleSet();
+-					bLocations.add(ClasspathLocation.forLibrary(path.toString(), accessRuleSet, externalAnnotationPath, this));
++					ClasspathLocation bLocation = ClasspathLocation.forLibrary(path.toString(), accessRuleSet, externalAnnotationPath, this);
++					bLocations.add(bLocation);
++					// TODO: Ideally we need to do something like mapToModulePathEntry using the path and if it is indeed
++					// a module path entry, then add the corresponding entry here, but that would need the target platform
++					if (bLocation instanceof IModulePathEntry) {
++						entries.add((IModulePathEntry) bLocation);
++					}
+ 				}
+ 				continue nextEntry;
+ 		}
+@@ -226,7 +247,11 @@ private void computeClasspathLocations(
+ 	this.sourceLocations = new ClasspathMultiDirectory[sLocations.size()];
+ 	if (!sLocations.isEmpty()) {
+ 		sLocations.toArray(this.sourceLocations);
+-
++		if ((mod = javaProject.getModuleDescription()) != null) {
++			ModuleDescriptionInfo info = (ModuleDescriptionInfo) ((SourceModule)mod).getElementInfo();
++			ModulePathEntry projectEntry = new ModulePathEntry(javaProject.getPath(), info, this.sourceLocations);
++			entries.add(0, projectEntry);
++		}
+ 		// collect the output folders, skipping duplicates
+ 		next : for (int i = 0, l = this.sourceLocations.length; i < l; i++) {
+ 			ClasspathMultiDirectory md = this.sourceLocations[i];
+@@ -254,6 +279,8 @@ private void computeClasspathLocations(
+ 		this.binaryLocations[index++] = (ClasspathLocation) outputFolders.get(i);
+ 	for (int i = 0, l = bLocations.size(); i < l; i++)
+ 		this.binaryLocations[index++] = (ClasspathLocation) bLocations.get(i);
++	
++	this.modulePathEntries = entries.toArray(new IModulePathEntry[entries.size()]);
+ }
+ 
+ public void cleanup() {
+@@ -263,6 +290,7 @@ public void cleanup() {
+ 		this.sourceLocations[i].cleanup();
+ 	for (int i = 0, l = this.binaryLocations.length; i < l; i++)
+ 		this.binaryLocations[i].cleanup();
++	this.modulePathEntries = null;
+ }
+ 
+ private void createOutputFolder(IContainer outputFolder) throws CoreException {
+@@ -314,7 +342,7 @@ private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeNam
+ 	char[] binaryFileName = CharOperation.concat(typeName, SUFFIX_class);
+ 	if (IModuleContext.UNNAMED_MODULE_CONTEXT == moduleContext) {
+ 		return Stream.of(this.binaryLocations)
+-				.map(p -> p.getLookupEnvironment().typeLookup())
++				.map(p -> p.typeLookup())
+ 				.reduce(ITypeLookup::chain)
+ 				.map(t -> t.findClass(binaryFileName, qPackageName, qBinaryFileName)).orElse(null);
+ 	}
+@@ -360,7 +388,7 @@ public boolean isPackage(String qualifiedPackageName) {
+ }
+ public boolean isPackage(String qualifiedPackageName, IModuleContext moduleContext) {
+ 	if (moduleContext == IModuleContext.UNNAMED_MODULE_CONTEXT) {
+-		return Stream.of(this.binaryLocations).map(p -> p.getLookupEnvironment().packageLookup())
++		return Stream.of(this.binaryLocations).map(p -> p.packageLookup())
+ 				.filter(l -> l.isPackage(qualifiedPackageName)).findAny().isPresent();
+ 	} else {
+ 		return moduleContext.getEnvironment().map(e -> e.packageLookup())
+@@ -400,30 +428,17 @@ public IModule getModule(char[] name) {
+ 	if (name == null)
+ 		return null;
+ 	IModule module = null;
+-	for (int i = 0, l = this.sourceLocations.length; i < l; i++) {
+-		if ((module = this.sourceLocations[i].getModule(name)) != null)
++	for (int i = 0; i < this.modulePathEntries.length; i++) {
++		if ((module = this.modulePathEntries[i].getModule(name)) != null)
+ 			break;
+ 	}
+-	if (module == null) {
+-		for (int i = 0, l = this.binaryLocations.length; i < l; i++) {
+-			if ((module = this.binaryLocations[i].getModule(name)) != null)
+-				break;
+-		}
+-	}
+-	if (module == null) {
+-		module = JavaModelManager.getModulePathManager().getModule(name);
+-	}
+ 	return module;
+ }
+ public IModuleEnvironment getModuleEnvironmentFor(char[] moduleName) {
+ 	IModule module = null;
+-	for (int i = 0, l = this.sourceLocations.length; i < l; i++) {
+-		if ((module = this.sourceLocations[i].getModule(moduleName)) != null)
+-			return this.sourceLocations[i].getLookupEnvironmentFor(module);
+-	}
+-	for (int i = 0, l = this.binaryLocations.length; i < l; i++) {
+-		if ((module = this.binaryLocations[i].getModule(moduleName)) != null)
+-			return this.binaryLocations[i].getLookupEnvironmentFor(module);
++	for (int i = 0; i < this.modulePathEntries.length; i++) {
++		if ((module = this.modulePathEntries[i].getModule(moduleName)) != null)
++			return this.modulePathEntries[i].getLookupEnvironmentFor(module);
+ 	}
+ 	return null;
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
+index b59136c..1e73cfa 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
+@@ -27,7 +27,6 @@ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IType;
+ import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+ import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+@@ -38,7 +37,7 @@ import org.eclipse.jdt.internal.core.util.ResourceCompilationUnit;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+ @SuppressWarnings("rawtypes")
+-public class ClasspathSourceDirectory extends ClasspathLocation implements IModuleEnvironment {
++public class ClasspathSourceDirectory extends ClasspathLocation {
+ 
+ 	IContainer sourceFolder;
+ 	SimpleLookupTable directoryCache;
+@@ -155,24 +154,6 @@ public String debugPathString() {
+ }
+ 
+ @Override
+-public IModule getModule() {
+-	// 
+-	return this.module;
+-}
+-
+-@Override
+-public IModuleEnvironment getLookupEnvironment() {
+-	// 
+-	return this;
+-}
+-
+-@Override
+-public IModuleEnvironment getLookupEnvironmentFor(IModule other) {
+-	//
+-	return this.module == other ? this : null;
+-}
+-
+-@Override
+ public ITypeLookup typeLookup() {
+ 	//
+ 	return this::findClass;
+commit 2be175b246969c556409bf90ff41deb0b119dc06
+Author: Sasikanth Bharadwaj <sasikanth.bharadwaj@in.ibm.com>
+Date:   Thu Dec 29 14:29:17 2016 +0530
+
+    bug 506461: [9] Full build fails when there multiple source folders in a
+    Java project
+    
+    Change-Id: I348647edfe4a6d374d002fd9c627f51d924f9be2
+
+0	10	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+0	33	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+index 64031c9..7614524 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+@@ -493,16 +493,6 @@ public class JavaProject
+ 		return true;
+ 	}
+ 
+-	public boolean isModuleProject() throws JavaModelException {
+-		IPackageFragmentRoot[] roots = getPackageFragmentRoots();
+-		for (IPackageFragmentRoot root : roots) {
+-			if (root.getKind() != IPackageFragmentRoot.K_SOURCE)
+-				continue;
+-			if (((PackageFragmentRoot)root).isModuleDescriptionRoot())
+-				return true;
+-		}
+-		return false;
+-	}
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.jdt.internal.core.JavaElement#close()
+ 	 */
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
+index eaec4a8..40b91ca 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
+@@ -841,39 +841,6 @@ protected void verifyAttachSource(IPath sourcePath) throws JavaModelException {
+ 		throw new JavaModelException(new JavaModelStatus(IJavaModelStatusConstants.RELATIVE_PATH, sourcePath));
+ 	}
+ }
+-/**
+- * return true if this package fragment root contains a module description, false otherwise
+- *
+- */
+-boolean isModuleDescriptionRoot() {
+-	// TODO: Ideally, for source roots, we should get this information from the raw classpath
+-	// by marking the entry that contains module-info as such. For binary roots, the implementation
+-	// should go into the respective sub classes
+-	try {
+-		IJavaElement[] pkgs = getChildren();
+-		for (int j = 0, length = pkgs.length; j < length; j++) {
+-			// only look in the default package
+-			if (pkgs[j].getElementName().length() == 0) {
+-				if (getKind() == IPackageFragmentRoot.K_SOURCE) {
+-					ICompilationUnit unit = ((PackageFragment) pkgs[j])
+-							.getCompilationUnit(TypeConstants.MODULE_INFO_FILE_NAME_STRING);
+-					if (unit instanceof CompilationUnit && unit.exists()) {
+-						return true;
+-					}
+-				} else {
+-					IClassFile classFile = ((IPackageFragment)pkgs[j]).getClassFile(TypeConstants.MODULE_INFO_CLASS_NAME_STRING);
+-					if (classFile instanceof ClassFile && classFile.exists()) {
+-						return true;
+-					}
+-				}
+-				break;
+-			}
+-		}
+-	} catch (JavaModelException e) {
+-		//
+-	}
+-	return false;
+-}
+ public IModuleDescription getModuleDescription() {
+ 	try {
+ 		IJavaElement[] pkgs = getChildren();

@@ -1,0 +1,1710 @@
+commit 69e78b4abede7bbdac9f5d64af842a3d7703024b
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Mon Mar 21 15:45:11 2016 -0700
+
+    Bug 490010 - Move external annotation processing out of ClassFileReader
+    
+    Change-Id: I38c57b200a6c30be70c20d6d0922e1fc3fa96761
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+12	3	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+6	1	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+10	74	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileReader.java
+258	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java
+7	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
+38	29	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+14	6	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+20	9	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+index 77ad903..48c6818 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+@@ -27,9 +27,12 @@ import java.util.zip.ZipFile;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassWithExternalAnnotations;
+ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationProvider;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
++import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
++import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding.ExternalAnnotationStatus;
+ import org.eclipse.jdt.internal.compiler.util.ManifestAnalyzer;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.compiler.util.Util;
+@@ -102,15 +105,21 @@ public NameEnvironmentAnswer findClass(char[] typeName, String qualifiedPackageN
+ 		return null; // most common case
+ 
+ 	try {
+-		ClassFileReader reader = ClassFileReader.read(this.zipFile, qualifiedBinaryFileName);
++		IBinaryType reader = ClassFileReader.read(this.zipFile, qualifiedBinaryFileName);
+ 		if (reader != null) {
+ 			if (this.annotationPaths != null) {
+ 				String qualifiedClassName = qualifiedBinaryFileName.substring(0, qualifiedBinaryFileName.length()-SuffixConstants.EXTENSION_CLASS.length()-1);
+ 				for (String annotationPath : this.annotationPaths) {
+ 					try {
+-						this.annotationZipFile = reader.setExternalAnnotationProvider(annotationPath, qualifiedClassName, this.annotationZipFile, null);
+-						if (reader.hasAnnotationProvider())
++						if (this.annotationZipFile == null) {
++							this.annotationZipFile = ClassWithExternalAnnotations.getAnnotationZipFile(annotationPath, null);
++						}
++						IBinaryType nextReader = ClassWithExternalAnnotations.create(reader, annotationPath, qualifiedClassName, this.annotationZipFile);
++
++						if (nextReader.getExternalAnnotationStatus() == ExternalAnnotationStatus.TYPE_IS_ANNOTATED) {
++							reader = nextReader;
+ 							break;
++						}
+ 					} catch (IOException e) {
+ 						// don't let error on annotations fail class reading
+ 					}
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+index 1c81ac4..b061120 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+@@ -24,6 +24,7 @@ import java.util.zip.ZipFile;
+ 
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassWithExternalAnnotations;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+@@ -270,7 +271,11 @@ private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeNam
+ 			if (classpathEntry.hasAnnotationFileFor(qualifiedTypeName)) {
+ 				ZipFile zip = classpathEntry instanceof ClasspathJar ? ((ClasspathJar) classpathEntry).zipFile : null;
+ 				try {
+-					((ClassFileReader) answer.getBinaryType()).setExternalAnnotationProvider(classpathEntry.getPath(), qualifiedTypeName, zip, null);
++					if (zip == null) {
++						zip = ClassWithExternalAnnotations.getAnnotationZipFile(classpathEntry.getPath(), null);
++					}
++					answer.setBinaryType(ClassWithExternalAnnotations.create(answer.getBinaryType(), classpathEntry.getPath(), 
++							qualifiedTypeName, zip));
+ 					break;
+ 				} catch (IOException e) {
+ 					// ignore broken entry, keep searching
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileReader.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileReader.java
+index cf51258..1d5f98e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileReader.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileReader.java
+@@ -17,24 +17,27 @@
+ package org.eclipse.jdt.internal.compiler.classfmt;
+ 
+ import java.io.File;
+-import java.io.FileInputStream;
+-import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.util.Arrays;
+-import java.util.zip.ZipEntry;
+ import java.util.zip.ZipFile;
+ 
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.codegen.AnnotationTargetTypeConstants;
+ import org.eclipse.jdt.internal.compiler.codegen.AttributeNamesConstants;
+-import org.eclipse.jdt.internal.compiler.env.*;
++import org.eclipse.jdt.internal.compiler.env.IBinaryAnnotation;
++import org.eclipse.jdt.internal.compiler.env.IBinaryElementValuePair;
++import org.eclipse.jdt.internal.compiler.env.IBinaryField;
++import org.eclipse.jdt.internal.compiler.env.IBinaryMethod;
++import org.eclipse.jdt.internal.compiler.env.IBinaryNestedType;
++import org.eclipse.jdt.internal.compiler.env.IBinaryType;
++import org.eclipse.jdt.internal.compiler.env.IBinaryTypeAnnotation;
++import org.eclipse.jdt.internal.compiler.env.ITypeAnnotationWalker;
+ import org.eclipse.jdt.internal.compiler.impl.Constant;
++import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding.ExternalAnnotationStatus;
+ import org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment;
+ import org.eclipse.jdt.internal.compiler.lookup.TagBits;
+-import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeIds;
+-import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding.ExternalAnnotationStatus;
+ import org.eclipse.jdt.internal.compiler.util.Util;
+ 
+ public class ClassFileReader extends ClassFileStruct implements IBinaryType {
+@@ -67,8 +70,6 @@ public class ClassFileReader extends ClassFileStruct implements IBinaryType {
+ 	private char[][][] missingTypeNames;
+ 	private int enclosingNameAndTypeIndex;
+ 	private char[] enclosingMethod;
+-	private ExternalAnnotationProvider annotationProvider;
+-	private ExternalAnnotationStatus externalAnnotationStatus = ExternalAnnotationStatus.NOT_EEA_CONFIGURED;
+ 
+ private static String printTypeModifiers(int modifiers) {
+ 	java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+@@ -412,57 +413,9 @@ public ClassFileReader(byte[] classFileBytes, char[] fileName, boolean fullyInit
+ /** Auxiliary interface for {@link #setExternalAnnotationProvider(String,String,ZipFile,ZipFileProducer)}. */
+ public interface ZipFileProducer { ZipFile produce() throws IOException; }
+ 
+-/**
+- * Create and remember a provider for external annotations using the given basePath,
+- * which is either a directory holding .eea text files, or a zip file of entries of the same format.
+- * @param basePath resolved filesystem path of either directory or zip file
+- * @param qualifiedBinaryTypeName slash-separated type name
+- * @param zipFile an existing zip file for the same basePath, or null. 
+- * 		Output: wl be filled with 
+- * @param producer an optional helper to produce the zipFile when needed.
+- * @return the client provided zip file; 
+- * 		or else a fresh new zip file, to let clients cache it, if desired; 
+- * 		or null to signal that basePath is not a zip file, but a directory.
+- * @throws IOException any unexpected errors during file access. File not found while
+- *		accessing an individual file if basePath is a directory <em>is</em> expected,
+- *		and simply answered with null. If basePath is neither a directory nor a zip file,
+- *		this is unexpected.
+- */
+-public ZipFile setExternalAnnotationProvider(String basePath, String qualifiedBinaryTypeName, ZipFile zipFile, ZipFileProducer producer) throws IOException {
+-	this.externalAnnotationStatus = ExternalAnnotationStatus.NO_EEA_FILE;
+-	String qualifiedBinaryFileName = qualifiedBinaryTypeName + ExternalAnnotationProvider.ANNOTATION_FILE_SUFFIX;
+-	if (zipFile == null) {
+-		File annotationBase = new File(basePath);
+-		if (annotationBase.isDirectory()) {
+-			try {
+-				String filePath = annotationBase.getAbsolutePath()+'/'+qualifiedBinaryFileName;
+-				this.annotationProvider = new ExternalAnnotationProvider(new FileInputStream(filePath), String.valueOf(getName()));
+-				this.externalAnnotationStatus = ExternalAnnotationStatus.TYPE_IS_ANNOTATED;
+-			} catch (FileNotFoundException e) {
+-				// expected, no need to report an error here
+-			}
+-			return null; // no zipFile
+-		}
+-		if (!annotationBase.exists())
+-			return null; // no zipFile, treat as not-yet-created directory
+-		zipFile = (producer != null ? producer.produce() : new ZipFile(annotationBase));
+-	}
+-	ZipEntry entry = zipFile.getEntry(qualifiedBinaryFileName);
+-	if (entry != null) {
+-		this.annotationProvider = new ExternalAnnotationProvider(zipFile.getInputStream(entry), String.valueOf(getName()));
+-		this.externalAnnotationStatus = ExternalAnnotationStatus.TYPE_IS_ANNOTATED;
+-	}
+-	return zipFile;
+-}
+-public boolean hasAnnotationProvider() {
+-	return this.annotationProvider != null;
+-}
+-public void markAsFromSource() {
+-	this.externalAnnotationStatus = ExternalAnnotationStatus.FROM_SOURCE;
+-}
+ @Override
+ public ExternalAnnotationStatus getExternalAnnotationStatus() {
+-	return this.externalAnnotationStatus;
++	return ExternalAnnotationStatus.NOT_EEA_CONFIGURED;
+ }
+ /**
+  * Conditionally add external annotations to the mix.
+@@ -471,23 +424,6 @@ public ExternalAnnotationStatus getExternalAnnotationStatus() {
+  */
+ @Override
+ public ITypeAnnotationWalker enrichWithExternalAnnotationsFor(ITypeAnnotationWalker walker, Object member, LookupEnvironment environment) {
+-	if (walker == ITypeAnnotationWalker.EMPTY_ANNOTATION_WALKER && this.annotationProvider != null) {
+-		if (member == null) {
+-			return this.annotationProvider.forTypeHeader(environment);
+-		} else if (member instanceof IBinaryField) {
+-			IBinaryField field = (IBinaryField) member;
+-			char[] fieldSignature = field.getGenericSignature();
+-			if (fieldSignature == null)
+-				fieldSignature = field.getTypeName();
+-			return this.annotationProvider.forField(field.getName(), fieldSignature, environment);
+-		} else if (member instanceof IBinaryMethod) {
+-			IBinaryMethod method = (IBinaryMethod) member;
+-			char[] methodSignature = method.getGenericSignature();
+-			if (methodSignature == null)
+-				methodSignature = method.getMethodDescriptor();
+-			return this.annotationProvider.forMethod(method.isConstructor() ? TypeConstants.INIT : method.getSelector(), methodSignature, environment);
+-		}
+-	}
+ 	return walker;
+ }
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java
+new file mode 100644
+index 0000000..9a8f295
+--- /dev/null
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java
+@@ -0,0 +1,258 @@
++package org.eclipse.jdt.internal.compiler.classfmt;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
++import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader.ZipFileProducer;
++import org.eclipse.jdt.internal.compiler.env.IBinaryAnnotation;
++import org.eclipse.jdt.internal.compiler.env.IBinaryField;
++import org.eclipse.jdt.internal.compiler.env.IBinaryMethod;
++import org.eclipse.jdt.internal.compiler.env.IBinaryNestedType;
++import org.eclipse.jdt.internal.compiler.env.IBinaryType;
++import org.eclipse.jdt.internal.compiler.env.IBinaryTypeAnnotation;
++import org.eclipse.jdt.internal.compiler.env.ITypeAnnotationWalker;
++import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding.ExternalAnnotationStatus;
++import org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment;
++import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
++
++public class ClassWithExternalAnnotations implements IBinaryType {
++	private IBinaryType inputType;
++	private ExternalAnnotationProvider annotationProvider;
++	private boolean isFromSource;
++
++	public ClassWithExternalAnnotations(IBinaryType toDecorate, ExternalAnnotationProvider externalAnnotationProvider) {
++		this.inputType = toDecorate;
++		this.annotationProvider = externalAnnotationProvider;
++	}
++
++	public ClassWithExternalAnnotations(IBinaryType toDecorate, boolean isFromSource) {
++		this.isFromSource = isFromSource;
++		this.inputType = toDecorate;
++	}
++
++	@Override
++	public char[] getFileName() {
++		return this.inputType.getFileName();
++	}
++
++	@Override
++	public boolean isBinaryType() {
++		return this.inputType.isBinaryType();
++	}
++
++	@Override
++	public IBinaryAnnotation[] getAnnotations() {
++		return this.inputType.getAnnotations();
++	}
++
++	@Override
++	public IBinaryTypeAnnotation[] getTypeAnnotations() {
++		return this.inputType.getTypeAnnotations();
++	}
++
++	@Override
++	public char[] getEnclosingMethod() {
++		return this.inputType.getEnclosingMethod();
++	}
++
++	@Override
++	public char[] getEnclosingTypeName() {
++		return this.inputType.getEnclosingTypeName();
++	}
++
++	@Override
++	public IBinaryField[] getFields() {
++		return this.inputType.getFields();
++	}
++
++	@Override
++	public char[] getGenericSignature() {
++		return this.inputType.getGenericSignature();
++	}
++
++	@Override
++	public char[][] getInterfaceNames() {
++		return this.inputType.getInterfaceNames();
++	}
++
++	@Override
++	public IBinaryNestedType[] getMemberTypes() {
++		return this.inputType.getMemberTypes();
++	}
++
++	@Override
++	public IBinaryMethod[] getMethods() {
++		return this.inputType.getMethods();
++	}
++
++	@Override
++	public char[][][] getMissingTypeNames() {
++		return this.inputType.getMissingTypeNames();
++	}
++
++	@Override
++	public char[] getName() {
++		return this.inputType.getName();
++	}
++
++	@Override
++	public char[] getSourceName() {
++		return this.inputType.getSourceName();
++	}
++
++	@Override
++	public char[] getSuperclassName() {
++		return this.inputType.getSuperclassName();
++	}
++
++	@Override
++	public long getTagBits() {
++		return this.inputType.getTagBits();
++	}
++
++	@Override
++	public boolean isAnonymous() {
++		return this.inputType.isAnonymous();
++	}
++
++	@Override
++	public boolean isLocal() {
++		return this.inputType.isLocal();
++	}
++
++	@Override
++	public boolean isMember() {
++		return this.inputType.isMember();
++	}
++
++	@Override
++	public char[] sourceFileName() {
++		return this.inputType.sourceFileName();
++	}
++
++	@Override
++	public int getModifiers() {
++		return this.inputType.getModifiers();
++	}
++
++	/**
++	 * Returns the zip file containing external annotations, if any. Returns null if there are no external annotations
++	 * or if the basePath refers to a directory.
++	 * 
++	 * @param basePath
++	 *            resolved filesystem path of either directory or zip file
++	 * @param producer
++	 *            an optional helper to produce the zipFile when needed.
++	 * @return the client provided zip file; or else a fresh new zip file, to let clients cache it, if desired; or null
++	 *         to signal that basePath is not a zip file, but a directory.
++	 * @throws IOException
++	 *             any unexpected errors during file access. File not found while accessing an individual file if
++	 *             basePath is a directory <em>is</em> expected, and simply answered with null. If basePath is neither a
++	 *             directory nor a zip file, this is unexpected.
++	 */
++	public static ZipFile getAnnotationZipFile(String basePath, ZipFileProducer producer) throws IOException {
++		File annotationBase = new File(basePath);
++		if (annotationBase.isDirectory()) {
++			return null; // no zipFile
++		}
++		if (!annotationBase.exists())
++			return null; // no zipFile, treat as not-yet-created directory
++		return (producer != null ? producer.produce() : new ZipFile(annotationBase));
++	}
++
++	/**
++	 * Creates an external annotation provider for external annotations using the given basePath, which is either a
++	 * directory holding .eea text files, or a zip file of entries of the same format.
++	 * 
++	 * @param basePath
++	 *            resolved filesystem path of either directory or zip file
++	 * @param qualifiedBinaryTypeName
++	 *            slash-separated type name
++	 * @param zipFile
++	 *            an existing zip file for the same basePath, or null.
++	 * @return the annotation provider or null if there are no external annotations.
++	 * @throws IOException
++	 *             any unexpected errors during file access. File not found while accessing an individual file if
++	 *             basePath is a directory <em>is</em> expected, and simply answered with null. If basePath is neither a
++	 *             directory nor a zip file, this is unexpected.
++	 */
++	public static ExternalAnnotationProvider externalAnnotationProvider(String basePath, String qualifiedBinaryTypeName,
++			ZipFile zipFile) throws IOException {
++		String qualifiedBinaryFileName = qualifiedBinaryTypeName + ExternalAnnotationProvider.ANNOTATION_FILE_SUFFIX;
++		if (zipFile == null) {
++			File annotationBase = new File(basePath);
++			if (annotationBase.isDirectory()) {
++				String filePath = annotationBase.getAbsolutePath() + '/' + qualifiedBinaryFileName;
++				return new ExternalAnnotationProvider(new FileInputStream(filePath), qualifiedBinaryTypeName);
++			}
++		} else {
++			ZipEntry entry = zipFile.getEntry(qualifiedBinaryFileName);
++			if (entry != null) {
++				return new ExternalAnnotationProvider(zipFile.getInputStream(entry), qualifiedBinaryTypeName);
++			}
++		}
++		return null;
++	}
++
++	/**
++	 * Create and remember a provider for external annotations using the given basePath, which is either a directory
++	 * holding .eea text files, or a zip file of entries of the same format.
++	 * 
++	 * @param basePath
++	 *            resolved filesystem path of either directory or zip file
++	 * @param qualifiedBinaryTypeName
++	 *            slash-separated type name
++	 * @param zipFile
++	 *            an existing zip file for the same basePath, or null. Output: wl be filled with
++	 * @return the client provided zip file; or else a fresh new zip file, to let clients cache it, if desired; or null
++	 *         to signal that basePath is not a zip file, but a directory.
++	 * @throws IOException
++	 *             any unexpected errors during file access. File not found while accessing an individual file if
++	 *             basePath is a directory <em>is</em> expected, and simply answered with null. If basePath is neither a
++	 *             directory nor a zip file, this is unexpected.
++	 */
++	public static ClassWithExternalAnnotations create(IBinaryType toDecorate, String basePath,
++			String qualifiedBinaryTypeName, ZipFile zipFile) throws IOException {
++		return new ClassWithExternalAnnotations(toDecorate,
++				externalAnnotationProvider(basePath, qualifiedBinaryTypeName, zipFile));
++	}
++
++	@Override
++	public ITypeAnnotationWalker enrichWithExternalAnnotationsFor(ITypeAnnotationWalker walker, Object member,
++			LookupEnvironment environment) {
++		if (walker == ITypeAnnotationWalker.EMPTY_ANNOTATION_WALKER && this.annotationProvider != null) {
++			if (member == null) {
++				return this.annotationProvider.forTypeHeader(environment);
++			} else if (member instanceof IBinaryField) {
++				IBinaryField field = (IBinaryField) member;
++				char[] fieldSignature = field.getGenericSignature();
++				if (fieldSignature == null)
++					fieldSignature = field.getTypeName();
++				return this.annotationProvider.forField(field.getName(), fieldSignature, environment);
++			} else if (member instanceof IBinaryMethod) {
++				IBinaryMethod method = (IBinaryMethod) member;
++				char[] methodSignature = method.getGenericSignature();
++				if (methodSignature == null)
++					methodSignature = method.getMethodDescriptor();
++				return this.annotationProvider.forMethod(
++						method.isConstructor() ? TypeConstants.INIT : method.getSelector(), methodSignature,
++						environment);
++			}
++		}
++		return walker;
++	}
++
++	@Override
++	public ExternalAnnotationStatus getExternalAnnotationStatus() {
++		if (this.annotationProvider == null) {
++			if (this.isFromSource) {
++				return ExternalAnnotationStatus.FROM_SOURCE;
++			}
++			return ExternalAnnotationStatus.NO_EEA_FILE;
++		}
++		return ExternalAnnotationStatus.TYPE_IS_ANNOTATED;
++	}
++}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
+index bc79c2f..64dc389 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
+@@ -40,9 +40,14 @@ public class NameEnvironmentAnswer {
+ 	public AccessRestriction getAccessRestriction() {
+ 		return this.accessRestriction;
+ 	}
++
++	public void setBinaryType(IBinaryType newType) {
++		this.binaryType = newType;
++	}
++
+ 	/**
+-	 * Answer the resolved binary form for the type or null if the
+-	 * receiver represents a compilation unit or source type.
++	 * Answer the resolved binary form for the type or null if the receiver represents a compilation unit or source
++	 * type.
+ 	 */
+ 	public IBinaryType getBinaryType() {
+ 		return this.binaryType;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+index 8a40f70..2799f97 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+@@ -30,6 +30,8 @@ import org.eclipse.jdt.core.*;
+ import org.eclipse.jdt.core.compiler.IProblem;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassWithExternalAnnotations;
++import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationProvider;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.core.nd.java.JavaNames;
+@@ -368,37 +370,37 @@ private IBinaryType getJarBinaryTypeInfo(PackageFragment pkg, boolean fullyIniti
+ 		return null;
+ 	}
+ 
+-	IBinaryType type = BinaryTypeFactory.readType(descriptor, fullyInitialize, null);
++	IBinaryType result = BinaryTypeFactory.readType(descriptor, fullyInitialize, null);
+ 
+ 	// TODO(sxenos): setup the external annotation provider if the IBinaryType came from the index
+ 	// TODO(sxenos): the old code always passed null as the third argument to setupExternalAnnotationProvider,
+ 	// but this looks like a bug. I've preserved it for now but we need to figure out what was supposed to go
+ 	// there.
+-	if (type instanceof ClassFileReader) {
+-		ClassFileReader reader = (ClassFileReader) type;
+-
+-		JarPackageFragmentRoot root = (JarPackageFragmentRoot) pkg.getParent();
+-		if (root.getKind() == IPackageFragmentRoot.K_BINARY) {
+-			JavaProject javaProject = (JavaProject) getAncestor(IJavaElement.JAVA_PROJECT);
+-			IClasspathEntry entry = javaProject.getClasspathEntryFor(getPath());
+-			if (entry != null) {
+-				String entryName = new String(CharArrayUtils.concat(
+-						JavaNames.fieldDescriptorToBinaryName(descriptor.fieldDescriptor), SuffixConstants.SUFFIX_CLASS));
+-				IProject project = javaProject.getProject();
+-				IPath externalAnnotationPath = ClasspathEntry.getExternalAnnotationPath(entry, project, false); // unresolved for use in ExternalAnnotationTracker
+-				if (externalAnnotationPath != null)
+-					setupExternalAnnotationProvider(project, externalAnnotationPath, null, reader,
+-							entryName.substring(0, entryName.length() - SuffixConstants.SUFFIX_CLASS.length));
++	JarPackageFragmentRoot root = (JarPackageFragmentRoot) pkg.getParent();
++	if (root.getKind() == IPackageFragmentRoot.K_BINARY) {
++		JavaProject javaProject = (JavaProject) getAncestor(IJavaElement.JAVA_PROJECT);
++		IClasspathEntry entry = javaProject.getClasspathEntryFor(getPath());
++		if (entry != null) {
++			String entryName = new String(CharArrayUtils.concat(
++					JavaNames.fieldDescriptorToBinaryName(descriptor.fieldDescriptor), SuffixConstants.SUFFIX_CLASS));
++			IProject project = javaProject.getProject();
++			IPath externalAnnotationPath = ClasspathEntry.getExternalAnnotationPath(entry, project, false); // unresolved for use in ExternalAnnotationTracker
++			if (externalAnnotationPath != null) {
++				result = setupExternalAnnotationProvider(project, externalAnnotationPath, null, result, 
++					entryName.substring(0, entryName.length() - SuffixConstants.SUFFIX_CLASS.length));
++			} else if (entry.getEntryKind() == IClasspathEntry.CPE_SOURCE) {
++				result = new ClassWithExternalAnnotations(result, true);
+ 			}
+ 		}
+ 	}
+ 
+-	return type;
++	return result;
+ }
+ 
+-private void setupExternalAnnotationProvider(IProject project, final IPath externalAnnotationPath,
+-		ZipFile annotationZip, ClassFileReader reader, final String typeName)
++private IBinaryType setupExternalAnnotationProvider(IProject project, final IPath externalAnnotationPath,
++		ZipFile annotationZip, IBinaryType reader, final String typeName)
+ {
++	IBinaryType result = reader;
+ 	// try resolve path within the workspace:
+ 	IWorkspaceRoot root = project.getWorkspace().getRoot();
+ 	IResource resource;
+@@ -414,24 +416,30 @@ private void setupExternalAnnotationProvider(IProject project, final IPath exter
+ 		if (resource.isVirtual()) {
+ 			Util.log(new Status(IStatus.ERROR, JavaCore.PLUGIN_ID,
+ 					"Virtual resource "+externalAnnotationPath+" cannot be used as annotationpath for project "+project.getName())); //$NON-NLS-1$ //$NON-NLS-2$
+-			return;
++			return reader;
+ 		}
+ 		resolvedPath = resource.getLocation().toString(); // workspace lookup succeeded -> resolve it
+ 	} else {
+ 		resolvedPath = externalAnnotationPath.toString(); // not in workspace, use as is
+ 	}
+ 	try {
+-		annotationZip = reader.setExternalAnnotationProvider(resolvedPath, typeName, annotationZip, new ClassFileReader.ZipFileProducer() {
+-			@Override public ZipFile produce() throws IOException {
+-				try {
+-					return JavaModelManager.getJavaModelManager().getZipFile(externalAnnotationPath); // use (absolute, but) unresolved path here
+-				} catch (CoreException e) {
+-					throw new IOException("Failed to read annotation file for "+typeName+" from "+externalAnnotationPath.toString(), e); //$NON-NLS-1$ //$NON-NLS-2$
+-				}
+-			}});
++		if (annotationZip == null) {
++			annotationZip = ClassWithExternalAnnotations.getAnnotationZipFile(resolvedPath, new ClassFileReader.ZipFileProducer() {
++				@Override public ZipFile produce() throws IOException {
++					try {
++						return JavaModelManager.getJavaModelManager().getZipFile(externalAnnotationPath); // use (absolute, but) unresolved path here
++					} catch (CoreException e) {
++						throw new IOException("Failed to read annotation file for "+typeName+" from "+externalAnnotationPath.toString(), e); //$NON-NLS-1$ //$NON-NLS-2$
++					}
++				}});
++		}
++
++		ExternalAnnotationProvider annotationProvider = ClassWithExternalAnnotations
++				.externalAnnotationProvider(resolvedPath, typeName, annotationZip);
++		result = new ClassWithExternalAnnotations(reader, annotationProvider);
+ 	} catch (IOException e) {
+ 		Util.log(e);
+-		return;
++		return result;
+ 	}
+ 	if (annotationZip == null) {
+ 		// Additional change listening for individual types only when annotations are in individual files.
+@@ -439,6 +447,7 @@ private void setupExternalAnnotationProvider(IProject project, final IPath exter
+ 		this.externalAnnotationBase = externalAnnotationPath; // remember so we can unregister later
+ 		ExternalAnnotationTracker.registerClassFile(externalAnnotationPath, new Path(typeName), this);
+ 	}
++	return result;
+ }
+ void closeAndRemoveFromJarTypeCache() throws JavaModelException {
+ 	super.close();
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+index 72917d5..66144d0 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+@@ -13,12 +13,15 @@ package org.eclipse.jdt.internal.core.builder;
+ import java.io.IOException;
+ import java.util.zip.ZipFile;
+ 
+-import org.eclipse.core.resources.*;
+-import org.eclipse.core.runtime.*;
+-
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
++import org.eclipse.core.resources.IContainer;
++import org.eclipse.core.resources.IResource;
++import org.eclipse.core.runtime.CoreException;
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.Path;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassWithExternalAnnotations;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
++import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+@@ -107,7 +110,7 @@ public boolean equals(Object o) {
+ public NameEnvironmentAnswer findClass(String binaryFileName, String qualifiedPackageName, String qualifiedBinaryFileName) {
+ 	if (!doesFileExist(binaryFileName, qualifiedPackageName, qualifiedBinaryFileName)) return null; // most common case
+ 
+-	ClassFileReader reader = null;
++	IBinaryType reader = null;
+ 	try {
+ 		reader = Util.newClassFileReader(this.binaryFolder.getFile(new Path(qualifiedBinaryFileName)));
+ 	} catch (CoreException e) {
+@@ -121,7 +124,12 @@ public NameEnvironmentAnswer findClass(String binaryFileName, String qualifiedPa
+ 		String fileNameWithoutExtension = qualifiedBinaryFileName.substring(0, qualifiedBinaryFileName.length() - SuffixConstants.SUFFIX_CLASS.length);
+ 		if (this.externalAnnotationPath != null) {
+ 			try {
+-				this.annotationZipFile = reader.setExternalAnnotationProvider(this.externalAnnotationPath, fileNameWithoutExtension, this.annotationZipFile, null);
++				if (this.annotationZipFile == null) {
++					this.annotationZipFile = ClassWithExternalAnnotations
++							.getAnnotationZipFile(this.externalAnnotationPath, null);
++				}
++				reader = ClassWithExternalAnnotations.create(reader, this.externalAnnotationPath,
++						fileNameWithoutExtension, this.annotationZipFile);
+ 			} catch (IOException e) {
+ 				// don't let error on annotations fail class reading
+ 			}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+index 1bda5fb..54b6b06 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+@@ -13,22 +13,27 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.builder;
+ 
+-import org.eclipse.core.resources.IFile;
+-import org.eclipse.core.runtime.*;
++import java.io.File;
++import java.io.IOException;
++import java.util.Date;
++import java.util.Enumeration;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
+ 
++import org.eclipse.core.resources.IFile;
++import org.eclipse.core.runtime.CoreException;
++import org.eclipse.core.runtime.IPath;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassWithExternalAnnotations;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
++import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.compiler.util.SimpleSet;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+-import java.io.*;
+-import java.util.*;
+-import java.util.zip.*;
+-
+ @SuppressWarnings("rawtypes")
+ public class ClasspathJar extends ClasspathLocation {
+ 
+@@ -165,13 +170,19 @@ public NameEnvironmentAnswer findClass(String binaryFileName, String qualifiedPa
+ 	if (!isPackage(qualifiedPackageName)) return null; // most common case
+ 
+ 	try {
+-		ClassFileReader reader = ClassFileReader.read(this.zipFile, qualifiedBinaryFileName);
++		IBinaryType reader = ClassFileReader.read(this.zipFile, qualifiedBinaryFileName);
+ 		if (reader != null) {
+ 			String fileNameWithoutExtension = qualifiedBinaryFileName.substring(0, qualifiedBinaryFileName.length() - SuffixConstants.SUFFIX_CLASS.length);
+ 			if (this.externalAnnotationPath != null) {
+ 				try {
+-					this.annotationZipFile = reader.setExternalAnnotationProvider(this.externalAnnotationPath, fileNameWithoutExtension, this.annotationZipFile, null);
+-				} catch (IOException e) {
++					if (this.annotationZipFile == null) {
++						this.annotationZipFile = ClassWithExternalAnnotations
++								.getAnnotationZipFile(this.externalAnnotationPath, null);
++					}
++
++					reader = ClassWithExternalAnnotations.create(reader, this.externalAnnotationPath,
++							fileNameWithoutExtension, this.annotationZipFile);
++					} catch (IOException e) {
+ 					// don't let error on annotations fail class reading
+ 				}
+ 			}
+commit 00612d5dfec347c046e050ebdf90bf45fa667cfa
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Thu Jun 16 09:30:34 2016 -0700
+
+    Bug 490010 - Move external annotation processing out of ClassFileReader
+    
+    Change-Id: I38c57b200a6c30be70c20d6d0922e1fc3fa96761
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+2	3	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+1	0	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+0	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileReader.java
+42	14	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java
+7	7	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+index 48c6818..859f5c5 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+@@ -114,10 +114,9 @@ public NameEnvironmentAnswer findClass(char[] typeName, String qualifiedPackageN
+ 						if (this.annotationZipFile == null) {
+ 							this.annotationZipFile = ClassWithExternalAnnotations.getAnnotationZipFile(annotationPath, null);
+ 						}
+-						IBinaryType nextReader = ClassWithExternalAnnotations.create(reader, annotationPath, qualifiedClassName, this.annotationZipFile);
++						reader = ClassWithExternalAnnotations.create(reader, annotationPath, qualifiedClassName, this.annotationZipFile);
+ 
+-						if (nextReader.getExternalAnnotationStatus() == ExternalAnnotationStatus.TYPE_IS_ANNOTATED) {
+-							reader = nextReader;
++						if (reader.getExternalAnnotationStatus() == ExternalAnnotationStatus.TYPE_IS_ANNOTATED) {
+ 							break;
+ 						}
+ 					} catch (IOException e) {
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+index b061120..434f010 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+@@ -269,6 +269,7 @@ private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeNam
+ 		for (int i = 0, length = this.classpaths.length; i < length; i++) {
+ 			Classpath classpathEntry = this.classpaths[i];
+ 			if (classpathEntry.hasAnnotationFileFor(qualifiedTypeName)) {
++				// in case of 'this.annotationsFromClasspath' we indeed search for .eea entries inside the main zipFile of the entry:
+ 				ZipFile zip = classpathEntry instanceof ClasspathJar ? ((ClasspathJar) classpathEntry).zipFile : null;
+ 				try {
+ 					if (zip == null) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileReader.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileReader.java
+index 1d5f98e..e2e2561 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileReader.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileReader.java
+@@ -20,7 +20,6 @@ import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.util.Arrays;
+-import java.util.zip.ZipFile;
+ 
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.codegen.AnnotationTargetTypeConstants;
+@@ -410,9 +409,6 @@ public ClassFileReader(byte[] classFileBytes, char[] fileName, boolean fullyInit
+ 	}
+ }
+ 
+-/** Auxiliary interface for {@link #setExternalAnnotationProvider(String,String,ZipFile,ZipFileProducer)}. */
+-public interface ZipFileProducer { ZipFile produce() throws IOException; }
+-
+ @Override
+ public ExternalAnnotationStatus getExternalAnnotationStatus() {
+ 	return ExternalAnnotationStatus.NOT_EEA_CONFIGURED;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java
+index 9a8f295..8942100 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java
+@@ -1,12 +1,22 @@
++/*******************************************************************************
++ * Copyright (c) 2016 Google, Inc. and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     Stefan Xenos <sxenos@gmail.com> (Google) - initial API and implementation
++ *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.classfmt;
+ 
+ import java.io.File;
+ import java.io.FileInputStream;
++import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipFile;
+ 
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader.ZipFileProducer;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryAnnotation;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryField;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryMethod;
+@@ -18,11 +28,18 @@ import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding.ExternalAnnota
+ import org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ 
++/**
++ * A decorator for {@link IBinaryType} that allows external annotations to be attached. This can be used to change the
++ * result of {@link #enrichWithExternalAnnotationsFor} or {@link #getExternalAnnotationStatus}.
++ */
+ public class ClassWithExternalAnnotations implements IBinaryType {
+ 	private IBinaryType inputType;
+ 	private ExternalAnnotationProvider annotationProvider;
+ 	private boolean isFromSource;
+ 
++	/** Auxiliary interface for {@link #getAnnotationZipFile(String, ZipFileProducer)}. */
++	public interface ZipFileProducer { ZipFile produce() throws IOException; }
++
+ 	public ClassWithExternalAnnotations(IBinaryType toDecorate, ExternalAnnotationProvider externalAnnotationProvider) {
+ 		this.inputType = toDecorate;
+ 		this.annotationProvider = externalAnnotationProvider;
+@@ -141,7 +158,7 @@ public class ClassWithExternalAnnotations implements IBinaryType {
+ 	/**
+ 	 * Returns the zip file containing external annotations, if any. Returns null if there are no external annotations
+ 	 * or if the basePath refers to a directory.
+-	 * 
++	 *
+ 	 * @param basePath
+ 	 *            resolved filesystem path of either directory or zip file
+ 	 * @param producer
+@@ -166,7 +183,7 @@ public class ClassWithExternalAnnotations implements IBinaryType {
+ 	/**
+ 	 * Creates an external annotation provider for external annotations using the given basePath, which is either a
+ 	 * directory holding .eea text files, or a zip file of entries of the same format.
+-	 * 
++	 *
+ 	 * @param basePath
+ 	 *            resolved filesystem path of either directory or zip file
+ 	 * @param qualifiedBinaryTypeName
+@@ -186,7 +203,12 @@ public class ClassWithExternalAnnotations implements IBinaryType {
+ 			File annotationBase = new File(basePath);
+ 			if (annotationBase.isDirectory()) {
+ 				String filePath = annotationBase.getAbsolutePath() + '/' + qualifiedBinaryFileName;
+-				return new ExternalAnnotationProvider(new FileInputStream(filePath), qualifiedBinaryTypeName);
++				try {
++					return new ExternalAnnotationProvider(new FileInputStream(filePath), qualifiedBinaryTypeName);
++				} catch (FileNotFoundException e) {
++					// Expected, no need to report an error here
++					return null;
++				}
+ 			}
+ 		} else {
+ 			ZipEntry entry = zipFile.getEntry(qualifiedBinaryFileName);
+@@ -198,26 +220,32 @@ public class ClassWithExternalAnnotations implements IBinaryType {
+ 	}
+ 
+ 	/**
+-	 * Create and remember a provider for external annotations using the given basePath, which is either a directory
+-	 * holding .eea text files, or a zip file of entries of the same format.
++	 * Possibly wrap the provided binary type in a ClassWithExternalAnnotations to which a fresh provider for external
++	 * annotations is associated. This provider is constructed using the given basePath, which is either a directory
++	 * holding .eea text files, or a zip file of entries of the same format. If no such provider could be constructed,
++	 * then the original binary type is returned unchanged.
+ 	 * 
++	 * @param toDecorate
++	 *            the binary type to wrap, if needed
+ 	 * @param basePath
+ 	 *            resolved filesystem path of either directory or zip file
+ 	 * @param qualifiedBinaryTypeName
+ 	 *            slash-separated type name
+ 	 * @param zipFile
+-	 *            an existing zip file for the same basePath, or null. Output: wl be filled with
+-	 * @return the client provided zip file; or else a fresh new zip file, to let clients cache it, if desired; or null
+-	 *         to signal that basePath is not a zip file, but a directory.
++	 *            an existing zip file for the same basePath, or null.
++	 * @return either a fresh ClassWithExternalAnnotations or the original binary type unchanged.
+ 	 * @throws IOException
+ 	 *             any unexpected errors during file access. File not found while accessing an individual file if
+-	 *             basePath is a directory <em>is</em> expected, and simply answered with null. If basePath is neither a
+-	 *             directory nor a zip file, this is unexpected.
++	 *             basePath is a directory <em>is</em> expected, and simply handled by not setting up an external
++	 *             annotation provider. If basePath is neither a directory nor a zip file, this is unexpected, resulting
++	 *             in an exception.
+ 	 */
+-	public static ClassWithExternalAnnotations create(IBinaryType toDecorate, String basePath,
++	public static IBinaryType create(IBinaryType toDecorate, String basePath,
+ 			String qualifiedBinaryTypeName, ZipFile zipFile) throws IOException {
+-		return new ClassWithExternalAnnotations(toDecorate,
+-				externalAnnotationProvider(basePath, qualifiedBinaryTypeName, zipFile));
++		ExternalAnnotationProvider externalAnnotationProvider = externalAnnotationProvider(basePath, qualifiedBinaryTypeName, zipFile);
++		if (externalAnnotationProvider == null)
++			return toDecorate;
++		return new ClassWithExternalAnnotations(toDecorate, externalAnnotationProvider);
+ 	}
+ 
+ 	@Override
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+index 2799f97..1e5ddb8 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+@@ -14,6 +14,12 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
+ import org.eclipse.core.resources.IContainer;
+ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.resources.IFolder;
+@@ -41,12 +47,6 @@ import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+ import org.eclipse.jdt.internal.core.util.MementoTokenizer;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+-import java.io.IOException;
+-import java.util.HashMap;
+-import java.util.Map;
+-import java.util.zip.ZipEntry;
+-import java.util.zip.ZipFile;
+-
+ /**
+  * @see IClassFile
+  */
+@@ -424,7 +424,7 @@ private IBinaryType setupExternalAnnotationProvider(IProject project, final IPat
+ 	}
+ 	try {
+ 		if (annotationZip == null) {
+-			annotationZip = ClassWithExternalAnnotations.getAnnotationZipFile(resolvedPath, new ClassFileReader.ZipFileProducer() {
++			annotationZip = ClassWithExternalAnnotations.getAnnotationZipFile(resolvedPath, new ClassWithExternalAnnotations.ZipFileProducer() {
+ 				@Override public ZipFile produce() throws IOException {
+ 					try {
+ 						return JavaModelManager.getJavaModelManager().getZipFile(externalAnnotationPath); // use (absolute, but) unresolved path here
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+index 54b6b06..b6d5a29 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+@@ -182,7 +182,7 @@ public NameEnvironmentAnswer findClass(String binaryFileName, String qualifiedPa
+ 
+ 					reader = ClassWithExternalAnnotations.create(reader, this.externalAnnotationPath,
+ 							fileNameWithoutExtension, this.annotationZipFile);
+-					} catch (IOException e) {
++				} catch (IOException e) {
+ 					// don't let error on annotations fail class reading
+ 				}
+ 			}
+commit 4f7f61a3539d170cf594d758512da05c9627a7f0
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Tue Aug 30 16:49:55 2016 -0700
+
+    Bug 490010 - Move code for external annotation processing out of
+    ClassFileReader
+    
+    Rename ClassWithExternalAnnotations to ExternalAnnotationDecorator.
+    
+    Change-Id: I26a9a71dbae43606da9273ea0b21816dcec913ad
+
+3	3	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+3	3	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+0	284	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java
+284	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ExternalAnnotationDecorator.java
+5	5	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+3	3	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+3	3	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+index 859f5c5..6245837 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+@@ -27,7 +27,7 @@ import java.util.zip.ZipFile;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassWithExternalAnnotations;
++import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationProvider;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+@@ -112,9 +112,9 @@ public NameEnvironmentAnswer findClass(char[] typeName, String qualifiedPackageN
+ 				for (String annotationPath : this.annotationPaths) {
+ 					try {
+ 						if (this.annotationZipFile == null) {
+-							this.annotationZipFile = ClassWithExternalAnnotations.getAnnotationZipFile(annotationPath, null);
++							this.annotationZipFile = ExternalAnnotationDecorator.getAnnotationZipFile(annotationPath, null);
+ 						}
+-						reader = ClassWithExternalAnnotations.create(reader, annotationPath, qualifiedClassName, this.annotationZipFile);
++						reader = ExternalAnnotationDecorator.create(reader, annotationPath, qualifiedClassName, this.annotationZipFile);
+ 
+ 						if (reader.getExternalAnnotationStatus() == ExternalAnnotationStatus.TYPE_IS_ANNOTATED) {
+ 							break;
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+index 434f010..17400b7 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+@@ -24,7 +24,7 @@ import java.util.zip.ZipFile;
+ 
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassWithExternalAnnotations;
++import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+@@ -273,9 +273,9 @@ private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeNam
+ 				ZipFile zip = classpathEntry instanceof ClasspathJar ? ((ClasspathJar) classpathEntry).zipFile : null;
+ 				try {
+ 					if (zip == null) {
+-						zip = ClassWithExternalAnnotations.getAnnotationZipFile(classpathEntry.getPath(), null);
++						zip = ExternalAnnotationDecorator.getAnnotationZipFile(classpathEntry.getPath(), null);
+ 					}
+-					answer.setBinaryType(ClassWithExternalAnnotations.create(answer.getBinaryType(), classpathEntry.getPath(), 
++					answer.setBinaryType(ExternalAnnotationDecorator.create(answer.getBinaryType(), classpathEntry.getPath(), 
+ 							qualifiedTypeName, zip));
+ 					break;
+ 				} catch (IOException e) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java
+deleted file mode 100644
+index 2bd8669..0000000
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassWithExternalAnnotations.java
++++ /dev/null
+@@ -1,284 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2016 Google, Inc. and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     Stefan Xenos <sxenos@gmail.com> (Google) - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.jdt.internal.compiler.classfmt;
+-
+-import java.io.File;
+-import java.io.FileInputStream;
+-import java.io.FileNotFoundException;
+-import java.io.IOException;
+-import java.util.zip.ZipEntry;
+-import java.util.zip.ZipFile;
+-
+-import org.eclipse.jdt.internal.compiler.env.IBinaryAnnotation;
+-import org.eclipse.jdt.internal.compiler.env.IBinaryField;
+-import org.eclipse.jdt.internal.compiler.env.IBinaryMethod;
+-import org.eclipse.jdt.internal.compiler.env.IBinaryNestedType;
+-import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+-import org.eclipse.jdt.internal.compiler.env.IBinaryTypeAnnotation;
+-import org.eclipse.jdt.internal.compiler.env.ITypeAnnotationWalker;
+-import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding.ExternalAnnotationStatus;
+-import org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment;
+-import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+-
+-/**
+- * A decorator for {@link IBinaryType} that allows external annotations to be attached. This can be used to change the
+- * result of {@link #enrichWithExternalAnnotationsFor} or {@link #getExternalAnnotationStatus}.
+- */
+-public class ClassWithExternalAnnotations implements IBinaryType {
+-	private IBinaryType inputType;
+-	private ExternalAnnotationProvider annotationProvider;
+-	private boolean isFromSource;
+-
+-	/** Auxiliary interface for {@link #getAnnotationZipFile(String, ZipFileProducer)}. */
+-	public interface ZipFileProducer { ZipFile produce() throws IOException; }
+-
+-	public ClassWithExternalAnnotations(IBinaryType toDecorate, ExternalAnnotationProvider externalAnnotationProvider) {
+-		this.inputType = toDecorate;
+-		this.annotationProvider = externalAnnotationProvider;
+-	}
+-
+-	public ClassWithExternalAnnotations(IBinaryType toDecorate, boolean isFromSource) {
+-		this.isFromSource = isFromSource;
+-		this.inputType = toDecorate;
+-	}
+-
+-	@Override
+-	public char[] getFileName() {
+-		return this.inputType.getFileName();
+-	}
+-
+-	@Override
+-	public boolean isBinaryType() {
+-		return this.inputType.isBinaryType();
+-	}
+-
+-	@Override
+-	public IBinaryAnnotation[] getAnnotations() {
+-		return this.inputType.getAnnotations();
+-	}
+-
+-	@Override
+-	public IBinaryTypeAnnotation[] getTypeAnnotations() {
+-		return this.inputType.getTypeAnnotations();
+-	}
+-
+-	@Override
+-	public char[] getEnclosingMethod() {
+-		return this.inputType.getEnclosingMethod();
+-	}
+-
+-	@Override
+-	public char[] getEnclosingTypeName() {
+-		return this.inputType.getEnclosingTypeName();
+-	}
+-
+-	@Override
+-	public IBinaryField[] getFields() {
+-		return this.inputType.getFields();
+-	}
+-
+-	@Override
+-	public char[] getGenericSignature() {
+-		return this.inputType.getGenericSignature();
+-	}
+-
+-	@Override
+-	public char[][] getInterfaceNames() {
+-		return this.inputType.getInterfaceNames();
+-	}
+-
+-	@Override
+-	public IBinaryNestedType[] getMemberTypes() {
+-		return this.inputType.getMemberTypes();
+-	}
+-
+-	@Override
+-	public IBinaryMethod[] getMethods() {
+-		return this.inputType.getMethods();
+-	}
+-
+-	@Override
+-	public char[][][] getMissingTypeNames() {
+-		return this.inputType.getMissingTypeNames();
+-	}
+-
+-	@Override
+-	public char[] getName() {
+-		return this.inputType.getName();
+-	}
+-
+-	@Override
+-	public char[] getSourceName() {
+-		return this.inputType.getSourceName();
+-	}
+-
+-	@Override
+-	public char[] getSuperclassName() {
+-		return this.inputType.getSuperclassName();
+-	}
+-
+-	@Override
+-	public long getTagBits() {
+-		return this.inputType.getTagBits();
+-	}
+-
+-	@Override
+-	public boolean isAnonymous() {
+-		return this.inputType.isAnonymous();
+-	}
+-
+-	@Override
+-	public boolean isLocal() {
+-		return this.inputType.isLocal();
+-	}
+-
+-	@Override
+-	public boolean isMember() {
+-		return this.inputType.isMember();
+-	}
+-
+-	@Override
+-	public char[] sourceFileName() {
+-		return this.inputType.sourceFileName();
+-	}
+-
+-	@Override
+-	public int getModifiers() {
+-		return this.inputType.getModifiers();
+-	}
+-
+-	/**
+-	 * Returns the zip file containing external annotations, if any. Returns null if there are no external annotations
+-	 * or if the basePath refers to a directory.
+-	 *
+-	 * @param basePath
+-	 *            resolved filesystem path of either directory or zip file
+-	 * @param producer
+-	 *            an optional helper to produce the zipFile when needed.
+-	 * @return the client provided zip file; or else a fresh new zip file, to let clients cache it, if desired; or null
+-	 *         to signal that basePath is not a zip file, but a directory.
+-	 * @throws IOException
+-	 *             any unexpected errors during file access. File not found while accessing an individual file if
+-	 *             basePath is a directory <em>is</em> expected, and simply answered with null. If basePath is neither a
+-	 *             directory nor a zip file, this is unexpected.
+-	 */
+-	public static ZipFile getAnnotationZipFile(String basePath, ZipFileProducer producer) throws IOException {
+-		File annotationBase = new File(basePath);
+-		if (!annotationBase.isFile()) {
+-			return null;
+-		}
+-		return (producer != null ? producer.produce() : new ZipFile(annotationBase));
+-	}
+-
+-	/**
+-	 * Creates an external annotation provider for external annotations using the given basePath, which is either a
+-	 * directory holding .eea text files, or a zip file of entries of the same format.
+-	 *
+-	 * @param basePath
+-	 *            resolved filesystem path of either directory or zip file
+-	 * @param qualifiedBinaryTypeName
+-	 *            slash-separated type name
+-	 * @param zipFile
+-	 *            an existing zip file for the same basePath, or null.
+-	 * @return the annotation provider or null if there are no external annotations.
+-	 * @throws IOException
+-	 *             any unexpected errors during file access. File not found while accessing an individual file if
+-	 *             basePath is a directory <em>is</em> expected, and simply answered with null. If basePath is neither a
+-	 *             directory nor a zip file, this is unexpected.
+-	 */
+-	public static ExternalAnnotationProvider externalAnnotationProvider(String basePath, String qualifiedBinaryTypeName,
+-			ZipFile zipFile) throws IOException {
+-		String qualifiedBinaryFileName = qualifiedBinaryTypeName + ExternalAnnotationProvider.ANNOTATION_FILE_SUFFIX;
+-		if (zipFile == null) {
+-			File annotationBase = new File(basePath);
+-			if (annotationBase.isDirectory()) {
+-				String filePath = annotationBase.getAbsolutePath() + '/' + qualifiedBinaryFileName;
+-				try {
+-					return new ExternalAnnotationProvider(new FileInputStream(filePath), qualifiedBinaryTypeName);
+-				} catch (FileNotFoundException e) {
+-					// Expected, no need to report an error here
+-					return null;
+-				}
+-			}
+-		} else {
+-			ZipEntry entry = zipFile.getEntry(qualifiedBinaryFileName);
+-			if (entry != null) {
+-				return new ExternalAnnotationProvider(zipFile.getInputStream(entry), qualifiedBinaryTypeName);
+-			}
+-		}
+-		return null;
+-	}
+-
+-	/**
+-	 * Possibly wrap the provided binary type in a ClassWithExternalAnnotations to which a fresh provider for external
+-	 * annotations is associated. This provider is constructed using the given basePath, which is either a directory
+-	 * holding .eea text files, or a zip file of entries of the same format. If no such provider could be constructed,
+-	 * then the original binary type is returned unchanged.
+-	 * 
+-	 * @param toDecorate
+-	 *            the binary type to wrap, if needed
+-	 * @param basePath
+-	 *            resolved filesystem path of either directory or zip file
+-	 * @param qualifiedBinaryTypeName
+-	 *            slash-separated type name
+-	 * @param zipFile
+-	 *            an existing zip file for the same basePath, or null.
+-	 * @return either a fresh ClassWithExternalAnnotations or the original binary type unchanged.
+-	 * @throws IOException
+-	 *             any unexpected errors during file access. File not found while accessing an individual file if
+-	 *             basePath is a directory <em>is</em> expected, and simply handled by not setting up an external
+-	 *             annotation provider. If basePath is neither a directory nor a zip file, this is unexpected, resulting
+-	 *             in an exception.
+-	 */
+-	public static IBinaryType create(IBinaryType toDecorate, String basePath,
+-			String qualifiedBinaryTypeName, ZipFile zipFile) throws IOException {
+-		ExternalAnnotationProvider externalAnnotationProvider = externalAnnotationProvider(basePath, qualifiedBinaryTypeName, zipFile);
+-		if (externalAnnotationProvider == null)
+-			return toDecorate;
+-		return new ClassWithExternalAnnotations(toDecorate, externalAnnotationProvider);
+-	}
+-
+-	@Override
+-	public ITypeAnnotationWalker enrichWithExternalAnnotationsFor(ITypeAnnotationWalker walker, Object member,
+-			LookupEnvironment environment) {
+-		if (walker == ITypeAnnotationWalker.EMPTY_ANNOTATION_WALKER && this.annotationProvider != null) {
+-			if (member == null) {
+-				return this.annotationProvider.forTypeHeader(environment);
+-			} else if (member instanceof IBinaryField) {
+-				IBinaryField field = (IBinaryField) member;
+-				char[] fieldSignature = field.getGenericSignature();
+-				if (fieldSignature == null)
+-					fieldSignature = field.getTypeName();
+-				return this.annotationProvider.forField(field.getName(), fieldSignature, environment);
+-			} else if (member instanceof IBinaryMethod) {
+-				IBinaryMethod method = (IBinaryMethod) member;
+-				char[] methodSignature = method.getGenericSignature();
+-				if (methodSignature == null)
+-					methodSignature = method.getMethodDescriptor();
+-				return this.annotationProvider.forMethod(
+-						method.isConstructor() ? TypeConstants.INIT : method.getSelector(), methodSignature,
+-						environment);
+-			}
+-		}
+-		return walker;
+-	}
+-
+-	@Override
+-	public ExternalAnnotationStatus getExternalAnnotationStatus() {
+-		if (this.annotationProvider == null) {
+-			if (this.isFromSource) {
+-				return ExternalAnnotationStatus.FROM_SOURCE;
+-			}
+-			return ExternalAnnotationStatus.NO_EEA_FILE;
+-		}
+-		return ExternalAnnotationStatus.TYPE_IS_ANNOTATED;
+-	}
+-}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ExternalAnnotationDecorator.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ExternalAnnotationDecorator.java
+new file mode 100644
+index 0000000..81a46b0
+--- /dev/null
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ExternalAnnotationDecorator.java
+@@ -0,0 +1,284 @@
++/*******************************************************************************
++ * Copyright (c) 2016 Google, Inc. and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     Stefan Xenos <sxenos@gmail.com> (Google) - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.compiler.classfmt;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
++import org.eclipse.jdt.internal.compiler.env.IBinaryAnnotation;
++import org.eclipse.jdt.internal.compiler.env.IBinaryField;
++import org.eclipse.jdt.internal.compiler.env.IBinaryMethod;
++import org.eclipse.jdt.internal.compiler.env.IBinaryNestedType;
++import org.eclipse.jdt.internal.compiler.env.IBinaryType;
++import org.eclipse.jdt.internal.compiler.env.IBinaryTypeAnnotation;
++import org.eclipse.jdt.internal.compiler.env.ITypeAnnotationWalker;
++import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding.ExternalAnnotationStatus;
++import org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment;
++import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
++
++/**
++ * A decorator for {@link IBinaryType} that allows external annotations to be attached. This can be used to change the
++ * result of {@link #enrichWithExternalAnnotationsFor} or {@link #getExternalAnnotationStatus}.
++ */
++public class ExternalAnnotationDecorator implements IBinaryType {
++	private IBinaryType inputType;
++	private ExternalAnnotationProvider annotationProvider;
++	private boolean isFromSource;
++
++	/** Auxiliary interface for {@link #getAnnotationZipFile(String, ZipFileProducer)}. */
++	public interface ZipFileProducer { ZipFile produce() throws IOException; }
++
++	public ExternalAnnotationDecorator(IBinaryType toDecorate, ExternalAnnotationProvider externalAnnotationProvider) {
++		this.inputType = toDecorate;
++		this.annotationProvider = externalAnnotationProvider;
++	}
++
++	public ExternalAnnotationDecorator(IBinaryType toDecorate, boolean isFromSource) {
++		this.isFromSource = isFromSource;
++		this.inputType = toDecorate;
++	}
++
++	@Override
++	public char[] getFileName() {
++		return this.inputType.getFileName();
++	}
++
++	@Override
++	public boolean isBinaryType() {
++		return this.inputType.isBinaryType();
++	}
++
++	@Override
++	public IBinaryAnnotation[] getAnnotations() {
++		return this.inputType.getAnnotations();
++	}
++
++	@Override
++	public IBinaryTypeAnnotation[] getTypeAnnotations() {
++		return this.inputType.getTypeAnnotations();
++	}
++
++	@Override
++	public char[] getEnclosingMethod() {
++		return this.inputType.getEnclosingMethod();
++	}
++
++	@Override
++	public char[] getEnclosingTypeName() {
++		return this.inputType.getEnclosingTypeName();
++	}
++
++	@Override
++	public IBinaryField[] getFields() {
++		return this.inputType.getFields();
++	}
++
++	@Override
++	public char[] getGenericSignature() {
++		return this.inputType.getGenericSignature();
++	}
++
++	@Override
++	public char[][] getInterfaceNames() {
++		return this.inputType.getInterfaceNames();
++	}
++
++	@Override
++	public IBinaryNestedType[] getMemberTypes() {
++		return this.inputType.getMemberTypes();
++	}
++
++	@Override
++	public IBinaryMethod[] getMethods() {
++		return this.inputType.getMethods();
++	}
++
++	@Override
++	public char[][][] getMissingTypeNames() {
++		return this.inputType.getMissingTypeNames();
++	}
++
++	@Override
++	public char[] getName() {
++		return this.inputType.getName();
++	}
++
++	@Override
++	public char[] getSourceName() {
++		return this.inputType.getSourceName();
++	}
++
++	@Override
++	public char[] getSuperclassName() {
++		return this.inputType.getSuperclassName();
++	}
++
++	@Override
++	public long getTagBits() {
++		return this.inputType.getTagBits();
++	}
++
++	@Override
++	public boolean isAnonymous() {
++		return this.inputType.isAnonymous();
++	}
++
++	@Override
++	public boolean isLocal() {
++		return this.inputType.isLocal();
++	}
++
++	@Override
++	public boolean isMember() {
++		return this.inputType.isMember();
++	}
++
++	@Override
++	public char[] sourceFileName() {
++		return this.inputType.sourceFileName();
++	}
++
++	@Override
++	public int getModifiers() {
++		return this.inputType.getModifiers();
++	}
++
++	/**
++	 * Returns the zip file containing external annotations, if any. Returns null if there are no external annotations
++	 * or if the basePath refers to a directory.
++	 *
++	 * @param basePath
++	 *            resolved filesystem path of either directory or zip file
++	 * @param producer
++	 *            an optional helper to produce the zipFile when needed.
++	 * @return the client provided zip file; or else a fresh new zip file, to let clients cache it, if desired; or null
++	 *         to signal that basePath is not a zip file, but a directory.
++	 * @throws IOException
++	 *             any unexpected errors during file access. File not found while accessing an individual file if
++	 *             basePath is a directory <em>is</em> expected, and simply answered with null. If basePath is neither a
++	 *             directory nor a zip file, this is unexpected.
++	 */
++	public static ZipFile getAnnotationZipFile(String basePath, ZipFileProducer producer) throws IOException {
++		File annotationBase = new File(basePath);
++		if (!annotationBase.isFile()) {
++			return null;
++		}
++		return (producer != null ? producer.produce() : new ZipFile(annotationBase));
++	}
++
++	/**
++	 * Creates an external annotation provider for external annotations using the given basePath, which is either a
++	 * directory holding .eea text files, or a zip file of entries of the same format.
++	 *
++	 * @param basePath
++	 *            resolved filesystem path of either directory or zip file
++	 * @param qualifiedBinaryTypeName
++	 *            slash-separated type name
++	 * @param zipFile
++	 *            an existing zip file for the same basePath, or null.
++	 * @return the annotation provider or null if there are no external annotations.
++	 * @throws IOException
++	 *             any unexpected errors during file access. File not found while accessing an individual file if
++	 *             basePath is a directory <em>is</em> expected, and simply answered with null. If basePath is neither a
++	 *             directory nor a zip file, this is unexpected.
++	 */
++	public static ExternalAnnotationProvider externalAnnotationProvider(String basePath, String qualifiedBinaryTypeName,
++			ZipFile zipFile) throws IOException {
++		String qualifiedBinaryFileName = qualifiedBinaryTypeName + ExternalAnnotationProvider.ANNOTATION_FILE_SUFFIX;
++		if (zipFile == null) {
++			File annotationBase = new File(basePath);
++			if (annotationBase.isDirectory()) {
++				String filePath = annotationBase.getAbsolutePath() + '/' + qualifiedBinaryFileName;
++				try {
++					return new ExternalAnnotationProvider(new FileInputStream(filePath), qualifiedBinaryTypeName);
++				} catch (FileNotFoundException e) {
++					// Expected, no need to report an error here
++					return null;
++				}
++			}
++		} else {
++			ZipEntry entry = zipFile.getEntry(qualifiedBinaryFileName);
++			if (entry != null) {
++				return new ExternalAnnotationProvider(zipFile.getInputStream(entry), qualifiedBinaryTypeName);
++			}
++		}
++		return null;
++	}
++
++	/**
++	 * Possibly wrap the provided binary type in a ClassWithExternalAnnotations to which a fresh provider for external
++	 * annotations is associated. This provider is constructed using the given basePath, which is either a directory
++	 * holding .eea text files, or a zip file of entries of the same format. If no such provider could be constructed,
++	 * then the original binary type is returned unchanged.
++	 * 
++	 * @param toDecorate
++	 *            the binary type to wrap, if needed
++	 * @param basePath
++	 *            resolved filesystem path of either directory or zip file
++	 * @param qualifiedBinaryTypeName
++	 *            slash-separated type name
++	 * @param zipFile
++	 *            an existing zip file for the same basePath, or null.
++	 * @return either a fresh ClassWithExternalAnnotations or the original binary type unchanged.
++	 * @throws IOException
++	 *             any unexpected errors during file access. File not found while accessing an individual file if
++	 *             basePath is a directory <em>is</em> expected, and simply handled by not setting up an external
++	 *             annotation provider. If basePath is neither a directory nor a zip file, this is unexpected, resulting
++	 *             in an exception.
++	 */
++	public static IBinaryType create(IBinaryType toDecorate, String basePath,
++			String qualifiedBinaryTypeName, ZipFile zipFile) throws IOException {
++		ExternalAnnotationProvider externalAnnotationProvider = externalAnnotationProvider(basePath, qualifiedBinaryTypeName, zipFile);
++		if (externalAnnotationProvider == null)
++			return toDecorate;
++		return new ExternalAnnotationDecorator(toDecorate, externalAnnotationProvider);
++	}
++
++	@Override
++	public ITypeAnnotationWalker enrichWithExternalAnnotationsFor(ITypeAnnotationWalker walker, Object member,
++			LookupEnvironment environment) {
++		if (walker == ITypeAnnotationWalker.EMPTY_ANNOTATION_WALKER && this.annotationProvider != null) {
++			if (member == null) {
++				return this.annotationProvider.forTypeHeader(environment);
++			} else if (member instanceof IBinaryField) {
++				IBinaryField field = (IBinaryField) member;
++				char[] fieldSignature = field.getGenericSignature();
++				if (fieldSignature == null)
++					fieldSignature = field.getTypeName();
++				return this.annotationProvider.forField(field.getName(), fieldSignature, environment);
++			} else if (member instanceof IBinaryMethod) {
++				IBinaryMethod method = (IBinaryMethod) member;
++				char[] methodSignature = method.getGenericSignature();
++				if (methodSignature == null)
++					methodSignature = method.getMethodDescriptor();
++				return this.annotationProvider.forMethod(
++						method.isConstructor() ? TypeConstants.INIT : method.getSelector(), methodSignature,
++						environment);
++			}
++		}
++		return walker;
++	}
++
++	@Override
++	public ExternalAnnotationStatus getExternalAnnotationStatus() {
++		if (this.annotationProvider == null) {
++			if (this.isFromSource) {
++				return ExternalAnnotationStatus.FROM_SOURCE;
++			}
++			return ExternalAnnotationStatus.NO_EEA_FILE;
++		}
++		return ExternalAnnotationStatus.TYPE_IS_ANNOTATED;
++	}
++}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+index 54ac4bb..5046eae 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+@@ -35,7 +35,7 @@ import org.eclipse.core.runtime.Status;
+ import org.eclipse.jdt.core.*;
+ import org.eclipse.jdt.core.compiler.IProblem;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassWithExternalAnnotations;
++import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationProvider;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+@@ -378,7 +378,7 @@ private IBinaryType getJarBinaryTypeInfo() throws CoreException, IOException, Cl
+ 					result = setupExternalAnnotationProvider(project, externalAnnotationPath, null, result, 
+ 						entryName.substring(0, entryName.length() - SuffixConstants.SUFFIX_CLASS.length));
+ 				} else if (entry.getEntryKind() == IClasspathEntry.CPE_SOURCE) {
+-					result = new ClassWithExternalAnnotations(result, true);
++					result = new ExternalAnnotationDecorator(result, true);
+ 				}
+ 			}
+ 		}
+@@ -414,7 +414,7 @@ private IBinaryType setupExternalAnnotationProvider(IProject project, final IPat
+ 	}
+ 	try {
+ 		if (annotationZip == null) {
+-			annotationZip = ClassWithExternalAnnotations.getAnnotationZipFile(resolvedPath, new ClassWithExternalAnnotations.ZipFileProducer() {
++			annotationZip = ExternalAnnotationDecorator.getAnnotationZipFile(resolvedPath, new ExternalAnnotationDecorator.ZipFileProducer() {
+ 				@Override public ZipFile produce() throws IOException {
+ 					try {
+ 						return JavaModelManager.getJavaModelManager().getZipFile(externalAnnotationPath); // use (absolute, but) unresolved path here
+@@ -424,9 +424,9 @@ private IBinaryType setupExternalAnnotationProvider(IProject project, final IPat
+ 				}});
+ 		}
+ 
+-		ExternalAnnotationProvider annotationProvider = ClassWithExternalAnnotations
++		ExternalAnnotationProvider annotationProvider = ExternalAnnotationDecorator
+ 				.externalAnnotationProvider(resolvedPath, typeName, annotationZip);
+-		result = new ClassWithExternalAnnotations(reader, annotationProvider);
++		result = new ExternalAnnotationDecorator(reader, annotationProvider);
+ 	} catch (IOException e) {
+ 		Util.log(e);
+ 		return result;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+index 66144d0..9b9a5f8 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+@@ -19,7 +19,7 @@ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.Path;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassWithExternalAnnotations;
++import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+@@ -125,10 +125,10 @@ public NameEnvironmentAnswer findClass(String binaryFileName, String qualifiedPa
+ 		if (this.externalAnnotationPath != null) {
+ 			try {
+ 				if (this.annotationZipFile == null) {
+-					this.annotationZipFile = ClassWithExternalAnnotations
++					this.annotationZipFile = ExternalAnnotationDecorator
+ 							.getAnnotationZipFile(this.externalAnnotationPath, null);
+ 				}
+-				reader = ClassWithExternalAnnotations.create(reader, this.externalAnnotationPath,
++				reader = ExternalAnnotationDecorator.create(reader, this.externalAnnotationPath,
+ 						fileNameWithoutExtension, this.annotationZipFile);
+ 			} catch (IOException e) {
+ 				// don't let error on annotations fail class reading
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+index b6d5a29..29ae59a 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+@@ -25,7 +25,7 @@ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassWithExternalAnnotations;
++import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+@@ -176,11 +176,11 @@ public NameEnvironmentAnswer findClass(String binaryFileName, String qualifiedPa
+ 			if (this.externalAnnotationPath != null) {
+ 				try {
+ 					if (this.annotationZipFile == null) {
+-						this.annotationZipFile = ClassWithExternalAnnotations
++						this.annotationZipFile = ExternalAnnotationDecorator
+ 								.getAnnotationZipFile(this.externalAnnotationPath, null);
+ 					}
+ 
+-					reader = ClassWithExternalAnnotations.create(reader, this.externalAnnotationPath,
++					reader = ExternalAnnotationDecorator.create(reader, this.externalAnnotationPath,
+ 							fileNameWithoutExtension, this.annotationZipFile);
+ 				} catch (IOException e) {
+ 					// don't let error on annotations fail class reading

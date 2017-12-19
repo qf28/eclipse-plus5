@@ -1,0 +1,1047 @@
+commit c69c700b22ba98a95d56e16f7365ecaf28392cdd
+Author: Walter Harley <wharley>
+Date:   Fri Aug 31 08:11:56 2007 +0000
+
+    Bug 200124 - implement createResourceFile for Java 6 processors in IDE
+
+2	1	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BinaryFileOutputStream.java
+18	15	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/generatedfile/GeneratedFileManager.java
+27	1	org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/dispatch/IdeProcessingEnvImpl.java
+115	8	org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeFilerImpl.java
+0	161	org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeJavaFileObject.java
+4	5	org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeJavaSourceFileWriter.java
+124	0	org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeNonSourceOutputStream.java
+143	0	org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeOutputFileObject.java
+160	0	org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeOutputJavaFileObject.java
+2	3	org.eclipse.jdt.apt.pluggable.tests/src/org/eclipse/jdt/apt/pluggable/tests/FilerTests.java
+1	1	org.eclipse.jdt.apt.pluggable.tests/src/org/eclipse/jdt/apt/pluggable/tests/processors/genclass6/GenClass6Proc.java
+1	1	org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BatchProcessingEnvImpl.java
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BinaryFileOutputStream.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BinaryFileOutputStream.java
+index b868be4..1e44b2f 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BinaryFileOutputStream.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/env/BinaryFileOutputStream.java
+@@ -16,6 +16,7 @@ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.util.Collections;
+ 
+ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.runtime.CoreException;
+@@ -79,7 +80,7 @@ public class BinaryFileOutputStream extends ByteArrayOutputStream {
+ 			
+ 		IFile parentFile = _env.getFile();
+ 		if (parentFile != null) {
+-			_env.getAptProject().getGeneratedFileManager().addGeneratedFileDependency(parentFile, _file);
++			_env.getAptProject().getGeneratedFileManager().addGeneratedFileDependency(Collections.singleton(parentFile), _file);
+ 			_env.addGeneratedNonSourceFile(_file);
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/generatedfile/GeneratedFileManager.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/generatedfile/GeneratedFileManager.java
+index c991a77..9bafe5d 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/generatedfile/GeneratedFileManager.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/generatedfile/GeneratedFileManager.java
+@@ -17,6 +17,7 @@ import java.io.ByteArrayInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
+@@ -333,9 +334,9 @@ public class GeneratedFileManager
+ 	 * This method must only be called during build, not reconcile. It is not possible to add
+ 	 * non-Java-source files during reconcile.
+ 	 */
+-	public void addGeneratedFileDependency(IFile parentFile, IFile generatedFile)
++	public void addGeneratedFileDependency(Collection<IFile> parentFiles, IFile generatedFile)
+ 	{
+-		addBuiltFileToMaps(parentFile, generatedFile, false);
++		addBuiltFileToMaps(parentFiles, generatedFile, false);
+ 	}
+ 
+ 	/**
+@@ -487,7 +488,7 @@ public class GeneratedFileManager
+ 	 * @return - the newly created IFile along with whether it was modified
+ 	 * @throws CoreException
+ 	 */
+-	public FileGenerationResult generateFileDuringBuild(List<IFile> parentFiles, String typeName, String contents,
++	public FileGenerationResult generateFileDuringBuild(Collection<IFile> parentFiles, String typeName, String contents,
+ 			boolean clearDuringReconcile, IProgressMonitor progressMonitor) throws CoreException
+ 	{
+ 		if (_skipTypeGeneration)
+@@ -543,11 +544,7 @@ public class GeneratedFileManager
+ 
+ 			// during a batch build, parentFile will be null.
+ 			// Only keep track of ownership in iterative builds
+-			for (IFile parentFile : parentFiles) {
+-				if (parentFile != null) {
+-					addBuiltFileToMaps(parentFile, file, true);
+-				}
+-			}
++			addBuiltFileToMaps(parentFiles, file, true);
+ 			if (clearDuringReconcile) {
+ 				_clearDuringReconcile.add(file);
+ 			}
+@@ -746,14 +743,20 @@ public class GeneratedFileManager
+ 	 * 
+ 	 * @param isSource true for source files that will be compiled; false for non-source, e.g., text or xml.
+ 	 */
+-	private synchronized void addBuiltFileToMaps(IFile parentFile, IFile generatedFile, boolean isSource)
++	private synchronized void addBuiltFileToMaps(Collection<IFile> parentFiles, IFile generatedFile, boolean isSource)
+ 	{
+-		boolean added = _buildDeps.put(parentFile, generatedFile, isSource);
+-		if (AptPlugin.DEBUG_GFM_MAPS) {
+-			if (added)
+-				AptPlugin.trace("build file dependency added: " + parentFile + " -> " + generatedFile); //$NON-NLS-1$//$NON-NLS-2$
+-			else
+-				AptPlugin.trace("build file dependency already exists: " + parentFile + " -> " + generatedFile); //$NON-NLS-1$//$NON-NLS-2$
++		// during a batch build, parentFile will be null.
++		// Only keep track of ownership in iterative builds
++		for (IFile parentFile : parentFiles) {
++			if (parentFile != null) {
++				boolean added = _buildDeps.put(parentFile, generatedFile, isSource);
++				if (AptPlugin.DEBUG_GFM_MAPS) {
++					if (added)
++						AptPlugin.trace("build file dependency added: " + parentFile + " -> " + generatedFile); //$NON-NLS-1$//$NON-NLS-2$
++					else
++						AptPlugin.trace("build file dependency already exists: " + parentFile + " -> " + generatedFile); //$NON-NLS-1$//$NON-NLS-2$
++				}
++			}
+ 		}
+ 	}
+ 	
+diff --git a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/dispatch/IdeProcessingEnvImpl.java b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/dispatch/IdeProcessingEnvImpl.java
+index e6b7705..c1e9fa6 100644
+--- a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/dispatch/IdeProcessingEnvImpl.java
++++ b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/dispatch/IdeProcessingEnvImpl.java
+@@ -20,6 +20,7 @@ import java.util.Map;
+ import javax.lang.model.element.Element;
+ 
+ import org.eclipse.core.resources.IFile;
++import org.eclipse.core.resources.IProject;
+ import org.eclipse.core.runtime.Path;
+ import org.eclipse.jdt.apt.core.env.Phase;
+ import org.eclipse.jdt.apt.core.internal.AptCompilationParticipant;
+@@ -86,6 +87,14 @@ public abstract class IdeProcessingEnvImpl extends BaseProcessingEnvImpl {
+ 	public AptProject getAptProject() {
+ 		return _aptProject;
+ 	}
++	
++	public IJavaProject getJavaProject() {
++		return _javaProject;
++	}
++	
++	public IProject getProject() {
++		return _javaProject.getProject();
++	}
+ 
+ 	/**
+ 	 * @return whether this environment supports building or reconciling.
+@@ -101,7 +110,7 @@ public abstract class IdeProcessingEnvImpl extends BaseProcessingEnvImpl {
+ 	 * to the containing top-level type.
+ 	 * If the element is not a source type at all, then return null.
+ 	 * @param elem
+-	 * @return
++	 * @return may be null
+ 	 */
+ 	public IFile getEnclosingIFile(Element elem) {
+ 		// if this cast fails it could be that a non-Eclipse element got passed in somehow.
+@@ -115,10 +124,27 @@ public abstract class IdeProcessingEnvImpl extends BaseProcessingEnvImpl {
+ 		return file;
+ 	}
+ 
++	/**
++	 * Inform the environment that a new Java file has been generated.
++	 * @param result must be non-null
++	 */
+ 	public void addNewUnit(FileGenerationResult result) {
+ 		AptCompilationParticipant.getInstance().addJava6GeneratedFile(result.getFile());
+ 		addNewUnit(_dispatchManager.findCompilationUnit(result.getFile()));
+ 	}
++	
++	/**
++	 * Inform the environment that a new non-Java file has been generated.
++	 * This file will not be submitted to a subsequent round of processing in
++	 * the current build, even if the file happens to be in a source location
++	 * and named with a Java-like name.  However, its dependencies will be
++	 * tracked in the same manner as Java files, e.g., it will be deleted
++	 * if changes in source cause it to no longer be generated.
++	 * @param file must be non-null
++	 */
++	public void addNewResource(IFile file) {
++		AptCompilationParticipant.getInstance().addJava6GeneratedFile(file);
++	}
+ 
+ 	public boolean currentProcessorSupportsRTTG()
+ 	{
+diff --git a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeFilerImpl.java b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeFilerImpl.java
+index 428d92c..828ae32 100644
+--- a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeFilerImpl.java
++++ b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeFilerImpl.java
+@@ -12,17 +12,27 @@
+ 
+ package org.eclipse.jdt.internal.apt.pluggable.core.filer;
+ 
++import java.io.File;
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.List;
++import java.util.HashSet;
++import java.util.Set;
+ 
+ import javax.annotation.processing.Filer;
+ import javax.lang.model.element.Element;
+ import javax.tools.FileObject;
+ import javax.tools.JavaFileObject;
++import javax.tools.StandardLocation;
+ import javax.tools.JavaFileManager.Location;
+ 
+ import org.eclipse.core.resources.IFile;
++import org.eclipse.core.resources.IResource;
++import org.eclipse.core.resources.IWorkspace;
++import org.eclipse.core.runtime.CoreException;
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.jdt.apt.core.internal.generatedfile.GeneratedSourceFolderManager;
++import org.eclipse.jdt.core.JavaModelException;
++import org.eclipse.jdt.internal.apt.pluggable.core.Apt6Plugin;
+ import org.eclipse.jdt.internal.apt.pluggable.core.dispatch.IdeAnnotationProcessorManager;
+ import org.eclipse.jdt.internal.apt.pluggable.core.dispatch.IdeProcessingEnvImpl;
+ 
+@@ -54,12 +64,41 @@ public class IdeFilerImpl implements Filer {
+ 
+ 	/* (non-Javadoc)
+ 	 * @see javax.annotation.processing.Filer#createResource(javax.tools.JavaFileManager.Location, java.lang.CharSequence, java.lang.CharSequence, javax.lang.model.element.Element[])
++	 * In the IDE implementation, we support only two Locations: SOURCE_OUTPUT, which means the APT generated source folder,
++	 * and CLASS_OUTPUT, which means the binary output folder associated with the APT generated source folder. 
+ 	 */
+ 	@Override
+ 	public FileObject createResource(Location location, CharSequence pkg,
+-			CharSequence relativeName, Element... originatingElements) throws IOException {
+-		//TODO
+-		throw new UnsupportedOperationException("Creating resource files is not yet implemented"); //$NON-NLS-1$
++			CharSequence relativeName, Element... originatingElements) throws IOException 
++	{
++		// Pre-emptively check parameters here, rather than later on when the resource is written and closed.
++		if (null == location) {
++			throw new IllegalArgumentException("Location is null");
++		}
++		if (!location.isOutputLocation()) {
++			throw new IllegalArgumentException("Location " + location.getName() + " is not an output location");
++		}
++		
++		if (null == pkg) {
++			throw new IllegalArgumentException("Package is null");
++		}
++		if (null == relativeName) {
++			throw new IllegalArgumentException("Relative name is null");
++		}
++		if ( relativeName.length() == 0) {
++			throw new IllegalArgumentException("Relative name is zero length");
++		}
++		IFile file = getOutputFileForLocation(location, pkg, relativeName);
++		
++		//TODO: check whether file has already been generated in this run
++		Set<IFile> parentFiles = new HashSet<IFile>(originatingElements.length);
++		for (Element elem : originatingElements) {
++			IFile enclosing = _env.getEnclosingIFile(elem);
++			if (null != enclosing) {
++				parentFiles.add(enclosing);
++			}
++		}
++		return new IdeOutputFileObject(_env, file, parentFiles);
+ 	}
+ 
+ 	/**
+@@ -71,12 +110,19 @@ public class IdeFilerImpl implements Filer {
+ 	public JavaFileObject createSourceFile(CharSequence name, Element... originatingElements)
+ 			throws IOException 
+ 	{
++		// Pre-emptively check parameters here, rather than later on when the resource is written and closed.
++		if (null == name) {
++			throw new IllegalArgumentException("Name is null");
++		}
+ 		//TODO: check whether file has already been generated in this run
+-		List<IFile> parentFiles = new ArrayList<IFile>(originatingElements.length);
++		Set<IFile> parentFiles = new HashSet<IFile>(originatingElements.length);
+ 		for (Element elem : originatingElements) {
+-			parentFiles.add(_env.getEnclosingIFile(elem));
++			IFile enclosing = _env.getEnclosingIFile(elem);
++			if (null != enclosing) {
++				parentFiles.add(enclosing);
++			}
+ 		}
+-		return new IdeJavaFileObject(_env, name, parentFiles);
++		return new IdeOutputJavaFileObject(_env, name, parentFiles);
+ 	}
+ 
+ 	/* (non-Javadoc)
+@@ -89,4 +135,65 @@ public class IdeFilerImpl implements Filer {
+ 		throw new UnsupportedOperationException("Reading resource files is not yet implemented"); //$NON-NLS-1$
+ 	}
+ 
++    /**
++     * Return a project-relative path.  This does not create the file nor its parent directories,
++     * but it does validate the path.
++     * @param pkg must be non-null but can be empty.
++     * @param relPath must be non-null and non-empty.
++     * @throws IOException if the path is not valid.
++     */
++    protected IFile getOutputFileForLocation( Location loc, CharSequence pkg, CharSequence relPath )
++    	throws IOException
++    {
++    	GeneratedSourceFolderManager gsfm = _env.getAptProject().getGeneratedSourceFolderManager();
++    	IPath path = null;
++    	if ( loc == StandardLocation.CLASS_OUTPUT )
++    	{
++    		try 
++    		{
++    			path = gsfm.getBinaryOutputLocation();
++    		}
++    		catch ( JavaModelException e )
++    		{
++    			Apt6Plugin.log(e, "Failure getting the binary output location"); //$NON-NLS-1$
++    			IOException ioe = new IOException();
++    			ioe.initCause(e);
++    			throw ioe;
++    		}
++    	}
++    	else if ( loc == StandardLocation.SOURCE_OUTPUT ) {
++    		path = gsfm.getFolder().getProjectRelativePath();
++    	}
++    	else {
++    		throw new IllegalArgumentException("Unsupported location: " + loc);
++    	}
++    	
++        if( pkg.length() > 0 )
++            path = path.append(pkg.toString().replace('.', File.separatorChar) );
++
++        path = path.append(relPath.toString());
++    	
++        IFile file = _env.getProject().getFile(path);
++
++		validatePath(file);
++        
++    	return file;
++    }
++    
++    /**
++     * Validate that a path fits the rules for being created.
++     * @see IWorkspace#validatePath()
++     * @throws IOException
++     */
++    private void validatePath(IFile file) throws IOException
++	{
++    	IStatus status = _env.getProject().getWorkspace().validatePath(file.getFullPath().toOSString(), IResource.FILE);
++    	if (!status.isOK()) {
++        	CoreException ce = new CoreException(status);
++        	IOException ioe = new IOException("Invalid path: " + file.toString()); //$NON-NLS-1$
++        	ioe.initCause(ce);
++        	throw ioe;
++        }
++	}
++
+ }
+diff --git a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeJavaFileObject.java b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeJavaFileObject.java
+deleted file mode 100644
+index d3ea5db..0000000
+--- a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeJavaFileObject.java
++++ /dev/null
+@@ -1,161 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007 BEA Systems, Inc. 
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *    wharley@bea.com - initial API and implementation
+- *    
+- *******************************************************************************/
+-
+-package org.eclipse.jdt.internal.apt.pluggable.core.filer;
+-
+-import java.io.IOException;
+-import java.io.InputStream;
+-import java.io.OutputStream;
+-import java.io.Reader;
+-import java.io.Writer;
+-import java.net.URI;
+-import java.util.List;
+-
+-import javax.lang.model.element.Modifier;
+-import javax.lang.model.element.NestingKind;
+-import javax.tools.JavaFileObject;
+-
+-import org.eclipse.core.resources.IFile;
+-import org.eclipse.jdt.internal.apt.pluggable.core.dispatch.IdeProcessingEnvImpl;
+-
+-/**
+- * Implementation of JavaFileObject used for Java 6 annotation processing within the IDE.
+- * This object is used only for writing source and class files.
+- * 
+- * @since 3.3
+- */
+-public class IdeJavaFileObject implements JavaFileObject {
+-	
+-	private final IdeProcessingEnvImpl _env;
+-	private final CharSequence _name;
+-	private final List<IFile> _parentFiles;
+-
+-	public IdeJavaFileObject(IdeProcessingEnvImpl env, CharSequence name, List<IFile> parentFiles) {
+-		_env = env;
+-		_parentFiles = parentFiles;
+-		_name = name;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.JavaFileObject#getAccessLevel()
+-	 */
+-	@Override
+-	public Modifier getAccessLevel() {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.JavaFileObject#getKind()
+-	 */
+-	@Override
+-	public Kind getKind() {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.JavaFileObject#getNestingKind()
+-	 */
+-	@Override
+-	public NestingKind getNestingKind() {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.JavaFileObject#isNameCompatible(java.lang.String, javax.tools.JavaFileObject.Kind)
+-	 */
+-	@Override
+-	public boolean isNameCompatible(String simpleName, Kind kind) {
+-		// TODO Auto-generated method stub
+-		return false;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.FileObject#delete()
+-	 */
+-	@Override
+-	public boolean delete() {
+-		throw new UnsupportedOperationException();
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.FileObject#getCharContent(boolean)
+-	 */
+-	@Override
+-	public CharSequence getCharContent(boolean ignoreEncodingErrors) throws IOException {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.FileObject#getLastModified()
+-	 */
+-	@Override
+-	public long getLastModified() {
+-		// TODO Auto-generated method stub
+-		return 0;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.FileObject#getName()
+-	 */
+-	@Override
+-	public String getName() {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.FileObject#openInputStream()
+-	 */
+-	@Override
+-	public InputStream openInputStream() throws IOException {
+-		throw new UnsupportedOperationException();
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.FileObject#openOutputStream()
+-	 */
+-	@Override
+-	public OutputStream openOutputStream() throws IOException {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.FileObject#openReader(boolean)
+-	 */
+-	@Override
+-	public Reader openReader(boolean ignoreEncodingErrors) throws IOException {
+-		throw new UnsupportedOperationException();
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.FileObject#openWriter()
+-	 */
+-	@Override
+-	public Writer openWriter() throws IOException {
+-		return new IdeJavaSourceFileWriter(_env, _name, _parentFiles);
+-	}
+-
+-	/* (non-Javadoc)
+-	 * @see javax.tools.FileObject#toUri()
+-	 */
+-	@Override
+-	public URI toUri() {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-
+-}
+diff --git a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeJavaSourceFileWriter.java b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeJavaSourceFileWriter.java
+index 8ba02c4..908fd91 100644
+--- a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeJavaSourceFileWriter.java
++++ b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeJavaSourceFileWriter.java
+@@ -14,7 +14,7 @@ package org.eclipse.jdt.internal.apt.pluggable.core.filer;
+ 
+ import java.io.IOException;
+ import java.io.StringWriter;
+-import java.util.List;
++import java.util.Collection;
+ 
+ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.runtime.CoreException;
+@@ -32,10 +32,10 @@ public class IdeJavaSourceFileWriter extends StringWriter {
+ 	
+ 	private final IdeProcessingEnvImpl _env;
+ 	private final CharSequence _name;
+-	private final List<IFile> _parentFiles;
++	private final Collection<IFile> _parentFiles;
+ 	private boolean _closed = false;
+ 
+-	public IdeJavaSourceFileWriter(IdeProcessingEnvImpl env, CharSequence name, List<IFile> parentFiles) {
++	public IdeJavaSourceFileWriter(IdeProcessingEnvImpl env, CharSequence name, Collection<IFile> parentFiles) {
+ 		_env = env;
+ 		_parentFiles = parentFiles;
+ 		_name = name;
+@@ -63,8 +63,7 @@ public class IdeJavaSourceFileWriter extends StringWriter {
+ 				//TODO - implement reconcile
+ 			}
+ 			else if ( phase == Phase.BUILD)	{
+-				// TODO: actually we need to be more sophisticated about dependencies, because they can be specified.  
+-				// Remember empty-parent situation.
++				// TODO: Remember empty-parent situation.
+ 				result = gfm.generateFileDuringBuild( 
+ 						_parentFiles,  _name.toString(), this.toString(), 
+ 						_env.currentProcessorSupportsRTTG(), null /* progress monitor */ );
+diff --git a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeNonSourceOutputStream.java b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeNonSourceOutputStream.java
+new file mode 100644
+index 0000000..4095661
+--- /dev/null
++++ b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeNonSourceOutputStream.java
+@@ -0,0 +1,124 @@
++/*******************************************************************************
++ * Copyright (c) 2007 BEA Systems, Inc.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *    wharley@bea.com - initial API and implementation
++ *******************************************************************************/
++
++package org.eclipse.jdt.internal.apt.pluggable.core.filer;
++
++import java.io.BufferedInputStream;
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.Collection;
++
++import org.eclipse.core.resources.IFile;
++import org.eclipse.core.runtime.CoreException;
++import org.eclipse.jdt.apt.core.internal.env.BinaryFileOutputStream;
++import org.eclipse.jdt.apt.core.internal.util.FileSystemUtil;
++import org.eclipse.jdt.internal.apt.pluggable.core.Apt6Plugin;
++import org.eclipse.jdt.internal.apt.pluggable.core.dispatch.IdeProcessingEnvImpl;
++
++/**
++ * @see BinaryFileOutputStream
++ */
++public class IdeNonSourceOutputStream  extends ByteArrayOutputStream
++{
++	private final IdeProcessingEnvImpl _env;
++	private final IFile _file;
++	private final Collection<IFile> _parentFiles;
++	
++	public IdeNonSourceOutputStream(IdeProcessingEnvImpl env, IFile file, Collection<IFile> parentFiles) {
++		_env = env;
++		_file = file;
++		_parentFiles = parentFiles;
++	}
++
++	@Override
++	public void close() throws IOException {
++		super.close();
++		
++		InputStream contents = new ByteArrayInputStream(toByteArray());
++		try {
++			
++			boolean contentsChanged = true;
++			if (!_file.exists()) {
++				saveToDisk(contents, true);
++			}
++			else {
++				InputStream in = null;
++				InputStream oldData = null;
++				try {
++					// Only write the contents if the data is different
++					in = new ByteArrayInputStream(toByteArray());
++					oldData = new BufferedInputStream(_file.getContents());
++					if (FileSystemUtil.compareStreams(in, oldData)) {
++						contentsChanged = false;
++					}
++				}
++				catch (CoreException ce) {
++					// Ignore -- couldn't read the old data, so assume it's different
++					contentsChanged = true;
++				}
++				finally {
++					closeInputStream(in);
++					closeInputStream(oldData);
++				}
++				if (contentsChanged) {
++					contents.reset();
++					saveToDisk(contents, false);
++				}
++			}
++		}
++		finally {
++			closeInputStream(contents);
++		}
++		
++		// If there are no parents, we don't need to track dependencies
++		if (_parentFiles != null && !_parentFiles.isEmpty()) {
++			_env.getAptProject().getGeneratedFileManager().addGeneratedFileDependency(_parentFiles, _file);
++			_env.addNewResource(_file);
++		}
++	}
++	
++	private void closeInputStream(InputStream stream) {
++		if (stream != null) {
++			try {
++				stream.close();
++			}
++			catch (IOException ioe) {}
++		}
++	}
++	
++	private void saveToDisk(InputStream toSave, boolean create) throws IOException{
++		try {
++			FileSystemUtil.makeDerivedParentFolders(_file.getParent());
++			if (create) {
++				_file.create(toSave, true, null);
++				_file.setDerived(true);
++			}
++			else {
++				_file.setContents(toSave, true, false, null);
++			}
++		}
++		catch (CoreException ce) {
++			if (_file.exists()) {
++				// Do nothing. This is a case-insensitive file system mismatch,
++				// and the underlying platform has saved the contents already.
++			}
++			else {
++				Apt6Plugin.log(ce, "Could not create generated non-Java file " + _file.getName()); //$NON-NLS-1$
++				IOException ioe = new IOException();
++				ioe.initCause(ce);
++				throw ioe;
++			}
++		}
++	}
++
++}
+diff --git a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeOutputFileObject.java b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeOutputFileObject.java
+new file mode 100644
+index 0000000..3f63bdc
+--- /dev/null
++++ b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeOutputFileObject.java
+@@ -0,0 +1,143 @@
++/*******************************************************************************
++ * Copyright (c) 2007 BEA Systems, Inc.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *    wharley@bea.com - initial API and implementation
++ *******************************************************************************/
++
++package org.eclipse.jdt.internal.apt.pluggable.core.filer;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.io.PrintWriter;
++import java.io.Reader;
++import java.io.Writer;
++import java.net.URI;
++import java.util.Collection;
++import java.util.Set;
++
++import javax.tools.FileObject;
++import javax.tools.JavaFileManager.Location;
++
++import org.eclipse.core.resources.IFile;
++import org.eclipse.jdt.internal.apt.pluggable.core.dispatch.IdeProcessingEnvImpl;
++
++/**
++ * Implementation of FileObject for generating resource files in the IDE.  
++ * This is used for files that are neither class files nor Java source files.
++ * TODO: at present this represents a write-only (generated) file.  When we
++ * implement the openResource() calls in Filer, we may want to move some of
++ * these methods into a base class.
++ * @see IdeOutputJavaFileObject
++ */
++public class IdeOutputFileObject implements FileObject
++{
++	private final IdeProcessingEnvImpl _env;
++	private final IFile _file;
++	private final Collection<IFile> _parentFiles;
++
++
++	/**
++	 * Create a new IdeOutputFileObject for writing.  The file will not actually be written until the Writer or OutputStream is closed.
++	 * @param env among other roles, the ProcessingEnvironment tracks what files have been generated in a given build.
++	 * @param location must be an output location (see {@link Location#isOutputLocation()}).
++	 * @param pkg
++	 * @param relativeName
++	 * @param parentFiles
++	 * @see javax.tools.StandardLocation
++	 */
++	public IdeOutputFileObject(IdeProcessingEnvImpl env, IFile file, Set<IFile> parentFiles) {
++		_env = env;
++		_file = file;
++		_parentFiles = parentFiles;
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#delete()
++	 */
++	@Override
++	public boolean delete()
++	{
++		throw new UnsupportedOperationException("Deleting a generated file is not permitted");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#getCharContent(boolean)
++	 */
++	@Override
++	public CharSequence getCharContent(boolean ignoreEncodingErrors) throws IOException
++	{
++		throw new UnsupportedOperationException("Reading a generated file is not permitted");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#getLastModified()
++	 */
++	@Override
++	public long getLastModified()
++	{
++		throw new UnsupportedOperationException("Not yet implemented");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#getName()
++	 */
++	@Override
++	public String getName()
++	{
++		// TODO
++		throw new UnsupportedOperationException("Not yet implemented");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#openInputStream()
++	 */
++	@Override
++	public InputStream openInputStream() throws IOException
++	{
++		throw new UnsupportedOperationException("Reading a generated file is not permitted");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#openOutputStream()
++	 */
++	@Override
++	public OutputStream openOutputStream() throws IOException
++	{
++		return new IdeNonSourceOutputStream(_env, _file, _parentFiles);
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#openReader(boolean)
++	 */
++	@Override
++	public Reader openReader(boolean ignoreEncodingErrors) throws IOException
++	{
++		throw new UnsupportedOperationException("Reading a generated file is not permitted");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#openWriter()
++	 */
++	@Override
++	public Writer openWriter() throws IOException
++	{
++		return new PrintWriter(openOutputStream());
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#toUri()
++	 */
++	@Override
++	public URI toUri()
++	{
++		// TODO
++		throw new UnsupportedOperationException("Not yet implemented");
++	}
++
++}
+diff --git a/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeOutputJavaFileObject.java b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeOutputJavaFileObject.java
+new file mode 100644
+index 0000000..f1a04bd
+--- /dev/null
++++ b/org.eclipse.jdt.apt.pluggable.core/src/org/eclipse/jdt/internal/apt/pluggable/core/filer/IdeOutputJavaFileObject.java
+@@ -0,0 +1,160 @@
++/*******************************************************************************
++ * Copyright (c) 2007 BEA Systems, Inc. 
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *    wharley@bea.com - initial API and implementation
++ *    
++ *******************************************************************************/
++
++package org.eclipse.jdt.internal.apt.pluggable.core.filer;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.io.Reader;
++import java.io.Writer;
++import java.net.URI;
++import java.util.Collection;
++
++import javax.lang.model.element.Modifier;
++import javax.lang.model.element.NestingKind;
++import javax.tools.JavaFileObject;
++
++import org.eclipse.core.resources.IFile;
++import org.eclipse.jdt.internal.apt.pluggable.core.dispatch.IdeProcessingEnvImpl;
++
++/**
++ * Implementation of JavaFileObject used for Java 6 annotation processing within the IDE.
++ * This object is used only for writing source and class files.
++ * 
++ * @since 3.3
++ */
++public class IdeOutputJavaFileObject implements JavaFileObject {
++	
++	private final IdeProcessingEnvImpl _env;
++	private final CharSequence _name;
++	private final Collection<IFile> _parentFiles;
++
++	public IdeOutputJavaFileObject(IdeProcessingEnvImpl env, CharSequence name, Collection<IFile> parentFiles) {
++		_env = env;
++		_parentFiles = parentFiles;
++		_name = name;
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.JavaFileObject#getAccessLevel()
++	 */
++	@Override
++	public Modifier getAccessLevel() {
++		//TODO
++		throw new UnsupportedOperationException("Not yet implemented");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.JavaFileObject#getKind()
++	 */
++	@Override
++	public Kind getKind() {
++		//TODO
++		throw new UnsupportedOperationException("Not yet implemented");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.JavaFileObject#getNestingKind()
++	 */
++	@Override
++	public NestingKind getNestingKind() {
++		//TODO
++		throw new UnsupportedOperationException("Not yet implemented");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.JavaFileObject#isNameCompatible(java.lang.String, javax.tools.JavaFileObject.Kind)
++	 */
++	@Override
++	public boolean isNameCompatible(String simpleName, Kind kind) {
++		//TODO
++		throw new UnsupportedOperationException("Not yet implemented");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#delete()
++	 */
++	@Override
++	public boolean delete() {
++		throw new UnsupportedOperationException("Deleting a file is not permitted from within an annotation processor");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#getCharContent(boolean)
++	 */
++	@Override
++	public CharSequence getCharContent(boolean ignoreEncodingErrors) throws IOException {
++		//TODO
++		throw new IllegalStateException("Generated files are write-only");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#getLastModified()
++	 */
++	@Override
++	public long getLastModified() {
++		//TODO
++		throw new UnsupportedOperationException("Not yet implemented");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#getName()
++	 */
++	@Override
++	public String getName() {
++		return _name.toString();
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#openInputStream()
++	 */
++	@Override
++	public InputStream openInputStream() throws IOException {
++		throw new IllegalStateException("Opening an input stream on a generated file is not permitted");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#openOutputStream()
++	 */
++	@Override
++	public OutputStream openOutputStream() throws IOException {
++		//TODO
++		throw new UnsupportedOperationException("Not yet implemented");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#openReader(boolean)
++	 */
++	@Override
++	public Reader openReader(boolean ignoreEncodingErrors) throws IOException {
++		throw new IllegalStateException("Opening a reader on a generated file is not permitted");
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#openWriter()
++	 */
++	@Override
++	public Writer openWriter() throws IOException {
++		return new IdeJavaSourceFileWriter(_env, _name, _parentFiles);
++	}
++
++	/* (non-Javadoc)
++	 * @see javax.tools.FileObject#toUri()
++	 */
++	@Override
++	public URI toUri() {
++		// The file does not exist until its writer is closed.
++		throw new UnsupportedOperationException("Not yet implemented");
++	}
++
++}
+diff --git a/org.eclipse.jdt.apt.pluggable.tests/src/org/eclipse/jdt/apt/pluggable/tests/FilerTests.java b/org.eclipse.jdt.apt.pluggable.tests/src/org/eclipse/jdt/apt/pluggable/tests/FilerTests.java
+index 64c87c3..50e88fb 100644
+--- a/org.eclipse.jdt.apt.pluggable.tests/src/org/eclipse/jdt/apt/pluggable/tests/FilerTests.java
++++ b/org.eclipse.jdt.apt.pluggable.tests/src/org/eclipse/jdt/apt/pluggable/tests/FilerTests.java
+@@ -51,9 +51,8 @@ public class FilerTests extends TestBase
+ 		final String[] expectedClasses = { "targets.filer.Parent01", "gen6.Generated01" };
+ 		expectingUniqueCompiledClasses(expectedClasses);
+ 		
+-		// TODO: disabled because final round is not yet working 
+ 		// Check whether non-source resource was generated in final round
+-		// expectingFile( proj, "src/summary.txt" );
++		expectingFile( proj, ".apt_generated/summary.txt" );
+ 		
+ 		//TODO: if a parent file is modified,
+ 		// the generated file should be regenerated and recompiled.
+@@ -61,11 +60,11 @@ public class FilerTests extends TestBase
+ 	
+ 		// Modify target file to remove annotation and incrementally rebuild; 
+ 		// generated file should be deleted.
+-		// TODO: doesn't work yet.  See https://bugs.eclipse.org/bugs/show_bug.cgi?id=188559
+ 		IdeTestUtils.copyResources(proj, "targets/filer01b", "src/targets/filer");
+ 		incrementalBuild();
+ 		expectingNoProblems();
+ 		expectingNoFile(proj, ".apt_generated/gen6/Generated01.java");
++		expectingNoFile( proj, ".apt_generated/summary.txt" );
+ 	}
+ 
+ }
+diff --git a/org.eclipse.jdt.apt.pluggable.tests/src/org/eclipse/jdt/apt/pluggable/tests/processors/genclass6/GenClass6Proc.java b/org.eclipse.jdt.apt.pluggable.tests/src/org/eclipse/jdt/apt/pluggable/tests/processors/genclass6/GenClass6Proc.java
+index 5b34ce2..33ca885 100644
+--- a/org.eclipse.jdt.apt.pluggable.tests/src/org/eclipse/jdt/apt/pluggable/tests/processors/genclass6/GenClass6Proc.java
++++ b/org.eclipse.jdt.apt.pluggable.tests/src/org/eclipse/jdt/apt/pluggable/tests/processors/genclass6/GenClass6Proc.java
+@@ -181,7 +181,7 @@ public class GenClass6Proc extends AbstractProcessor {
+ 		try {
+ 			Element[] parents = new Element[_classesToSummarize.size()];
+ 			parents = _classesToSummarize.values().toArray(parents);
+-			FileObject summaryFile = _filer.createResource(StandardLocation.SOURCE_OUTPUT, null, "summary.txt", parents);
++			FileObject summaryFile = _filer.createResource(StandardLocation.SOURCE_OUTPUT, "", "summary.txt", parents);
+ 			pw = new PrintWriter(summaryFile.openWriter());
+ 			for (String clazz : _classesToSummarize.keySet()) {
+ 				pw.println(clazz);
+diff --git a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BatchProcessingEnvImpl.java b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BatchProcessingEnvImpl.java
+index a466bcd..ac70cde 100644
+--- a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BatchProcessingEnvImpl.java
++++ b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BatchProcessingEnvImpl.java
+@@ -31,7 +31,7 @@ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+  * The implementation of ProcessingEnvironment that is used when compilation is
+  * driven by the command line or by the Tool interface.  This environment uses
+  * the JavaFileManager provided by the compiler.
+- * @see org.eclipse.jdt.internal.compiler.apt.ide.dispatch.IdeProcessingEnvImpl
++ * @see org.eclipse.jdt.internal.apt.pluggable.core.dispatch.IdeProcessingEnvImpl
+  */
+ public class BatchProcessingEnvImpl extends BaseProcessingEnvImpl {
+ 

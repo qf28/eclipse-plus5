@@ -1,0 +1,1196 @@
+commit 614ee403e4fb28af460eaf223fe750d04305a162
+Author: Andrew Niefer <aniefer>
+Date:   Fri Feb 19 19:51:04 2010 +0000
+
+    bug 302201 - fix broken query
+
+31	4	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/SiteXMLAction.java
+21	1	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/VersionSuffixGenerator.java
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/SiteXMLAction.java b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/SiteXMLAction.java
+index ebd5b07..f4c92e8 100644
+--- a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/SiteXMLAction.java
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/SiteXMLAction.java
+@@ -23,7 +23,8 @@ import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory.InstallableUnitDescription;
+ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.metadata.*;
+-import org.eclipse.equinox.p2.metadata.expression.*;
++import org.eclipse.equinox.p2.metadata.expression.ExpressionUtil;
++import org.eclipse.equinox.p2.metadata.expression.IExpression;
+ import org.eclipse.equinox.p2.metadata.query.ExpressionQuery;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+ import org.eclipse.equinox.p2.publisher.*;
+@@ -144,9 +145,8 @@ public class SiteXMLAction extends AbstractPublisherAction {
+ 				qualifier = null;
+ 			}
+ 			if (qualifier != null && qualifier.endsWith(QUALIFIER)) {
+-				String v = versionString.substring(0, versionString.indexOf(QUALIFIER));
+-				String qualifierVersion = v.endsWith(".") ? v.substring(0, v.length() - 1) : v; //$NON-NLS-1$
+-				IQuery<IInstallableUnit> qualifierQuery = new ExpressionQuery<IInstallableUnit>(IInstallableUnit.class, qualifierMatchExpr, id, SimplePattern.compile(qualifierVersion + '*'));
++				VersionRange range = createVersionRange(version.toString());
++				IQuery<IInstallableUnit> qualifierQuery = new ExpressionQuery<IInstallableUnit>(IInstallableUnit.class, qualifierMatchExpr, id, range);
+ 				query = new LatestIUVersionQuery<IInstallableUnit>(qualifierQuery);
+ 			} else {
+ 				query = new LimitQuery<IInstallableUnit>(new InstallableUnitQuery(id, version), 1);
+@@ -164,6 +164,33 @@ public class SiteXMLAction extends AbstractPublisherAction {
+ 		return null;
+ 	}
+ 
++	protected VersionRange createVersionRange(String versionId) {
++		VersionRange range = null;
++		if (versionId == null || "0.0.0".equals(versionId)) //$NON-NLS-1$
++			range = VersionRange.emptyRange;
++		else {
++			int qualifierIdx = versionId.indexOf(QUALIFIER);
++			if (qualifierIdx != -1) {
++				String newVersion = versionId.substring(0, qualifierIdx);
++				if (newVersion.endsWith(".")) //$NON-NLS-1$
++					newVersion = newVersion.substring(0, newVersion.length() - 1);
++
++				Version lower = Version.parseVersion(newVersion);
++				Version upper = null;
++				String newQualifier = VersionSuffixGenerator.incrementQualifier(Version.toOSGiVersion(lower).getQualifier());
++				org.osgi.framework.Version osgiVersion = Version.toOSGiVersion(lower);
++				if (newQualifier == null)
++					upper = Version.createOSGi(osgiVersion.getMajor(), osgiVersion.getMinor(), osgiVersion.getMicro() + 1);
++				else
++					upper = Version.createOSGi(osgiVersion.getMajor(), osgiVersion.getMinor(), osgiVersion.getMicro(), newQualifier);
++				range = new VersionRange(lower, true, upper, false);
++			} else {
++				range = new VersionRange(Version.parseVersion(versionId), true, Version.parseVersion(versionId), true);
++			}
++		}
++		return range;
++	}
++
+ 	/**
+ 	 * Computes the mapping of features to categories as defined in the site.xml,
+ 	 * if available. Returns an empty map if there is not site.xml, or no categories.
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/VersionSuffixGenerator.java b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/VersionSuffixGenerator.java
+index 0cdf730..d2f7cbd 100644
+--- a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/VersionSuffixGenerator.java
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/VersionSuffixGenerator.java
+@@ -25,7 +25,27 @@ public class VersionSuffixGenerator {
+ 	private static final int QUALIFIER_SUFFIX_VERSION = 1;
+ 
+ 	// The 64 characters that are legal in a version qualifier, in lexicographical order.
+-	private static final String BASE_64_ENCODING = "-0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"; //$NON-NLS-1$
++	public static final String BASE_64_ENCODING = "-0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"; //$NON-NLS-1$
++
++	public static String incrementQualifier(String qualifier) {
++		int idx = qualifier.length() - 1;
++
++		for (; idx >= 0; idx--) {
++			//finding last non-'z' character
++			if (qualifier.charAt(idx) != 'z')
++				break;
++		}
++
++		if (idx >= 0) {
++			// charAt(idx) is < 'z', so don't need to check bounds
++			int c = BASE_64_ENCODING.indexOf(qualifier.charAt(idx)) + 1;
++			String newQualifier = qualifier.substring(0, idx);
++			newQualifier += BASE_64_ENCODING.charAt(c);
++			return newQualifier;
++		}
++
++		return null;
++	}
+ 
+ 	private static void appendEncodedCharacter(StringBuffer buffer, int c) {
+ 		while (c > 62) {
+commit 3a38ea838308bd6743b26cf6557076dbb31a2e11
+Author: Thomas Hallgren <thallgren>
+Date:   Fri Feb 19 22:46:40 2010 +0000
+
+    303383 : We don't need both QLMatchQuery and ExpressionQuery and some things related to  bug 302201 : Unify the two query approaches used in p2
+
+2	2	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/TranslationSupport.java
+23	0	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/expression/Expression.java
+1	1	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/expression/Literal.java
+18	1	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/query/LatestIUVersionQuery.java
+8	0	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/metadata/query/ExpressionQuery.java
+5	0	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/CompoundQuery.java
+4	0	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/ContextQuery.java
+8	2	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/IQuery.java
+40	1	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/LimitQuery.java
+5	0	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/MatchQuery.java
+48	11	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/PipedQuery.java
+132	0	bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/Pipe.java
+10	0	bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/QLFactory.java
+14	1	bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/WrappedIQuery.java
+5	4	bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/IQLExpression.java
+8	0	bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/IQLFactory.java
+5	2	bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/QLContextQuery.java
+0	91	bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/QLMatchQuery.java
+1	1	bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/IUDescription.java
+3	3	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/AggregateQueryTest.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/CompoundQueryableTest.java
+2	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/QueryTest.java
+12	11	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/EvaluatorTest.java
+4	3	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/PerformanceTest.java
+5	5	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/TestQueryReimplementation.java
+5	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/RepositoryLocationQuery.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/actions/ExistingIUInProfileAction.java
+1	2	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/SiteXMLAction.java
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/TranslationSupport.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/TranslationSupport.java
+index 9f11ef4..aee0cce 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/TranslationSupport.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/TranslationSupport.java
+@@ -206,7 +206,7 @@ public class TranslationSupport {
+ 			localeQuery[j] = new ExpressionQuery<IInstallableUnit>(IInstallableUnit.class, capabilityMatch, locales.get(j), NAMESPACE_IU_LOCALIZATION);
+ 		}
+ 
+-		IQuery<IInstallableUnit> iuQuery = new PipedQuery<IInstallableUnit>(new FragmentQuery(), CompoundQuery.createCompoundQuery(localeQuery, false));
++		IQuery<IInstallableUnit> iuQuery = PipedQuery.createPipe(new FragmentQuery(), CompoundQuery.createCompoundQuery(localeQuery, false));
+ 		IQueryResult<IInstallableUnit> collected = fragmentSource.query(iuQuery, null);
+ 		localeCollectorCache.put(locale, new SoftReference<IQueryResult<IInstallableUnit>>(collected));
+ 		return collected;
+@@ -247,7 +247,7 @@ public class TranslationSupport {
+ 			}
+ 		};
+ 
+-		IQuery<IInstallableUnit> iuQuery = new PipedQuery<IInstallableUnit>(new FragmentQuery(), hostLocalizationQuery);
++		IQuery<IInstallableUnit> iuQuery = PipedQuery.createPipe(new FragmentQuery(), hostLocalizationQuery);
+ 		IQueryResult<IInstallableUnit> collected = iuQuery.perform(localizationFragments.iterator());
+ 		if (!collected.isEmpty()) {
+ 			String translation = null;
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/expression/Expression.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/expression/Expression.java
+index 767f7c1..da211f9 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/expression/Expression.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/expression/Expression.java
+@@ -272,6 +272,29 @@ public abstract class Expression implements IExpression, Comparable<Expression>,
+ 		}
+ 	}
+ 
++	public static class VariableFinder implements IExpressionVisitor {
++		private boolean found = false;
++		private final Variable variable;
++
++		public VariableFinder(Variable variable) {
++			this.variable = variable;
++		}
++
++		public boolean visit(IExpression expression) {
++			if (variable.equals(expression))
++				found = true;
++			return !found;
++		}
++
++		public void reset() {
++			found = false;
++		}
++
++		public boolean isFound() {
++			return found;
++		}
++	}
++
+ 	private static class MembersFinder implements IExpressionVisitor {
+ 		private final ArrayList<String> members = new ArrayList<String>();
+ 		private final Class<?> elementClass;
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/expression/Literal.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/expression/Literal.java
+index 2884fb7..6dd3c90 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/expression/Literal.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/expression/Literal.java
+@@ -25,7 +25,7 @@ public final class Literal extends Expression {
+ 
+ 	public static final Literal TRUE_CONSTANT = new Literal(Boolean.TRUE);
+ 
+-	static Literal create(Object value) {
++	public static Literal create(Object value) {
+ 		if (value == null)
+ 			return NULL_CONSTANT;
+ 		if (value == Boolean.TRUE)
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/query/LatestIUVersionQuery.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/query/LatestIUVersionQuery.java
+index 1115e2e..fc26911 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/query/LatestIUVersionQuery.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/query/LatestIUVersionQuery.java
+@@ -11,13 +11,15 @@ package org.eclipse.equinox.internal.p2.metadata.query;
+ 
+ import java.util.*;
+ import org.eclipse.equinox.p2.metadata.IVersionedId;
++import org.eclipse.equinox.p2.metadata.index.IIndexProvider;
++import org.eclipse.equinox.p2.metadata.index.IQueryWithIndex;
+ import org.eclipse.equinox.p2.query.*;
+ 
+ /**
+  * This query returns the latest version for each unique VersionedID.  
+  * All other elements are discarded.
+  */
+-public class LatestIUVersionQuery<T extends IVersionedId> extends ContextQuery<T> {
++public class LatestIUVersionQuery<T extends IVersionedId> extends ContextQuery<T> implements IQueryWithIndex<T> {
+ 
+ 	private final IQuery<T> query;
+ 
+@@ -35,7 +37,22 @@ public class LatestIUVersionQuery<T extends IVersionedId> extends ContextQuery<T
+ 	public IQueryResult<T> perform(Iterator<T> iterator) {
+ 		if (query != null)
+ 			iterator = query.perform(iterator).iterator();
++		return latest(iterator);
++	}
++
++	public IQueryResult<T> perform(IIndexProvider<T> indexProvider) {
++		Iterator<T> iterator;
++		if (query != null) {
++			if (query instanceof IQueryWithIndex<?>)
++				iterator = ((IQueryWithIndex<T>) query).perform(indexProvider).iterator();
++			else
++				iterator = query.perform(indexProvider.everything()).iterator();
++		} else
++			iterator = indexProvider.everything();
++		return latest(iterator);
++	}
+ 
++	private IQueryResult<T> latest(Iterator<T> iterator) {
+ 		HashMap<String, T> greatestIUVersion = new HashMap<String, T>();
+ 		while (iterator.hasNext()) {
+ 			T versionedID = iterator.next();
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/metadata/query/ExpressionQuery.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/metadata/query/ExpressionQuery.java
+index 345ed61..914d0da 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/metadata/query/ExpressionQuery.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/metadata/query/ExpressionQuery.java
+@@ -42,6 +42,14 @@ public class ExpressionQuery<T> implements IQueryWithIndex<T> {
+ 		this.context = expression.createContext();
+ 	}
+ 
++	public ExpressionQuery(Class<? extends T> matchingClass, String expression, Object... parameters) {
++		this(matchingClass, ExpressionUtil.getFactory().<T> matchExpression(ExpressionUtil.getParser().parse(expression), parameters));
++	}
++
++	public IEvaluationContext getContext() {
++		return context;
++	}
++
+ 	public IQueryResult<T> perform(IIndexProvider<T> indexProvider) {
+ 		Iterator<T> iterator = null;
+ 		for (String member : Expression.getIndexCandidateMembers(IArtifactKey.class, ExpressionFactory.THIS, (Expression) expression)) {
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/CompoundQuery.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/CompoundQuery.java
+index 67a160c..cebbb84 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/CompoundQuery.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/CompoundQuery.java
+@@ -14,6 +14,7 @@ package org.eclipse.equinox.p2.query;
+ import java.lang.reflect.Array;
+ import java.util.*;
+ import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.equinox.p2.metadata.expression.IExpression;
+ 
+ /**
+  * A query that combines a group of sub-queries.<P>
+@@ -235,4 +236,8 @@ public abstract class CompoundQuery<T> implements ICompositeQuery<T> {
+ 			return new SetCollector<T>(result);
+ 		}
+ 	}
++
++	public IExpression getExpression() {
++		return null;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/ContextQuery.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/ContextQuery.java
+index 5936aeb..7131ec4 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/ContextQuery.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/ContextQuery.java
+@@ -10,6 +10,7 @@
+ package org.eclipse.equinox.p2.query;
+ 
+ import java.util.Iterator;
++import org.eclipse.equinox.p2.metadata.expression.IExpression;
+ 
+ /**
+  * ContextQuery is the abstract superclass for Queries that require the entire
+@@ -42,4 +43,7 @@ public abstract class ContextQuery<T> implements IQuery<T> {
+ 	 */
+ 	public abstract IQueryResult<T> perform(Iterator<T> iterator);
+ 
++	public IExpression getExpression() {
++		return null;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/IQuery.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/IQuery.java
+index 7afd485..9447d18 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/IQuery.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/IQuery.java
+@@ -12,6 +12,7 @@
+ package org.eclipse.equinox.p2.query;
+ 
+ import java.util.Iterator;
++import org.eclipse.equinox.p2.metadata.expression.IExpression;
+ 
+ /**
+  * The root interface for all queries that can be performed on an {@link IQueryable}.
+@@ -30,13 +31,18 @@ import java.util.Iterator;
+  * @since 2.0
+  */
+ public interface IQuery<T> {
+-
+ 	/**
+ 	 * Evaluates the query for a specific input.  
+ 	 * 
+ 	 * @param iterator The elements for which to evaluate the query on
+ 	 * @return The results of the query.
+ 	 */
+-	public abstract IQueryResult<T> perform(Iterator<T> iterator);
++	IQueryResult<T> perform(Iterator<T> iterator);
+ 
++	/**
++	 * Returns the IExpression backing this query of <code>null</code> if
++	 * this is not an expression query.
++	 * @return An expression or <code>null</code>.
++	 */
++	IExpression getExpression();
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/LimitQuery.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/LimitQuery.java
+index 6da75ca..09447e2 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/LimitQuery.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/LimitQuery.java
+@@ -10,13 +10,20 @@
+ package org.eclipse.equinox.p2.query;
+ 
+ import java.util.*;
++import org.eclipse.equinox.internal.p2.metadata.expression.Expression;
++import org.eclipse.equinox.internal.p2.metadata.expression.ExpressionFactory;
++import org.eclipse.equinox.p2.metadata.IArtifactKey;
++import org.eclipse.equinox.p2.metadata.expression.IEvaluationContext;
++import org.eclipse.equinox.p2.metadata.expression.IMatchExpression;
++import org.eclipse.equinox.p2.metadata.index.*;
++import org.eclipse.equinox.p2.metadata.query.ExpressionQuery;
+ 
+ /**
+  * A limit query can be used to limit the number of query results returned.  Once
+  * the limit is reached, the query is terminated.
+  * @since 2.0
+  */
+-public class LimitQuery<T> extends ContextQuery<T> implements ICompositeQuery<T> {
++public class LimitQuery<T> extends ContextQuery<T> implements ICompositeQuery<T>, IQueryWithIndex<T> {
+ 
+ 	private final IQuery<T> query;
+ 	private final int limit;
+@@ -54,4 +61,36 @@ public class LimitQuery<T> extends ContextQuery<T> implements ICompositeQuery<T>
+ 		return Collections.singletonList(query);
+ 	}
+ 
++	public IQueryResult<T> perform(IIndexProvider<T> indexProvider) {
++		if (!(query instanceof ExpressionQuery<?>))
++			return perform(indexProvider.everything());
++
++		ExpressionQuery<T> expQuery = (ExpressionQuery<T>) query;
++		IMatchExpression<T> expression = expQuery.getExpression();
++		IEvaluationContext context = expQuery.getContext();
++		Iterator<T> iterator = null;
++		for (String member : Expression.getIndexCandidateMembers(IArtifactKey.class, ExpressionFactory.THIS, (Expression) expression)) {
++			IIndex<T> index = indexProvider.getIndex(member);
++			if (index != null) {
++				iterator = index.getCandidates(context, ExpressionFactory.THIS, expression);
++				if (iterator != null)
++					break;
++			}
++		}
++		if (iterator == null)
++			iterator = indexProvider.everything();
++
++		int count = 0;
++		Collector<T> result = new Collector<T>();
++		while (iterator.hasNext()) {
++			T candidate = iterator.next();
++			if (expQuery.isMatch(candidate)) {
++				result.accept(candidate);
++				if (++count >= limit)
++					break;
++			}
++		}
++		return result;
++	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/MatchQuery.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/MatchQuery.java
+index 065f4fe..ba42a12 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/MatchQuery.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/MatchQuery.java
+@@ -11,6 +11,7 @@
+ package org.eclipse.equinox.p2.query;
+ 
+ import java.util.Iterator;
++import org.eclipse.equinox.p2.metadata.expression.IExpression;
+ 
+ /**
+  * This class represents the superclass of most of p2's queries.  Every element
+@@ -88,4 +89,8 @@ public abstract class MatchQuery<T> implements IMatchQuery<T> {
+ 	public void postPerform() {
+ 		// nothing to do by default
+ 	}
++
++	public IExpression getExpression() {
++		return null;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/PipedQuery.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/PipedQuery.java
+index 0e16b76..8873993 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/PipedQuery.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/p2/query/PipedQuery.java
+@@ -11,6 +11,9 @@
+ package org.eclipse.equinox.p2.query;
+ 
+ import java.util.*;
++import org.eclipse.equinox.p2.metadata.expression.IExpression;
++import org.eclipse.equinox.p2.metadata.index.IIndexProvider;
++import org.eclipse.equinox.p2.metadata.index.IQueryWithIndex;
+ 
+ /**
+  * A PipedQuery is a composite query in which each sub-query is executed in succession.  
+@@ -18,31 +21,42 @@ import java.util.*;
+  * query will short-circuit if any query returns an empty result set.
+  * @since 2.0
+  */
+-public class PipedQuery<T> implements ICompositeQuery<T> {
++public class PipedQuery<T> implements ICompositeQuery<T>, IQueryWithIndex<T> {
+ 	protected final IQuery<T>[] queries;
+ 
+ 	/**
++	 * Creates a piped query based on the two provided input queries. The full
++	 * query input will be passed into the first query in the provided array. The
++	 * second query will obtain as input the result of the first query.
++	 * 
++	 * @param query1 the first query
++	 * @param query2 the second query
++	 */
++	@SuppressWarnings("unchecked")
++	public static <E> IQuery<E> createPipe(IQuery<? extends E> query1, IQuery<? extends E> query2) {
++		return new PipedQuery<E>(new IQuery[] {query1, query2});
++	}
++
++	/**
+ 	 * Creates a piped query based on the provided input queries. The full
+ 	 * query input will be passed into the first query in the provided array. Subsequent
+ 	 * queries will obtain as input the result of execution of the previous query. 
+ 	 * 
+ 	 * @param queries the ordered list of queries to perform
+ 	 */
+-	public PipedQuery(IQuery<T>[] queries) {
+-		this.queries = queries;
++	public static <E> IQuery<E> createPipe(IQuery<E>[] queries) {
++		return new PipedQuery<E>(queries);
+ 	}
+ 
+ 	/**
+-	 * Creates a piped query based on the two provided input queries. The full
+-	 * query input will be passed into the first query in the provided array. The
+-	 * second query will obtain as input the result of the first query.
++	 * Creates a piped query based on the provided input queries. The full
++	 * query input will be passed into the first query in the provided array. Subsequent
++	 * queries will obtain as input the result of execution of the previous query. 
+ 	 * 
+-	 * @param query1 the first query
+-	 * @param query2 the second query
++	 * @param queries the ordered list of queries to perform
+ 	 */
+-	@SuppressWarnings("unchecked")
+-	public PipedQuery(IQuery<T> query1, IQuery<T> query2) {
+-		this(new IQuery[] {query1, query2});
++	private PipedQuery(IQuery<T>[] queries) {
++		this.queries = queries;
+ 	}
+ 
+ 	/*(non-Javadoc)
+@@ -69,4 +83,27 @@ public class PipedQuery<T> implements ICompositeQuery<T> {
+ 		}
+ 		return last;
+ 	}
++
++	public IQueryResult<T> perform(IIndexProvider<T> indexProvider) {
++		IQueryResult<T> last = Collector.emptyCollector();
++		if (queries.length > 0) {
++			IQuery<T> firstQuery = queries[0];
++			if (firstQuery instanceof IQueryWithIndex<?>)
++				last = ((IQueryWithIndex<T>) firstQuery).perform(indexProvider);
++			else
++				last = firstQuery.perform(indexProvider.everything());
++			for (int i = 1; i < queries.length; i++) {
++				if (last.isEmpty())
++					break;
++				// Take the results of the previous query and use them
++				// to drive the next one (i.e. composing queries)
++				last = queries[i].perform(last.iterator());
++			}
++		}
++		return last;
++	}
++
++	public IExpression getExpression() {
++		return null;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/Pipe.java b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/Pipe.java
+new file mode 100644
+index 0000000..aa74f32
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/Pipe.java
+@@ -0,0 +1,132 @@
++/*******************************************************************************
++ * Copyright (c) 2009 Cloudsmith Inc. and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     Cloudsmith Inc. - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.ql.expression;
++
++import java.util.ArrayList;
++import java.util.Iterator;
++import org.eclipse.equinox.internal.p2.metadata.expression.*;
++import org.eclipse.equinox.p2.metadata.expression.*;
++import org.eclipse.equinox.p2.metadata.index.IIndex;
++import org.eclipse.equinox.p2.metadata.index.IIndexProvider;
++import org.eclipse.equinox.p2.ql.IQLExpression;
++import org.eclipse.equinox.p2.ql.IQLFactory;
++
++public class Pipe extends NAry implements IQLExpression {
++
++	private class NoIndexProvider implements IIndexProvider<Object> {
++		private Iterator<Object> everything;
++
++		NoIndexProvider() { //
++		}
++
++		public IIndex<Object> getIndex(String memberName) {
++			return null;
++		}
++
++		public Iterator<Object> everything() {
++			return everything;
++		}
++
++		@SuppressWarnings("unchecked")
++		void setEverything(Iterator<?> everything) {
++			this.everything = (Iterator<Object>) everything;
++		}
++	}
++
++	private static Expression[] makePipeable(Expression[] operands) {
++		// We expect two types of expressions. The ones that act on THIS
++		// i.e. boolean match expressions or the ones that act EVERYTHING
++		// by iterating a collection.
++		//
++		// Our task here is to convert all booleans into collections so
++		// that:
++		//  <boolean expression> becomes select(x | <boolean expression)
++		//
++		// If we find consecutive boolean expressions, we can actually
++		// make one more optimization:
++		//  <expr1>, <expr2> becomes select(x | <expr1> && <expr2>)
++
++		ArrayList<Expression> pipeables = new ArrayList<Expression>();
++		ArrayList<Expression> booleans = new ArrayList<Expression>();
++		VariableFinder finder = new VariableFinder(ExpressionFactory.EVERYTHING);
++		for (int idx = 0; idx < operands.length; ++idx) {
++			Expression operand = operands[idx];
++			finder.reset();
++			operand.accept(finder);
++			if (finder.isFound()) {
++				if (!booleans.isEmpty()) {
++					// Concatenate all found booleans.
++					pipeables.add(makePipeableOfBooleans(booleans));
++					booleans.clear();
++				}
++				pipeables.add(operand);
++			} else
++				booleans.add(operand);
++		}
++		if (!booleans.isEmpty())
++			pipeables.add(makePipeableOfBooleans(booleans));
++		return pipeables.toArray(new Expression[pipeables.size()]);
++	}
++
++	private static Expression makePipeableOfBooleans(ArrayList<Expression> booleans) {
++		IQLFactory factory = (IQLFactory) ExpressionUtil.getFactory();
++		Expression boolExpr = booleans.get(0);
++		int top = booleans.size();
++		if (top > 1)
++			boolExpr = (Expression) factory.and(booleans.toArray(new IExpression[top]));
++		return (Expression) factory.select(ExpressionFactory.EVERYTHING, factory.lambda(ExpressionFactory.THIS, boolExpr));
++	}
++
++	protected Pipe(Expression[] operands) {
++		super(makePipeable(assertLength(operands, 2, "pipe"))); //$NON-NLS-1$
++	}
++
++	public int getExpressionType() {
++		return TYPE_PIPE;
++	}
++
++	@Override
++	public String getOperator() {
++		return "pipe"; //$NON-NLS-1$
++	}
++
++	@Override
++	public Object evaluate(IEvaluationContext context) {
++		return evaluateAsIterator(context);
++	}
++
++	@Override
++	public Iterator<?> evaluateAsIterator(IEvaluationContext context) {
++		Iterator<?> iterator = operands[0].evaluateAsIterator(context);
++		if (operands.length == 0 || !iterator.hasNext())
++			return iterator;
++
++		Class<Object> elementClass = Object.class;
++		Variable everything = ExpressionFactory.EVERYTHING;
++		IEvaluationContext nextContext = EvaluationContext.create(context, everything);
++		NoIndexProvider noIndexProvider = new NoIndexProvider();
++		nextContext.setIndexProvider(noIndexProvider);
++		for (int idx = 1; idx < operands.length; ++idx) {
++			Expression expr = operands[idx];
++			noIndexProvider.setEverything(iterator);
++			everything.setValue(nextContext, new Everything<Object>(elementClass, noIndexProvider));
++			iterator = expr.evaluateAsIterator(nextContext);
++			if (!iterator.hasNext())
++				break;
++		}
++		return iterator;
++	}
++
++	@Override
++	public int getPriority() {
++		return PRIORITY_COLLECTION;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/QLFactory.java b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/QLFactory.java
+index 8568e68..5cb9c5c 100644
+--- a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/QLFactory.java
++++ b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/QLFactory.java
+@@ -6,6 +6,7 @@ import java.util.*;
+ import org.eclipse.equinox.internal.p2.metadata.expression.*;
+ import org.eclipse.equinox.p2.metadata.expression.IExpression;
+ import org.eclipse.equinox.p2.ql.IQLFactory;
++import org.eclipse.equinox.p2.query.IQuery;
+ 
+ public class QLFactory extends ExpressionFactory implements IQLFactory, IQLConstants {
+ 	@SuppressWarnings("hiding")
+@@ -102,6 +103,10 @@ public class QLFactory extends ExpressionFactory implements IQLFactory, IQLConst
+ 		return new Latest((Expression) collection);
+ 	}
+ 
++	public IExpression limit(IExpression collection, int count) {
++		return new Limit((Expression) collection, Literal.create(new Integer(count)));
++	}
++
+ 	public IExpression limit(IExpression collection, IExpression limit) {
+ 		return new Limit((Expression) collection, (Expression) limit);
+ 	}
+@@ -151,6 +156,11 @@ public class QLFactory extends ExpressionFactory implements IQLFactory, IQLConst
+ 		return super.variable(name);
+ 	}
+ 
++	public IExpression toExpression(IQuery<?> query) {
++		Literal queryConstant = Literal.create(query);
++		return new WrappedIQuery(new Expression[] {queryConstant});
++	}
++
+ 	public IExpression unique(IExpression collection, IExpression cache) {
+ 		return new Unique((Expression) collection, (Expression) cache);
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/WrappedIQuery.java b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/WrappedIQuery.java
+index 2436976..2fdfa03 100644
+--- a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/WrappedIQuery.java
++++ b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/internal/p2/ql/expression/WrappedIQuery.java
+@@ -19,6 +19,19 @@ import org.eclipse.equinox.p2.query.IQuery;
+ 
+ public final class WrappedIQuery extends Function implements IQLConstants {
+ 
++	/**
++	 * <p>The WrappedIQuery constructor takes an array with one or two arguments.
++	 * The first argument must evaluate to an instance of {@link IQuery}. The second
++	 * argument is optional. The following applies:</p><ul>
++	 * <li>If first argument evaluates to an instance of {@link IMatchQuery}, then
++	 * a provided second argument assumed to be the candidate to match. The
++	 * variable <code>this</code> will be used if no second argument is not provided.</li>
++	 * <li>For all other types of queries the second argument must evaluate
++	 * to an iterator. If it is not provided, it defaults to the variable
++	 * <code>everything</code>.
++	 * </ul>
++	 * @param operands
++	 */
+ 	public WrappedIQuery(Expression[] operands) {
+ 		super(assertLength(operands, 1, 2, KEYWORD_IQUERY));
+ 	}
+@@ -43,7 +56,7 @@ public final class WrappedIQuery extends Function implements IQLConstants {
+ 		if (operands.length > 1)
+ 			iterator = operands[1].evaluateAsIterator(context);
+ 		else
+-			iterator = QLFactory.EVERYTHING.evaluateAsIterator(context);
++			iterator = ExpressionFactory.EVERYTHING.evaluateAsIterator(context);
+ 
+ 		return ((IQuery<Object>) query).perform((Iterator<Object>) iterator);
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/IQLExpression.java b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/IQLExpression.java
+index 905bb85..2e6e50a 100644
+--- a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/IQLExpression.java
++++ b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/IQLExpression.java
+@@ -13,8 +13,9 @@ public interface IQLExpression extends IExpression {
+ 	int TYPE_INTERSECT = 27;
+ 	int TYPE_LATEST = 28;
+ 	int TYPE_LIMIT = 29;
+-	int TYPE_SELECT = 30;
+-	int TYPE_TRAVERSE = 31;
+-	int TYPE_UNION = 32;
+-	int TYPE_UNIQUE = 33;
++	int TYPE_PIPE = 30;
++	int TYPE_SELECT = 31;
++	int TYPE_TRAVERSE = 32;
++	int TYPE_UNION = 33;
++	int TYPE_UNIQUE = 34;
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/IQLFactory.java b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/IQLFactory.java
+index 8afa182..74d4ee4 100644
+--- a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/IQLFactory.java
++++ b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/IQLFactory.java
+@@ -14,6 +14,7 @@ import java.util.Map;
+ import org.eclipse.equinox.p2.metadata.IVersionedId;
+ import org.eclipse.equinox.p2.metadata.expression.IExpression;
+ import org.eclipse.equinox.p2.metadata.expression.IExpressionFactory;
++import org.eclipse.equinox.p2.query.IQuery;
+ 
+ /**
+  * This inteface provides all the factory methods needed to create the all possible
+@@ -175,4 +176,11 @@ public interface IQLFactory extends IExpressionFactory {
+ 	 * @return A collection expression
+ 	 */
+ 	IExpression unique(IExpression collection, IExpression cache);
++
++	/**
++	 * Wrap an {@link IQuery} as an expression.
++	 * @param query
++	 * @return An expression that wraps the query
++	 */
++	IExpression toExpression(IQuery<?> query);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/QLContextQuery.java b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/QLContextQuery.java
+index b8733d6..8022adf 100644
+--- a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/QLContextQuery.java
++++ b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/QLContextQuery.java
+@@ -12,8 +12,7 @@ package org.eclipse.equinox.p2.ql;
+ 
+ import java.util.Iterator;
+ import org.eclipse.equinox.internal.p2.ql.expression.QLUtil;
+-import org.eclipse.equinox.p2.metadata.expression.ExpressionUtil;
+-import org.eclipse.equinox.p2.metadata.expression.IEvaluationContext;
++import org.eclipse.equinox.p2.metadata.expression.*;
+ import org.eclipse.equinox.p2.metadata.index.IIndexProvider;
+ import org.eclipse.equinox.p2.metadata.index.IQueryWithIndex;
+ import org.eclipse.equinox.p2.query.IQueryResult;
+@@ -67,6 +66,10 @@ public class QLContextQuery<T> extends QLQuery<T> implements IQueryWithIndex<T>
+ 		return result;
+ 	}
+ 
++	public IExpression getExpression() {
++		return expression;
++	}
++
+ 	/**
+ 	 * Query without using a collector. Instead, return the result of the query directly.
+ 	 * @param queryContext The context for the query.
+diff --git a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/QLMatchQuery.java b/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/QLMatchQuery.java
+deleted file mode 100644
+index 8cd491a..0000000
+--- a/bundles/org.eclipse.equinox.p2.ql/src/org/eclipse/equinox/p2/ql/QLMatchQuery.java
++++ /dev/null
+@@ -1,91 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2009, 2010 Cloudsmith Inc. and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     Cloudsmith Inc. - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.p2.ql;
+-
+-import java.util.ArrayList;
+-import java.util.Iterator;
+-import org.eclipse.equinox.internal.p2.metadata.expression.EvaluationContext;
+-import org.eclipse.equinox.internal.p2.ql.expression.QLFactory;
+-import org.eclipse.equinox.internal.p2.ql.expression.QLUtil;
+-import org.eclipse.equinox.p2.metadata.expression.*;
+-import org.eclipse.equinox.p2.query.IMatchQuery;
+-import org.eclipse.equinox.p2.query.IQueryResult;
+-
+-/**
+- * An IQuery implementation that is based on the p2 query language.
+- */
+-public class QLMatchQuery<T> extends QLQuery<T> implements IMatchQuery<T> {
+-	private final IMatchExpression<T> expression;
+-	private IEvaluationContext context;
+-
+-	/**
+-	 * Creates a new query instance with indexed parameters.
+-	 * @param instanceClass The class used for filtering elements before calling {@link #isMatch(Object)} 
+-	 * @param expression The expression that represents the query.
+-	 */
+-	public QLMatchQuery(Class<T> instanceClass, IMatchExpression<T> expression) {
+-		super(instanceClass);
+-		this.expression = expression;
+-	}
+-
+-	/**
+-	 * Creates a new query instance with indexed parameters.
+-	 * @param instanceClass The class used for filtering elements before calling {@link #isMatch(Object)} 
+-	 * @param expression The expression that represents the query.
+-	 * @param parameters Parameters to use for the query.
+-	 */
+-	public QLMatchQuery(Class<T> instanceClass, String expression, Object... parameters) {
+-		this(instanceClass, ExpressionUtil.getFactory().<T> matchExpression(ExpressionUtil.getParser().parse(expression), parameters));
+-	}
+-
+-	/**
+-	 * Checks if the <code>candidate</code> object is an instance of the <code>elementClass</code>
+-	 * used by this query. If it is, the result calling {@link IMatchExpression#isMatch(IEvaluationContext, Object)}
+-	 * on the contained expression is returned.
+-	 * @param candidate The object to test
+-	 * @return <code>true</code> if <code>candidate</code> is an instance of the element class and the
+-	 * expression match test returns true.
+-	 */
+-	public boolean isMatch(T candidate) {
+-		return elementClass.isInstance(candidate) && expression.isMatch(context, candidate);
+-	}
+-
+-	public void postPerform() {
+-		context = null;
+-	}
+-
+-	public void prePerform() {
+-		//
+-	}
+-
+-	public IQueryResult<T> perform(Iterator<T> iterator) {
+-		if (QLUtil.needsTranslationSupport(expression)) {
+-			IQueryContext<T> queryContext = QL.newQueryContext(iterator);
+-			IExpression translations = QLFactory.TRANSLATIONS;
+-			context = EvaluationContext.create(expression.createContext(), translations);
+-			context.setValue(translations, queryContext.getTranslationSupport(getLocale()));
+-		} else
+-			context = expression.createContext();
+-
+-		prePerform();
+-		try {
+-			ArrayList<T> result = new ArrayList<T>();
+-			while (iterator.hasNext()) {
+-				T candidate = iterator.next();
+-				if (isMatch(candidate))
+-					result.add(candidate);
+-			}
+-			return new QueryResult<T>(result);
+-		} finally {
+-			postPerform();
+-		}
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/IUDescription.java b/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/IUDescription.java
+index d38685e..787da35 100644
+--- a/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/IUDescription.java
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/IUDescription.java
+@@ -126,7 +126,7 @@ public class IUDescription extends DataType {
+ 			return queries.get(0);
+ 
+ 		@SuppressWarnings("unchecked")
+-		IQuery<IInstallableUnit> query = new PipedQuery<IInstallableUnit>(queries.toArray(new IQuery[queries.size()]));
++		IQuery<IInstallableUnit> query = PipedQuery.createPipe(queries.toArray(new IQuery[queries.size()]));
+ 		return query;
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/AggregateQueryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/AggregateQueryTest.java
+index bea6a9c..d067dde 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/AggregateQueryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/AggregateQueryTest.java
+@@ -29,7 +29,7 @@ public class AggregateQueryTest extends TestCase {
+ 	}
+ 
+ 	public void testEmptyCompositeQuery() {
+-		PipedQuery query = new PipedQuery(new IQuery[0]);
++		IQuery query = PipedQuery.createPipe(new IQuery[0]);
+ 		query.perform(getABCDE().iterator());
+ 		// We should not throw an exception.  No guarantee on what perform
+ 		// will return in this case
+@@ -114,11 +114,11 @@ public class AggregateQueryTest extends TestCase {
+ 			}
+ 		};
+ 
+-		PipedQuery compoundQuery = new PipedQuery(getLatest, getAllBut3);
++		IQuery compoundQuery = PipedQuery.createPipe(getLatest, getAllBut3);
+ 		IQueryResult result = compoundQuery.perform(get123().iterator());
+ 		assertEquals(0, AbstractProvisioningTest.queryResultSize(result));
+ 
+-		compoundQuery = new PipedQuery(getAllBut3, getLatest);
++		compoundQuery = PipedQuery.createPipe(getAllBut3, getLatest);
+ 		result = compoundQuery.perform(get123().iterator());
+ 		assertEquals(1, AbstractProvisioningTest.queryResultSize(result));
+ 		assertEquals("2", result.iterator().next());
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/CompoundQueryableTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/CompoundQueryableTest.java
+index 0b324ca..766acce 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/CompoundQueryableTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/CompoundQueryableTest.java
+@@ -278,7 +278,7 @@ public class CompoundQueryableTest extends TestCase {
+ 		CompoundQueryable cQueryable1 = new CompoundQueryable(queryable3, queryable2);
+ 		CompoundQueryable cQueryable = new CompoundQueryable(cQueryable1, queryable1);
+ 		CompoundQueryTestProgressMonitor monitor = new CompoundQueryTestProgressMonitor();
+-		IQueryResult queryResult = cQueryable.query(new PipedQuery(contextQuery, greatestNumberQuery), monitor);
++		IQueryResult queryResult = cQueryable.query(PipedQuery.createPipe(contextQuery, greatestNumberQuery), monitor);
+ 		assertEquals("1.0", 1, AbstractProvisioningTest.queryResultSize(queryResult));
+ 		AbstractProvisioningTest.assertContains("1.2", queryResult, 12);
+ 		assertTrue("1.0", monitor.isDone());
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/QueryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/QueryTest.java
+index 4ae0081..3c787c3 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/QueryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/core/QueryTest.java
+@@ -154,7 +154,7 @@ public class QueryTest extends TestCase {
+ 		List items = Arrays.asList("red", "green", "blue");
+ 		PerformHookQuery query1 = new PerformHookQuery();
+ 		PerformHookQuery query2 = new PerformHookQuery();
+-		PipedQuery cQuery = new PipedQuery(query1, query2);
++		IQuery cQuery = PipedQuery.createPipe(query1, query2);
+ 		assertFalse("1.0", query1.isComplete());
+ 		assertFalse("1.1", query1.isPrepared());
+ 		assertFalse("1.2", query2.isComplete());
+@@ -195,7 +195,7 @@ public class QueryTest extends TestCase {
+ 		List items = Arrays.asList("red", new Object());
+ 		PerformHookQuery query1 = new PerformHookQuery();
+ 		PerformHookQuery query2 = new PerformHookQuery();
+-		PipedQuery cQuery = new PipedQuery(query1, query2);
++		IQuery cQuery = PipedQuery.createPipe(query1, query2);
+ 		assertFalse("1.0", query1.isComplete());
+ 		assertFalse("1.1", query1.isPrepared());
+ 		assertFalse("1.2", query2.isComplete());
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/EvaluatorTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/EvaluatorTest.java
+index 1379220..5765efc 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/EvaluatorTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/EvaluatorTest.java
+@@ -20,6 +20,7 @@ import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory;
+ import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.metadata.expression.*;
+ import org.eclipse.equinox.p2.metadata.expression.IContextExpression;
++import org.eclipse.equinox.p2.metadata.query.ExpressionQuery;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+ import org.eclipse.equinox.p2.publisher.PublisherInfo;
+ import org.eclipse.equinox.p2.publisher.PublisherResult;
+@@ -78,21 +79,21 @@ public class EvaluatorTest extends AbstractProvisioningTest {
+ 
+ 	public void testRange() throws Exception {
+ 		IMetadataRepository repo = getMDR("/testData/metadataRepo/multipleversions1");
+-		IQueryResult result = repo.query(new QLMatchQuery(IInstallableUnit.class, "version ~= $0", new VersionRange("2.0.0")), new NullProgressMonitor());
++		IQueryResult result = repo.query(new ExpressionQuery(IInstallableUnit.class, "version ~= $0", new VersionRange("2.0.0")), new NullProgressMonitor());
+ 		assertEquals(queryResultSize(result), 2);
+ 	}
+ 
+ 	public void testProperty() throws Exception {
+ 		IMetadataRepository repo = getMDR("/testData/metadataRepo/multipleversions1");
+ 
+-		IQueryResult result = repo.query(new QLMatchQuery(IInstallableUnit.class, "properties.exists(p | boolean(p.value))"), new NullProgressMonitor());
++		IQueryResult result = repo.query(new ExpressionQuery(IInstallableUnit.class, "properties.exists(p | boolean(p.value))"), new NullProgressMonitor());
+ 		assertEquals(queryResultSize(result), 3);
+ 
+-		result = repo.query(new QLMatchQuery(IInstallableUnit.class, "boolean(properties['org.eclipse.equinox.p2.type.group'])"), new NullProgressMonitor());
++		result = repo.query(new ExpressionQuery(IInstallableUnit.class, "boolean(properties['org.eclipse.equinox.p2.type.group'])"), new NullProgressMonitor());
+ 		assertEquals(queryResultSize(result), 3);
+ 
+ 		Filter filter = TestActivator.context.createFilter("(org.eclipse.equinox.p2.type.group=true)");
+-		result = repo.query(new QLMatchQuery(IInstallableUnit.class, "properties ~= $0", filter), new NullProgressMonitor());
++		result = repo.query(new ExpressionQuery(IInstallableUnit.class, "properties ~= $0", filter), new NullProgressMonitor());
+ 		assertEquals(queryResultSize(result), 3);
+ 	}
+ 
+@@ -132,14 +133,14 @@ public class EvaluatorTest extends AbstractProvisioningTest {
+ 		applicability[1][1] = MetadataFactory.createRequiredCapability("org.eclipse.equinox.p2.flavor", "tooling", null, null, false, false);
+ 
+ 		IMetadataRepository repo = getMDR("/testData/metadataRepo/wsdlTestRepo");
+-		IQueryResult result = repo.query(new QLMatchQuery(IInstallableUnit.class, "$0.exists(rcs | rcs.all(rc | this ~= rc))", (Object) applicability), new NullProgressMonitor());
++		IQueryResult result = repo.query(new ExpressionQuery(IInstallableUnit.class, "$0.exists(rcs | rcs.all(rc | this ~= rc))", (Object) applicability), new NullProgressMonitor());
+ 		assertEquals(queryResultSize(result), 3);
+ 	}
+ 
+ 	public void testPattern() throws Exception {
+ 		IProvidedCapability pc = MetadataFactory.createProvidedCapability("org.eclipse.equinox.p2.eclipse.type", "source", null);
+ 		IMetadataRepository repo = getMDR("/testData/metadataRepo/wsdlTestRepo");
+-		IQueryResult result = repo.query(new QLMatchQuery(IInstallableUnit.class, "id ~= /tooling.*.default/", pc), new NullProgressMonitor());
++		IQueryResult result = repo.query(new ExpressionQuery(IInstallableUnit.class, "id ~= /tooling.*.default/", pc), new NullProgressMonitor());
+ 		assertEquals(queryResultSize(result), 3);
+ 	}
+ 
+@@ -154,7 +155,7 @@ public class EvaluatorTest extends AbstractProvisioningTest {
+ 
+ 	public void testNot() throws Exception {
+ 		IMetadataRepository repo = getMDR("/testData/metadataRepo/wsdlTestRepo");
+-		IQueryResult result = repo.query(new QLMatchQuery(IInstallableUnit.class, "!(id ~= /tooling.*/)"), new NullProgressMonitor());
++		IQueryResult result = repo.query(new ExpressionQuery(IInstallableUnit.class, "!(id ~= /tooling.*/)"), new NullProgressMonitor());
+ 		assertEquals(queryResultSize(result), 4);
+ 	}
+ 
+@@ -165,13 +166,13 @@ public class EvaluatorTest extends AbstractProvisioningTest {
+ 		assertNotNull(artifactManager);
+ 
+ 		IArtifactRepository repo = artifactManager.loadRepository(artifactRepo, new NullProgressMonitor());
+-		IQueryResult result = repo.query(new QLMatchQuery(IArtifactKey.class, "classifier ~= /*/"), new NullProgressMonitor());
++		IQueryResult result = repo.query(new ExpressionQuery(IArtifactKey.class, "classifier ~= /*/"), new NullProgressMonitor());
+ 		assertTrue(queryResultSize(result) > 1);
+ 		Iterator itor = result.iterator();
+ 		while (itor.hasNext())
+ 			assertTrue(itor.next() instanceof IArtifactKey);
+ 
+-		result = repo.descriptorQueryable().query(new QLMatchQuery(IArtifactDescriptor.class, "artifactKey.classifier ~= /*/"), new NullProgressMonitor());
++		result = repo.descriptorQueryable().query(new ExpressionQuery(IArtifactDescriptor.class, "artifactKey.classifier ~= /*/"), new NullProgressMonitor());
+ 		assertTrue(queryResultSize(result) > 1);
+ 		itor = result.iterator();
+ 		while (itor.hasNext())
+@@ -266,7 +267,7 @@ public class EvaluatorTest extends AbstractProvisioningTest {
+ 				return "true".equals(((IInstallableUnit) candidate).getProperty("org.eclipse.equinox.p2.type.group"));
+ 			}
+ 		});
+-		IQueryResult result = repo.query(new QLMatchQuery(IInstallableUnit.class, expr), new NullProgressMonitor());
++		IQueryResult result = repo.query(new ExpressionQuery(IInstallableUnit.class, expr), new NullProgressMonitor());
+ 		assertEquals(queryResultSize(result), 497);
+ 	}
+ 
+@@ -357,7 +358,7 @@ public class EvaluatorTest extends AbstractProvisioningTest {
+ 		IQueryResult result = queryableArray.query(new InstallableUnitQuery("foo"), null);
+ 		assertEquals("2.1", 1, queryResultSize(result));
+ 
+-		QLMatchQuery lq = new QLMatchQuery(IInstallableUnit.class, "translations['org.eclipse.equinox.p2.name'] ~= /German*/");
++		QLContextQuery lq = new QLContextQuery<IInstallableUnit>(IInstallableUnit.class, "select(x | x.translations['org.eclipse.equinox.p2.name'] ~= /German*/)");
+ 		lq.setLocale(Locale.GERMAN);
+ 		Iterator itr = queryableArray.query(lq, new NullProgressMonitor()).iterator();
+ 		assertTrue(itr.hasNext());
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/PerformanceTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/PerformanceTest.java
+index 1744339..a37f1be 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/PerformanceTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/PerformanceTest.java
+@@ -20,7 +20,8 @@ import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory;
+ import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.metadata.query.ExpressionQuery;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+-import org.eclipse.equinox.p2.ql.*;
++import org.eclipse.equinox.p2.ql.QL;
++import org.eclipse.equinox.p2.ql.QLContextQuery;
+ import org.eclipse.equinox.p2.query.*;
+ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepository;
+ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepositoryManager;
+@@ -32,7 +33,7 @@ public class PerformanceTest extends AbstractProvisioningTest {
+ 		IMetadataRepository repo = getMDR("/testData/galileoM7");
+ 
+ 		IRequirement capability = MetadataFactory.createRequiredCapability("org.eclipse.equinox.p2.eclipse.type", "feature", new VersionRange("[1.0.0,2.0.0)"), null, false, false);
+-		QLMatchQuery predicateQuery = new QLMatchQuery(IInstallableUnit.class, "this ~= $0", capability);
++		ExpressionQuery predicateQuery = new ExpressionQuery(IInstallableUnit.class, "this ~= $0", capability);
+ 		IQuery capabilityQuery = new ExpressionQuery(IInstallableUnit.class, capability.getMatches());
+ 		IQueryResult result;
+ 		long tradQueryMS = 0;
+@@ -96,7 +97,7 @@ public class PerformanceTest extends AbstractProvisioningTest {
+ 		IMetadataRepository repo = getMDR("/testData/galileoM7");
+ 
+ 		IUPropertyQuery propertyQuery = new IUPropertyQuery("df_LT.providerName", "Eclipse.org");
+-		QLMatchQuery predicateQuery = new QLMatchQuery(IInstallableUnit.class, "properties[$0] == $1", "df_LT.providerName", "Eclipse.org");
++		ExpressionQuery predicateQuery = new ExpressionQuery(IInstallableUnit.class, "properties[$0] == $1", "df_LT.providerName", "Eclipse.org");
+ 		IQueryResult result;
+ 		long tradQueryMS = 0;
+ 		long exprQueryMS = 0;
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/TestQueryReimplementation.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/TestQueryReimplementation.java
+index 6010bee..6d7df7f 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/TestQueryReimplementation.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ql/TestQueryReimplementation.java
+@@ -13,14 +13,14 @@ package org.eclipse.equinox.p2.tests.ql;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory;
+ import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.metadata.expression.*;
+-import org.eclipse.equinox.p2.ql.QLMatchQuery;
++import org.eclipse.equinox.p2.metadata.query.ExpressionQuery;
+ import org.eclipse.equinox.p2.query.IQueryResult;
+ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepository;
+ import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+ 
+ public class TestQueryReimplementation extends AbstractProvisioningTest {
+ 
+-	public static class UpdateQuery extends QLMatchQuery {
++	public static class UpdateQuery extends ExpressionQuery {
+ 		private static final IExpression expr1;
+ 		private static final IExpression expr2;
+ 
+@@ -44,7 +44,7 @@ public class TestQueryReimplementation extends AbstractProvisioningTest {
+ 		}
+ 	}
+ 
+-	public static class IUPropertyQuery extends QLMatchQuery {
++	public static class IUPropertyQuery extends ExpressionQuery {
+ 		private static final IExpression expr = ExpressionUtil.getParser().parse("properties[$0] == $1");
+ 
+ 		public IUPropertyQuery(String propertyName, String propertyValue) {
+@@ -52,12 +52,12 @@ public class TestQueryReimplementation extends AbstractProvisioningTest {
+ 		}
+ 	}
+ 
+-	public static class InstallableUnitQuery extends QLMatchQuery {
++	public static class InstallableUnitQuery extends ExpressionQuery {
+ 		/**
+ 		 * A convenience query that will match any {@link IInstallableUnit}
+ 		 * it encounters.
+ 		 */
+-		public static final QLMatchQuery ANY = new QLMatchQuery(IInstallableUnit.class, "");
++		public static final ExpressionQuery ANY = new ExpressionQuery(IInstallableUnit.class, "");
+ 
+ 		private static final IExpression idVersionQuery;
+ 		private static final IExpression idRangeQuery;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/RepositoryLocationQuery.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/RepositoryLocationQuery.java
+index b05664b..fffecce 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/RepositoryLocationQuery.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/RepositoryLocationQuery.java
+@@ -13,6 +13,7 @@ package org.eclipse.equinox.internal.p2.ui;
+ 
+ import java.net.URI;
+ import java.util.Iterator;
++import org.eclipse.equinox.p2.metadata.expression.IExpression;
+ import org.eclipse.equinox.p2.query.*;
+ import org.eclipse.equinox.p2.repository.IRepository;
+ 
+@@ -45,4 +46,8 @@ public class RepositoryLocationQuery implements IQuery<URI> {
+ 			return ((IRepository<?>) o).getLocation();
+ 		return null;
+ 	}
++
++	public IExpression getExpression() {
++		return null;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/actions/ExistingIUInProfileAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/actions/ExistingIUInProfileAction.java
+index 6f2431b..dd761dd 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/actions/ExistingIUInProfileAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/actions/ExistingIUInProfileAction.java
+@@ -90,7 +90,7 @@ public abstract class ExistingIUInProfileAction extends ProfileModificationActio
+ 		int lock = getLock(profile, iu);
+ 		if ((lock & getLockConstant()) == getLockConstant())
+ 			return false;
+-		return !profile.query(new PipedQuery<IInstallableUnit>(new InstallableUnitQuery(iu), getPolicy().getVisibleInstalledIUQuery()), null).isEmpty();
++		return !profile.query(PipedQuery.createPipe(new InstallableUnitQuery(iu), getPolicy().getVisibleInstalledIUQuery()), null).isEmpty();
+ 	}
+ 
+ 	protected abstract int getLockConstant();
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/SiteXMLAction.java b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/SiteXMLAction.java
+index 03b3044..c433857 100644
+--- a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/SiteXMLAction.java
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/SiteXMLAction.java
+@@ -30,7 +30,6 @@ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+ import org.eclipse.equinox.p2.publisher.*;
+ import org.eclipse.equinox.p2.publisher.eclipse.URLEntry;
+ import org.eclipse.equinox.p2.ql.QLContextQuery;
+-import org.eclipse.equinox.p2.ql.QLMatchQuery;
+ import org.eclipse.equinox.p2.query.*;
+ import org.eclipse.equinox.p2.repository.IRepository;
+ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepository;
+@@ -174,7 +173,7 @@ public class SiteXMLAction extends AbstractPublisherAction {
+ 		} else if (type.equals("context")) { //$NON-NLS-1$
+ 			query = new QLContextQuery<IInstallableUnit>(IInstallableUnit.class, expression, params);
+ 		} else if (type.equals("match")) //$NON-NLS-1$
+-			query = new QLMatchQuery<IInstallableUnit>(IInstallableUnit.class, expression, params);
++			query = new ExpressionQuery<IInstallableUnit>(IInstallableUnit.class, expression, params);
+ 		if (query == null)
+ 			return CollectionUtils.emptyList();
+ 		IQueryResult<IInstallableUnit> queryResult = results.query(query, null);

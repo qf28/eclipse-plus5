@@ -1,0 +1,265 @@
+commit 2c8a1971c62dc48ffb2e146590810a3648f5c97c
+Author: Pascal Rapicault <prapicau>
+Date:   Thu May 29 21:54:29 2008 +0000
+
+    Bug 233201 / Bug 234518 - Some servers return a webpage instead of the requested file.
+
+21	18	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorRequest.java
+4	3	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+2	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/IArtifactDescriptor.java
+23	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/Messages.java
+43	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/ZipVerifierStep.java
+1	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/messages.properties
+7	2	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/Generator.java
+2	0	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepository.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorRequest.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorRequest.java
+index 03084c2..021f843 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorRequest.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorRequest.java
+@@ -90,22 +90,7 @@ public class MirrorRequest extends ArtifactRequest {
+ 			return;
+ 		}
+ 
+-		// Get the output stream to store the artifact
+-		// Since we are mirroring, ensure we clear out data from the original descriptor that may
+-		// not apply in the new repo location.
+-		// TODO this is brittle.  perhaps the repo itself should do this?  there are cases where
+-		// we really do need to give the repo the actual descriptor to use however...
+-		ArtifactDescriptor destinationDescriptor = new ArtifactDescriptor(getArtifactDescriptor());
+-		destinationDescriptor.setProcessingSteps(EMPTY_STEPS);
+-		destinationDescriptor.setProperty(IArtifactDescriptor.DOWNLOAD_MD5, null);
+-		//		destinationDescriptor.setProperty(IArtifactDescriptor.DOWNLOAD_SIZE, null);
+-
+-		if (targetDescriptorProperties != null)
+-			destinationDescriptor.addProperties(targetDescriptorProperties);
+-
+-		if (targetRepositoryProperties != null)
+-			destinationDescriptor.addRepositoryProperties(targetRepositoryProperties);
+-
++		ArtifactDescriptor destinationDescriptor = getDestinationDescriptor(descriptor);
+ 		IStatus status = transfer(destinationDescriptor, descriptor, monitor);
+ 		// if ok, cancelled or transfer has already been done with the canonical form return with status set 
+ 		if (status.getSeverity() == IStatus.CANCEL) {
+@@ -124,7 +109,25 @@ public class MirrorRequest extends ArtifactRequest {
+ 		// retry with canonical, first remove possibly erroneously added descriptor
+ 		if (target.contains(destinationDescriptor))
+ 			target.removeDescriptor(destinationDescriptor);
+-		setResult(transfer(destinationDescriptor, canonical, monitor));
++		setResult(transfer(getDestinationDescriptor(canonical), canonical, monitor));
++	}
++
++	private ArtifactDescriptor getDestinationDescriptor(IArtifactDescriptor sourceDescriptor) {
++		// Get the descriptor to use to store the artifact
++		// Since we are mirroring, ensure we clear out data from the original descriptor that may
++		// not apply in the new repo location.
++		// TODO this is brittle.  perhaps the repo itself should do this?  there are cases where
++		// we really do need to give the repo the actual descriptor to use however...
++		ArtifactDescriptor destinationDescriptor = new ArtifactDescriptor(sourceDescriptor);
++		destinationDescriptor.setProcessingSteps(EMPTY_STEPS);
++		destinationDescriptor.setProperty(IArtifactDescriptor.DOWNLOAD_MD5, null);
++		destinationDescriptor.setProperty(IArtifactDescriptor.DOWNLOAD_CONTENTTYPE, null);
++		destinationDescriptor.setProperty(IArtifactDescriptor.FORMAT, null);
++		if (targetDescriptorProperties != null)
++			destinationDescriptor.addProperties(targetDescriptorProperties);
++		if (targetRepositoryProperties != null)
++			destinationDescriptor.addRepositoryProperties(targetRepositoryProperties);
++		return destinationDescriptor;
+ 	}
+ 
+ 	private IStatus transfer(IArtifactDescriptor destinationDescriptor, IArtifactDescriptor sourceDescriptor, IProgressMonitor monitor) {
+@@ -137,7 +140,7 @@ public class MirrorRequest extends ArtifactRequest {
+ 
+ 		// Do the actual transfer
+ 		try {
+-			return getSourceRepository().getArtifact(descriptor, destination, monitor);
++			return getSourceRepository().getArtifact(sourceDescriptor, destination, monitor);
+ 		} finally {
+ 			try {
+ 				destination.close();
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+index c4a6c36..f7f0c1e 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+@@ -18,11 +18,11 @@ import java.util.jar.JarOutputStream;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.core.runtime.jobs.Job;
+ import org.eclipse.equinox.internal.p2.artifact.repository.*;
++import org.eclipse.equinox.internal.p2.artifact.repository.Messages;
+ import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.*;
+-import org.eclipse.equinox.internal.provisional.p2.artifact.repository.processing.ProcessingStep;
+-import org.eclipse.equinox.internal.provisional.p2.artifact.repository.processing.ProcessingStepHandler;
++import org.eclipse.equinox.internal.provisional.p2.artifact.repository.processing.*;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
+@@ -308,7 +308,8 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 
+ 	private OutputStream addPreSteps(ProcessingStepHandler handler, IArtifactDescriptor descriptor, OutputStream destination, IProgressMonitor monitor) {
+ 		ArrayList steps = new ArrayList();
+-		//		steps.add(new ZipVerifierStep());
++		if (IArtifactDescriptor.TYPE_ZIP.equals(descriptor.getProperty(IArtifactDescriptor.DOWNLOAD_CONTENTTYPE)))
++			steps.add(new ZipVerifierStep());
+ 		// Add steps here if needed
+ 		if (steps.isEmpty())
+ 			return destination;
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/IArtifactDescriptor.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/IArtifactDescriptor.java
+index 7debc65..8359506 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/IArtifactDescriptor.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/IArtifactDescriptor.java
+@@ -19,6 +19,8 @@ public interface IArtifactDescriptor {
+ 	public static final String DOWNLOAD_SIZE = "download.size"; //$NON-NLS-1$
+ 	public static final String ARTIFACT_SIZE = "artifact.size"; //$NON-NLS-1$
+ 	public static final String DOWNLOAD_MD5 = "download.md5"; //$NON-NLS-1$
++	public static final String DOWNLOAD_CONTENTTYPE = "download.contentType"; //$NON-NLS-1$
++	public static final String TYPE_ZIP = "application/zip"; //$NON-NLS-1$
+ 	public static final String ARTIFACT_MD5 = "artifact.md5"; //$NON-NLS-1$
+ 	public static final String FORMAT = "format"; //$NON-NLS-1$
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/Messages.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/Messages.java
+new file mode 100644
+index 0000000..e81dc26
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/Messages.java
+@@ -0,0 +1,23 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others. All rights reserved. This
++ * program and the accompanying materials are made available under the terms of
++ * the Eclipse Public License v1.0 which accompanies this distribution, and is
++ * available at http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors: IBM Corporation - initial API and implementation
++ ******************************************************************************/
++package org.eclipse.equinox.internal.provisional.p2.artifact.repository.processing;
++
++import org.eclipse.osgi.util.NLS;
++
++public class Messages extends NLS {
++	private static final String BUNDLE_NAME = "org.eclipse.equinox.internal.provisional.p2.artifact.repository.processing.messages"; //$NON-NLS-1$
++	public static String ZipVerifierStep_invalid_archive;
++	static {
++		// initialize resource bundle
++		NLS.initializeMessages(BUNDLE_NAME, Messages.class);
++	}
++
++	private Messages() {
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/ZipVerifierStep.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/ZipVerifierStep.java
+new file mode 100644
+index 0000000..a649b0c
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/ZipVerifierStep.java
+@@ -0,0 +1,43 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others. All rights reserved. This
++ * program and the accompanying materials are made available under the terms of
++ * the Eclipse Public License v1.0 which accompanies this distribution, and is
++ * available at http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors: IBM Corporation - initial API and implementation
++ ******************************************************************************/
++package org.eclipse.equinox.internal.provisional.p2.artifact.repository.processing;
++
++import java.io.IOException;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.Status;
++import org.eclipse.equinox.internal.p2.artifact.repository.Activator;
++
++public class ZipVerifierStep extends ProcessingStep {
++	static final int[] ZIP_HEADER = new int[] {0x50, 0x4b, 0x03, 0x04};
++
++	private int valid = 0; //-1 indicates that it is not a zip, >3 indicates that we are done the verification 
++
++	public void write(int b) throws IOException {
++		getDestination().write(b);
++		if (valid > 3)
++			return;
++		if (valid == -1) {
++			return;
++		}
++		if (b != ZIP_HEADER[valid++]) {
++			valid = -1;
++			setStatus(new Status(IStatus.ERROR, Activator.ID, Messages.ZipVerifierStep_invalid_archive));
++			return;
++		}
++	}
++
++	public void close() throws IOException {
++		if (valid > 3) {
++			setStatus(Status.OK_STATUS);
++		} else {
++			setStatus(new Status(IStatus.ERROR, Activator.ID, Messages.ZipVerifierStep_invalid_archive));
++		}
++		super.close();
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/messages.properties b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/messages.properties
+new file mode 100644
+index 0000000..5027daf
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/provisional/p2/artifact/repository/processing/messages.properties
+@@ -0,0 +1 @@
++ZipVerifierStep_invalid_archive=Downloaded stream not a valid archive. Check the server.
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/Generator.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/Generator.java
+index c215ef1..ed5ce1b 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/Generator.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/Generator.java
+@@ -20,8 +20,7 @@ import org.eclipse.equinox.internal.p2.metadata.generator.*;
+ import org.eclipse.equinox.internal.p2.metadata.generator.Messages;
+ import org.eclipse.equinox.internal.p2.metadata.generator.features.*;
+ import org.eclipse.equinox.internal.provisional.frameworkadmin.*;
+-import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactDescriptor;
+-import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepository;
++import org.eclipse.equinox.internal.provisional.p2.artifact.repository.*;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+@@ -365,6 +364,7 @@ public class Generator {
+ 
+ 						IArtifactKey key = MetadataGeneratorHelper.createBundleArtifactKey(bd.getSymbolicName(), bd.getVersion().toString());
+ 						IArtifactDescriptor ad = MetadataGeneratorHelper.createArtifactDescriptor(key, new File(bd.getLocation()), true, false);
++						((ArtifactDescriptor) ad).setProperty(IArtifactDescriptor.DOWNLOAD_CONTENTTYPE, IArtifactDescriptor.TYPE_ZIP);
+ 						File bundleFile = new File(bd.getLocation());
+ 						if (bundleFile.isDirectory())
+ 							publishArtifact(ad, bundleFile.listFiles(), destination, false);
+@@ -517,6 +517,10 @@ public class Generator {
+ 
+ 			if (bundle.getSymbolicName().equals(ORG_ECLIPSE_EQUINOX_LAUNCHER)) {
+ 				bundle = EclipseInstallGeneratorInfoProvider.createLauncher();
++			} else if (bundle.getSymbolicName().startsWith(ORG_ECLIPSE_EQUINOX_LAUNCHER + '.')) {
++				//launcher fragments will be handled by generateDefaultConfigIU(Set) for --launcher.library.
++				//they don't need to be started so skip them here to avoid having to merge config commands
++				continue;
+ 			}
+ 			if (bundle.getSymbolicName().equals(ORG_ECLIPSE_UPDATE_CONFIGURATOR)) {
+ 				bundle.setStartLevel(BundleInfo.NO_LEVEL);
+@@ -1216,6 +1220,7 @@ public class Generator {
+ 				tempFile = File.createTempFile("p2.generator", ""); //$NON-NLS-1$ //$NON-NLS-2$
+ 				FileUtils.zip(files, tempFile);
+ 				if (!destination.contains(descriptor)) {
++					destination.setProperty(IArtifactDescriptor.DOWNLOAD_CONTENTTYPE, IArtifactDescriptor.TYPE_ZIP);
+ 					OutputStream output = new BufferedOutputStream(destination.getOutputStream(descriptor));
+ 					FileUtils.copyStream(new BufferedInputStream(new FileInputStream(tempFile)), true, output, true);
+ 				}
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepository.java b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepository.java
+index 62fe110..6b66e66 100644
+--- a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepository.java
+@@ -77,6 +77,7 @@ public class UpdateSiteArtifactRepository extends AbstractRepository implements
+ 			ArtifactDescriptor featureArtifactDescriptor = new ArtifactDescriptor(featureKey);
+ 			URL featureURL = updateSite.getFeatureURL(feature.getId(), feature.getVersion());
+ 			featureArtifactDescriptor.setRepositoryProperty(PROP_ARTIFACT_REFERENCE, featureURL.toExternalForm());
++			featureArtifactDescriptor.setProperty(IArtifactDescriptor.DOWNLOAD_CONTENTTYPE, IArtifactDescriptor.TYPE_ZIP);
+ 			allSiteArtifacts.add(featureArtifactDescriptor);
+ 
+ 			FeatureEntry[] featureEntries = feature.getEntries();
+@@ -87,6 +88,7 @@ public class UpdateSiteArtifactRepository extends AbstractRepository implements
+ 					ArtifactDescriptor artifactDescriptor = new ArtifactDescriptor(key);
+ 					URL pluginURL = updateSite.getPluginURL(entry);
+ 					artifactDescriptor.setRepositoryProperty(PROP_ARTIFACT_REFERENCE, pluginURL.toExternalForm());
++					artifactDescriptor.setProperty(IArtifactDescriptor.DOWNLOAD_CONTENTTYPE, IArtifactDescriptor.TYPE_ZIP);
+ 					allSiteArtifacts.add(artifactDescriptor);
+ 				}
+ 			}

@@ -1,0 +1,616 @@
+commit bd535e161ae51275db712332d0a58b89c143219a
+Author: Susan Franklin <sfranklin>
+Date:   Wed Feb 27 18:01:00 2008 +0000
+
+    Bug 211102 - [repo] [ui] IMetadataRepositoryManager URL validation
+
+5	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/ProvisionException.java
+1	0	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
+32	0	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+1	0	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/messages.properties
+26	0	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/p2/metadata/repository/IMetadataRepositoryManager.java
+26	0	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
+31	11	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+34	0	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/Messages.java
+5	0	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/messages.properties
+27	32	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepository.java
+65	5	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepositoryFactory.java
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/ProvisionException.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/ProvisionException.java
+index fcdd274..9eb14b0 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/ProvisionException.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/ProvisionException.java
+@@ -66,6 +66,11 @@ public class ProvisionException extends CoreException {
+ 	 * made to create or access a repository of unknown type.
+ 	 */
+ 	public static final int REPOSITORY_UNKNOWN_TYPE = 1005;
++	/** 
++	 * Status code constant (value 1006) indicating that a specified
++	 * repository location is not valid.
++	 */
++	public static final int REPOSITORY_INVALID_LOCATION = 1006;
+ 
+ 	//Metadata repository codes [1100-1199]
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
+index 88fcee9..40f0fd0 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
+@@ -35,5 +35,6 @@ public class Messages extends NLS {
+ 	public static String repoMan_internalError;
+ 	public static String repoMan_notExists;
+ 	public static String repoMan_unknownType;
++	public static String repoMan_invalidLocation;
+ 
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+index ebbcc55..61d4f1a 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+@@ -154,6 +154,9 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 			case ProvisionException.REPOSITORY_NOT_FOUND :
+ 				msg = NLS.bind(Messages.repoMan_notExists, location);
+ 				break;
++			case ProvisionException.REPOSITORY_INVALID_LOCATION :
++				msg = NLS.bind(Messages.repoMan_invalidLocation, location);
++				break;
+ 		}
+ 		if (msg == null)
+ 			msg = Messages.repoMan_internalError;
+@@ -293,6 +296,35 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		return null;//will never get here
+ 	}
+ 
++	public IStatus validateRepositoryLocation(URL location, IProgressMonitor monitor) {
++		Assert.isNotNull(location);
++		IMetadataRepository result = getRepository(location);
++		if (result != null)
++			return Status.OK_STATUS;
++		String[] suffixes = getAllSuffixes();
++		SubMonitor sub = SubMonitor.convert(monitor, Messages.REPO_LOADING, suffixes.length * 100);
++		IStatus status = new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, NLS.bind(Messages.repoMan_notExists, location.toExternalForm()), null);
++		for (int i = 0; i < suffixes.length; i++) {
++			SubMonitor loopMonitor = sub.newChild(100);
++			IExtension[] providers = findMatchingRepositoryExtensions(suffixes[i]);
++			// Loop over the candidates and return the first one that successfully loads
++			monitor.beginTask("", providers.length * 10); //$NON-NLS-1$
++			for (int j = 0; j < providers.length; j++) {
++				IMetadataRepositoryFactory factory = (IMetadataRepositoryFactory) createExecutableExtension(providers[j], FACTORY);
++				if (factory != null) {
++					status = factory.validate(location, loopMonitor.newChild(10));
++					if (status.isOK()) {
++						sub.done();
++						return status;
++					}
++				}
++			}
++
++		}
++		sub.done();
++		return status;
++	}
++
+ 	/**
+ 	 * Try to load a pre-existing repo at the given location
+ 	 */
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/messages.properties b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/messages.properties
+index 62eefac..7542e54 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/messages.properties
+@@ -24,3 +24,4 @@ repoMan_failedRead=The repository could not be read: {0}
+ repoMan_internalError=Internal error
+ repoMan_notExists=No repository found at {0}
+ repoMan_unknownType=Unknown repository type at {0}
++repoMan_invalidLocation={0} is not a valid repository location
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/p2/metadata/repository/IMetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/p2/metadata/repository/IMetadataRepositoryManager.java
+index 7abf72d..0233ace 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/p2/metadata/repository/IMetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/p2/metadata/repository/IMetadataRepositoryManager.java
+@@ -12,6 +12,7 @@ package org.eclipse.equinox.internal.provisional.p2.metadata.repository;
+ 
+ import java.net.URL;
+ import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+ import org.eclipse.equinox.internal.provisional.p2.query.IQueryable;
+@@ -112,6 +113,31 @@ public interface IMetadataRepositoryManager extends IQueryable {
+ 	public IMetadataRepository loadRepository(URL location, IProgressMonitor monitor) throws ProvisionException;
+ 
+ 	/**
++	 * Validates a given URL and returns a status indicating whether a valid repository is likely
++	 * to be found at the given URL.  Callers must assume that the validity of a 
++	 * repository location cannot be completely determined until an attempt to load 
++	 * the repository is made.  Implementors should make all attempts to validate
++	 * the URL without actually loading the repository.  The computation for this 
++	 * method must be signficantly faster than that of loading the repository.
++	 * Early detectable error conditions, such as the inexistence of the location,
++	 * or an inability to read the location, should be determined in this method.
++	 * 
++	 * @param location The location of the repository to validate
++	 * @param monitor a progress monitor, or <code>null</code> if progress
++	 *    reporting is not desired
++	 * @return A status indicating whether a valid repository is likely located at the
++	 * location.  A status with severity <code>OK</code> indicates that the repository is
++	 * likely to be loadable, or that as much validation as could be done was done.
++	 * Reasons for a non-OK status include:
++	 * <ul>
++	 * <li>The specified location is not a valid repository location.</li>
++	 * <li>There is no existing repository at that location.</li>
++	 * <li>The repository at that location could not be read.</li>
++	 * </ul>
++	 */
++	public IStatus validateRepositoryLocation(URL location, IProgressMonitor monitor);
++
++	/**
+ 	 * Removes the metadata repository at the given location from the list of
+ 	 * metadata repositories tracked by the repository manager.  The underlying
+ 	 * repository is not deleted.
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/IMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
+index ec3230e..896127c 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
+@@ -12,6 +12,7 @@ package org.eclipse.equinox.internal.provisional.spi.p2.metadata.repository;
+ 
+ import java.net.URL;
+ import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+ 
+@@ -47,4 +48,29 @@ public interface IMetadataRepositoryFactory {
+ 	 * </ul>
+ 	 */
+ 	public IMetadataRepository load(URL location, IProgressMonitor monitor) throws ProvisionException;
++
++	/**
++	 * Validates a candidate repository URL and returns a status indicating the
++	 * likelihood of a valid repository being located at the location.  Callers must assume
++	 * that the validity of a repository location cannot be completely determined until an 
++	 * attempt to load the repository is made.  Implementors should make all attempts to
++	 * validate the URL that can be made without actually loading the repository.  
++	 * The computation for this method must be signficantly faster than that of loading the
++	 * repository.  Early detectable error conditions, such as the inexistence of the
++	 * location, or an inability to read the location, should be determined in this method.
++	 * 
++	 * @param location The location of the repository to validate
++	 * @param monitor a progress monitor, or <code>null</code> if progress
++	 *    reporting is not desired
++	 * @return A status indicating whether a valid repository is likely located at the
++	 * location.  A status with severity <code>OK</code> indicates that the repository is
++	 * likely to be loadable, or that as much validation as could be done was done.
++	 * Reasons for a non-OK status include:
++	 * <ul>
++	 * <li>The specified location is not a valid repository location.</li>
++	 * <li>There is no existing repository at that location.</li>
++	 * <li>The repository at that location could not be read.</li>
++	 * </ul>
++	 */
++	public IStatus validate(URL location, IProgressMonitor monitor);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/SimpleMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+index cdc5ce8..1fc6ce1 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+@@ -95,12 +95,29 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 		return localFile;
+ 	}
+ 
++	/*
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.provisional.spi.p2.metadata.repository.IMetadataRepositoryFactory#validate(java.net.URL, org.eclipse.core.runtime.IProgressMonitor)
++	 */
++	public IStatus validate(URL location, IProgressMonitor monitor) {
++		try {
++			validateAndLoad(location, false, monitor);
++		} catch (ProvisionException e) {
++			return e.getStatus();
++		}
++		return Status.OK_STATUS;
++	}
++
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.spi.p2.metadata.repository.IMetadataRepositoryFactory#load(java.net.URL, org.eclipse.core.runtime.IProgressMonitor)
+ 	 */
+ 	public IMetadataRepository load(URL location, IProgressMonitor monitor) throws ProvisionException {
++		return validateAndLoad(location, true, monitor);
++	}
++
++	protected IMetadataRepository validateAndLoad(URL location, boolean doLoad, IProgressMonitor monitor) throws ProvisionException {
+ 		long time = 0;
+-		final String debugMsg = "Restoring metadata repository "; //$NON-NLS-1$
++		final String debugMsg = "Validating and loading metadata repository "; //$NON-NLS-1$
+ 		if (Tracing.DEBUG_METADATA_PARSING) {
+ 			Tracing.debug(debugMsg + location);
+ 			time = -System.currentTimeMillis();
+@@ -125,17 +142,19 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 				}
+ 				//parse the repository descriptor file
+ 				sub.setWorkRemaining(100);
+-				InputStream descriptorStream = jarStream != null ? jarStream : inStream;
+-				IMetadataRepository result = new MetadataRepositoryIO().read(localFile.toURL(), descriptorStream, sub.newChild(100));
+-				if (result instanceof LocalMetadataRepository)
+-					((LocalMetadataRepository) result).initializeAfterLoad(location);
+-				if (result instanceof URLMetadataRepository)
+-					((URLMetadataRepository) result).initializeAfterLoad(location);
+-				if (Tracing.DEBUG_METADATA_PARSING) {
+-					time += System.currentTimeMillis();
+-					Tracing.debug(debugMsg + "time (ms): " + time); //$NON-NLS-1$ 
++				if (doLoad) {
++					InputStream descriptorStream = jarStream != null ? jarStream : inStream;
++					IMetadataRepository result = new MetadataRepositoryIO().read(localFile.toURL(), descriptorStream, sub.newChild(100));
++					if (result instanceof LocalMetadataRepository)
++						((LocalMetadataRepository) result).initializeAfterLoad(location);
++					if (result instanceof URLMetadataRepository)
++						((URLMetadataRepository) result).initializeAfterLoad(location);
++					if (Tracing.DEBUG_METADATA_PARSING) {
++						time += System.currentTimeMillis();
++						Tracing.debug(debugMsg + "time (ms): " + time); //$NON-NLS-1$ 
++					}
++					return result;
+ 				}
+-				return result;
+ 			} finally {
+ 				safeClose(jarStream);
+ 				safeClose(inStream);
+@@ -150,6 +169,7 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 			if (monitor != null)
+ 				monitor.done();
+ 		}
++		return null;
+ 	}
+ 
+ 	/**
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/Messages.java b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/Messages.java
+new file mode 100644
+index 0000000..dc94592
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/Messages.java
+@@ -0,0 +1,34 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ ******************************************************************************/
++
++package org.eclipse.equinox.internal.p2.updatesite;
++
++import org.eclipse.osgi.util.NLS;
++
++/**
++ * @since 3.4
++ *
++ */
++public class Messages extends NLS {
++	private static final String BUNDLE_NAME = "org.eclipse.equinox.internal.p2.updatesite.messages"; //$NON-NLS-1$
++	public static String UpdateSiteMetadataRepository_ErrorParsingUpdateSite;
++	public static String UpdateSiteMetadataRepository_ErrorReadingUpdateSite;
++	public static String UpdateSiteMetadataRepository_PlatformAdminNotRegistered;
++	public static String UpdateSiteMetadataRepositoryFactory_ErrorReadingSite;
++	public static String UpdateSiteMetadataRepositoryFactory_InvalidRepositoryLocation;
++	static {
++		// initialize resource bundle
++		NLS.initializeMessages(BUNDLE_NAME, Messages.class);
++	}
++
++	private Messages() {
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/messages.properties b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/messages.properties
+new file mode 100644
+index 0000000..a72f5d0
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/messages.properties
+@@ -0,0 +1,5 @@
++UpdateSiteMetadataRepository_ErrorParsingUpdateSite=Error parsing update site at {0}
++UpdateSiteMetadataRepository_ErrorReadingUpdateSite=Error reading update site at {0}
++UpdateSiteMetadataRepository_PlatformAdminNotRegistered=PlatformAdmin not registered.
++UpdateSiteMetadataRepositoryFactory_ErrorReadingSite=Error reading update site at {0}
++UpdateSiteMetadataRepositoryFactory_InvalidRepositoryLocation=Invalid repository location {0}
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepository.java b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepository.java
+index c8f700b..8cc8c77 100644
+--- a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepository.java
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepository.java
+@@ -14,11 +14,12 @@ import java.io.*;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+-import java.util.zip.*;
+-import org.eclipse.core.runtime.IProgressMonitor;
++import java.util.zip.Checksum;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
+ import org.eclipse.equinox.internal.p2.metadata.generator.features.*;
+ import org.eclipse.equinox.internal.p2.updatesite.Activator;
++import org.eclipse.equinox.internal.p2.updatesite.Messages;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
+@@ -30,6 +31,7 @@ import org.eclipse.equinox.internal.provisional.p2.query.Query;
+ import org.eclipse.equinox.internal.provisional.spi.p2.core.repository.AbstractRepository;
+ import org.eclipse.equinox.internal.provisional.spi.p2.metadata.repository.SimpleMetadataRepositoryFactory;
+ import org.eclipse.osgi.service.resolver.*;
++import org.eclipse.osgi.util.NLS;
+ import org.osgi.framework.BundleContext;
+ import org.osgi.framework.ServiceReference;
+ import org.xml.sax.SAXException;
+@@ -37,32 +39,25 @@ import org.xml.sax.SAXException;
+ public class UpdateSiteMetadataRepository extends AbstractRepository implements IMetadataRepository {
+ 
+ 	private final IMetadataRepository metadataRepository;
++	private static final String FEATURE_VERSION_SEPARATOR = "_"; //$NON-NLS-1$
++	private static final String JAR_EXTENSION = ".jar"; //$NON-NLS-1$
++	private static final String FEATURE_DIR = "features/"; //$NON-NLS-1$
++	private static final String FEATURE_TEMP_FILE = "feature"; //$NON-NLS-1$
++	private static final String PROP_SITE_CHECKSUM = "site.checksum"; //$NON-NLS-1$
+ 
+-	public UpdateSiteMetadataRepository(URL location) throws ProvisionException {
++	public UpdateSiteMetadataRepository(URL location, URL localRepositoryURL, InputStream is, Checksum checksum) throws ProvisionException {
+ 		super("update site: " + location.toExternalForm(), null, null, location, null, null);
+ 		BundleContext context = Activator.getBundleContext();
+ 
+-		URL localRepositoryURL = null;
+-		try {
+-			String stateDirName = Integer.toString(location.toExternalForm().hashCode());
+-			File bundleData = context.getDataFile(null);
+-			File stateDir = new File(bundleData, stateDirName);
+-			localRepositoryURL = stateDir.toURL();
+-		} catch (MalformedURLException e) {
+-			// TODO Auto-generated catch block
+-			e.printStackTrace();
+-		}
+ 		metadataRepository = initializeMetadataRepository(context, localRepositoryURL, "update site implementation - " + location.toExternalForm());
+ 
+ 		try {
+ 			DefaultSiteParser siteParser = new DefaultSiteParser();
+ 			long start = System.currentTimeMillis();
+-			Checksum checksum = new CRC32();
+-			InputStream is = new CheckedInputStream(new BufferedInputStream(location.openStream()), checksum);
+ 			SiteModel siteModel = siteParser.parse(is);
+-			System.out.println("Time Fetching Metadata Site " + location + " was: " + (System.currentTimeMillis() - start) + " ms");
++			System.out.println("Time Fetching Metadata Site " + location + " was: " + (System.currentTimeMillis() - start) + " ms"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+ 
+-			String savedChecksum = (String) metadataRepository.getProperties().get("site.checksum");
++			String savedChecksum = (String) metadataRepository.getProperties().get(PROP_SITE_CHECKSUM);
+ 			String checksumString = Long.toString(checksum.getValue());
+ 			if (savedChecksum != null && savedChecksum.equals(checksumString))
+ 				return;
+@@ -79,7 +74,7 @@ public class UpdateSiteMetadataRepository extends AbstractRepository implements
+ 			Map featureKeyToCategoryNames = new HashMap();
+ 			for (int i = 0; i < siteFeatures.length; i++) {
+ 				SiteFeature siteFeature = siteFeatures[i];
+-				String featureKey = siteFeature.getFeatureIdentifier() + "_" + siteFeature.getFeatureVersion();
++				String featureKey = siteFeature.getFeatureIdentifier() + FEATURE_VERSION_SEPARATOR + siteFeature.getFeatureVersion();
+ 				featureKeyToCategoryNames.put(featureKey, siteFeature.getCategoryNames());
+ 			}
+ 
+@@ -114,7 +109,7 @@ public class UpdateSiteMetadataRepository extends AbstractRepository implements
+ 				IInstallableUnit featureIU = MetadataGeneratorHelper.createFeatureJarIU(feature, false);
+ 				IInstallableUnit groupIU = MetadataGeneratorHelper.createGroupIU(feature, featureIU);
+ 
+-				String featureKey = feature.getId() + "_" + feature.getVersion();
++				String featureKey = feature.getId() + FEATURE_VERSION_SEPARATOR + feature.getVersion();
+ 				String[] categoryNames = (String[]) featureKeyToCategoryNames.get(featureKey);
+ 				if (categoryNames != null) {
+ 					for (int j = 0; j < categoryNames.length; j++) {
+@@ -137,15 +132,15 @@ public class UpdateSiteMetadataRepository extends AbstractRepository implements
+ 
+ 			IInstallableUnit[] ius = (IInstallableUnit[]) allSiteIUs.toArray(new IInstallableUnit[allSiteIUs.size()]);
+ 			metadataRepository.addInstallableUnits(ius);
+-			metadataRepository.setProperty("site.checksum", checksumString);
+-			System.out.println("Time Fetching Metadata Site and Features for " + location + " was: " + (System.currentTimeMillis() - start) + " ms");
++			metadataRepository.setProperty(PROP_SITE_CHECKSUM, checksumString);
++			System.out.println("Time Fetching Metadata Site and Features for " + location + " was: " + (System.currentTimeMillis() - start) + " ms"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+ 
+-		} catch (IOException e) {
+-			// TODO Auto-generated catch block
+-			e.printStackTrace();
+ 		} catch (SAXException e) {
+-			// TODO Auto-generated catch block
+-			e.printStackTrace();
++			String msg = NLS.bind(Messages.UpdateSiteMetadataRepository_ErrorParsingUpdateSite, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_READ, msg, e));
++		} catch (IOException e) {
++			String msg = NLS.bind(Messages.UpdateSiteMetadataRepository_ErrorReadingUpdateSite, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_READ, msg, e));
+ 		}
+ 	}
+ 
+@@ -173,7 +168,7 @@ public class UpdateSiteMetadataRepository extends AbstractRepository implements
+ 		Map featuresMap = new HashMap();
+ 		for (int i = 0; i < siteFeatures.length; i++) {
+ 			SiteFeature siteFeature = siteFeatures[i];
+-			String key = siteFeature.getFeatureIdentifier() + "_" + siteFeature.getFeatureVersion();
++			String key = siteFeature.getFeatureIdentifier() + FEATURE_VERSION_SEPARATOR + siteFeature.getFeatureVersion();
+ 			if (featuresMap.containsKey(key))
+ 				continue;
+ 
+@@ -200,12 +195,12 @@ public class UpdateSiteMetadataRepository extends AbstractRepository implements
+ 			if (entry.isRequires() || entry.isPlugin())
+ 				continue;
+ 
+-			String key = entry.getId() + "_" + entry.getVersion();
++			String key = entry.getId() + FEATURE_VERSION_SEPARATOR + entry.getVersion();
+ 			if (featuresMap.containsKey(key))
+ 				continue;
+ 
+ 			try {
+-				URL featureURL = new URL(location, "features/" + entry.getId() + "_" + entry.getVersion() + ".jar");
++				URL featureURL = new URL(location, FEATURE_DIR + entry.getId() + FEATURE_VERSION_SEPARATOR + entry.getVersion() + JAR_EXTENSION);
+ 				Feature includedFeature = parseFeature(featureParser, featureURL);
+ 				featuresMap.put(key, includedFeature);
+ 				loadIncludedFeatures(includedFeature, featureParser, featuresMap);
+@@ -221,7 +216,7 @@ public class UpdateSiteMetadataRepository extends AbstractRepository implements
+ 
+ 	private Feature parseFeature(FeatureParser featureParser, URL featureURL) throws IOException, FileNotFoundException {
+ 
+-		File featureFile = File.createTempFile("feature", ".jar");
++		File featureFile = File.createTempFile(FEATURE_TEMP_FILE, JAR_EXTENSION);
+ 		try {
+ 			FileUtils.copyStream(featureURL.openStream(), false, new BufferedOutputStream(new FileOutputStream(featureFile)), true);
+ 			Feature feature = featureParser.parse(featureFile);
+@@ -245,10 +240,10 @@ public class UpdateSiteMetadataRepository extends AbstractRepository implements
+ 
+ 		ServiceReference reference = context.getServiceReference(PlatformAdmin.class.getName());
+ 		if (reference == null)
+-			throw new IllegalStateException("PlatformAdmin not registered.");
++			throw new IllegalStateException(Messages.UpdateSiteMetadataRepository_PlatformAdminNotRegistered);
+ 		PlatformAdmin platformAdmin = (PlatformAdmin) context.getService(reference);
+ 		if (platformAdmin == null)
+-			throw new IllegalStateException("PlatformAdmin not registered.");
++			throw new IllegalStateException(Messages.UpdateSiteMetadataRepository_PlatformAdminNotRegistered);
+ 
+ 		try {
+ 			StateObjectFactory stateObjectFactory = platformAdmin.getFactory();
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepositoryFactory.java
+index d182627..5fc204c 100644
+--- a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepositoryFactory.java
+@@ -10,21 +10,81 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.updatesite.metadata;
+ 
++import java.io.*;
++import java.net.MalformedURLException;
+ import java.net.URL;
+-import org.eclipse.core.runtime.IProgressMonitor;
++import java.util.zip.*;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.updatesite.Activator;
++import org.eclipse.equinox.internal.p2.updatesite.Messages;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.internal.provisional.spi.p2.metadata.repository.IMetadataRepositoryFactory;
++import org.eclipse.osgi.util.NLS;
+ 
+ public class UpdateSiteMetadataRepositoryFactory implements IMetadataRepositoryFactory {
+ 
+-	public IMetadataRepository create(URL location, String name, String type) throws ProvisionException {
++	public IMetadataRepository create(URL location, String name, String type) {
+ 		return null;
+ 	}
+ 
++	private IMetadataRepository validateAndLoad(URL location, IProgressMonitor monitor, boolean doLoad) throws ProvisionException {
++		if (!location.getPath().endsWith("site.xml")) { //$NON-NLS-1$
++			String msg = NLS.bind(Messages.UpdateSiteMetadataRepositoryFactory_InvalidRepositoryLocation, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_INVALID_LOCATION, msg, null));
++		}
++		URL localRepositoryURL = null;
++		InputStream is = null;
++		Checksum checksum = new CRC32();
++
++		try {
++			String stateDirName = Integer.toString(location.toExternalForm().hashCode());
++			File bundleData = Activator.getBundleContext().getDataFile(null);
++			File stateDir = new File(bundleData, stateDirName);
++			localRepositoryURL = stateDir.toURL();
++			is = new CheckedInputStream(new BufferedInputStream(location.openStream()), checksum);
++
++			if (doLoad)
++				return new UpdateSiteMetadataRepository(location, localRepositoryURL, is, checksum);
++		} catch (MalformedURLException e) {
++			String msg = NLS.bind(Messages.UpdateSiteMetadataRepositoryFactory_InvalidRepositoryLocation, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_INVALID_LOCATION, msg, e));
++		} catch (IOException e) {
++			String msg = NLS.bind(Messages.UpdateSiteMetadataRepositoryFactory_ErrorReadingSite, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_READ, msg, e));
++		} finally {
++			safeClose(is);
++		}
++		return null;
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.provisional.spi.p2.metadata.repository.IMetadataRepositoryFactory#validate(java.net.URL, org.eclipse.core.runtime.IProgressMonitor)
++	 */
++	public IStatus validate(URL location, IProgressMonitor monitor) {
++		try {
++			validateAndLoad(location, monitor, false);
++		} catch (ProvisionException e) {
++			return e.getStatus();
++		}
++		return Status.OK_STATUS;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.provisional.spi.p2.metadata.repository.IMetadataRepositoryFactory#load(java.net.URL, org.eclipse.core.runtime.IProgressMonitor)
++	 */
+ 	public IMetadataRepository load(URL location, IProgressMonitor monitor) throws ProvisionException {
+-		if (!location.getPath().endsWith("site.xml")) //$NON-NLS-1$
+-			return null;
+-		return new UpdateSiteMetadataRepository(location);
++		return validateAndLoad(location, monitor, true);
++	}
++
++	private void safeClose(InputStream stream) {
++		if (stream == null)
++			return;
++		try {
++			stream.close();
++		} catch (IOException e) {
++			//ignore
++		}
+ 	}
+ }
+commit c0c50072d8ea36322cd57c1f8d9326dc2e285690
+Author: John Arthorne <johna>
+Date:   Thu Mar 6 21:49:01 2008 +0000
+
+    Bug 211102 [repo] [ui] IMetadataRepositoryManager URL validation
+
+1	5	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/p2/metadata/repository/IMetadataRepositoryManager.java
+7	8	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/p2/metadata/repository/IMetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/p2/metadata/repository/IMetadataRepositoryManager.java
+index 545ecbd..4e1dedb 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/p2/metadata/repository/IMetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/p2/metadata/repository/IMetadataRepositoryManager.java
+@@ -164,11 +164,7 @@ public interface IMetadataRepositoryManager extends IQueryable {
+ 	 * Validates a given URL and returns a status indicating whether a valid repository is likely
+ 	 * to be found at the given URL.  Callers must assume that the validity of a 
+ 	 * repository location cannot be completely determined until an attempt to load 
+-	 * the repository is made.  Implementors should make all attempts to validate
+-	 * the URL without actually loading the repository.  The computation for this 
+-	 * method must be significantly faster than that of loading the repository.
+-	 * Early detectable error conditions, such as the non-existence of the location,
+-	 * or an inability to read the location, should be determined in this method.
++	 * the repository is made.  
+ 	 * 
+ 	 * @param location The location of the repository to validate
+ 	 * @param monitor a progress monitor, or <code>null</code> if progress
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/IMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
+index 896127c..e23d1ed 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/provisional/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
+@@ -51,20 +51,19 @@ public interface IMetadataRepositoryFactory {
+ 
+ 	/**
+ 	 * Validates a candidate repository URL and returns a status indicating the
+-	 * likelihood of a valid repository being located at the location.  Callers must assume
+-	 * that the validity of a repository location cannot be completely determined until an 
+-	 * attempt to load the repository is made.  Implementors should make all attempts to
+-	 * validate the URL that can be made without actually loading the repository.  
+-	 * The computation for this method must be signficantly faster than that of loading the
+-	 * repository.  Early detectable error conditions, such as the inexistence of the
+-	 * location, or an inability to read the location, should be determined in this method.
++	 * likelihood of a valid repository being located at the location.  Implementors 
++	 * should make all attempts to validate the URL that can be made without 
++	 * actually loading the repository.  The computation for this method must be 
++	 * significantly faster than loading the repository.  Early detectable error 
++	 * conditions, such as the non-existence of the location, or an inability to read 
++	 * the location, should be determined in this method.
+ 	 * 
+ 	 * @param location The location of the repository to validate
+ 	 * @param monitor a progress monitor, or <code>null</code> if progress
+ 	 *    reporting is not desired
+ 	 * @return A status indicating whether a valid repository is likely located at the
+ 	 * location.  A status with severity <code>OK</code> indicates that the repository is
+-	 * likely to be loadable, or that as much validation as could be done was done.
++	 * likely to be loadable, or that as much validation as could be done was successful.
+ 	 * Reasons for a non-OK status include:
+ 	 * <ul>
+ 	 * <li>The specified location is not a valid repository location.</li>

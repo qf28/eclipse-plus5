@@ -1,0 +1,742 @@
+commit 2382903d523e8107d8ced048a61b925ed1fbb620
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Aug 3 22:04:12 2017 +0200
+
+    Bug 519444: [9] Add --add-exports support in IDE
+    
+    
+    Change-Id: I0e72435e29a38bf615ea76dd9e2159039767dc67
+
+127	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+23	1	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+51	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 20b58b9..bfa1c2a 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -4549,6 +4549,133 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			deleteProject("mod.two");
+ 		}
+ 	}
++	public void testAddExports() throws CoreException {
++		if (!isJRE9) return;
++		try {
++			String[] sources = new String[] {
++					"src/module-info.java",
++					"module morg.astro {\n" +
++//					"	exports org.astro to com.greetings;\n" + // this export will be added via add-exports
++					"}",
++					"src/org/astro/World.java",
++					"package org.astro;\n" +
++					"public interface World {\n" +
++					"	public String name();\n" +
++					"}"
++			};
++			IJavaProject p1 = setupModuleProject("morg.astro", sources);
++			IClasspathAttribute modAttr = new ClasspathAttribute("module", "true");
++			IClasspathAttribute addExports = new ClasspathAttribute(IClasspathAttribute.ADD_EXPORTS, "morg.astro/org.astro=com.greetings");
++			IClasspathEntry dep = JavaCore.newProjectEntry(p1.getPath(), null, false,
++															new IClasspathAttribute[] {modAttr, addExports},
++															false/*not exported*/);
++			String[] src = new String[] {
++					"src/module-info.java",
++					"module com.greetings {\n" +
++					"	requires morg.astro;\n" +
++					"	exports com.greetings;\n" +
++					"}",
++					"src/com/greetings/MyWorld.java",
++					"package com.greetings;\n" +
++					"import org.astro.World;\n" +
++					"public class MyWorld implements World {\n" +
++					"	public String name() {\n" +
++					"		return \" My World!!\";\n" +
++					"	}\n" +
++					"}"
++			};
++			IJavaProject p2 = setupModuleProject("com.greetings", src, new IClasspathEntry[] { dep });
++			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers",	"",  markers);
++		} finally {
++			deleteProject("morg.astro");
++			deleteProject("com.greetings");
++		}
++	}
++	public void testAddReads() throws CoreException, IOException {
++		if (!isJRE9) return;
++		try {
++			// org.astro defines the "real" org.astro.World:
++			String[] sources = new String[] {
++					"src/module-info.java",
++					"module org.astro {\n" +
++					"	exports org.astro;\n" + 
++					"}",
++					"src/org/astro/World.java",
++					"package org.astro;\n" +
++					"public interface World {\n" +
++					"	public String name();\n" +
++					"}"
++			};
++			IJavaProject p = setupModuleProject("org.astro", sources);
++
++			// build mod.one with a private copy of org.astro.World:
++			String[] src1 = new String[] {
++					"src/module-info.java",
++					"module mod.one {\n" +
++					"	exports one.p;\n" +
++					"}\n",
++					"src/org/astro/World.java",
++					"package org.astro;\n" +
++					"public interface World { public String name(); }\n",
++					"src/one/p/C.java",
++					"package one.p;\n" +
++					"public class C {\n" +
++					"	public void test(org.astro.World w) {\n" +
++					"		System.out.println(w.name());\n" +
++					"	}\n" +
++					"}\n"
++			};
++			IClasspathAttribute modAttr = new ClasspathAttribute("module", "true");
++			IClasspathEntry dep = JavaCore.newProjectEntry(p.getPath(), null, false,
++															new IClasspathAttribute[] { modAttr },
++															false/*not exported*/);
++			IJavaProject p1 = setupModuleProject("mod.one", src1, new IClasspathEntry[] { dep });
++			p1.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = p1.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers",	"",  markers);
++
++			// jar-up without the private copy:
++			deleteFile("/mod.one/src/org/astro/World.java");
++			deleteFile("/mod.one/bin/org/astro/World.class");
++			String modOneJarPath = getWorkspacePath()+File.separator+"mod.one.jar";
++			Util.zip(new File(getWorkspacePath()+"/mod.one/bin"), modOneJarPath);
++
++			// com.greetings depends on both other modules:
++			String[] src2 = new String[] {
++				"src/module-info.java",
++				"module com.greetings {\n" +
++				"	requires org.astro;\n" +
++				"	requires mod.one;\n" +
++				"}",
++				"src/com/greetings/MyTest.java",
++				"package com.greetings;\n" +
++				"public class MyTest {\n" +
++				"	public void test(one.p.C c, org.astro.World w) {\n" +
++				"		c.test(w);\n" +
++				"	}\n" +
++				"}"
++			};
++			IClasspathEntry dep1 = JavaCore.newProjectEntry(p.getPath(), null, false,
++															new IClasspathAttribute[] {new ClasspathAttribute("module", "true")},
++															false/*not exported*/);
++			// need to re-wire dependency mod.one -> org.astro for resolving one.p.C:
++			IClasspathEntry dep2 = JavaCore.newLibraryEntry(new Path(modOneJarPath), null, null, null,
++															new IClasspathAttribute[] {
++																	new ClasspathAttribute("module", "true"),
++																	new ClasspathAttribute(IClasspathAttribute.ADD_READS, "mod.one=org.astro")
++															},
++															false/*not exported*/);
++			IJavaProject p2 = setupModuleProject("com.greetings", src2, new IClasspathEntry[] { dep1, dep2 });
++			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.INCREMENTAL_BUILD, null);
++			markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers",	"",  markers);
++		} finally {
++			deleteProject("org.astro");
++			deleteProject("com.greetings");
++		}
++	}
+ 	protected void assertNoErrors() throws CoreException {
+ 		for (IProject p : getWorkspace().getRoot().getProjects()) {
+ 			int maxSeverity = p.findMaxProblemSeverity(null, true, IResource.DEPTH_INFINITE);
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+index 3da4369..51ed24e 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2005, 2016 IBM Corporation and others.
++ * Copyright (c) 2005, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -129,6 +129,28 @@ public interface IClasspathAttribute {
+ 	String AUTOMATIC_MODULE = "module"; //$NON-NLS-1$
+ 
+ 	/**
++	 * Constant for the name of the add_exports attribute.
++	 * 
++	 * <p>The value of this attribute must adhere to the syntax of <code>javac's</code>
++	 * {@code --add-exports} command line option: {@code <source-module>/<package>=<target-module>(,<target-module>)*}.
++	 * The given exports will be added at compile time.</p>
++	 * 
++	 * @since 3.13 BETA_JAVA9
++	 */
++	String ADD_EXPORTS = "add-exports"; //$NON-NLS-1$
++
++	/**
++	 * Constant for the name of the add_exports attribute.
++	 * 
++	 * <p>The value of this attribute must adhere to the syntax of <code>javac's</code>
++	 * {@code --add-reads} command line option: {@code <source-module>=<target-module>}.
++	 * The given reads edge will be added at compile time.</p>
++	 * 
++	 * @since 3.13 BETA_JAVA9
++	 */
++	String ADD_READS = "add-reads"; //$NON-NLS-1$
++
++	/**
+ 	 * Constant for the name of the external annotation path attribute. 
+ 	 * 
+ 	 * <p>The value for this attribute has to be the string representation of a path.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+index bda7661..55b612b 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+@@ -27,8 +27,11 @@ import org.eclipse.jdt.core.*;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.env.*;
++import org.eclipse.jdt.internal.compiler.env.IUpdatableModule.UpdateKind;
++import org.eclipse.jdt.internal.compiler.env.IUpdatableModule.UpdatesByKind;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.lookup.AutoModule;
++import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.compiler.util.SimpleSet;
+@@ -38,6 +41,7 @@ import org.eclipse.jdt.internal.core.*;
+ 
+ import java.io.*;
+ import java.util.*;
++import java.util.function.Consumer;
+ import java.util.stream.Collectors;
+ 
+ @SuppressWarnings({"rawtypes", "unchecked"})
+@@ -51,6 +55,8 @@ BuildNotifier notifier;
+ 
+ SimpleSet initialTypeNames; // assumed that each name is of the form "a/b/ClassName", or, if a module is given: "my.mod:a/b/ClassName"
+ SimpleLookupTable additionalUnits;
++/** Tasks resulting from add-reads or add-exports classpath attributes. */
++Map<String,UpdatesByKind> moduleUpdates = new HashMap<>();
+ 
+ NameEnvironment(IWorkspaceRoot root, JavaProject javaProject, SimpleLookupTable binaryLocationsPerProject, BuildNotifier notifier) throws CoreException {
+ 	this.isIncrementalBuild = false;
+@@ -124,6 +130,33 @@ private void computeClasspathLocations(
+ 		if (target == null) continue nextEntry;
+ 		boolean isOnModulePath = entry.isAutomaticModule();
+ 
++		for (IClasspathAttribute attribute : entry.getExtraAttributes()) {
++			String attributeName = attribute.getName();
++			if (attributeName.equals(IClasspathAttribute.ADD_EXPORTS)) {
++				String value = attribute.getValue(); // format: <source-module>/<package>=<target-module>(,<target-module>)*
++				int slash = value.indexOf('/');
++				int equals = value.indexOf('=');
++				if (slash != -1 && equals != -1) {
++					String modName = value.substring(0, slash);
++					char[] packName = value.substring(slash+1, equals).toCharArray();
++					char[][] targets = CharOperation.splitOn(',', value.substring(equals+1).toCharArray());
++					addModuleUpdate(modName, m -> m.addExports(packName, targets), UpdateKind.PACKAGE);
++				} else {
++					org.eclipse.jdt.internal.core.util.Util.log(IStatus.WARNING, "Invalid argument to add-exports: "+value); //$NON-NLS-1$
++				}
++			} else if (attributeName.equals(IClasspathAttribute.ADD_READS)) {
++				String value = attribute.getValue(); // format: <source-module>=<target-module>
++				int equals = value.indexOf('=');
++				if (equals != -1) {
++					String srcMod = value.substring(0, equals);
++					char[] targetMod = value.substring(equals+1).toCharArray();
++					addModuleUpdate(srcMod, m -> m.addReads(targetMod), UpdateKind.MODULE);
++				} else {
++					org.eclipse.jdt.internal.core.util.Util.log(IStatus.WARNING, "Invalid argument to add-reads: "+value); //$NON-NLS-1$
++				}
++			}
++		}
++
+ 		switch(entry.getEntryKind()) {
+ 			case IClasspathEntry.CPE_SOURCE :
+ 				if (!(target instanceof IContainer)) continue nextEntry;
+@@ -609,4 +642,22 @@ public IModule[] getAllAutomaticModules() {
+ 			.collect(Collectors.toSet());
+ 	return set.toArray(new IModule[set.size()]);
+ }
++void addModuleUpdate(String moduleName, Consumer<IUpdatableModule> update, UpdateKind kind) {
++	UpdatesByKind updates = this.moduleUpdates.get(moduleName);
++	if (updates == null) {
++		this.moduleUpdates.put(moduleName, updates = new UpdatesByKind());
++	}
++	updates.getList(kind, true).add(update);
++}
++@Override
++public void applyModuleUpdates(IUpdatableModule compilerModule, IUpdatableModule.UpdateKind kind) {
++	char[] name = compilerModule.name();
++	if (name != ModuleBinding.UNNAMED) { // can't update the unnamed module
++		UpdatesByKind updates = this.moduleUpdates.get(String.valueOf(name));
++		if (updates != null) {
++			for (Consumer<IUpdatableModule> update : updates.getList(kind, false))
++				update.accept(compilerModule);
++		}
++	}
++}
+ }
+commit 8af65b1cffd9d89bcc44847f7f1f3b58a5b432e5
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Aug 5 14:52:36 2017 +0200
+
+    Bug 519444: [9] Add --add-exports support in IDE
+    - integrate with reconciler (SearchableNameEnvironment), too
+    - refactoring & documentation
+    
+    Change-Id: I2ef79502d10792255ec9b311b87dbff8a27db435
+
+11	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+5	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleAwareNameEnvironment.java
+6	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IUpdatableModule.java
+95	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
+15	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+6	46	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index bfa1c2a..357ba89 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -4671,6 +4671,17 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.INCREMENTAL_BUILD, null);
+ 			markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
+ 			assertMarkers("Unexpected markers",	"",  markers);
++
++			// check that reconcile respects --add-reads, too:
++			this.problemRequestor.reset();
++			ICompilationUnit cu = getCompilationUnit("/com.greetings/src/com/greetings/MyTest.java");
++			cu.getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++				"Unexpected problems",
++				"----------\n" +
++				"----------\n",
++				this.problemRequestor);
++
+ 		} finally {
+ 			deleteProject("org.astro");
+ 			deleteProject("com.greetings");
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleAwareNameEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleAwareNameEnvironment.java
+index e692682..cbddb7c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleAwareNameEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleAwareNameEnvironment.java
+@@ -119,5 +119,10 @@ public interface IModuleAwareNameEnvironment extends INameEnvironment {
+ 	IModule getModule(char[] moduleName);
+ 	IModule[] getAllAutomaticModules();
+ 
++	/**
++	 * Ask the name environment to perform any updates (add-exports or add-reads) to the given module.
++	 * @param module the compiler representation of the module to updates
++	 * @param kind selects what kind of updates should be performed
++	 */
+ 	default void applyModuleUpdates(IUpdatableModule module, IUpdatableModule.UpdateKind kind) { /* default: do nothing */ }
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IUpdatableModule.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IUpdatableModule.java
+index a055a3b..e4a6ca7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IUpdatableModule.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IUpdatableModule.java
+@@ -21,10 +21,14 @@ import java.util.function.Consumer;
+ 
+ /**
+  * Interface to a module as needed to implement the updates for {@code --add-reads}
+- * and {@code --add-exports} command line options.
++ * and {@code --add-exports} command line options (or corresponding classpath attributes).
+  */
+ public interface IUpdatableModule {
+-	
++
++	/**
++	 * The compiler first wires modules only, before then wiring packages based on the module graph.
++	 * This enum selects one of these phases when asking the environment to perform its updates.
++	 */
+ 	enum UpdateKind { MODULE, PACKAGE }
+ 
+ 	/** Structure for update operations, sorted by {@link UpdateKind}. */
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
+new file mode 100644
+index 0000000..4275879
+--- /dev/null
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
+@@ -0,0 +1,95 @@
++/*******************************************************************************
++ * Copyright (c) 2017 GK Software AG, and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
++ * Contributors:
++ *     Stephan Herrmann - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core;
++
++import java.util.HashMap;
++import java.util.Map;
++import java.util.function.Consumer;
++
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.jdt.core.IClasspathAttribute;
++import org.eclipse.jdt.core.IClasspathEntry;
++import org.eclipse.jdt.core.compiler.CharOperation;
++import org.eclipse.jdt.internal.compiler.env.IModuleAwareNameEnvironment;
++import org.eclipse.jdt.internal.compiler.env.IUpdatableModule;
++import org.eclipse.jdt.internal.compiler.env.IUpdatableModule.UpdateKind;
++import org.eclipse.jdt.internal.compiler.env.IUpdatableModule.UpdatesByKind;
++import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
++import org.eclipse.jdt.internal.core.util.Util;
++
++/**
++ * An instance of this class collects add-exports and add-reads options from a project's
++ * class path entries, and performs the corresponding updates when requested by the compiler.
++ */
++public class ModuleUpdater {
++
++	private Map<String,UpdatesByKind> moduleUpdates = new HashMap<>();
++
++	/**
++	 * Detects any ADD_EXPORTS or ADD_READS classpath attributes, parses the value,
++	 * and collects the resulting module updates.
++	 * @param entry a classpath entry of the current project.
++	 */
++	public void computeModuleUpdates(IClasspathEntry entry) {
++		for (IClasspathAttribute attribute : entry.getExtraAttributes()) {
++			String attributeName = attribute.getName();
++			if (attributeName.equals(IClasspathAttribute.ADD_EXPORTS)) {
++				String value = attribute.getValue(); // format: <source-module>/<package>=<target-module>(,<target-module>)*
++				int slash = value.indexOf('/');
++				int equals = value.indexOf('=');
++				if (slash != -1 && equals != -1) {
++					String modName = value.substring(0, slash);
++					char[] packName = value.substring(slash+1, equals).toCharArray();
++					char[][] targets = CharOperation.splitOn(',', value.substring(equals+1).toCharArray());
++					addModuleUpdate(modName, m -> m.addExports(packName, targets), UpdateKind.PACKAGE);
++				} else {
++					Util.log(IStatus.WARNING, "Invalid argument to add-exports: "+value); //$NON-NLS-1$
++				}
++			} else if (attributeName.equals(IClasspathAttribute.ADD_READS)) {
++				String value = attribute.getValue(); // format: <source-module>=<target-module>
++				int equals = value.indexOf('=');
++				if (equals != -1) {
++					String srcMod = value.substring(0, equals);
++					char[] targetMod = value.substring(equals+1).toCharArray();
++					addModuleUpdate(srcMod, m -> m.addReads(targetMod), UpdateKind.MODULE);
++				} else {
++					Util.log(IStatus.WARNING, "Invalid argument to add-reads: "+value); //$NON-NLS-1$
++				}
++			}
++		}
++	}
++
++	private void addModuleUpdate(String moduleName, Consumer<IUpdatableModule> update, UpdateKind kind) {
++		UpdatesByKind updates = this.moduleUpdates.get(moduleName);
++		if (updates == null) {
++			this.moduleUpdates.put(moduleName, updates = new UpdatesByKind());
++		}
++		updates.getList(kind, true).add(update);
++	}
++
++	/**
++	 * @see IModuleAwareNameEnvironment#applyModuleUpdates(IUpdatableModule, UpdateKind)
++	 */
++	public void applyModuleUpdates(IUpdatableModule compilerModule, UpdateKind kind) {
++		char[] name = compilerModule.name();
++		if (name != ModuleBinding.UNNAMED) { // can't update the unnamed module
++			UpdatesByKind updates = this.moduleUpdates.get(String.valueOf(name));
++			if (updates != null) {
++				for (Consumer<IUpdatableModule> update : updates.getList(kind, false))
++					update.accept(compilerModule);
++			}
++		}
++	}
++}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+index 227be17..027978c 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+@@ -32,7 +32,9 @@ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.IModuleAwareNameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.ISourceType;
++import org.eclipse.jdt.internal.compiler.env.IUpdatableModule;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
++import org.eclipse.jdt.internal.compiler.env.IUpdatableModule.UpdateKind;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+@@ -63,6 +65,8 @@ public class SearchableEnvironment
+ 	// moduleName -> IJavaProject | IJavaPackageFragmentRoot (lazily populated)
+ 	private Map<String,IJavaElement> knownModuleLocations; // null indicates: not using JPMS
+ 
++	private ModuleUpdater moduleUpdater;
++
+ 	/**
+ 	 * Creates a SearchableEnvironment on the given project
+ 	 */
+@@ -81,6 +85,11 @@ public class SearchableEnvironment
+ 				}
+ 			}
+ 		}
++		if (CompilerOptions.versionToJdkLevel(project.getOption(JavaCore.COMPILER_COMPLIANCE, true)) >= ClassFileConstants.JDK9) {
++			this.moduleUpdater = new ModuleUpdater();
++			for (IClasspathEntry entry : project.getRawClasspath())
++				this.moduleUpdater.computeModuleUpdates(entry);
++		}
+ 	}
+ 
+ 	/**
+@@ -915,4 +924,10 @@ public class SearchableEnvironment
+ 	public IModule[] getAllAutomaticModules() {
+ 		return new IModule[0];
+ 	}
++
++	@Override
++	public void applyModuleUpdates(IUpdatableModule module, UpdateKind kind) {
++		if (this.moduleUpdater != null)
++			this.moduleUpdater.applyModuleUpdates(module, kind);
++	}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+index 55b612b..eeaf55b 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+@@ -27,11 +27,8 @@ import org.eclipse.jdt.core.*;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.env.*;
+-import org.eclipse.jdt.internal.compiler.env.IUpdatableModule.UpdateKind;
+-import org.eclipse.jdt.internal.compiler.env.IUpdatableModule.UpdatesByKind;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.lookup.AutoModule;
+-import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.compiler.util.SimpleSet;
+@@ -41,7 +38,6 @@ import org.eclipse.jdt.internal.core.*;
+ 
+ import java.io.*;
+ import java.util.*;
+-import java.util.function.Consumer;
+ import java.util.stream.Collectors;
+ 
+ @SuppressWarnings({"rawtypes", "unchecked"})
+@@ -56,7 +52,7 @@ BuildNotifier notifier;
+ SimpleSet initialTypeNames; // assumed that each name is of the form "a/b/ClassName", or, if a module is given: "my.mod:a/b/ClassName"
+ SimpleLookupTable additionalUnits;
+ /** Tasks resulting from add-reads or add-exports classpath attributes. */
+-Map<String,UpdatesByKind> moduleUpdates = new HashMap<>();
++ModuleUpdater moduleUpdater;
+ 
+ NameEnvironment(IWorkspaceRoot root, JavaProject javaProject, SimpleLookupTable binaryLocationsPerProject, BuildNotifier notifier) throws CoreException {
+ 	this.isIncrementalBuild = false;
+@@ -119,6 +115,7 @@ private void computeClasspathLocations(
+ 	Map<String, IModulePathEntry> moduleEntries = null;
+ 	if (CompilerOptions.versionToJdkLevel(javaProject.getOption(JavaCore.COMPILER_COMPLIANCE, true)) >= ClassFileConstants.JDK9) {
+ 		moduleEntries = new HashMap<>(classpathEntries.length);
++		this.moduleUpdater = new ModuleUpdater();
+ 	}
+ 	IModuleDescription mod = null;
+ 	
+@@ -130,32 +127,8 @@ private void computeClasspathLocations(
+ 		if (target == null) continue nextEntry;
+ 		boolean isOnModulePath = entry.isAutomaticModule();
+ 
+-		for (IClasspathAttribute attribute : entry.getExtraAttributes()) {
+-			String attributeName = attribute.getName();
+-			if (attributeName.equals(IClasspathAttribute.ADD_EXPORTS)) {
+-				String value = attribute.getValue(); // format: <source-module>/<package>=<target-module>(,<target-module>)*
+-				int slash = value.indexOf('/');
+-				int equals = value.indexOf('=');
+-				if (slash != -1 && equals != -1) {
+-					String modName = value.substring(0, slash);
+-					char[] packName = value.substring(slash+1, equals).toCharArray();
+-					char[][] targets = CharOperation.splitOn(',', value.substring(equals+1).toCharArray());
+-					addModuleUpdate(modName, m -> m.addExports(packName, targets), UpdateKind.PACKAGE);
+-				} else {
+-					org.eclipse.jdt.internal.core.util.Util.log(IStatus.WARNING, "Invalid argument to add-exports: "+value); //$NON-NLS-1$
+-				}
+-			} else if (attributeName.equals(IClasspathAttribute.ADD_READS)) {
+-				String value = attribute.getValue(); // format: <source-module>=<target-module>
+-				int equals = value.indexOf('=');
+-				if (equals != -1) {
+-					String srcMod = value.substring(0, equals);
+-					char[] targetMod = value.substring(equals+1).toCharArray();
+-					addModuleUpdate(srcMod, m -> m.addReads(targetMod), UpdateKind.MODULE);
+-				} else {
+-					org.eclipse.jdt.internal.core.util.Util.log(IStatus.WARNING, "Invalid argument to add-reads: "+value); //$NON-NLS-1$
+-				}
+-			}
+-		}
++		if (this.moduleUpdater != null)
++			this.moduleUpdater.computeModuleUpdates(entry);
+ 
+ 		switch(entry.getEntryKind()) {
+ 			case IClasspathEntry.CPE_SOURCE :
+@@ -642,22 +615,9 @@ public IModule[] getAllAutomaticModules() {
+ 			.collect(Collectors.toSet());
+ 	return set.toArray(new IModule[set.size()]);
+ }
+-void addModuleUpdate(String moduleName, Consumer<IUpdatableModule> update, UpdateKind kind) {
+-	UpdatesByKind updates = this.moduleUpdates.get(moduleName);
+-	if (updates == null) {
+-		this.moduleUpdates.put(moduleName, updates = new UpdatesByKind());
+-	}
+-	updates.getList(kind, true).add(update);
+-}
+ @Override
+ public void applyModuleUpdates(IUpdatableModule compilerModule, IUpdatableModule.UpdateKind kind) {
+-	char[] name = compilerModule.name();
+-	if (name != ModuleBinding.UNNAMED) { // can't update the unnamed module
+-		UpdatesByKind updates = this.moduleUpdates.get(String.valueOf(name));
+-		if (updates != null) {
+-			for (Consumer<IUpdatableModule> update : updates.getList(kind, false))
+-				update.accept(compilerModule);
+-		}
+-	}
++	if (this.moduleUpdater != null)
++		this.moduleUpdater.applyModuleUpdates(compilerModule, kind);
+ }
+ }
+commit 10dd02010dd61fe266fb956c77e9e4e93f61367c
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Aug 26 21:31:56 2017 +0200
+
+    Bug 519444: [9] Add --add-exports support in IDE
+    
+    - support multiple add-eports per classpath attribute
+    
+    Change-Id: Ie33ce52fc2a073005e9d4e284dd43a753bc59d43
+
+50	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+2	0	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaProject.java
+21	18	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 4aa7f6f..f9d670f 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -4597,6 +4597,56 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			deleteProject("com.greetings");
+ 		}
+ 	}
++	public void testAddExports2() throws CoreException {
++		if (!isJRE9) return;
++		try {
++			String[] sources = new String[] {
++					"src/module-info.java",
++					"module morg.astro {\n" +
++//					"	exports org.astro to com.greetings;\n" + // this export will be added via add-exports
++//					"	exports org.eclipse to com.greetings;\n" + // this export will be added via add-exports
++					"}",
++					"src/org/astro/World.java",
++					"package org.astro;\n" +
++					"public interface World {\n" +
++					"	public String name();\n" +
++					"}",
++					"src/org/eclipse/Planet.java",
++					"package org.eclipse;\n" +
++					"public class Planet {}\n"
++			};
++			IJavaProject p1 = setupModuleProject("morg.astro", sources);
++			IClasspathAttribute modAttr = new ClasspathAttribute("module", "true");
++			IClasspathAttribute addExports = new ClasspathAttribute(IClasspathAttribute.ADD_EXPORTS,
++						"morg.astro/org.astro=com.greetings:morg.astro/org.eclipse=com.greetings");
++			IClasspathEntry dep = JavaCore.newProjectEntry(p1.getPath(), null, false,
++															new IClasspathAttribute[] {modAttr, addExports},
++															false/*not exported*/);
++			String[] src = new String[] {
++					"src/module-info.java",
++					"module com.greetings {\n" +
++					"	requires morg.astro;\n" +
++					"	exports com.greetings;\n" +
++					"}",
++					"src/com/greetings/MyWorld.java",
++					"package com.greetings;\n" +
++					"import org.astro.World;\n" +
++					"public class MyWorld implements World {\n" +
++					"	org.eclipse.Planet planet;\n" +
++					"	public String name() {\n" +
++					"		return \" My World!!\";\n" +
++					"	}\n" +
++					"}"
++			};
++			IJavaProject p2 = setupModuleProject("com.greetings", src, new IClasspathEntry[] { dep });
++			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers",	"",  markers);
++		} finally {
++			deleteProject("morg.astro");
++			deleteProject("com.greetings");
++		}
++	}
+ 	public void testAddReads() throws CoreException, IOException {
+ 		if (!isJRE9) return;
+ 		try {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaProject.java
+index 5d78a43..aa8f7d3 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaProject.java
+@@ -601,6 +601,8 @@ public interface IJavaProject extends IParent, IJavaElement, IOpenable {
+ 	 * valid Java module descriptor.
+ 	 * 
+ 	 * @return the <code>IModule</code> this project represents.
++	 * @exception JavaModelException if this element does not exist or if an
++	 *		exception occurs while accessing its corresponding resource
+ 	 * @since 3.13 BETA_JAVA9
+ 	 */
+ 	IModuleDescription getModuleDescription() throws JavaModelException;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
+index 4275879..900a849 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleUpdater.java
+@@ -45,27 +45,30 @@ public class ModuleUpdater {
+ 	public void computeModuleUpdates(IClasspathEntry entry) {
+ 		for (IClasspathAttribute attribute : entry.getExtraAttributes()) {
+ 			String attributeName = attribute.getName();
++			String values = attribute.getValue(); // the attributes considered here may have multiple values separated by ':'
+ 			if (attributeName.equals(IClasspathAttribute.ADD_EXPORTS)) {
+-				String value = attribute.getValue(); // format: <source-module>/<package>=<target-module>(,<target-module>)*
+-				int slash = value.indexOf('/');
+-				int equals = value.indexOf('=');
+-				if (slash != -1 && equals != -1) {
+-					String modName = value.substring(0, slash);
+-					char[] packName = value.substring(slash+1, equals).toCharArray();
+-					char[][] targets = CharOperation.splitOn(',', value.substring(equals+1).toCharArray());
+-					addModuleUpdate(modName, m -> m.addExports(packName, targets), UpdateKind.PACKAGE);
+-				} else {
+-					Util.log(IStatus.WARNING, "Invalid argument to add-exports: "+value); //$NON-NLS-1$
++				for (String value : values.split(":")) { // format: <source-module>/<package>=<target-module>(,<target-module>)* //$NON-NLS-1$
++					int slash = value.indexOf('/');
++					int equals = value.indexOf('=');
++					if (slash != -1 && equals != -1) {
++						String modName = value.substring(0, slash);
++						char[] packName = value.substring(slash+1, equals).toCharArray();
++						char[][] targets = CharOperation.splitOn(',', value.substring(equals+1).toCharArray());
++						addModuleUpdate(modName, m -> m.addExports(packName, targets), UpdateKind.PACKAGE);
++					} else {
++						Util.log(IStatus.WARNING, "Invalid argument to add-exports: "+value); //$NON-NLS-1$
++					}
+ 				}
+ 			} else if (attributeName.equals(IClasspathAttribute.ADD_READS)) {
+-				String value = attribute.getValue(); // format: <source-module>=<target-module>
+-				int equals = value.indexOf('=');
+-				if (equals != -1) {
+-					String srcMod = value.substring(0, equals);
+-					char[] targetMod = value.substring(equals+1).toCharArray();
+-					addModuleUpdate(srcMod, m -> m.addReads(targetMod), UpdateKind.MODULE);
+-				} else {
+-					Util.log(IStatus.WARNING, "Invalid argument to add-reads: "+value); //$NON-NLS-1$
++				for (String value : values.split(":")) { // format: <source-module>=<target-module> //$NON-NLS-1$
++					int equals = value.indexOf('=');
++					if (equals != -1) {
++						String srcMod = value.substring(0, equals);
++						char[] targetMod = value.substring(equals+1).toCharArray();
++						addModuleUpdate(srcMod, m -> m.addReads(targetMod), UpdateKind.MODULE);
++					} else {
++						Util.log(IStatus.WARNING, "Invalid argument to add-reads: "+value); //$NON-NLS-1$
++					}
+ 				}
+ 			}
+ 		}

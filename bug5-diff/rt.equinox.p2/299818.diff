@@ -1,0 +1,341 @@
+commit 187dd473bda839f352a947ae27b87edcf66e3e6b
+Author: Susan Franklin <sfranklin>
+Date:   Thu Apr 22 00:55:13 2010 +0000
+
+    Bug 299818 -  [ui] Uninstall should not contact the external world
+
+37	11	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/PlannerResolutionJob.java
+2	2	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/SearchForUpdatesResolutionJob.java
+13	2	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/InstallOperation.java
+15	3	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/ProfileChangeOperation.java
+14	0	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/UninstallOperation.java
+1	1	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/UpdateOperation.java
+1	0	bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/operations/AllTests.java
+51	0	bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/operations/UninstallTest.java
+5	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/AvailableIUsPage.java
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/PlannerResolutionJob.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/PlannerResolutionJob.java
+index c8cd61c..823534e 100644
+--- a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/PlannerResolutionJob.java
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/PlannerResolutionJob.java
+@@ -29,20 +29,21 @@ public class PlannerResolutionJob extends ProvisioningJob implements IProfileCha
+ 	IProvisioningPlan plan;
+ 	MultiStatus additionalStatus;
+ 	ResolutionResult report;
+-	ProvisioningContext provisioningContext;
++	ProvisioningContext firstPass, secondPass, successful;
+ 
+ 	public static MultiStatus getProfileChangeRequestAlteredStatus() {
+ 		return PlanAnalyzer.getProfileChangeAlteredStatus();
+ 	}
+ 
+-	public PlannerResolutionJob(String label, ProvisioningSession session, String profileId, ProfileChangeRequest request, ProvisioningContext provisioningContext, MultiStatus additionalStatus) {
++	public PlannerResolutionJob(String label, ProvisioningSession session, String profileId, ProfileChangeRequest request, ProvisioningContext firstPass, ProvisioningContext secondPass, MultiStatus additionalStatus) {
+ 		super(label, session);
+ 		this.request = request;
+ 		this.profileId = profileId;
+-		if (provisioningContext == null)
+-			this.provisioningContext = new ProvisioningContext(session.getProvisioningAgent());
++		if (firstPass == null)
++			this.firstPass = new ProvisioningContext(session.getProvisioningAgent());
+ 		else
+-			this.provisioningContext = provisioningContext;
++			this.firstPass = firstPass;
++		this.secondPass = secondPass;
+ 		Assert.isNotNull(additionalStatus);
+ 		this.additionalStatus = additionalStatus;
+ 	}
+@@ -55,21 +56,46 @@ public class PlannerResolutionJob extends ProvisioningJob implements IProfileCha
+ 		return request;
+ 	}
+ 
+-	public ProvisioningContext getProvisioningContext() {
+-		return provisioningContext;
++	public ProvisioningContext getActualProvisioningContext() {
++		return successful;
+ 	}
+ 
+-	public void setProvisioningContext(ProvisioningContext context) {
+-		this.provisioningContext = context;
++	public void setFirstPassProvisioningContext(ProvisioningContext firstPass) {
++		this.firstPass = firstPass;
++	}
++
++	public void setSecondPassProvisioningContext(ProvisioningContext secondPass) {
++		this.secondPass = firstPass;
+ 	}
+ 
+ 	public IStatus runModal(IProgressMonitor monitor) {
+-		plan = ((IPlanner) getSession().getProvisioningAgent().getService(IPlanner.SERVICE_NAME)).getProvisioningPlan(request, provisioningContext, monitor);
++		SubMonitor sub;
++		if (secondPass != null) {
++			sub = SubMonitor.convert(monitor, 1000);
++		} else {
++			sub = SubMonitor.convert(monitor, 500);
++		}
++
++		plan = ((IPlanner) getSession().getProvisioningAgent().getService(IPlanner.SERVICE_NAME)).getProvisioningPlan(request, firstPass, sub.newChild(500));
++		IStatus status;
++		if (plan == null) {
++			status = new Status(IStatus.ERROR, Activator.ID, Messages.PlannerResolutionJob_NullProvisioningPlan);
++		} else {
++			status = plan.getStatus();
++		}
++
++		if (status.getSeverity() != IStatus.ERROR || secondPass == null) {
++			successful = firstPass;
++			return status;
++		}
++
++		// First resolution was in error, try again with an alternate provisioning context
++		successful = secondPass;
++		plan = ((IPlanner) getSession().getProvisioningAgent().getService(IPlanner.SERVICE_NAME)).getProvisioningPlan(request, secondPass, sub.newChild(500));
+ 		if (plan == null) {
+ 			return new Status(IStatus.ERROR, Activator.ID, Messages.PlannerResolutionJob_NullProvisioningPlan);
+ 		}
+ 		return plan.getStatus();
+-
+ 	}
+ 
+ 	public ResolutionResult getResolutionResult() {
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/SearchForUpdatesResolutionJob.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/SearchForUpdatesResolutionJob.java
+index b62c46c..ef99f08 100644
+--- a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/SearchForUpdatesResolutionJob.java
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/SearchForUpdatesResolutionJob.java
+@@ -24,8 +24,8 @@ public class SearchForUpdatesResolutionJob extends PlannerResolutionJob {
+ 	ProfileChangeRequest[] requestHolder;
+ 	UpdateOperation operation;
+ 
+-	public SearchForUpdatesResolutionJob(String label, ProvisioningSession session, String profileId, ProfileChangeRequest request, ProvisioningContext provisioningContext, MultiStatus additionalStatus, IRunnableWithProgress searchForUpdatesRunnable, ProfileChangeRequest[] requestHolder, UpdateOperation operation) {
+-		super(label, session, profileId, request, provisioningContext, additionalStatus);
++	public SearchForUpdatesResolutionJob(String label, ProvisioningSession session, String profileId, ProfileChangeRequest request, ProvisioningContext firstPass, ProvisioningContext secondPass, MultiStatus additionalStatus, IRunnableWithProgress searchForUpdatesRunnable, ProfileChangeRequest[] requestHolder, UpdateOperation operation) {
++		super(label, session, profileId, request, firstPass, secondPass, additionalStatus);
+ 		this.searchForUpdatesRunnable = searchForUpdatesRunnable;
+ 		this.requestHolder = requestHolder;
+ 		this.operation = operation;
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/InstallOperation.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/InstallOperation.java
+index ebdc195..97113f6 100644
+--- a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/InstallOperation.java
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/InstallOperation.java
+@@ -12,15 +12,15 @@
+ 
+ package org.eclipse.equinox.p2.operations;
+ 
+-import org.eclipse.equinox.p2.planner.ProfileInclusionRules;
+-
+ import java.util.Collection;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.operations.*;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProfileChangeRequest;
+ import org.eclipse.equinox.p2.engine.IProfile;
++import org.eclipse.equinox.p2.engine.ProvisioningContext;
+ import org.eclipse.equinox.p2.engine.query.UserVisibleRootQuery;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
++import org.eclipse.equinox.p2.planner.ProfileInclusionRules;
+ import org.eclipse.equinox.p2.query.IQueryResult;
+ import org.eclipse.equinox.p2.query.QueryUtil;
+ 
+@@ -46,6 +46,7 @@ import org.eclipse.equinox.p2.query.QueryUtil;
+ public class InstallOperation extends ProfileChangeOperation {
+ 
+ 	private Collection<IInstallableUnit> toInstall;
++	private static final String CUSTOM_PROVISIONING_CONTEXT_MARKER = "org.eclipse.equinox.p2.operations.customContext"; //$NON-NLS-1$
+ 
+ 	/**
+ 	 * Create an install operation on the specified provisioning session that installs
+@@ -144,4 +145,14 @@ public class InstallOperation extends ProfileChangeOperation {
+ 		return Messages.InstallOperation_InstallJobName;
+ 
+ 	}
++
++	@Override
++	ProvisioningContext getSecondPassProvisioningContext() {
++		// If we were already contacting all sites, then let's go ahead
++		// and follow references if the first try fails
++		if (context.getProperty(CUSTOM_PROVISIONING_CONTEXT_MARKER) == null) {
++			context.setProperty(ProvisioningContext.FOLLOW_REPOSITORY_REFERENCES, Boolean.toString(true));
++		}
++		return context;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/ProfileChangeOperation.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/ProfileChangeOperation.java
+index d650206..65b2ba6 100644
+--- a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/ProfileChangeOperation.java
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/ProfileChangeOperation.java
+@@ -178,7 +178,7 @@ public abstract class ProfileChangeOperation implements IProfileChangeJob {
+ 	protected abstract void computeProfileChangeRequest(MultiStatus status, IProgressMonitor monitor);
+ 
+ 	private void createPlannerResolutionJob() {
+-		job = new PlannerResolutionJob(getResolveJobName(), session, profileId, request, context, noChangeRequest);
++		job = new PlannerResolutionJob(getResolveJobName(), session, profileId, request, getFirstPassProvisioningContext(), getSecondPassProvisioningContext(), noChangeRequest);
+ 	}
+ 
+ 	/**
+@@ -311,7 +311,7 @@ public abstract class ProfileChangeOperation implements IProfileChangeJob {
+ 		IStatus status = getResolutionResult();
+ 		if (status.getSeverity() != IStatus.CANCEL && status.getSeverity() != IStatus.ERROR) {
+ 			if (job.getProvisioningPlan() != null) {
+-				ProfileModificationJob pJob = new ProfileModificationJob(getProvisioningJobName(), session, profileId, job.getProvisioningPlan(), context);
++				ProfileModificationJob pJob = new ProfileModificationJob(getProvisioningJobName(), session, profileId, job.getProvisioningPlan(), job.getActualProvisioningContext());
+ 				pJob.setAdditionalProgressMonitor(monitor);
+ 				return pJob;
+ 			}
+@@ -329,7 +329,7 @@ public abstract class ProfileChangeOperation implements IProfileChangeJob {
+ 	public void setProvisioningContext(ProvisioningContext context) {
+ 		this.context = context;
+ 		if (job != null)
+-			job.setProvisioningContext(context);
++			updateJobProvisioningContexts(job, context);
+ 	}
+ 
+ 	/**
+@@ -364,4 +364,16 @@ public abstract class ProfileChangeOperation implements IProfileChangeJob {
+ 		return getResolutionResult() != null;
+ 	}
+ 
++	ProvisioningContext getFirstPassProvisioningContext() {
++		return getProvisioningContext();
++	}
++
++	ProvisioningContext getSecondPassProvisioningContext() {
++		return null;
++	}
++
++	protected void updateJobProvisioningContexts(PlannerResolutionJob job, ProvisioningContext context) {
++		job.setFirstPassProvisioningContext(context);
++	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/UninstallOperation.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/UninstallOperation.java
+index 09a526f..d0bebec 100644
+--- a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/UninstallOperation.java
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/UninstallOperation.java
+@@ -12,12 +12,14 @@
+ 
+ package org.eclipse.equinox.p2.operations;
+ 
++import java.net.URI;
+ import java.util.Collection;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.MultiStatus;
+ import org.eclipse.equinox.internal.p2.operations.Messages;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProfileChangeRequest;
+ import org.eclipse.equinox.p2.engine.IProfile;
++import org.eclipse.equinox.p2.engine.ProvisioningContext;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ 
+ /**
+@@ -85,4 +87,16 @@ public class UninstallOperation extends ProfileChangeOperation {
+ 		return Messages.UninstallOperation_ResolveJobName;
+ 	}
+ 
++	@Override
++	ProvisioningContext getFirstPassProvisioningContext() {
++		ProvisioningContext pc = new ProvisioningContext(session.getProvisioningAgent());
++		pc.setMetadataRepositories(new URI[0]);
++		pc.setArtifactRepositories(new URI[0]);
++		return pc;
++	}
++
++	@Override
++	ProvisioningContext getSecondPassProvisioningContext() {
++		return context;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/UpdateOperation.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/UpdateOperation.java
+index f37afb5..d306cde 100644
+--- a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/UpdateOperation.java
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/UpdateOperation.java
+@@ -316,7 +316,7 @@ public class UpdateOperation extends ProfileChangeOperation {
+ 		// for the resolution job to get the request from the operation after it has been
+ 		// computed.
+ 		final ProfileChangeRequest[] requestHolder = new ProfileChangeRequest[1];
+-		job = new SearchForUpdatesResolutionJob(getResolveJobName(), session, profileId, request, context, noChangeRequest, new IRunnableWithProgress() {
++		job = new SearchForUpdatesResolutionJob(getResolveJobName(), session, profileId, request, getFirstPassProvisioningContext(), getSecondPassProvisioningContext(), noChangeRequest, new IRunnableWithProgress() {
+ 			public void run(IProgressMonitor mon) throws OperationCanceledException {
+ 				// We only check for other jobs running if this job is *not* scheduled
+ 				if (job.getState() == Job.NONE && session.hasScheduledOperationsFor(profileId)) {
+diff --git a/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/operations/AllTests.java b/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/operations/AllTests.java
+index 6c7724e..d79be13 100644
+--- a/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/operations/AllTests.java
++++ b/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/operations/AllTests.java
+@@ -22,6 +22,7 @@ public class AllTests extends TestCase {
+ 		suite.addTestSuite(SizingTest.class);
+ 		suite.addTestSuite(InstallerPlanTest.class);
+ 		suite.addTestSuite(UpdatePlanning.class);
++		suite.addTestSuite(UninstallTest.class);
+ 		return suite;
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/operations/UninstallTest.java b/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/operations/UninstallTest.java
+new file mode 100644
+index 0000000..6622e78
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests.ui/src/org/eclipse/equinox/p2/tests/ui/operations/UninstallTest.java
+@@ -0,0 +1,51 @@
++/*******************************************************************************
++ *  Copyright (c) 2010 IBM Corporation and others.
++ *  All rights reserved. This program and the accompanying materials
++ *  are made available under the terms of the Eclipse Public License v1.0
++ *  which accompanies this distribution, and is available at
++ *  http://www.eclipse.org/legal/epl-v10.html
++ * 
++ *  Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.p2.tests.ui.operations;
++
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.util.HashSet;
++import org.eclipse.equinox.p2.core.ProvisionException;
++import org.eclipse.equinox.p2.engine.ProvisioningContext;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
++import org.eclipse.equinox.p2.metadata.expression.ExpressionUtil;
++import org.eclipse.equinox.p2.operations.UninstallOperation;
++import org.eclipse.equinox.p2.query.*;
++import org.eclipse.equinox.p2.repository.artifact.IArtifactRepository;
++import org.eclipse.equinox.p2.tests.ui.AbstractProvisioningUITest;
++
++/**
++ * Tests for the ability to install an IU that has an installer plan by
++ * using the operation API.
++ */
++public class UninstallTest extends AbstractProvisioningUITest {
++	public void testUninstallContactsNoRepositories() throws ProvisionException, URISyntaxException {
++
++		HashSet<IInstallableUnit> ius = new HashSet<IInstallableUnit>();
++		ius.add(top1);
++		UninstallOperation op = new UninstallOperation(getSession(), ius);
++		// We set the provisioning context to the same one we use for install
++		ProvisioningContext pc = new ProvisioningContext(getAgent());
++		pc.setArtifactRepositories(new URI[] {testRepoLocation});
++		pc.setMetadataRepositories(new URI[] {testRepoLocation});
++		op.setProvisioningContext(pc);
++		op.setProfileId(TESTPROFILE);
++		assertTrue("Should resolve", op.resolveModal(getMonitor()).isOK());
++
++		// The provisioning context actually used should have nothing (because the first pass is to try with no repos)
++		pc = op.getProvisioningPlan().getContext();
++		IQueryable<IInstallableUnit> queryable = pc.getMetadata(getMonitor());
++		assertTrue("metadata queryable should be empty", queryable.query(QueryUtil.ALL_UNITS, getMonitor()).isEmpty());
++		IQueryable<IArtifactRepository> artifactQueryable = pc.getArtifactRepositories(getMonitor());
++		IQuery<IArtifactRepository> all = new ExpressionMatchQuery<IArtifactRepository>(IArtifactRepository.class, ExpressionUtil.TRUE_EXPRESSION);
++		assertTrue("artifact queryable should be empty", artifactQueryable.query(all, getMonitor()).isEmpty());
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/AvailableIUsPage.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/AvailableIUsPage.java
+index 852c587..2c7496b 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/AvailableIUsPage.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/AvailableIUsPage.java
+@@ -568,6 +568,10 @@ public class AvailableIUsPage extends ProvisioningWizardPage implements ISelecta
+ 		if (resolveAllCheckbox.getSelection())
+ 			return new ProvisioningContext(getProvisioningUI().getSession().getProvisioningAgent());
+ 		// Use the contents of the combo to determine the context
+-		return repoSelector.getProvisioningContext();
++		ProvisioningContext context = repoSelector.getProvisioningContext();
++		// This should really be a property value retrieved by API
++		// See https://bugs.eclipse.org/bugs/show_bug.cgi?id=303258
++		context.setProperty("org.eclipse.equinox.p2.operations.customContext", Boolean.toString(true)); //$NON-NLS-1$
++		return context;
+ 	}
+ }

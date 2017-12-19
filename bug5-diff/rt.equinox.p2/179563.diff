@@ -1,0 +1,2495 @@
+commit 528f078a349320a22ddd5ae4089bb702fac11ae4
+Author: John Arthorne <johna>
+Date:   Wed Nov 28 01:54:16 2007 +0000
+
+    Bug 179563 [prov] [repo] Metadata repository implementation for eclipse update sites
+
+864	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/DefaultSiteParser.java
+43	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/Messages.java
+202	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteCategory.java
+445	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteFeature.java
+317	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteModel.java
+30	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/messages.properties
+1	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/AllTests.java
+35	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/SiteParserTest.java
+483	0	bundles/org.eclipse.equinox.p2.tests/testData/generator/Europa/site.xml
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/DefaultSiteParser.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/DefaultSiteParser.java
+new file mode 100644
+index 0000000..9cda5c3
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/DefaultSiteParser.java
+@@ -0,0 +1,864 @@
++/*******************************************************************************
++ * Copyright (c) 2000, 2006 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.metadata.generator.features;
++
++import java.io.*;
++import java.util.*;
++import javax.xml.parsers.*;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
++import org.eclipse.equinox.internal.p2.core.helpers.Tracing;
++import org.eclipse.equinox.internal.p2.metadata.repository.Activator;
++import org.eclipse.equinox.p2.metadata.generator.URLEntry;
++import org.eclipse.osgi.util.NLS;
++import org.w3c.dom.*;
++import org.xml.sax.*;
++import org.xml.sax.helpers.DefaultHandler;
++
++/**
++ * Default site parser.
++ * Parses the site manifest file as defined by the platform. Defers
++ * to a model factory to create the actual concrete model objects. The 
++ * update framework supplies two factory implementations:
++ * <ul>
++ * <li>@see org.eclipse.update.core.model.SiteModelFactory
++ * <li>@see org.eclipse.update.core.BaseSiteFactory
++ * </ul>
++ * 
++ * <p>
++ * <b>Note:</b> This class/interface is part of an interim API that is still under development and expected to
++ * change significantly before reaching stability. It is being made available at this early stage to solicit feedback
++ * from pioneering adopters on the understanding that any code that uses this API will almost certainly be broken
++ * (repeatedly) as the API evolves.
++ * </p>
++ * @since 2.0
++ */
++public class DefaultSiteParser extends DefaultHandler {
++
++	private static final String ARCHIVE = "archive"; //$NON-NLS-1$
++
++	private static final String CATEGORY = "category"; //$NON-NLS-1$
++	private static final String CATEGORY_DEF = "category-def"; //$NON-NLS-1$
++
++	//private static final String ASSOCIATE_SITES = "associateSites"; //$NON-NLS-1$
++	//	private static final String ASSOCIATE_SITE = "associateSite"; //$NON-NLS-1$
++	private static final String DEFAULT_INFO_URL = "index.html"; //$NON-NLS-1$
++
++	private static final String DESCRIPTION = "description"; //$NON-NLS-1$
++
++	private static final String FEATURE = "feature"; //$NON-NLS-1$
++	private static final String FEATURES = "features/"; //$NON-NLS-1$
++	private static final String MIRROR = "mirror"; //$NON-NLS-1$
++	private final static SAXParserFactory parserFactory = SAXParserFactory.newInstance();
++	private static final String PLUGIN_ID = Activator.ID;
++	private static final String SITE = "site"; //$NON-NLS-1$
++	private static final int STATE_ARCHIVE = 3;
++	private static final int STATE_CATEGORY = 4;
++	private static final int STATE_CATEGORY_DEF = 5;
++	private static final int STATE_DESCRIPTION_CATEGORY_DEF = 7;
++
++	private static final int STATE_DESCRIPTION_SITE = 6;
++	private static final int STATE_FEATURE = 2;
++	private static final int STATE_IGNORED_ELEMENT = -1;
++	private static final int STATE_INITIAL = 0;
++	private static final int STATE_SITE = 1;
++	private int currentState;
++
++	private boolean DESCRIPTION_SITE_ALREADY_SEEN = false;
++	// Current object stack (used to hold the current object we are
++	// populating in this plugin descriptor
++	Stack objectStack = new Stack();
++
++	private SAXParser parser;
++
++	// Current State Information
++	Stack stateStack = new Stack();
++
++	private MultiStatus status;
++
++	/*
++	 * 
++	 */
++	private static void debug(String s) {
++		Tracing.debug("DefaultSiteParser: " + s); //$NON-NLS-1$
++	}
++
++	//	private static URLEntry[] getAssociateSites(String associateSitesURL) {
++	//
++	//		try {
++	//			DocumentBuilderFactory domFactory = DocumentBuilderFactory.newInstance();
++	//			DocumentBuilder builder = domFactory.newDocumentBuilder();
++	//			Document document = builder.parse(associateSitesURL);
++	//			if (document == null)
++	//				return null;
++	//			NodeList mirrorNodes = document.getElementsByTagName(ASSOCIATE_SITE);
++	//			URLEntry[] mirrors = new URLEntry[mirrorNodes.getLength()];
++	//			for (int i = 0; i < mirrorNodes.getLength(); i++) {
++	//				Element mirrorNode = (Element) mirrorNodes.item(i);
++	//				mirrors[i] = new URLEntry();
++	//				String infoURL = mirrorNode.getAttribute("url"); //$NON-NLS-1$
++	//				String label = mirrorNode.getAttribute("label"); //$NON-NLS-1$
++	//				mirrors[i].setURL(infoURL);
++	//				mirrors[i].setAnnotation(label);
++	//
++	//				if (Tracing.DEBUG_GENERATOR_PARSING)
++	//					debug("Processed mirror: url:" + infoURL + " label:" + label); //$NON-NLS-1$ //$NON-NLS-2$
++	//			}
++	//			return mirrors;
++	//		} catch (Exception e) {
++	//			// log if absolute url
++	//			if (associateSitesURL != null && (associateSitesURL.startsWith("http://") //$NON-NLS-1$
++	//					|| associateSitesURL.startsWith("https://") //$NON-NLS-1$
++	//					|| associateSitesURL.startsWith("file://") //$NON-NLS-1$
++	//					|| associateSitesURL.startsWith("ftp://") //$NON-NLS-1$
++	//			|| associateSitesURL.startsWith("jar://"))) //$NON-NLS-1$
++	//				log(Messages.DefaultSiteParser_mirrors, e);
++	//			return null;
++	//		}
++	//	}
++
++	static URLEntry[] getMirrors(String mirrorsURL) {
++
++		try {
++			String countryCode = Locale.getDefault().getCountry().toLowerCase();
++			int timeZone = (new GregorianCalendar()).get(Calendar.ZONE_OFFSET) / (60 * 60 * 1000);
++
++			if (mirrorsURL.indexOf("?") != -1) { //$NON-NLS-1$
++				mirrorsURL = mirrorsURL + "&"; //$NON-NLS-1$
++			} else {
++				mirrorsURL = mirrorsURL + "?"; //$NON-NLS-1$
++			}
++			mirrorsURL = mirrorsURL + "countryCode=" + countryCode + "&timeZone=" + timeZone + "&responseType=xml"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++
++			DocumentBuilderFactory domFactory = DocumentBuilderFactory.newInstance();
++			DocumentBuilder builder = domFactory.newDocumentBuilder();
++			Document document = builder.parse(mirrorsURL);
++			if (document == null)
++				return null;
++			NodeList mirrorNodes = document.getElementsByTagName(MIRROR);
++			URLEntry[] mirrors = new URLEntry[mirrorNodes.getLength()];
++			for (int i = 0; i < mirrorNodes.getLength(); i++) {
++				Element mirrorNode = (Element) mirrorNodes.item(i);
++				mirrors[i] = new URLEntry();
++				String infoURL = mirrorNode.getAttribute("url"); //$NON-NLS-1$
++				String label = mirrorNode.getAttribute("label"); //$NON-NLS-1$
++				mirrors[i].setURL(infoURL);
++				mirrors[i].setAnnotation(label);
++
++				if (Tracing.DEBUG_GENERATOR_PARSING)
++					debug("Processed mirror: url:" + infoURL + " label:" + label); //$NON-NLS-1$ //$NON-NLS-2$
++			}
++			return mirrors;
++		} catch (Exception e) {
++			// log if absolute url
++			if (mirrorsURL != null && (mirrorsURL.startsWith("http://") //$NON-NLS-1$
++					|| mirrorsURL.startsWith("https://") //$NON-NLS-1$
++					|| mirrorsURL.startsWith("file://") //$NON-NLS-1$
++					|| mirrorsURL.startsWith("ftp://") //$NON-NLS-1$
++			|| mirrorsURL.startsWith("jar://"))) //$NON-NLS-1$
++				LogHelper.log(new Status(IStatus.ERROR, Activator.ID, Messages.DefaultSiteParser_mirrors, e));
++			return null;
++		}
++	}
++
++	static void log(Exception e) {
++		LogHelper.log(new Status(IStatus.ERROR, Activator.ID, "Internal Error", e)); //$NON-NLS-1$
++	}
++
++	static void log(IStatus error) {
++		LogHelper.log(error);
++	}
++
++	static void log(String message) {
++		LogHelper.log(new Status(IStatus.WARNING, Activator.ID, message, null));
++	}
++
++	static void log(String message, Exception e) {
++		LogHelper.log(new Status(IStatus.WARNING, Activator.ID, message, e));
++	}
++
++	/**
++	 * Constructs a site parser.
++	 */
++	public DefaultSiteParser() {
++		super();
++		stateStack = new Stack();
++		objectStack = new Stack();
++		status = null;
++		DESCRIPTION_SITE_ALREADY_SEEN = false;
++		try {
++			parserFactory.setNamespaceAware(true);
++			this.parser = parserFactory.newSAXParser();
++		} catch (ParserConfigurationException e) {
++			log(e);
++		} catch (SAXException e) {
++			log(e);
++		}
++
++		if (Tracing.DEBUG_GENERATOR_PARSING)
++			debug("Created"); //$NON-NLS-1$
++	}
++
++	/**
++	 * Handle character text
++	 * @see DefaultHandler#characters(char[], int, int)
++	 * @since 2.0
++	 */
++	public void characters(char[] ch, int start, int length) {
++		String text = new String(ch, start, length);
++		//only push if description
++		int state = ((Integer) stateStack.peek()).intValue();
++		if (state == STATE_DESCRIPTION_SITE || state == STATE_DESCRIPTION_CATEGORY_DEF)
++			objectStack.push(text);
++
++	}
++
++	/**
++	 * Handle end of element tags
++	 * @see DefaultHandler#endElement(String, String, String)
++	 * @since 2.0
++	 */
++	public void endElement(String uri, String localName, String qName) {
++
++		String text = null;
++		URLEntry info = null;
++
++		int state = ((Integer) stateStack.peek()).intValue();
++		switch (state) {
++			case STATE_IGNORED_ELEMENT :
++			case STATE_ARCHIVE :
++			case STATE_CATEGORY :
++				stateStack.pop();
++				break;
++
++			case STATE_INITIAL :
++				internalError(Messages.DefaultSiteParser_ParsingStackBackToInitialState);
++				break;
++
++			case STATE_SITE :
++				stateStack.pop();
++				if (objectStack.peek() instanceof String) {
++					text = (String) objectStack.pop();
++					SiteModel site = (SiteModel) objectStack.peek();
++					site.getDescriptionModel().setAnnotation(text);
++				}
++				//do not pop the object
++				break;
++
++			case STATE_FEATURE :
++				stateStack.pop();
++				objectStack.pop();
++				break;
++
++			case STATE_CATEGORY_DEF :
++				stateStack.pop();
++				if (objectStack.peek() instanceof String) {
++					text = (String) objectStack.pop();
++					SiteCategory category = (SiteCategory) objectStack.peek();
++					category.getDescriptionModel().setAnnotation(text);
++				}
++				objectStack.pop();
++				break;
++
++			case STATE_DESCRIPTION_SITE :
++				stateStack.pop();
++				text = ""; //$NON-NLS-1$
++				while (objectStack.peek() instanceof String) {
++					// add text, preserving at most one space between text fragments
++					String newText = (String) objectStack.pop();
++					if (trailingSpace(newText) && !leadingSpace(text)) {
++						text = " " + text; //$NON-NLS-1$
++					}
++					text = newText.trim() + text;
++					if (leadingSpace(newText) && !leadingSpace(text)) {
++						text = " " + text; //$NON-NLS-1$
++					}
++				}
++				text = text.trim();
++
++				info = (URLEntry) objectStack.pop();
++				if (text != null)
++					info.setAnnotation(text);
++
++				SiteModel siteModel = (SiteModel) objectStack.peek();
++				// override description.
++				// do not raise error as previous description may be default one
++				// when parsing site tag
++				if (DESCRIPTION_SITE_ALREADY_SEEN)
++					debug(NLS.bind(Messages.DefaultSiteParser_ElementAlreadySet, (new String[] {getState(state)})));
++				siteModel.setDescriptionModel(info);
++				DESCRIPTION_SITE_ALREADY_SEEN = true;
++				break;
++
++			case STATE_DESCRIPTION_CATEGORY_DEF :
++				stateStack.pop();
++				text = ""; //$NON-NLS-1$
++				while (objectStack.peek() instanceof String) {
++					// add text, preserving at most one space between text fragments
++					String newText = (String) objectStack.pop();
++					if (trailingSpace(newText) && !leadingSpace(text)) {
++						text = " " + text; //$NON-NLS-1$
++					}
++					text = newText.trim() + text;
++					if (leadingSpace(newText) && !leadingSpace(text)) {
++						text = " " + text; //$NON-NLS-1$
++					}
++				}
++				text = text.trim();
++
++				info = (URLEntry) objectStack.pop();
++				if (text != null)
++					info.setAnnotation(text);
++
++				SiteCategory category = (SiteCategory) objectStack.peek();
++				if (category.getDescriptionModel() != null)
++					internalError(NLS.bind(Messages.DefaultSiteParser_ElementAlreadySet, (new String[] {getState(state), category.getLabel()})));
++				else
++					category.setDescriptionModel(info);
++				break;
++
++			default :
++				internalError(NLS.bind(Messages.DefaultSiteParser_UnknownEndState, (new String[] {getState(state)})));
++				break;
++		}
++
++		if (Tracing.DEBUG_GENERATOR_PARSING)
++			debug("End Element:" + uri + ":" + localName + ":" + qName);//$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++	}
++
++	/*
++	 * Handles an error state specified by the status.  The collection of all logged status
++	 * objects can be accessed using <code>getStatus()</code>.
++	 *
++	 * @param error a status detailing the error condition
++	 */
++	private void error(IStatus error) {
++
++		if (status == null) {
++			status = new MultiStatus(PLUGIN_ID, 0, Messages.DefaultSiteParser_ErrorParsingSite, null);
++		}
++
++		status.add(error);
++		if (Tracing.DEBUG_GENERATOR_PARSING)
++			LogHelper.log(error);
++	}
++
++	/**
++	 * Handle errors
++	 * @see DefaultHandler#error(SAXParseException)
++	 * @since 2.0
++	 */
++	public void error(SAXParseException ex) {
++		logStatus(ex);
++	}
++
++	/**
++	 * Handle fatal errors
++	 * @see DefaultHandler#fatalError(SAXParseException)
++	 * @exception SAXException
++	 * @since 2.0
++	 */
++	public void fatalError(SAXParseException ex) throws SAXException {
++		logStatus(ex);
++		throw ex;
++	}
++
++	/*
++	 * return the state as String
++	 */
++	private String getState(int state) {
++
++		switch (state) {
++			case STATE_IGNORED_ELEMENT :
++				return "Ignored"; //$NON-NLS-1$
++
++			case STATE_INITIAL :
++				return "Initial"; //$NON-NLS-1$
++
++			case STATE_SITE :
++				return "Site"; //$NON-NLS-1$
++
++			case STATE_FEATURE :
++				return "Feature"; //$NON-NLS-1$
++
++			case STATE_ARCHIVE :
++				return "Archive"; //$NON-NLS-1$
++
++			case STATE_CATEGORY :
++				return "Category"; //$NON-NLS-1$
++
++			case STATE_CATEGORY_DEF :
++				return "Category Def"; //$NON-NLS-1$
++
++			case STATE_DESCRIPTION_CATEGORY_DEF :
++				return "Description / Category Def"; //$NON-NLS-1$
++
++			case STATE_DESCRIPTION_SITE :
++				return "Description / Site"; //$NON-NLS-1$
++
++			default :
++				return Messages.DefaultSiteParser_UnknownState;
++		}
++	}
++
++	/**
++	 * Returns all status objects accumulated by the parser.
++	 *
++	 * @return multi-status containing accumulated status, or <code>null</code>.
++	 * @since 2.0
++	 */
++	public MultiStatus getStatus() {
++		return status;
++	}
++
++	private void handleCategoryDefState(String elementName, Attributes attributes) {
++		if (elementName.equals(FEATURE)) {
++			stateStack.push(new Integer(STATE_FEATURE));
++			processFeature(attributes);
++		} else if (elementName.equals(ARCHIVE)) {
++			stateStack.push(new Integer(STATE_ARCHIVE));
++			processArchive(attributes);
++		} else if (elementName.equals(CATEGORY_DEF)) {
++			stateStack.push(new Integer(STATE_CATEGORY_DEF));
++			processCategoryDef(attributes);
++		} else if (elementName.equals(DESCRIPTION)) {
++			stateStack.push(new Integer(STATE_DESCRIPTION_CATEGORY_DEF));
++			processInfo(attributes);
++		} else
++			internalErrorUnknownTag(NLS.bind(Messages.DefaultSiteParser_UnknownElement, (new String[] {elementName, getState(currentState)})));
++	}
++
++	private void handleCategoryState(String elementName, Attributes attributes) {
++		if (elementName.equals(DESCRIPTION)) {
++			stateStack.push(new Integer(STATE_DESCRIPTION_SITE));
++			processInfo(attributes);
++		} else if (elementName.equals(FEATURE)) {
++			stateStack.push(new Integer(STATE_FEATURE));
++			processFeature(attributes);
++		} else if (elementName.equals(ARCHIVE)) {
++			stateStack.push(new Integer(STATE_ARCHIVE));
++			processArchive(attributes);
++		} else if (elementName.equals(CATEGORY_DEF)) {
++			stateStack.push(new Integer(STATE_CATEGORY_DEF));
++			processCategoryDef(attributes);
++		} else if (elementName.equals(CATEGORY)) {
++			stateStack.push(new Integer(STATE_CATEGORY));
++			processCategory(attributes);
++		} else
++			internalErrorUnknownTag(NLS.bind(Messages.DefaultSiteParser_UnknownElement, (new String[] {elementName, getState(currentState)})));
++	}
++
++	private void handleFeatureState(String elementName, Attributes attributes) {
++		if (elementName.equals(DESCRIPTION)) {
++			stateStack.push(new Integer(STATE_DESCRIPTION_SITE));
++			processInfo(attributes);
++		} else if (elementName.equals(FEATURE)) {
++			stateStack.push(new Integer(STATE_FEATURE));
++			processFeature(attributes);
++		} else if (elementName.equals(ARCHIVE)) {
++			stateStack.push(new Integer(STATE_ARCHIVE));
++			processArchive(attributes);
++		} else if (elementName.equals(CATEGORY_DEF)) {
++			stateStack.push(new Integer(STATE_CATEGORY_DEF));
++			processCategoryDef(attributes);
++		} else if (elementName.equals(CATEGORY)) {
++			stateStack.push(new Integer(STATE_CATEGORY));
++			processCategory(attributes);
++		} else
++			internalErrorUnknownTag(NLS.bind(Messages.DefaultSiteParser_UnknownElement, (new String[] {elementName, getState(currentState)})));
++	}
++
++	private void handleInitialState(String elementName, Attributes attributes) throws SAXException {
++		if (elementName.equals(SITE)) {
++			stateStack.push(new Integer(STATE_SITE));
++			processSite(attributes);
++		} else {
++			internalErrorUnknownTag(NLS.bind(Messages.DefaultSiteParser_UnknownElement, (new String[] {elementName, getState(currentState)})));
++			// what we received was not a site.xml, no need to continue
++			throw new SAXException(Messages.DefaultSiteParser_InvalidXMLStream);
++		}
++
++	}
++
++	private void handleSiteState(String elementName, Attributes attributes) {
++		if (elementName.equals(DESCRIPTION)) {
++			stateStack.push(new Integer(STATE_DESCRIPTION_SITE));
++			processInfo(attributes);
++		} else if (elementName.equals(FEATURE)) {
++			stateStack.push(new Integer(STATE_FEATURE));
++			processFeature(attributes);
++		} else if (elementName.equals(ARCHIVE)) {
++			stateStack.push(new Integer(STATE_ARCHIVE));
++			processArchive(attributes);
++		} else if (elementName.equals(CATEGORY_DEF)) {
++			stateStack.push(new Integer(STATE_CATEGORY_DEF));
++			processCategoryDef(attributes);
++		} else
++			internalErrorUnknownTag(NLS.bind(Messages.DefaultSiteParser_UnknownElement, (new String[] {elementName, getState(currentState)})));
++	}
++
++	/*
++	 * 
++	 */
++	private void internalError(String message) {
++		error(new Status(IStatus.ERROR, PLUGIN_ID, IStatus.OK, message, null));
++	}
++
++	/*
++	 * 
++	 */
++	private void internalErrorUnknownTag(String msg) {
++		stateStack.push(new Integer(STATE_IGNORED_ELEMENT));
++		internalError(msg);
++	}
++
++	private boolean leadingSpace(String str) {
++		if (str.length() <= 0) {
++			return false;
++		}
++		return Character.isWhitespace(str.charAt(0));
++	}
++
++	/*
++	 * 
++	 */
++	private void logStatus(SAXParseException ex) {
++		String name = ex.getSystemId();
++		if (name == null)
++			name = ""; //$NON-NLS-1$
++		else
++			name = name.substring(1 + name.lastIndexOf("/")); //$NON-NLS-1$
++
++		String msg;
++		if (name.equals("")) //$NON-NLS-1$
++			msg = NLS.bind(Messages.DefaultSiteParser_ErrorParsing, (new String[] {ex.getMessage()}));
++		else {
++			String[] values = new String[] {name, Integer.toString(ex.getLineNumber()), Integer.toString(ex.getColumnNumber()), ex.getMessage()};
++			msg = NLS.bind(Messages.DefaultSiteParser_ErrorlineColumnMessage, values);
++		}
++		error(new Status(IStatus.ERROR, PLUGIN_ID, msg, ex));
++	}
++
++	/**
++	 * Parses the specified input steam and constructs a site model.
++	 * The input stream is not closed as part of this operation.
++	 * 
++	 * @param in input stream
++	 * @return site model
++	 * @exception SAXException
++	 * @exception IOException
++	 * @since 2.0
++	 */
++	public SiteModel parse(InputStream in) throws SAXException, IOException {
++		stateStack.push(new Integer(STATE_INITIAL));
++		currentState = ((Integer) stateStack.peek()).intValue();
++		parser.parse(new InputSource(in), this);
++		if (objectStack.isEmpty())
++			throw new SAXException(Messages.DefaultSiteParser_NoSiteTag);
++		if (objectStack.peek() instanceof SiteModel) {
++			return (SiteModel) objectStack.pop();
++		}
++		String stack = ""; //$NON-NLS-1$
++		Iterator iter = objectStack.iterator();
++		while (iter.hasNext()) {
++			stack = stack + iter.next().toString() + "\r\n"; //$NON-NLS-1$
++		}
++		throw new SAXException(NLS.bind(Messages.DefaultSiteParser_WrongParsingStack, (new String[] {stack})));
++	}
++
++	/* 
++	 * process archive info
++	 */
++	private void processArchive(Attributes attributes) {
++		URLEntry archive = new URLEntry();
++		String id = attributes.getValue("path"); //$NON-NLS-1$
++		if (id == null || id.trim().equals("")) { //$NON-NLS-1$
++			internalError(NLS.bind(Messages.DefaultSiteParser_Missing, (new String[] {"path", getState(currentState)}))); //$NON-NLS-1$
++		}
++
++		archive.setAnnotation(id);
++
++		String url = attributes.getValue("url"); //$NON-NLS-1$
++		if (url == null || url.trim().equals("")) { //$NON-NLS-1$
++			internalError(NLS.bind(Messages.DefaultSiteParser_Missing, (new String[] {"archive", getState(currentState)}))); //$NON-NLS-1$
++		} else {
++			archive.setURL(url);
++
++			SiteModel site = (SiteModel) objectStack.peek();
++			site.addArchiveReferenceModel(archive);
++		}
++		if (Tracing.DEBUG_GENERATOR_PARSING)
++			debug("End processing Archive: path:" + id + " url:" + url);//$NON-NLS-1$ //$NON-NLS-2$
++
++	}
++
++	/* 
++	 * process the Category  info
++	 */
++	private void processCategory(Attributes attributes) {
++		String category = attributes.getValue("name"); //$NON-NLS-1$
++		SiteFeature feature = (SiteFeature) objectStack.peek();
++		feature.addCategoryName(category);
++
++		if (Tracing.DEBUG_GENERATOR_PARSING)
++			debug("End processing Category: name:" + category); //$NON-NLS-1$
++	}
++
++	/* 
++	 * process category def info
++	 */
++	private void processCategoryDef(Attributes attributes) {
++		SiteCategory category = new SiteCategory();
++		String name = attributes.getValue("name"); //$NON-NLS-1$
++		String label = attributes.getValue("label"); //$NON-NLS-1$
++		category.setName(name);
++		category.setLabel(label);
++
++		SiteModel site = (SiteModel) objectStack.peek();
++		site.addCategoryModel(category);
++		objectStack.push(category);
++
++		if (Tracing.DEBUG_GENERATOR_PARSING)
++			debug("End processing CategoryDef: name:" + name + " label:" + label); //$NON-NLS-1$ //$NON-NLS-2$
++	}
++
++	/* 
++	 * process feature info
++	 */
++	private void processFeature(Attributes attributes) {
++		SiteFeature feature = new SiteFeature();
++
++		// feature location on the site
++		String urlInfo = attributes.getValue("url"); //$NON-NLS-1$
++		// identifier and version
++		String id = attributes.getValue("id"); //$NON-NLS-1$
++		String ver = attributes.getValue("version"); //$NON-NLS-1$
++
++		boolean noURL = (urlInfo == null || urlInfo.trim().equals("")); //$NON-NLS-1$
++		boolean noId = (id == null || id.trim().equals("")); //$NON-NLS-1$
++		boolean noVersion = (ver == null || ver.trim().equals("")); //$NON-NLS-1$
++
++		// We need to have id and version, or the url, or both.
++		if (noURL) {
++			if (noId || noVersion)
++				internalError(NLS.bind(Messages.DefaultSiteParser_Missing, (new String[] {"url", getState(currentState)}))); //$NON-NLS-1$
++			else
++				// default url
++				urlInfo = FEATURES + id + '_' + ver; // 
++		}
++
++		feature.setURLString(urlInfo);
++
++		String type = attributes.getValue("type"); //$NON-NLS-1$
++		feature.setType(type);
++
++		// if one is null, and not the other
++		if (noId ^ noVersion) {
++			String[] values = new String[] {id, ver, getState(currentState)};
++			log(NLS.bind(Messages.DefaultFeatureParser_IdOrVersionInvalid, values));
++		} else {
++			feature.setFeatureIdentifier(id);
++			feature.setFeatureVersion(ver);
++		}
++
++		// get label if it exists
++		String label = attributes.getValue("label"); //$NON-NLS-1$
++		if (label != null) {
++			if ("".equals(label.trim())) //$NON-NLS-1$
++				label = null;
++		}
++		feature.setLabel(label);
++
++		// OS
++		String os = attributes.getValue("os"); //$NON-NLS-1$
++		feature.setOS(os);
++
++		// WS
++		String ws = attributes.getValue("ws"); //$NON-NLS-1$
++		feature.setWS(ws);
++
++		// NL
++		String nl = attributes.getValue("nl"); //$NON-NLS-1$
++		feature.setNL(nl);
++
++		// arch
++		String arch = attributes.getValue("arch"); //$NON-NLS-1$
++		feature.setArch(arch);
++
++		//patch
++		String patch = attributes.getValue("patch"); //$NON-NLS-1$
++		feature.setPatch(patch);
++
++		SiteModel site = (SiteModel) objectStack.peek();
++		site.addFeatureReferenceModel(feature);
++		feature.setSiteModel(site);
++
++		objectStack.push(feature);
++
++		if (Tracing.DEBUG_GENERATOR_PARSING)
++			debug("End Processing DefaultFeature Tag: url:" + urlInfo + " type:" + type); //$NON-NLS-1$ //$NON-NLS-2$
++
++	}
++
++	/* 
++	 * process URL info with element text
++	 */
++	private void processInfo(Attributes attributes) {
++		URLEntry inf = new URLEntry();
++		String infoURL = attributes.getValue("url"); //$NON-NLS-1$
++		inf.setURL(infoURL);
++
++		if (Tracing.DEBUG_GENERATOR_PARSING)
++			debug("Processed Info: url:" + infoURL); //$NON-NLS-1$
++
++		objectStack.push(inf);
++	}
++
++	/* 
++	 * process site info
++	 */
++	private void processSite(Attributes attributes) {
++		// create site map
++		SiteModel site = new SiteModel();
++
++		// if URL is specified, it replaces the URL of the site
++		// used to calculate the location of features and archives
++		String siteURL = attributes.getValue("url"); //$NON-NLS-1$
++		if (siteURL != null && !("".equals(siteURL.trim()))) { //$NON-NLS-1$
++			if (!siteURL.endsWith("/") && !siteURL.endsWith(File.separator)) { //$NON-NLS-1$
++				siteURL += "/"; //$NON-NLS-1$
++			}
++			site.setLocationURLString(siteURL);
++		}
++
++		// provide default description URL
++		// If <description> is specified, for the site,  it takes precedence		
++		URLEntry description = new URLEntry();
++		description.setURL(DEFAULT_INFO_URL);
++		site.setDescriptionModel(description);
++
++		// verify we can parse the site ...if the site has
++		// a different type throw an exception to force reparsing
++		// with the matching parser
++		String type = attributes.getValue("type"); //$NON-NLS-1$
++		site.setType(type);
++
++		// get mirrors, if any
++		String mirrorsURL = attributes.getValue("mirrorsURL"); //$NON-NLS-1$
++		if (mirrorsURL != null && mirrorsURL.trim().length() > 0) {
++			URLEntry[] mirrors = getMirrors(mirrorsURL);
++			if (mirrors != null)
++				site.setMirrorSiteEntryModels(mirrors);
++			else
++				site.setMirrorsURLString(mirrorsURL);
++		}
++
++		String pack200 = attributes.getValue("pack200"); //$NON-NLS-1$
++		if (pack200 != null && new Boolean(pack200).booleanValue()) {
++			site.setSupportsPack200(true);
++		}
++
++		//		if (attributes.getValue("digestURL") != null) { //$NON-NLS-1$
++		//			site.setDigestExist(true);
++		//			site.setDigestURL(attributes.getValue("digestURL")); //$NON-NLS-1$
++		//
++		//			if ((attributes.getValue("availableLocales") != null) && (!attributes.getValue("availableLocales").trim().equals(""))) { //$NON-NLS-1$//$NON-NLS-2$ //$NON-NLS-3$
++		//				StringTokenizer locals = new StringTokenizer(attributes.getValue("availableLocales"), ","); //$NON-NLS-1$//$NON-NLS-2$
++		//				String[] availableLocals = new String[locals.countTokens()];
++		//				int i = 0;
++		//				while (locals.hasMoreTokens()) {
++		//					availableLocals[i++] = locals.nextToken();
++		//				}
++		//								extendedSite.setAvailableLocals(availableLocals);
++		//			}
++		//		}
++		//
++		//		if ((site instanceof ExtendedSite) && (attributes.getValue("associateSitesURL") != null)) { //$NON-NLS-1$
++		//			IURLEntry[] associateSites = getAssociateSites(attributes.getValue("associateSitesURL"), factory); //$NON-NLS-1$
++		//			if (associateSites != null)
++		//				((ExtendedSite) site).setAssociateSites(associateSites);
++		//			else
++		//				site.setMirrorsURLString(mirrorsURL);
++		//		}
++
++		objectStack.push(site);
++
++		if (Tracing.DEBUG_GENERATOR_PARSING)
++			debug("End process Site tag: siteURL:" + siteURL + " type:" + type);//$NON-NLS-1$ //$NON-NLS-2$
++
++	}
++
++	/**
++	 * Handle start of element tags
++	 * @see DefaultHandler#startElement(String, String, String, Attributes)
++	 * @since 2.0
++	 */
++	public void startElement(String uri, String localName, String qName, Attributes attributes) throws SAXException {
++
++		if (Tracing.DEBUG_GENERATOR_PARSING) {
++			debug("State: " + currentState); //$NON-NLS-1$
++			debug("Start Element: uri:" + uri + " local Name:" + localName + " qName:" + qName);//$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++		}
++
++		switch (currentState) {
++			case STATE_IGNORED_ELEMENT :
++				internalErrorUnknownTag(NLS.bind(Messages.DefaultSiteParser_UnknownElement, (new String[] {localName, getState(currentState)})));
++				break;
++			case STATE_INITIAL :
++				handleInitialState(localName, attributes);
++				break;
++
++			case STATE_SITE :
++				handleSiteState(localName, attributes);
++				break;
++
++			case STATE_FEATURE :
++				handleFeatureState(localName, attributes);
++				break;
++
++			case STATE_ARCHIVE :
++				handleSiteState(localName, attributes);
++				break;
++
++			case STATE_CATEGORY :
++				handleCategoryState(localName, attributes);
++				break;
++
++			case STATE_CATEGORY_DEF :
++				handleCategoryDefState(localName, attributes);
++				break;
++
++			case STATE_DESCRIPTION_SITE :
++				handleSiteState(localName, attributes);
++				break;
++
++			case STATE_DESCRIPTION_CATEGORY_DEF :
++				handleSiteState(localName, attributes);
++				break;
++
++			default :
++				internalErrorUnknownTag(NLS.bind(Messages.DefaultSiteParser_UnknownStartState, (new String[] {getState(currentState)})));
++				break;
++		}
++		int newState = ((Integer) stateStack.peek()).intValue();
++		if (newState != STATE_IGNORED_ELEMENT)
++			currentState = newState;
++
++	}
++
++	private boolean trailingSpace(String str) {
++		if (str.length() <= 0) {
++			return false;
++		}
++		return Character.isWhitespace(str.charAt(str.length() - 1));
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/Messages.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/Messages.java
+new file mode 100644
+index 0000000..b209555
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/Messages.java
+@@ -0,0 +1,43 @@
++/*******************************************************************************
++ * Copyright (c) 2000, 2007 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.metadata.generator.features;
++
++import org.eclipse.osgi.util.NLS;
++
++public final class Messages extends NLS {
++
++	private static final String BUNDLE_NAME = "org.eclipse.update.internal.core.messages";//$NON-NLS-1$
++
++	public static String DefaultFeatureParser_IdOrVersionInvalid;
++	public static String DefaultSiteParser_NoSiteTag;
++	public static String DefaultSiteParser_WrongParsingStack;
++	public static String DefaultSiteParser_UnknownElement;
++	public static String DefaultSiteParser_UnknownStartState;
++	public static String DefaultSiteParser_Missing;
++	public static String DefaultSiteParser_ParsingStackBackToInitialState;
++	public static String DefaultSiteParser_ElementAlreadySet;
++	public static String DefaultSiteParser_CategoryAlreadySet;
++	public static String DefaultSiteParser_UnknownEndState;
++	public static String DefaultSiteParser_ErrorParsing;
++	public static String DefaultSiteParser_ErrorlineColumnMessage;
++	public static String DefaultSiteParser_ErrorParsingSite;
++	public static String DefaultSiteParser_UnknownState;
++	public static String DefaultSiteParser_InvalidXMLStream;
++	public static String DefaultSiteParser_mirrors;
++
++	static {
++		NLS.initializeMessages(BUNDLE_NAME, Messages.class);
++	}
++
++	private Messages() {
++		// Do not instantiate
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteCategory.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteCategory.java
+new file mode 100644
+index 0000000..a0f3709
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteCategory.java
+@@ -0,0 +1,202 @@
++/*******************************************************************************
++ * Copyright (c) 2000, 2006 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.metadata.generator.features;
++
++import java.net.MalformedURLException;
++import java.net.URL;
++import java.util.Comparator;
++import org.eclipse.equinox.p2.metadata.generator.URLEntry;
++
++/**
++ * Feature category definition model object.
++ * <p>
++ * This class may be instantiated or subclassed by clients. However, in most 
++ * cases clients should instead instantiate or subclass the provided 
++ * concrete implementation of this model.
++ * </p>
++ * <p>
++ * <b>Note:</b> This class/interface is part of an interim API that is still under development and expected to
++ * change significantly before reaching stability. It is being made available at this early stage to solicit feedback
++ * from pioneering adopters on the understanding that any code that uses this API will almost certainly be broken
++ * (repeatedly) as the API evolves.
++ * </p>
++ * @since 2.0
++ */
++
++public class SiteCategory {
++
++	private static Comparator comp;
++	private String name;
++	private String label;
++	private String localizedLabel;
++	private URLEntry description;
++
++	/**
++	 * Returns a comparator for category models.
++	 * 
++	 * @return comparator
++	 * @since 2.0
++	 */
++	public static Comparator getComparator() {
++		if (comp == null) {
++			comp = new Comparator() {
++				/*
++				 * @see Comparator#compare(Object,Object)
++				 * Returns 0 if versions are equal.
++				 * Returns -1 if object1 is after than object2.
++				 * Returns +1 if object1 is before than object2.
++				 */
++				public int compare(Object o1, Object o2) {
++
++					SiteCategory cat1 = (SiteCategory) o1;
++					SiteCategory cat2 = (SiteCategory) o2;
++
++					if (cat1.equals(cat2))
++						return 0;
++					return cat1.getName().compareTo(cat2.getName());
++				}
++			};
++		}
++		return comp;
++	}
++
++	/**
++	 * Creates an uninitialized model object.
++	 * 
++	 * @since 2.0
++	 */
++	public SiteCategory() {
++		super();
++	}
++
++	/**
++	 * Compare two category models for equality.
++	 * 
++	 * @see Object#equals(Object)
++	 * @since 2.0
++	 */
++	public boolean equals(Object obj) {
++		boolean result = false;
++		if (obj instanceof SiteCategory) {
++			SiteCategory otherCategory = (SiteCategory) obj;
++			result = getName().equalsIgnoreCase(otherCategory.getName());
++		}
++		return result;
++	}
++
++	/**
++	 * Retrieve the detailed category description
++	 * 
++	 * @return category description, or <code>null</code>.
++	 * @since 2.0
++	 */
++	public URLEntry getDescriptionModel() {
++		return description;
++	}
++
++	/**
++	 * Retrieve the displayable label for the category. If the model
++	 * object has been resolved, the label is localized.
++	 * 
++	 * @return displayable label, or <code>null</code>.
++	 * @since 2.0
++	 */
++	public String getLabel() {
++		if (localizedLabel != null)
++			return localizedLabel;
++		return label;
++	}
++
++	/**
++	 * Retrieve the non-localized displayable label for the category.
++	 * 
++	 * @return non-localized displayable label, or <code>null</code>.
++	 * @since 2.0
++	 */
++	public String getLabelNonLocalized() {
++		return label;
++	}
++
++	/**
++	 * Retrieve the name of the category.
++	 * 
++	 * @return category name, or <code>null</code>.
++	 * @since 2.0
++	 */
++	public String getName() {
++		return name;
++	}
++
++	/**
++	 * Compute hash code for category model.
++	 * 
++	 * @see Object#hashCode()
++	 * @since 2.0
++	 */
++	public int hashCode() {
++		return getName().hashCode();
++	}
++
++	/**
++	 * Resolve the model object.
++	 * Any URL strings in the model are resolved relative to the 
++	 * base URL argument. Any translatable strings in the model that are
++	 * specified as translation keys are localized using the supplied 
++	 * resource bundle.
++	 * 
++	 * @param base URL
++	 * @param bundleURL resource bundle URL
++	 * @exception MalformedURLException
++	 * @since 2.0
++	 */
++	public void resolve(URL base, URL bundleURL) throws MalformedURLException {
++		// resolve local elements
++		//		localizedLabel = resolveNLString(bundleURL, label);
++
++		// delegate to references
++		//		resolveReference(getDescriptionModel(), base, bundleURL);
++	}
++
++	/**
++	 * Sets the category description.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param description category description
++	 * @since 2.0
++	 */
++	public void setDescriptionModel(URLEntry description) {
++		this.description = description;
++	}
++
++	/**
++	 * Sets the category displayable label.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param label displayable label, or resource key
++	 * @since 2.0
++	 */
++	public void setLabel(String label) {
++		this.label = label;
++		this.localizedLabel = null;
++	}
++
++	/**
++	 * Sets the category name.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param name category name
++	 * @since 2.0
++	 */
++	public void setName(String name) {
++		this.name = name;
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteFeature.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteFeature.java
+new file mode 100644
+index 0000000..853058c
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteFeature.java
+@@ -0,0 +1,445 @@
++/*******************************************************************************
++ * Copyright (c) 2000, 2007 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *     James D Miles (IBM Corp.) - bug 191783, NullPointerException in FeatureDownloader
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.metadata.generator.features;
++
++import java.io.File;
++import java.net.MalformedURLException;
++import java.net.URL;
++import java.util.*;
++
++/**
++ * Feature reference model object.
++ * <p>
++ * This class may be instantiated or subclassed by clients. However, in most 
++ * cases clients should instead instantiate or subclass the provided 
++ * concrete implementation of this model.
++ * </p>
++ * <p>
++ * <b>Note:</b> This class/interface is part of an interim API that is still under development and expected to
++ * change significantly before reaching stability. It is being made available at this early stage to solicit feedback
++ * from pioneering adopters on the understanding that any code that uses this API will almost certainly be broken
++ * (repeatedly) as the API evolves.
++ * </p>
++ * @since 2.0
++ */
++public class SiteFeature {
++
++	private String arch;
++	// performance
++	private URL base;
++	private List /* of String*/categoryNames;
++	private String featureId;
++	private String featureVersion;
++	private String label;
++	private String nl;
++
++	private String os;
++	private String patch;
++	private final boolean resolved = false;
++	private SiteModel site;
++	private String type;
++	private URL url;
++	private String urlString;
++	private String ws;
++
++	/*
++	 * Compares two URL for equality
++	 * Return false if one of them is null
++	 */
++	public static boolean sameURL(URL url1, URL url2) {
++
++		if (url1 == null || url2 == null)
++			return false;
++		if (url1 == url2)
++			return true;
++		if (url1.equals(url2))
++			return true;
++
++		// check if URL are file: URL as we may
++		// have 2 URL pointing to the same featureReference
++		// but with different representation
++		// (i.e. file:/C;/ and file:C:/)
++		if (!"file".equalsIgnoreCase(url1.getProtocol())) //$NON-NLS-1$
++			return false;
++		if (!"file".equalsIgnoreCase(url2.getProtocol())) //$NON-NLS-1$
++			return false;
++
++		File file1 = new File(url1.getFile());
++		File file2 = new File(url2.getFile());
++
++		if (file1 == null)
++			return false;
++
++		return (file1.equals(file2));
++	}
++
++	/**
++	 * Creates an uninitialized feature reference model object.
++	 * 
++	 * @since 2.0
++	 */
++	public SiteFeature() {
++		super();
++	}
++
++	/**
++	 * Adds the name of a category this feature belongs to.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param categoryName category name
++	 * @since 2.0
++	 */
++	public void addCategoryName(String categoryName) {
++		if (this.categoryNames == null)
++			this.categoryNames = new ArrayList();
++		if (!this.categoryNames.contains(categoryName))
++			this.categoryNames.add(categoryName);
++	}
++
++	private void delayedResolve() {
++
++		// PERF: delay resolution
++		if (resolved)
++			return;
++
++		// resolve local elements
++		try {
++			url = new URL(base, urlString);
++		} catch (MalformedURLException e) {
++			//			UpdateCore.warn("", e); //$NON-NLS-1$
++		}
++	}
++
++	/**
++	 * Compares 2 feature reference models for equality
++	 *  
++	 * @param object feature reference model to compare with
++	 * @return <code>true</code> if the two models are equal, 
++	 * <code>false</code> otherwise
++	 * @since 2.0 
++	 */
++	public boolean equals(Object object) {
++
++		if (object == null)
++			return false;
++		if (getURL() == null)
++			return false;
++
++		if (!(object instanceof SiteFeature))
++			return false;
++
++		SiteFeature f = (SiteFeature) object;
++
++		return sameURL(getURL(), f.getURL());
++	}
++
++	/**
++	 * Returns the names of categories the referenced feature belongs to.
++	 * 
++	 * @return an array of names, or an empty array.
++	 * @since 2.0
++	 */
++	public String[] getCategoryNames() {
++		if (categoryNames == null)
++			return new String[0];
++
++		return (String[]) categoryNames.toArray(new String[0]);
++	}
++
++	/**
++	 * Returns the feature identifier as a string
++	 * 
++	 * @return feature identifier
++	 * @since 2.0
++	 */
++	public String getFeatureIdentifier() {
++		return featureId;
++	}
++
++	/**
++	 * Returns the feature version as a string
++	 * 
++	 * @return feature version 
++	 * @since 2.0
++	 */
++	public String getFeatureVersion() {
++		return featureVersion;
++	}
++
++	/**
++	 * Retrieve the displayable label for the feature reference. If the model
++	 * object has been resolved, the label is localized.
++	 *
++	 * @return displayable label, or <code>null</code>.
++	 * @since 2.0
++	 */
++	public String getLabel() {
++		return label;
++	}
++
++	/**
++	 * Retrieve the non-localized displayable label for the feature reference.
++	 *
++	 * @return non-localized displayable label, or <code>null</code>.
++	 * @since 2.0
++	 */
++	public String getLabelNonLocalized() {
++		return label;
++	}
++
++	/**
++	 * Get optional locale specification as a comma-separated string.
++	 *
++	 * @return the locale specification string, or <code>null</code>.
++	 * @since 2.1
++	 */
++	public String getNL() {
++		return nl;
++	}
++
++	/**
++	 * Get optional operating system specification as a comma-separated string.
++	 *
++	 * @return the operating system specification string, or <code>null</code>.
++	 * @since 2.1
++	 */
++	public String getOS() {
++		return os;
++	}
++
++	/**
++	 * Get optional system architecture specification as a comma-separated string.
++	 *
++	 * @return the system architecture specification string, or <code>null</code>.
++	 * @since 2.1
++	 */
++	public String getOSArch() {
++		return arch;
++	}
++
++	/**
++	 * Returns the patch mode.
++	 */
++	public String getPatch() {
++		return patch;
++	}
++
++	/**
++	 * Returns the site model for the reference.
++	 * 
++	 * @return site model
++	 * @since 2.0
++	 */
++	public SiteModel getSiteModel() {
++		return site;
++	}
++
++	/**
++	 * Returns the referenced feature type.
++	 * 
++	 * @return feature type, or <code>null</code> representing the default
++	 * feature type for the site
++	 * @since 2.0
++	 */
++	public String getType() {
++		return type;
++	}
++
++	/**
++	 * Returns the resolved URL for the feature reference.
++	 * 
++	 * @return url string
++	 * @since 2.0
++	 */
++	public URL getURL() {
++		delayedResolve();
++		return url;
++	}
++
++	/**
++	 * Returns the unresolved URL string for the reference.
++	 *
++	 * @return url string
++	 * @since 2.0
++	 */
++	public String getURLString() {
++		return urlString;
++	}
++
++	/**
++	 * Get optional windowing system specification as a comma-separated string.
++	 *
++	 * @return the windowing system specification string, or <code>null</code>.
++	 * @since 2.1
++	 */
++	public String getWS() {
++		return ws;
++	}
++
++	/**
++	 * Resolve the model object.
++	 * Any URL strings in the model are resolved relative to the 
++	 * base URL argument. Any translatable strings in the model that are
++	 * specified as translation keys are localized using the supplied 
++	 * resource bundle.
++	 * 
++	 * @param resolveBase URL
++	 * @param bundleURL resource bundle URL
++	 * @exception MalformedURLException
++	 * @since 2.0
++	 */
++	public void resolve(URL resolveBase, URL bundleURL) throws MalformedURLException {
++		this.base = resolveBase;
++	}
++
++	/**
++	 * Sets the system architecture specification.
++	 * Throws a runtime exception if this object is marked read-only.
++	 *
++	 * @param arch system architecture specification as a comma-separated list
++	 * @since 2.1
++	 */
++	public void setArch(String arch) {
++		this.arch = arch;
++	}
++
++	/**
++	 * Sets the names of categories this feature belongs to.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param categoryNames an array of category names
++	 * @since 2.0
++	 */
++	public void setCategoryNames(String[] categoryNames) {
++		if (categoryNames == null)
++			this.categoryNames = null;
++		else
++			this.categoryNames = new ArrayList(Arrays.asList(categoryNames));
++	}
++
++	/**
++	 * Sets the feature identifier.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param featureId feature identifier
++	 * @since 2.0
++	 */
++	public void setFeatureIdentifier(String featureId) {
++		this.featureId = featureId;
++	}
++
++	/**
++	 * Sets the feature version.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param featureVersion feature version
++	 * @since 2.0
++	 */
++	public void setFeatureVersion(String featureVersion) {
++		this.featureVersion = featureVersion;
++	}
++
++	/**
++	 * Sets the label.
++	 * @param label The label to set
++	 */
++	public void setLabel(String label) {
++		this.label = label;
++	}
++
++	/**
++	 * Sets the locale specification.
++	 * Throws a runtime exception if this object is marked read-only.
++	 *
++	 * @param nl locale specification as a comma-separated list
++	 * @since 2.1
++	 */
++	public void setNL(String nl) {
++		this.nl = nl;
++	}
++
++	/**
++	 * Sets the operating system specification.
++	 * Throws a runtime exception if this object is marked read-only.
++	 *
++	 * @param os operating system specification as a comma-separated list
++	 * @since 2.1
++	 */
++	public void setOS(String os) {
++		this.os = os;
++	}
++
++	/**
++	 * Sets the patch mode.
++	 */
++	public void setPatch(String patch) {
++		this.patch = patch;
++	}
++
++	/**
++	 * Sets the site for the referenced.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param site site for the reference
++	 * @since 2.0
++	 */
++	public void setSiteModel(SiteModel site) {
++		this.site = site;
++	}
++
++	/**
++	 * Sets the referenced feature type.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param type referenced feature type
++	 * @since 2.0
++	 */
++	public void setType(String type) {
++		this.type = type;
++	}
++
++	/**
++	 * Sets the unresolved URL for the feature reference.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param urlString unresolved URL string
++	 * @since 2.0
++	 */
++	public void setURLString(String urlString) {
++		this.urlString = urlString;
++		this.url = null;
++	}
++
++	/**
++	 * Sets the windowing system specification.
++	 * Throws a runtime exception if this object is marked read-only.
++	 *
++	 * @param ws windowing system specification as a comma-separated list
++	 * @since 2.1
++	 */
++	public void setWS(String ws) {
++		this.ws = ws;
++	}
++
++	/**
++	 * @see Object#toString()
++	 */
++	public String toString() {
++		StringBuffer buffer = new StringBuffer();
++		buffer.append(getClass().toString() + " :"); //$NON-NLS-1$
++		buffer.append(" at "); //$NON-NLS-1$
++		if (url != null)
++			buffer.append(url.toExternalForm());
++		return buffer.toString();
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteModel.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteModel.java
+new file mode 100644
+index 0000000..eeb15e7
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/SiteModel.java
+@@ -0,0 +1,317 @@
++/*******************************************************************************
++ * Copyright (c) 2000, 2006 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.metadata.generator.features;
++
++import java.net.MalformedURLException;
++import java.net.URL;
++import java.util.*;
++import org.eclipse.equinox.p2.metadata.generator.URLEntry;
++
++/**
++ * Site model object.
++ * <p>
++ * This class may be instantiated or subclassed by clients. However, in most 
++ * cases clients should instead instantiate or subclass the provided 
++ * concrete implementation of this model.
++ * </p>
++ * <p>
++ * <b>Note:</b> This class/interface is part of an interim API that is still under development and expected to
++ * change significantly before reaching stability. It is being made available at this early stage to solicit feedback
++ * from pioneering adopters on the understanding that any code that uses this API will almost certainly be broken
++ * (repeatedly) as the API evolves.
++ * </p>
++ * @since 2.0
++ */
++public class SiteModel {
++
++	private List /*of ArchiveReferenceModel*/archiveReferences;
++	private Set /*of SiteCategory*/categories;
++	private URLEntry description;
++	private List /*of SiteFeature*/featureReferences;
++	private URL locationURL;
++	private String locationURLString;
++	private List /* of URLEntry */mirrors;
++	private String mirrorsURLString;
++	private boolean supportsPack200;
++	private String type;
++
++	/**
++	 * Creates an uninitialized site model object.
++	 * 
++	 * @since 2.0
++	 */
++	public SiteModel() {
++		super();
++	}
++
++	/**
++	 * Adds an archive reference model to site.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param archiveReference archive reference model
++	 * @since 2.0
++	 */
++	public void addArchiveReferenceModel(URLEntry archiveReference) {
++		if (this.archiveReferences == null)
++			this.archiveReferences = new ArrayList();
++		if (!this.archiveReferences.contains(archiveReference))
++			this.archiveReferences.add(archiveReference);
++	}
++
++	/**
++	 * Adds a category model to site.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param category category model
++	 * @since 2.0
++	 */
++	public void addCategoryModel(SiteCategory category) {
++		if (this.categories == null)
++			this.categories = new TreeSet(SiteCategory.getComparator());
++		if (!this.categories.contains(category))
++			this.categories.add(category);
++	}
++
++	/**
++	 * Adds a feature reference model to site.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param featureReference feature reference model
++	 * @since 2.0
++	 */
++	public void addFeatureReferenceModel(SiteFeature featureReference) {
++		if (this.featureReferences == null)
++			this.featureReferences = new ArrayList();
++		// PERF: do not check if already present 
++		//if (!this.featureReferences.contains(featureReference))
++		this.featureReferences.add(featureReference);
++	}
++
++	/**
++	 * Adds a mirror site.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param mirror mirror model 
++	 * @since 3.1
++	 */
++	public void addMirrorModel(URLEntry mirror) {
++		if (this.mirrors == null)
++			this.mirrors = new ArrayList();
++		if (!this.mirrors.contains(mirror))
++			this.mirrors.add(mirror);
++	}
++
++	private void doSetMirrorSiteEntryModels(URLEntry[] newMirrors) {
++		if (newMirrors == null || newMirrors.length == 0)
++			this.mirrors = null;
++		else
++			this.mirrors = new ArrayList(Arrays.asList(newMirrors));
++	}
++
++	/**
++	 * Returns an array of plug-in and non-plug-in archive reference models
++	 * on this site
++	 * 
++	 * @return an array of archive reference models, or an empty array if there are
++	 * no archives known to this site.
++	 * @since 2.0
++	 */
++	public URLEntry[] getArchiveReferenceModels() {
++		if (archiveReferences == null || archiveReferences.size() == 0)
++			return new URLEntry[0];
++
++		return (URLEntry[]) archiveReferences.toArray(new URLEntry[0]);
++	}
++
++	/**
++	 * Returns an array of category models for this site.
++	 * 
++	 * @return array of site category models, or an empty array.
++	 * @since 2.0
++	 */
++	public SiteCategory[] getCategoryModels() {
++		if (categories == null || categories.size() == 0)
++			return new SiteCategory[0];
++
++		return (SiteCategory[]) categories.toArray(new SiteCategory[0]);
++	}
++
++	/**
++	 * Returns the site description.
++	 * 
++	 * @return site description, or <code>null</code>.
++	 * @since 2.0
++	 */
++	public URLEntry getDescriptionModel() {
++		return description;
++	}
++
++	/**
++	 * Returns an array of feature reference models on this site.
++	 * 
++	 * @return an array of feature reference models, or an empty array.
++	 * @since 2.0
++	 */
++	public SiteFeature[] getFeatureReferenceModels() {
++		if (featureReferences == null || featureReferences.size() == 0)
++			return new SiteFeature[0];
++
++		return (SiteFeature[]) featureReferences.toArray(new SiteFeature[0]);
++	}
++
++	/**
++	 * Returns the resolved URL for the site.
++	 * 
++	 * @return url, or <code>null</code>
++	 * @since 2.0
++	 */
++	public URL getLocationURL() {
++		return locationURL;
++	}
++
++	/**
++	 * Returns the unresolved URL string for the site.
++	 *
++	 * @return url string, or <code>null</code>
++	 * @since 2.0
++	 */
++	public String getLocationURLString() {
++		return locationURLString;
++	}
++
++	/**
++	 * Return an array of update site mirrors
++	 * 
++	 * @return an array of mirror entries, or an empty array.
++	 * @since 3.1
++	 */
++	public URLEntry[] getMirrorSiteEntryModels() {
++		//delayedResolve(); no delay;
++		if (mirrors == null || mirrors.size() == 0)
++			// see if we can get mirrors from the provided url
++			if (mirrorsURLString != null)
++				doSetMirrorSiteEntryModels(DefaultSiteParser.getMirrors(mirrorsURLString));
++
++		if (mirrors == null || mirrors.size() == 0)
++			return new URLEntry[0];
++		return (URLEntry[]) mirrors.toArray(new URLEntry[0]);
++	}
++
++	/** 
++	 * Returns the site type.
++	 * 
++	 * @return site type, or <code>null</code>.
++	 * @since 2.0
++	 */
++	public String getType() {
++		return type;
++	}
++
++	public boolean isPack200Supported() {
++		return supportsPack200;
++	}
++
++	/**
++	 * Resolve the model object.
++	 * Any URL strings in the model are resolved relative to the 
++	 * base URL argument. Any translatable strings in the model that are
++	 * specified as translation keys are localized using the supplied 
++	 * resource bundle.
++	 * 
++	 * @param base URL
++	 * @param bundleURL resource bundle URL
++	 * @exception MalformedURLException
++	 * @since 2.0
++	 */
++	public void resolve(URL base, URL bundleURL) throws MalformedURLException {
++
++		// Archives and feature are relative to location URL
++		// if the Site element has a URL tag: see spec	
++		//		locationURL = resolveURL(base, bundleURL, getLocationURLString());
++		//		if (locationURL == null)
++		//			locationURL = base;
++		//		resolveListReference(getFeatureReferenceModels(), locationURL, bundleURL);
++		//		resolveListReference(getArchiveReferenceModels(), locationURL, bundleURL);
++		//
++		//		resolveReference(getDescriptionModel(), base, bundleURL);
++		//		resolveListReference(getCategoryModels(), base, bundleURL);
++		//
++		//		URL url = resolveURL(base, bundleURL, mirrorsURLString);
++		//		if (url != null)
++		//			mirrorsURLString = url.toString();
++		//
++		//		if ((this instanceof ExtendedSite) && ((ExtendedSite) this).isDigestExist()) {
++		//			ExtendedSite extendedSite = (ExtendedSite) this;
++		//			extendedSite.setLiteFeatures(UpdateManagerUtils.getLightFeatures(extendedSite));
++		//		}
++	}
++
++	/**
++	 * Sets the site description.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param description site description
++	 * @since 2.0
++	 */
++	public void setDescriptionModel(URLEntry description) {
++		this.description = description;
++	}
++
++	/**
++	 * Sets the unresolved URL for the site.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param locationURLString url for the site (as a string)
++	 * @since 2.0
++	 */
++	public void setLocationURLString(String locationURLString) {
++		this.locationURLString = locationURLString;
++	}
++
++	/**
++	 * Sets additional mirror sites
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param mirrors additional update site mirrors
++	 * @since 3.1
++	 */
++	public void setMirrorSiteEntryModels(URLEntry[] mirrors) {
++		doSetMirrorSiteEntryModels(mirrors);
++	}
++
++	/**
++	 * Sets the mirrors url. Mirror sites will then be obtained from this mirror url later.
++	 * This method is complementary to setMirrorsiteEntryModels(), and only one of these 
++	 * methods should be called.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param mirrorsURL additional update site mirrors
++	 * @since 3.1
++	 */
++	public void setMirrorsURLString(String mirrorsURL) {
++		this.mirrorsURLString = mirrorsURL;
++	}
++
++	public void setSupportsPack200(boolean value) {
++		this.supportsPack200 = value;
++	}
++
++	/**
++	 * Sets the site type.
++	 * Throws a runtime exception if this object is marked read-only.
++	 * 
++	 * @param type site type
++	 * @since 2.0
++	 */
++	public void setType(String type) {
++		this.type = type;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/messages.properties b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/messages.properties
+new file mode 100644
+index 0000000..052ad26
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/features/messages.properties
+@@ -0,0 +1,30 @@
++###############################################################################
++# Copyright (c) 2000, 2007 IBM Corporation and others.
++# All rights reserved. This program and the accompanying materials
++# are made available under the terms of the Eclipse Public License v1.0
++# which accompanies this distribution, and is available at
++# http://www.eclipse.org/legal/epl-v10.html
++#
++# Contributors:
++#     IBM Corporation - initial API and implementation
++###############################################################################
++# Install Update Core Properties File
++#
++
++DefaultFeatureParser_IdOrVersionInvalid= Error parsing feature stream. The unique identifier or the version is null or empty for the State: \"{2}\": unique identifier=\"{0}\" version=\"{1}\".
++DefaultSiteParser_NoSiteTag= Error parsing site stream. Unable to find root element \"site\" in the stream.
++DefaultSiteParser_WrongParsingStack= Internal Error parsing site stream. Unexpected Parsing Stack: \"{0}\"
++DefaultSiteParser_UnknownElement= Error parsing site stream. Unknown element \"{0}\" in parsing state \"{1}\". Check the validity of the XML file.
++DefaultSiteParser_UnknownStartState= Internal Error parsing site stream. Unknown start state \"{0}\".
++DefaultSiteParser_Missing= Error parsing site stream. The \"{0}\" tag of the element \"{1}\" is null or empty. Value is required.
++DefaultSiteParser_ParsingStackBackToInitialState= Internal Error parsing site stream. Parsing stack back to Initial State.
++DefaultSiteParser_ElementAlreadySet= Error parsing site stream. Element: \"{0}\" already set for the Site.
++DefaultSiteParser_CategoryAlreadySet= Error parsing site stream. Element: \"{0}\": \"{1}\" already set for the Site.
++DefaultSiteParser_UnknownEndState= Internal Error parsing site stream. Unknown end state \"{0}\".
++DefaultSiteParser_ErrorParsing= Error Parsing site stream. Error: \"{0}\"
++DefaultSiteParser_ErrorlineColumnMessage= Error Parsing site stream. Element \"{0}\" line: \"{1}\" column:\"{2}\". Error: \"{3}\".
++DefaultSiteParser_ErrorParsingSite= Error Parsing site stream.
++DefaultSiteParser_UnknownState= Unknown State \"{0}\".
++DefaultSiteParser_InvalidXMLStream= The XML stream is not a valid default \"site.xml\" file. The root tag is not site.
++DefaultSiteParser_mirrors = Error processing update site mirror.
++
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/AllTests.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/AllTests.java
+index c7538b7..f8f63bd 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/AllTests.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/AllTests.java
+@@ -20,6 +20,7 @@ public class AllTests extends TestCase {
+ 	public static Test suite() {
+ 		TestSuite suite = new TestSuite(AllTests.class.getName());
+ 		suite.addTestSuite(EclipseSDK33Test.class);
++		suite.addTestSuite(SiteParserTest.class);
+ 		return suite;
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/SiteParserTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/SiteParserTest.java
+new file mode 100644
+index 0000000..f4b71bd
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/generator/SiteParserTest.java
+@@ -0,0 +1,35 @@
++/*******************************************************************************
++ * Copyright (c) 2007 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.p2.tests.generator;
++
++import java.io.IOException;
++import org.eclipse.equinox.internal.p2.metadata.generator.features.DefaultSiteParser;
++import org.eclipse.equinox.internal.p2.metadata.generator.features.SiteModel;
++import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
++import org.eclipse.equinox.p2.tests.TestData;
++import org.xml.sax.SAXException;
++
++/**
++ * Test the site.xml parser included in the generator.
++ */
++public class SiteParserTest extends AbstractProvisioningTest {
++	public void testEuropaSite() {
++		DefaultSiteParser parser = new DefaultSiteParser();
++		try {
++			SiteModel site = parser.parse(TestData.get("generator", "Europa/site.xml"));
++			System.out.println(site);
++		} catch (SAXException e) {
++			fail("4.99", e);
++		} catch (IOException e) {
++			fail("4.99", e);
++		}
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/testData/generator/Europa/site.xml b/bundles/org.eclipse.equinox.p2.tests/testData/generator/Europa/site.xml
+new file mode 100644
+index 0000000..a9bf017
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/testData/generator/Europa/site.xml
+@@ -0,0 +1,483 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<site digestURL="http://download.eclipse.org/releases/europa/" mirrorsURL="http://www.eclipse.org/downloads/download.php?file=/releases/europa/site.xml&amp;format=xml&amp;protocol=http" pack200="true">
++
++    <description url="http://www.eclipse.org/europa/">
++        This Europa Discovery Site contains a number of Eclipse based projects 
++        released simultaneously, June 2007.
++    </description>
++
++    <category-def label="C and C++ Developement" name="C and C++ Developement">
++        <description>Integrated Developement for C and C++ programs.</description>
++    </category-def>
++    <category-def label="Charting and Reporting" name="Charting and Reporting">
++        <description>Business Intelligence and Reporting Tools</description>
++    </category-def>
++    <category-def label="Collaboration Tools" name="Collaboration Tools">
++        <description>
++            Collaboration and integration tools for the Eclipse environment.
++        </description>
++    </category-def>
++    <category-def label="Communications" name="Communications">
++        <description>
++            Real-time communications for Eclipse.  To use applications (e.g. IM, real-time collab, etc.), both the Core API and Application features are required.
++        </description>
++    </category-def>
++    <category-def label="Database Development" name="Database Development">
++        <description>Tools to allow integration with and easy use of Databases.</description>
++    </category-def>
++    <category-def label="Graphical Editors and Frameworks" name="Graphical Editors and Frameworks">
++        <description>A framework to create graphical editors.</description>
++    </category-def>
++    <category-def label="Java Development" name="Java Development">
++        <description>
++            Integrated development tools for Java Development, including plugin developement with Java, and J2EE applications.
++        </description>
++    </category-def>
++    <category-def label="Models and Model Development" name="Models and Model Development">
++        <description>
++            Model creation and manipulation frameworks (e.g. EMF, GMF) and specific models (SDO, JEM, XSD Infoset).
++        </description>
++    </category-def>
++    <category-def label="Remote Access and Device Development" name="Remote Access and Device Development">
++        <description>Tools and Frameworks for accessing and managing remote computers or embedded devices</description>
++    </category-def>
++    <category-def label="SOA Development" name="SOA Development">
++        <description>A platform and tools for developing
++        Service-Oriented Component-based  Applications.</description>
++    </category-def>
++    <category-def label="Testing and Performance" name="Testing and Performance">
++        <description>Tools and Frameworks to improve performance and automatic testing.</description>
++    </category-def>
++    <category-def label="Web and JEE Development" name="Web and JEE Development">
++        <description>A platform and tools for developing XML, WebServices, and JEE Applications.</description>
++    </category-def>
++    <category-def label="Programming Languages" name="Programming Languages">
++        <description>
++            Tools and Frameworks supporting programming languages for the Eclipse environment.
++        </description>
++    </category-def>
++    <category-def label="Other Tools" name="Other Tools">
++        <description>
++            Other tools for the Eclipse environment.
++        </description>
++    </category-def>
++    <category-def label="Enabling Features" name="Enabling Features">
++        <description>
++            These features provide functionality required by one or more projects, but do not provide end-user functionality by
++            themselves.
++        </description>
++    </category-def>
++
++    <feature id="org.eclipse.eclipsemonkey" patch="false" url="features/org.eclipse.eclipsemonkey_1.0.0.200706060947.jar" version="1.0.0.200706060947">
++        <category name="Other Tools"/>
++    </feature>
++    <feature id="org.apache.batik" patch="false" url="features/org.apache.batik_1.6.0.v20061222-1222-0842283444-3444.jar" version="1.6.0.v20061222-1222-0842283444-3444">
++        <category name="Enabling Features"/>
++    </feature>
++
++
++
++    <feature id="org.eclipse.platform" patch="false" url="features/org.eclipse.platform_3.3.2.R33x_v20071022-_19UEksF-G8Yc6bUv3Dz.jar" version="3.3.2.R33x_v20071022-_19UEksF-G8Yc6bUv3Dz">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.cvs" patch="false" url="features/org.eclipse.cvs_1.0.1.R33x_r20070802-7C79_9_KKG-mDM9e3H5D.jar" version="1.0.1.R33x_r20070802-7C79_9_KKG-mDM9e3H5D">
++        <category name="Collaboration Tools"/>
++    </feature>
++
++
++    <feature id="org.eclipse.equinox" patch="false" url="features/org.eclipse.equinox_3.3.1.R33x_r20070918-7n7LECgEKVsLIM1aGBO4b00.jar" version="3.3.1.R33x_r20070918-7n7LECgEKVsLIM1aGBO4b00">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.birt" patch="false" url="features/org.eclipse.birt_2.2.1.v20070709-7M7M7A3OP2Mz-yAItil64r9z0tw0.jar" version="2.2.1.v20070709-7M7M7A3OP2Mz-yAItil64r9z0tw0">
++        <category name="Charting and Reporting"/>
++    </feature>
++    <feature id="org.eclipse.birt.doc" patch="false" url="features/org.eclipse.birt.doc_2.2.1.v20070709-110-s332Aw31181_2_.jar" version="2.2.1.v20070709-110-s332Aw31181_2_">
++        <category name="Charting and Reporting"/>
++    </feature>
++    
++    <feature id="org.apache.derby.core" url="features/org.apache.derby.core_10.1.2.1.jar" version="10.1.2.1">
++        <category name="Enabling Features"/>
++    </feature>
++
++    <feature id="com.lowagie.itext" url="features/com.lowagie.itext_1.5.2.v20070608-041-w31181821.jar" version="1.5.2.v20070608-041-w31181821">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.apache.commons.codec" url="features/org.apache.commons.codec_1.3.0.v20070907-02--w311817222849.jar" version="1.3.0.v20070907-02--w311817222849">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.mozilla.rhino" url="features/org.mozilla.rhino_1.6.0.v20070406-05--w31181821.jar" version="1.6.0.v20070406-05--w31181821">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.w3c.sac" url="features/org.w3c.sac_1.3.0.v20070406-02--w31181821.jar" version="1.3.0.v20070406-02--w31181821">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.cdt" patch="false" url="features/org.eclipse.cdt_4.0.1.200709241202.jar" version="4.0.1.200709241202">
++        <category name="C and C++ Developement"/>
++    </feature>
++    <feature id="org.eclipse.jdt" patch="false" url="features/org.eclipse.jdt_3.3.1.r331_v20070629-7o7jE72EDlXAbqAcnbmyg1rf8RIL.jar" version="3.3.1.r331_v20070629-7o7jE72EDlXAbqAcnbmyg1rf8RIL">
++        <category name="Java Development"/>
++    </feature>
++    <feature id="org.eclipse.pde" patch="false" url="features/org.eclipse.pde_3.3.2.R33x_r20071022-7N7M4CYWLBCz-yHkMIuHN.jar" version="3.3.2.R33x_r20071022-7N7M4CYWLBCz-yHkMIuHN">
++        <category name="Java Development"/>
++    </feature>
++
++    <feature id="org.eclipse.emf" patch="false" url="features/org.eclipse.emf_2.3.1.v200709252135.jar" version="2.3.1.v200709252135">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.emf.sdk" patch="false" url="features/org.eclipse.emf.sdk_2.3.1.v200709252135.jar" version="2.3.1.v200709252135">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.emf.ecore.sdo" patch="false" url="features/org.eclipse.emf.ecore.sdo_2.3.0.v200709252135.jar" version="2.3.0.v200709252135">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.emf.ecore.sdo.sdk" patch="false" url="features/org.eclipse.emf.ecore.sdo.sdk_2.3.0.v200709252135.jar" version="2.3.0.v200709252135">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.xsd" patch="false" url="features/org.eclipse.xsd_2.3.1.v200709252135.jar" version="2.3.1.v200709252135">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.xsd.sdk" patch="false" url="features/org.eclipse.xsd.sdk_2.3.1.v200709252135.jar" version="2.3.1.v200709252135">
++        <category name="Models and Model Development"/>
++    </feature>
++
++    <feature id="org.eclipse.emf.common" patch="false" url="features/org.eclipse.emf.common_2.3.0.v200709252135.jar" version="2.3.0.v200709252135">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.common.ui" patch="false" url="features/org.eclipse.emf.common.ui_2.3.1.v200709252135.jar" version="2.3.1.v200709252135">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.ecore" patch="false" url="features/org.eclipse.emf.ecore_2.3.1.v200709252135.jar" version="2.3.1.v200709252135">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.ecore.edit" patch="false" url="features/org.eclipse.emf.ecore.edit_2.3.0.v200709252135.jar" version="2.3.0.v200709252135">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.edit" patch="false" url="features/org.eclipse.emf.edit_2.3.1.v200709252135.jar" version="2.3.1.v200709252135">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.edit.ui" patch="false" url="features/org.eclipse.emf.edit.ui_2.3.1.v200709252135.jar" version="2.3.1.v200709252135">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.xsd.edit" patch="false" url="features/org.eclipse.xsd.edit_2.3.0.v200709252135.jar" version="2.3.0.v200709252135">
++        <category name="Enabling Features"/>
++    </feature>
++
++    <feature id="org.eclipse.emf.emfqtv.all" patch="false" url="features/org.eclipse.emf.emfqtv.all_1.1.1.v200707252036-652_sIRHttoHhmdpTYReXV-2KEZZ.jar" version="1.1.1.v200707252036-652_sIRHttoHhmdpTYReXV-2KEZZ">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.emf.emfqtv.all.sdk" patch="false" url="features/org.eclipse.emf.emfqtv.all.sdk_1.1.1.v200707252036-7A7_3DjfUA5Xin8dz-9aGNVIHYlK.jar" version="1.1.1.v200707252036-7A7_3DjfUA5Xin8dz-9aGNVIHYlK">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.emf.query" patch="false" url="features/org.eclipse.emf.query_1.1.0.v200706071712-10-7w311817182823.jar" version="1.1.0.v200706071712-10-7w311817182823">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.query.ocl" patch="false" url="features/org.eclipse.emf.query.ocl_1.1.0.v200706071712-10-7w311817182823.jar" version="1.1.0.v200706071712-10-7w311817182823">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.validation" patch="false" url="features/org.eclipse.emf.validation_1.1.1.v200708161445-318Z9oA55P5O6O8IC_.jar" version="1.1.1.v200708161445-318Z9oA55P5O6O8IC_">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.validation.ocl" patch="false" url="features/org.eclipse.emf.validation.ocl_1.1.0.v200706071520-10-7w311817182631.jar" version="1.1.0.v200706071520-10-7w311817182631">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.transaction" patch="false" url="features/org.eclipse.emf.transaction_1.1.1.v200708231948-208Z8s733G3G5C5I9D.jar" version="1.1.1.v200708231948-208Z8s733G3G5C5I9D">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.workspace" patch="false" url="features/org.eclipse.emf.workspace_1.1.1.v200707252036-208Z8s733G3F5E6_8B.jar" version="1.1.1.v200707252036-208Z8s733G3F5E6_8B">
++        <category name="Enabling Features"/>
++    </feature>
++    
++    <feature id="org.eclipse.jet" patch="false" url="features/org.eclipse.jet_0.8.1.v20070913-17E19oA55P5V_8.jar" version="0.8.1.v20070913-17E19oA55P5V_8">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.jet.sdk" patch="false" url="features/org.eclipse.jet.sdk_0.8.1.v20070913-07U182TZ7cjWEGkBuJH.jar" version="0.8.1.v20070913-07U182TZ7cjWEGkBuJH">
++        <category name="Models and Model Development"/>
++    </feature>
++
++    <feature id="org.eclipse.gmf.europa" patch="false" url="features/org.eclipse.gmf.europa_2.0.1.v20070809-0000-7X77__EIn-hz0YSfRy8HJNAMTFfk.jar" version="2.0.1.v20070809-0000-7X77__EIn-hz0YSfRy8HJNAMTFfk">
++        <category name="Models and Model Development"/>
++    </feature>
++
++	<feature id="org.eclipse.eodm" patch="false" url="features/org.eclipse.eodm_0.9.1.v200710090302.jar" version="0.9.1.v200710090302">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.eodm.sdk" patch="false" url="features/org.eclipse.eodm.sdk_0.9.1.v200710090302.jar" version="0.9.1.v200710090302">
++        <category name="Models and Model Development"/>
++    </feature>
++	<feature id="org.eclipse.ocl.all" patch="false" url="features/org.eclipse.ocl.all_1.1.1.v200707131415-3227_75ThLBBkBkFRGdQZ.jar" version="1.1.1.v200707131415-3227_75ThLBBkBkFRGdQZ">
++		<category name="Models and Model Development"/>
++	</feature>
++	<feature id="org.eclipse.ocl.all.sdk" patch="false" url="features/org.eclipse.ocl.all.sdk_1.1.1.v200707131415-653_-JAYPRgmMdz-YXRDlgnKonBk.jar" version="1.1.1.v200707131415-653_-JAYPRgmMdz-YXRDlgnKonBk">
++		<category name="Models and Model Development"/>
++	</feature>
++    <feature id="org.eclipse.ocl" patch="false" url="features/org.eclipse.ocl_1.1.1.v200707131415-3209oA55P5N7F8JDH.jar" version="1.1.1.v200707131415-3209oA55P5N7F8JDH">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.ocl.uml" patch="false" url="features/org.eclipse.ocl.uml_1.1.1.v200707131415-1007w311818242526.jar" version="1.1.1.v200707131415-1007w311818242526">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.emf.ocl" patch="false" url="features/org.eclipse.emf.ocl_1.1.1.v200709121956-1007w31181_232_67.jar" version="1.1.1.v200709121956-1007w31181_232_67">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.uml2" patch="false" url="features/org.eclipse.uml2_2.1.1.v200708301222.jar" version="2.1.1.v200708301222">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.uml2.sdk" patch="false" url="features/org.eclipse.uml2.sdk_2.1.1.v200708301222.jar" version="2.1.1.v200708301222">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.uml2tools" patch="false" url="features/org.eclipse.uml2tools_0.7.1.v200710010534.jar" version="0.7.1.v200710010534">
++        <category name="Models and Model Development"/>
++    </feature>
++    <feature id="org.eclipse.uml2tools.sdk" patch="false" url="features/org.eclipse.uml2tools.sdk_0.7.1.v200710010534.jar" version="0.7.1.v200710010534">
++        <category name="Models and Model Development"/>
++    </feature>
++
++    <feature id="org.eclipse.tptp.birt" patch="false" url="features/org.eclipse.tptp.birt_4.4.1.v200706132116-7I7G_B-hthrMpLSZUYptCTz-cV-E.jar" version="4.4.1.v200706132116-7I7G_B-hthrMpLSZUYptCTz-cV-E">
++        <category name="Testing and Performance"/>
++    </feature>
++    <feature id="org.eclipse.tptp.wtp" patch="false" url="features/org.eclipse.tptp.wtp_4.4.1.v200709261752-7748a-CIHlAZ8lIHAlCqJfJeRF.jar" version="4.4.1.v200709261752-7748a-CIHlAZ8lIHAlCqJfJeRF">
++        <category name="Testing and Performance"/>
++    </feature>
++    <feature id="org.eclipse.tptp.monitoring.runtime" patch="false" url="features/org.eclipse.tptp.monitoring.runtime_4.4.1.v200706132116-7U7R_E-wavnIGH7KFhrm5z08Zs8T.jar" version="4.4.1.v200706132116-7U7R_E-wavnIGH7KFhrm5z08Zs8T">
++        <category name="Testing and Performance"/>
++    </feature>
++    <feature id="org.eclipse.tptp.platform.runtime" patch="false" url="features/org.eclipse.tptp.platform.runtime_4.4.1.v200706132116-8I83EIX1JNK7dwt7tHntrj6xnH84.jar" version="4.4.1.v200706132116-8I83EIX1JNK7dwt7tHntrj6xnH84">
++        <category name="Testing and Performance"/>
++    </feature>
++    <feature id="org.eclipse.tptp.test.runtime" patch="false" url="features/org.eclipse.tptp.test.runtime_4.3.101.v200709261752-7E7_Ak-QhKUAY67ta21mO89G_GXO.jar" version="4.3.101.v200709261752-7E7_Ak-QhKUAY67ta21mO89G_GXO">
++        <category name="Testing and Performance"/>
++    </feature>
++    <feature id="org.eclipse.tptp.trace.runtime" patch="false" url="features/org.eclipse.tptp.trace.runtime_4.3.1.v200709261752-7E783-UUENBmM3RiQ4UxVz-eZD8.jar" version="4.3.1.v200709261752-7E783-UUENBmM3RiQ4UxVz-eZD8">
++        <category name="Testing and Performance"/>
++    </feature>
++
++    <feature id="org.eclipse.wst.xml_ui.feature" url="features/org.eclipse.wst.xml_ui.feature_2.0.1.v200709110650-7A1ECGCnbckz0bnr5wCp8KNAjipR.jar" version="2.0.1.v200709110650-7A1ECGCnbckz0bnr5wCp8KNAjipR">
++        <category name="Web and JEE Development"/>
++    </feature>
++    <feature id="org.eclipse.wst" patch="false" url="features/org.eclipse.wst_2.0.1.v200709110510-7C-778k0JWNr93WEIHvplSVojWel.jar" version="2.0.1.v200709110510-7C-778k0JWNr93WEIHvplSVojWel">
++        <category name="Web and JEE Development"/>
++    </feature>
++    <feature id="org.eclipse.jst" patch="false" url="features/org.eclipse.jst_2.0.1.v200709110510-7B-68dDTNImaz0di_Tvks1JyDPVe.jar" version="2.0.1.v200709110510-7B-68dDTNImaz0di_Tvks1JyDPVe">
++        <category name="Web and JEE Development"/>
++        <category name="Java Development"/>
++    </feature>
++    <feature id="org.eclipse.jpt.feature" patch="false" url="features/org.eclipse.jpt.feature_1.0.1.v200709130000-77-5CYQCCz-D7LQCCCD.jar" version="1.0.1.v200709130000-77-5CYQCCz-D7LQCCCD">
++        <category name="Web and JEE Development"/>
++        <category name="Java Development"/>
++    </feature>
++
++    <feature id="org.eclipse.wst.common_ui.feature" url="features/org.eclipse.wst.common_ui.feature_2.0.1.v200709110622-7C5EH2E9RvTVnijrspVz0bgOmfz-.jar" version="2.0.1.v200709110622-7C5EH2E9RvTVnijrspVz0bgOmfz-">
++        <category name="Enabling Features"/>
++    </feature>        
++    
++    
++    <feature id="org.eclipse.gef" patch="false" url="features/org.eclipse.gef_3.3.1.v20070814.jar" version="3.3.1.v20070814">
++        <category name="Graphical Editors and Frameworks"/>
++    </feature>
++    
++    <feature id="org.eclipse.gef.sdk" patch="false" url="features/org.eclipse.gef.sdk_3.3.1.v20070814.jar" version="3.3.1.v20070814">
++        <category name="Graphical Editors and Frameworks"/>
++    </feature>
++    
++    <feature id="org.eclipse.datatools.connectivity.feature" patch="false" url="features/org.eclipse.datatools.connectivity.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.connectivity.oda.designer.feature" patch="false" url="features/org.eclipse.datatools.connectivity.oda.designer.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.connectivity.oda.feature" patch="false" url="features/org.eclipse.datatools.connectivity.oda.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.doc.user" patch="false" url="features/org.eclipse.datatools.doc.user_1.5.1.200710161.jar" version="1.5.1.200710161">
++        <category name="Database Development"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.apache.derby.feature" patch="false" url="features/org.eclipse.datatools.enablement.apache.derby.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.feature" patch="false" url="features/org.eclipse.datatools.enablement.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Database Development"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.hsqldb.feature" patch="false" url="features/org.eclipse.datatools.enablement.hsqldb.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.ibm.feature" patch="false" url="features/org.eclipse.datatools.enablement.ibm.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.jdbc.feature" patch="false" url="features/org.eclipse.datatools.enablement.jdbc.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.jdt.feature" patch="false" url="features/org.eclipse.datatools.enablement.jdt.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.msft.feature" patch="false" url="features/org.eclipse.datatools.enablement.msft.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.mysql.feature" patch="false" url="features/org.eclipse.datatools.enablement.mysql.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.oda.designer.feature" patch="false" url="features/org.eclipse.datatools.enablement.oda.designer.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.oda.feature" patch="false" url="features/org.eclipse.datatools.enablement.oda.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.oracle.feature" patch="false" url="features/org.eclipse.datatools.enablement.oracle.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.postgresql.feature" patch="false" url="features/org.eclipse.datatools.enablement.postgresql.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.enablement.sybase.feature" patch="false" url="features/org.eclipse.datatools.enablement.sybase.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.intro" patch="false" url="features/org.eclipse.datatools.intro_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Database Development"/>
++    </feature>
++    <feature id="org.eclipse.datatools.modelbase.feature" patch="false" url="features/org.eclipse.datatools.modelbase.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.sdk.feature" patch="false" url="features/org.eclipse.datatools.sdk.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Database Development"/>
++    </feature>
++    <feature id="org.eclipse.datatools.sqldevtools.data.feature" patch="false" url="features/org.eclipse.datatools.sqldevtools.data.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.sqldevtools.ddl.feature" patch="false" url="features/org.eclipse.datatools.sqldevtools.ddl.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.sqldevtools.feature" patch="false" url="features/org.eclipse.datatools.sqldevtools.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Database Development"/>
++    </feature>
++    <feature id="org.eclipse.datatools.sqldevtools.parsers.feature" patch="false" url="features/org.eclipse.datatools.sqldevtools.parsers.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    <feature id="org.eclipse.datatools.sqldevtools.results.feature" patch="false" url="features/org.eclipse.datatools.sqldevtools.results.feature_1.5.1.200709261.jar" version="1.5.1.200709261">
++        <category name="Enabling Features"/>
++    </feature>
++    
++    <feature id="org.eclipse.rse" patch="false" url="features/org.eclipse.rse_2.0.2.v20071030-7D-68mJIkR9WAviqV8z0U9vz-C.jar" version="2.0.2.v20071030-7D-68mJIkR9WAviqV8z0U9vz-C">
++        <category name="Remote Access and Device Development"/>
++    </feature>
++    <feature id="org.eclipse.rse.sdk" patch="false" url="features/org.eclipse.rse.sdk_2.0.2.v20071030-7J-79E7ZoHPP5ZoeZ-oUe1z-wJnl.jar" version="2.0.2.v20071030-7J-79E7ZoHPP5ZoeZ-oUe1z-wJnl">
++        <category name="Remote Access and Device Development"/>
++    </feature>
++    <feature id="org.eclipse.rse.remotecdt" patch="false" url="features/org.eclipse.rse.remotecdt_2.0.1.v20070926-4-18s733G3K5H.jar" version="2.0.1.v20070926-4-18s733G3K5H">
++        <category name="Remote Access and Device Development"/>
++    </feature>
++    <feature id="org.eclipse.tm.terminal.sdk" patch="false" url="features/org.eclipse.tm.terminal.sdk_1.0.2.v20071030-7_-7CAvNKwNabWDLhQglhNDDmGSL.jar" version="1.0.2.v20071030-7_-7CAvNKwNabWDLhQglhNDDmGSL">
++        <category name="Remote Access and Device Development"/>
++    </feature>
++    <feature id="org.eclipse.tm.discovery" patch="false" url="features/org.eclipse.tm.discovery_2.0.0.v20070611-7J--E8McIJNJCPr.jar" version="2.0.0.v20070611-7J--E8McIJNJCPr">
++        <category name="Remote Access and Device Development"/>
++    </feature>
++
++    <feature id="org.eclipse.dd.dsf.sdk" patch="false" url="features/org.eclipse.dd.dsf.sdk_0.9.0.v20070615.jar" version="0.9.0.v20070615">
++        <category name="Remote Access and Device Development"/>
++    </feature>
++    <feature id="org.eclipse.dd.dsf.gdb" patch="false" url="features/org.eclipse.dd.dsf.gdb_0.9.0.v20070615.jar" version="0.9.0.v20070615">
++        <category name="Remote Access and Device Development"/>
++    </feature>
++    <feature id="org.eclipse.dd.debug.memory.renderings" patch="false" url="features/org.eclipse.dd.debug.memory.renderings_0.9.0.v20070615.jar" version="0.9.0.v20070615">
++        <category name="Remote Access and Device Development"/>
++    </feature>
++    <feature id="org.eclipse.dd.ipxact" patch="false" url="features/org.eclipse.dd.ipxact_0.2.0.v20070615.jar" version="0.2.0.v20070615">
++        <category name="Remote Access and Device Development"/>
++    </feature>
++
++    <feature id="org.eclipse.ecf.core" patch="false" url="features/org.eclipse.ecf.core_1.2.0.v20071019-1300.jar" version="1.2.0.v20071019-1300">
++        <category name="Communications"/>
++    </feature>
++    <feature id="org.eclipse.ecf.examples" patch="false" url="features/org.eclipse.ecf.examples_1.2.0.v20071019-1300.jar" version="1.2.0.v20071019-1300">
++        <category name="Communications"/>
++    </feature>
++
++    <feature id="org.eclipse.ajdt" patch="false" url="features/org.eclipse.ajdt_1.5.0.200706070619.jar" version="1.5.0.200706070619">
++        <category name="Java Development"/>
++        <category name="Programming Languages"/>
++    </feature>
++    
++    <feature id="org.eclipse.dltk.core" patch="false" url="features/org.eclipse.dltk.core_0.9.1.r09_v20070920-08O2E8AWjpkOySy5VAPB.jar" version="0.9.1.r09_v20070920-08O2E8AWjpkOySy5VAPB">
++        <category name="Enabling Features"/>
++    </feature>
++
++    <feature id="org.eclipse.dltk.ruby" patch="false" url="features/org.eclipse.dltk.ruby_0.9.1.r09_v20070920-07q2BMEkrz-IMCd7gEK.jar" version="0.9.1.r09_v20070920-07q2BMEkrz-IMCd7gEK">
++        <category name="Programming Languages"/>
++    </feature>
++
++    <feature id="org.eclipse.dltk.tcl" patch="false" url="features/org.eclipse.dltk.tcl_0.9.1.r09_v20070920-07z1CQMUYXGgJt3K73.jar" version="0.9.1.r09_v20070920-07z1CQMUYXGgJt3K73">
++        <category name="Programming Languages"/>
++    </feature>
++
++
++	   <feature id="org.eclipse.buckminster.core.feature" url="features/org.eclipse.buckminster.core.feature_0.2.0.r3636.jar" version="0.2.0.r3636">
++	      <category name="Other Tools"/>
++	   </feature>
++	   <feature id="org.eclipse.buckminster.cvs.feature" url="features/org.eclipse.buckminster.cvs.feature_0.2.0.r3383.jar" version="0.2.0.r3383">
++	      <category name="Other Tools"/>
++	   </feature>
++	   <feature id="org.eclipse.buckminster.maven.feature" url="features/org.eclipse.buckminster.maven.feature_0.2.0.r3388.jar" version="0.2.0.r3388">
++	      <category name="Other Tools"/>
++	   </feature>
++	   <feature id="org.eclipse.buckminster.p4.feature" url="features/org.eclipse.buckminster.p4.feature_0.2.0.r3381.jar" version="0.2.0.r3381">
++	      <category name="Other Tools"/>
++	   </feature>
++	   <feature id="org.eclipse.buckminster.pde.feature" url="features/org.eclipse.buckminster.pde.feature_0.2.0.r3636.jar" version="0.2.0.r3636">
++	      <category name="Other Tools"/>
++	   </feature>
++
++        <category-def label="Mylyn" name="Mylyn"/>
++   <feature id="org.eclipse.mylyn_feature" url="features/org.eclipse.mylyn_feature_2.1.0.v20070927-0900.jar" version="2.1.0.v20070927-0900">
++      <category name="Mylyn"/>
++   </feature>
++   <feature id="org.eclipse.mylyn.context_feature" url="features/org.eclipse.mylyn.context_feature_2.1.0.v20070927-0900.jar" version="2.1.0.v20070927-0900">
++      <category name="Mylyn"/>
++   </feature>
++   <feature id="org.eclipse.mylyn.ide_feature" url="features/org.eclipse.mylyn.ide_feature_2.1.0.v20070927-0900.jar" version="2.1.0.v20070927-0900">
++      <category name="Mylyn"/>
++   </feature>
++   <feature id="org.eclipse.mylyn.java_feature" url="features/org.eclipse.mylyn.java_feature_2.1.0.v20070927-0900.jar" version="2.1.0.v20070927-0900">
++      <category name="Mylyn"/>
++   </feature>
++   <feature id="org.eclipse.mylyn.pde_feature" url="features/org.eclipse.mylyn.pde_feature_2.1.0.v20070927-0900.jar" version="2.1.0.v20070927-0900">
++      <category name="Mylyn"/>
++   </feature>
++   <feature id="org.eclipse.mylyn.bugzilla_feature" url="features/org.eclipse.mylyn.bugzilla_feature_2.1.0.v20070927-0900.jar" version="2.1.0.v20070927-0900">
++      <category name="Mylyn"/>
++   </feature>
++   <feature id="org.eclipse.mylyn.trac_feature" url="features/org.eclipse.mylyn.trac_feature_2.1.0.v20070927-0900.jar" version="2.1.0.v20070927-0900">
++      <category name="Mylyn"/>
++   </feature>
++
++   <!-- SOA Tools -->
++   <feature id="org.eclipse.stp.b2j.feature" url="features/org.eclipse.stp.b2j.feature_0.7.0.200710161054-07C-7733G535E53CA.jar" version="0.7.0.200710161054-07C-7733G535E53CA">
++     <category name="SOA Development"/>
++   </feature>
++   
++   <feature id="org.eclipse.stp.bpmn.feature" url="features/org.eclipse.stp.bpmn.feature_0.7.0.200710161054-07Q-7E77YA7AUA7QM.jar" version="0.7.0.200710161054-07Q-7E77YA7AUA7QM">
++     <category name="SOA Development"/>
++   </feature>
++
++   <feature id="org.eclipse.stp.core.feature" url="features/org.eclipse.stp.core.feature_0.7.0.200710161054-07Q-7E77YA7AUA7QM.jar" version="0.7.0.200710161054-07Q-7E77YA7AUA7QM">
++     <category name="SOA Development"/>
++   </feature>
++   
++   <feature id="org.eclipse.stp.servicecreation" url="features/org.eclipse.stp.servicecreation_0.7.0.200710161054-07l-7MAAqGAGkGAeY.jar" version="0.7.0.200710161054-07l-7MAAqGAGkGAeY">
++     <category name="SOA Development"/>
++   </feature>
++   
++   <feature id="org.eclipse.stp.sc.jaxws.feature" url="features/org.eclipse.stp.sc.jaxws.feature_0.7.0.200710161054-07J-7A55P858M85JG.jar" version="0.7.0.200710161054-07J-7A55P858M85JG">
++     <category name="SOA Development"/>
++   </feature>
++   
++   <feature id="org.eclipse.stp.sc.sca.feature" url="features/org.eclipse.stp.sc.sca.feature_0.7.0.200710161054-07J-7A55P858M85JG.jar" version="0.7.0.200710161054-07J-7A55P858M85JG">
++     <category name="SOA Development"/>
++   </feature>
++   
++   <feature id="org.eclipse.stp.soas.feature" url="features/org.eclipse.stp.soas.feature_0.7.0.200710161054-07e-7MAAqGAGkGAeY.jar" version="0.7.0.200710161054-07e-7MAAqGAGkGAeY">
++     <category name="SOA Development"/>
++   </feature>
++   
++   <feature id="org.eclipse.stp.soas.runtime.feature" url="features/org.eclipse.stp.soas.runtime.feature_0.7.0.200710161054-07J-7A55P858M85JG.jar" version="0.7.0.200710161054-07J-7A55P858M85JG">
++     <category name="SOA Development"/>
++   </feature>
++</site>
+\ No newline at end of file

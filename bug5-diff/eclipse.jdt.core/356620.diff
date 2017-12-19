@@ -1,0 +1,3255 @@
+commit 47da1e1f50b1360a7b560d74dfe1c60303fec552
+Author: Satyam Kandula <satyam.kandula@in.ibm.com>
+Date:   Mon Dec 12 16:32:59 2011 +0530
+
+    Bug 356620: Support Pre-built indexes
+
+28	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/util/Util.java
+863	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/JavaIndexTests.java
+2	2	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/JavaSearchScopeTests.java
+2	1	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/RunJavaSearchTests.java
+1	0	org.eclipse.jdt.core/META-INF/MANIFEST.MF
+62	0	org.eclipse.jdt.core/antadapter/org/eclipse/jdt/core/BuildJarIndex.java
+5	1	org.eclipse.jdt.core/antadapter/org/eclipse/jdt/internal/antadapter/messages.properties
+3	2	org.eclipse.jdt.core/build.properties
+11	1	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+13	4	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathChange.java
+29	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
+9	4	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+12	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+17	1	org.eclipse.jdt.core/plugin.xml
+42	0	org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/JavaIndexer.java
+158	0	org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/JavaIndexerApplication.java
+29	0	org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/messages.properties
+9	5	org.eclipse.jdt.core/search/org/eclipse/jdt/core/search/SearchParticipant.java
+66	58	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/DiskIndex.java
+98	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/FileIndexLocation.java
+11	5	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/Index.java
+124	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/IndexLocation.java
+108	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/JarIndexLocation.java
+4	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/IndexSelector.java
+15	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchParticipant.java
+15	2	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/PatternSearchJob.java
+19	5	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
+61	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/DefaultJavaIndexer.java
+3	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexAllProject.java
+1	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexBinaryFolder.java
+119	87	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/util/Util.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/util/Util.java
+index 8b41712..70415af 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/util/Util.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/util/Util.java
+@@ -1348,6 +1348,34 @@ private static void zip(File dir, ZipOutputStream zip, int rootPathLength) throw
+         }
+     }
+ }
++
++/**
++ * Zips the given files into the given jar. All the files are kept at the root of the zip. 
++ */
++public static void zipFiles(File[] files, String zipPath) throws IOException {
++	File zipFile = new File(zipPath);
++	if (zipFile.exists()) {
++		if (!delete(zipFile))
++			throw new IOException("Could not delete " + zipPath);
++		// ensure the new zip file has a different timestamp than the previous one
++		int timeToWait = 1000; // some platform (like Linux) have a 1s granularity)
++		waitAtLeast(timeToWait);
++	} else {
++		zipFile.getParentFile().mkdirs();
++	}
++	ZipOutputStream zip = new ZipOutputStream(new FileOutputStream(zipFile));
++	try {
++		for (int i = 0, length = files.length; i < length; i++) {
++			File file = files[i];
++			ZipEntry entry = new ZipEntry(file.getName());
++			zip.putNextEntry(entry);
++			zip.write(org.eclipse.jdt.internal.compiler.util.Util.getFileByteContent(file));
++			zip.closeEntry();
++		}
++	} finally {
++		zip.close();
++	}
++}
+ /**
+  * Returns the compilation errors / warnings for the given CompilationResult.
+  *
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/JavaIndexTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/JavaIndexTests.java
+new file mode 100644
+index 0000000..4ca9bdf
+--- /dev/null
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/JavaIndexTests.java
+@@ -0,0 +1,863 @@
++/*******************************************************************************
++ * Copyright (c) 2011 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.core.tests.model;
++
++import java.io.File;
++import java.io.IOException;
++import java.net.URL;
++
++import junit.framework.Test;
++
++import org.eclipse.core.resources.IProject;
++import org.eclipse.core.runtime.CoreException;
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.Path;
++import org.eclipse.core.runtime.preferences.IEclipsePreferences;
++import org.eclipse.core.runtime.preferences.InstanceScope;
++import org.eclipse.jdt.core.ClasspathContainerInitializer;
++import org.eclipse.jdt.core.IClasspathAttribute;
++import org.eclipse.jdt.core.IClasspathEntry;
++import org.eclipse.jdt.core.IJavaElement;
++import org.eclipse.jdt.core.IJavaProject;
++import org.eclipse.jdt.core.JavaCore;
++import org.eclipse.jdt.core.index.*;
++import org.eclipse.jdt.core.search.SearchEngine;
++import org.eclipse.jdt.core.tests.util.Util;
++import org.eclipse.jdt.internal.core.JavaModelManager;
++import org.eclipse.jdt.internal.core.UserLibraryClasspathContainer;
++import org.osgi.service.prefs.BackingStoreException;
++
++public class JavaIndexTests extends AbstractJavaSearchTests  {
++
++	static {
++		// TESTS_NAMES = new String[] {"testPlatformIndexFile"};
++	}
++	public JavaIndexTests(String name) {
++		super(name);
++	}
++
++	public static Test suite() {
++		return buildModelTestSuite(JavaIndexTests.class);
++	}
++	// Test that the index file is really generated.
++	public void testGenerateIndex() throws IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			assertTrue(new File(indexFilePath).exists());
++		} finally {
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	// Test that the index file and the jar can be deleted after the indexing is done
++	// This is to ensure that the files are closed
++	public void testDeleteIndexedFile() {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			assertTrue("Could not delete the index file", new File(indexFilePath).delete());
++			assertTrue("Could not delete the jar file", new File(jarFilePath).delete());
++		} catch (IOException e) {
++			assertFalse("Test failed", true);
++		}
++	}
++	
++	// Test that search works fine with the index file
++	public void testUseIndex() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			long modified = new File(indexFilePath).lastModified();
++			
++			IJavaProject p = createJavaProject("P");
++			Path libPath = new Path(jarFilePath);
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			
++			waitUntilIndexesReady();
++			
++			// Test that specified index file is really used
++			java.io.File indexFile = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile();
++			assertEquals("Specified index file is not being used", indexFilePath,indexFile.toString());
++			
++			// Test that search works properly 
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			// Ensure that the index file is not modified
++			assertEquals(modified, new File(indexFilePath).lastModified());
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	// Test that the same index file is used even after restarting
++	public void testUseIndexAfterRestart() throws IOException, CoreException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			long modified = new File(indexFilePath).lastModified();
++			IJavaProject p = createJavaProject("P");
++			Path libPath = new Path(jarFilePath);
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			simulateExitRestart();
++			getJavaModel().refreshExternalArchives(null, null);
++			waitUntilIndexesReady();
++			
++			this.resultCollector = new JavaSearchResultCollector();
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			java.io.File indexFile = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile();
++			assertEquals(indexFilePath,indexFile.toString());
++			// Ensure that the file is not modified
++			assertEquals(modified, new File(indexFilePath).lastModified());
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	// Test that the same index file is used even after restarting
++	public void testUseIndexInternalJarAfterRestart() throws IOException, CoreException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = "/P/Test.jar";
++		try {
++			IJavaProject p = createJavaProject("P");
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			long modified = new File(indexFilePath).lastModified();
++			IPath libPath = new Path(jarFilePath);
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults("\\P\\Test.jar pkg.Test");
++			
++			simulateExitRestart();
++			getJavaModel().refreshExternalArchives(null, null);
++			waitUntilIndexesReady();
++			
++			this.resultCollector = new JavaSearchResultCollector();
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults("\\P\\Test.jar pkg.Test");
++			
++			java.io.File indexFile = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile();
++			assertEquals(indexFilePath,indexFile.toString());
++			// Ensure that the file is not modified
++			assertEquals(modified, new File(indexFilePath).lastModified());
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++		}
++	}
++	
++	// Test that a jar file that gets modified after the index is created doesn't return new changes. 
++	// This behavior might have to be modified but.. 
++	public void testModifyJarAfterIndex() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}", 
++					"pkg/NewTest.java",
++					"package pkg;\n" +
++					"public class NewTest {\n" +
++					"  protected NewTest(int i) {}\n" +
++					"}"}, jarFilePath);
++			IJavaProject p = createJavaProject("P");
++			Path libPath = new Path(jarFilePath);
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			search("NewTest", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults("");
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++
++	// test a non-existent index
++	public void testNonExistentIndex() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			IJavaProject p = createJavaProject("P");
++			Path libPath = new Path(jarFilePath);
++			new File(indexFilePath).delete();
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	// test a non-existent index
++	public void testNonExistentIndexRestart() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			
++			new File(indexFilePath).delete();
++			
++			IJavaProject p = createJavaProject("P");
++			Path libPath = new Path(jarFilePath);
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			java.io.File indexFile = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile();
++			long modified = indexFile.lastModified();
++			assertEquals(modified, indexFile.lastModified());
++			
++			simulateExitRestart();
++			getJavaModel().refreshExternalArchives(null,null);
++			waitUntilIndexesReady();
++			
++			this.resultCollector = new JavaSearchResultCollector();
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			indexFile = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile();
++			assertEquals("Index File should not have got modified",modified, indexFile.lastModified());
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	// test that if the index is not existent after restart, it should build up a new index
++	public void testNonExistentIndexAfterRestart() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" + 
++					"public class Test {\n" +
++					"protected Test(int i) {}\n" + "}" 
++					},jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			
++			IJavaProject p = createJavaProject("P");
++			Path libPath = new Path(jarFilePath);
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			simulateExitRestart();
++			File indexFile = new File(indexFilePath);
++			indexFile.delete();
++			assertTrue(!indexFile.exists());
++			getJavaModel().refreshExternalArchives(null,null);
++			waitUntilIndexesReady();
++			
++			this.resultCollector = new JavaSearchResultCollector();
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	// test a non-existent index which becomes existent after restart
++	public void testExistentIndexAfterRestart() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			
++			File indexFile = new File(indexFilePath);
++			indexFile.delete();
++			assertTrue(!indexFile.exists());
++			
++			IJavaProject p = createJavaProject("P");
++			Path libPath = new Path(jarFilePath);
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			simulateExitRestart();
++			getJavaModel().refreshExternalArchives(null,null);
++			waitUntilIndexesReady();
++			
++			this.resultCollector = new JavaSearchResultCollector();
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			indexFile = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile();
++			assertEquals(indexFilePath,indexFile.toString());
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	// Test that the index file is not deleted when the project is deleted
++	public void testDeleteProject() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			IJavaProject p = createJavaProject("P");
++			createExternalFolder("externalLib");
++			Path libPath = new Path(jarFilePath);
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			deleteProject("P");
++			File f = new File(indexFilePath);
++			assertTrue(f.exists());
++		} finally {
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++
++	
++	// Test index file in platform
++	public void testPlatformIndexFile() throws CoreException, IOException {
++		String indexFilePath = null;
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		String indexUrl = "platform:/resource/P/Test.index";
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			
++			IJavaProject p = createJavaProject("P");
++			indexFilePath = p.getProject().getLocation().append("Test.index").toFile().getAbsolutePath();
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			long modified = new File(indexFilePath).lastModified();
++			
++			Path libPath = new Path(jarFilePath);
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, indexUrl);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			String indexFileName = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile().getName();
++			assertEquals(indexFileName, "Test.index");
++			
++			simulateExitRestart();
++			getJavaModel().refreshExternalArchives(null,null);
++			waitUntilIndexesReady();
++			
++			this.resultCollector = new JavaSearchResultCollector();
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			indexFileName = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile().getName();
++			assertEquals(indexFileName, "Test.index");
++
++			assertEquals(modified, new File(indexFilePath).lastModified());
++		} finally {
++			deleteProject("P");
++			if (indexFilePath != null) new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	
++	public void testEditClasspath() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			File f = new File(indexFilePath);
++			long modified = f.lastModified();
++			IJavaProject p = this.createJavaProject("P", new String[] {}, "bin");
++
++			String content = new String(
++					"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++					+ "<classpath>\n"
++					+ "<classpathentry kind=\"src\" path=\"src a\"/>\n"
++					+ "<classpathentry kind=\"src\" path=\"src x\"/>\n"
++					+ "<classpathentry kind=\"lib\" path=\""
++					+ getExternalJCLPath()
++					+ "\"/>\n"
++					+ "<classpathentry kind=\"lib\" path=\""
++					+ jarFilePath
++					+ "\">"
++					+ "<attributes>\n" 
++					+ "	<attribute name=\"index_location\" value=\"file:///"
++					+ indexFilePath
++					+"\"/>\n" 
++					+ "</attributes>\n"
++					+ "</classpathentry>\n"
++					+ "<classpathentry kind=\"output\" path=\"bin\"/>\n"
++					+ "</classpath>\n");
++
++			editFile("/P/.classpath", content);
++			p.open(null);
++			waitUntilIndexesReady();
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			java.io.File indexFile = JavaModelManager.getIndexManager().getIndex(new Path(jarFilePath), false, false).getIndexFile();
++			assertEquals(indexFilePath,indexFile.toString());
++			f = new File(indexFilePath);
++			assertEquals(modified, f.lastModified());
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	// Test changing the classpath	
++	public void testChangeClasspath() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}", 
++					"pkg/NewTest.java",
++					"package pkg;\n" +
++					"public class NewTest {\n" +
++					"  protected NewTest(int i) {}\n" +
++					"}"}, jarFilePath);
++			IJavaProject p = createJavaProject("P");
++			Path libPath = new Path(jarFilePath);
++			
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, null, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			search("NewTest", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.NewTest");
++			
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			this.resultCollector = new JavaSearchResultCollector();
++			search("NewTest", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults("");
++			
++			entry = JavaCore.newLibraryEntry(libPath, null, null, null, null, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			this.resultCollector = new JavaSearchResultCollector();
++			search("NewTest", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.NewTest");
++			
++			
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	// Test changing the classpath	
++	public void testChangeClasspathForInternalJar() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = "/P/Test.jar";
++		try {
++			IJavaProject p = createJavaProject("P");
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}", 
++					"pkg/NewTest.java",
++					"package pkg;\n" +
++					"public class NewTest {\n" +
++					"  protected NewTest(int i) {}\n" +
++					"}"}, jarFilePath);
++			Path libPath = new Path(jarFilePath);
++			
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, null, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			search("NewTest", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults("\\P\\Test.jar pkg.NewTest");
++			
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			this.resultCollector = new JavaSearchResultCollector();
++			search("NewTest", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults("");
++			
++			entry = JavaCore.newLibraryEntry(libPath, null, null, null, null, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			this.resultCollector = new JavaSearchResultCollector();
++			search("NewTest", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults("\\P\\Test.jar pkg.NewTest");
++			
++			
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++		}
++	}
++		
++	public void testMultipleProjects() throws CoreException, IOException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			
++			IJavaProject p1 = createJavaProject("P1");
++			Path libPath = new Path(jarFilePath);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, null, false);
++			setClasspath(p1, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			
++			IJavaProject p2 = createJavaProject("P2");
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, "file:///"+indexFilePath);
++			entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p2, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p1}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			File indexFile = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile();
++			assertEquals(indexFilePath,indexFile.toString());
++			
++		} finally {
++			deleteProject("P1");
++			deleteProject("P2");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++	
++	public void setContainerPath(IJavaProject p, IPath jarPath, String indexLocation) throws CoreException, BackingStoreException {
++		// Create new user library "SomeUserLibrary"
++		ClasspathContainerInitializer initializer= JavaCore.getClasspathContainerInitializer(JavaCore.USER_LIBRARY_CONTAINER_ID);
++		String libraryName = "SomeUserLibrary";
++		IPath containerPath = new Path(JavaCore.USER_LIBRARY_CONTAINER_ID);
++		UserLibraryClasspathContainer containerSuggestion = new UserLibraryClasspathContainer(libraryName);
++		initializer.requestClasspathContainerUpdate(containerPath.append(libraryName), null, containerSuggestion);
++
++		// Modify user library
++		IEclipsePreferences preferences = InstanceScope.INSTANCE.getNode(JavaCore.PLUGIN_ID);
++		String propertyName = JavaModelManager.CP_USERLIBRARY_PREFERENCES_PREFIX+"SomeUserLibrary";
++		StringBuffer propertyValue = new StringBuffer("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<userlibrary systemlibrary=\"false\" version=\"1\">\r\n<archive ");
++		//String jarFullPath = getWorkspaceRoot().getLocation().append(jarFile.getFullPath()).toString();
++		propertyValue.append(" path=\"" + jarPath + "\">\r\n");
++		propertyValue.append(" <attributes>\r\n");
++		propertyValue.append("		<attribute name=\"index_location\" value=\"");
++		propertyValue.append(indexLocation);
++		propertyValue.append("\"/>\r\n</attributes>\r\n");
++		propertyValue.append("</archive>\r\n");
++		propertyValue.append("</userlibrary>\r\n");
++		preferences.put(propertyName, propertyValue.toString());
++		preferences.flush();
++		
++		IClasspathEntry[] entries = p.getRawClasspath();
++		int length = entries.length;
++		System.arraycopy(entries, 0, entries = new IClasspathEntry[length+1], 0, length);
++		entries[length] = JavaCore.newContainerEntry(containerSuggestion.getPath());
++		p.setRawClasspath(entries, null);
++	}
++	
++	public void testUserLibraryIndex() throws IOException, CoreException, BackingStoreException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			long modified = new File(indexFilePath).lastModified();
++			
++			IJavaProject p = createJavaProject("P");
++			
++			Path libPath = new Path(jarFilePath);
++			setContainerPath(p, libPath, "file:///"+indexFilePath);
++			
++			waitUntilIndexesReady();
++			
++			// Test that specified index file is really used
++			java.io.File indexFile = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile();
++			assertEquals("Specified index file is not being used", indexFilePath,indexFile.toString());
++			
++			// Test that search works properly 
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			// Ensure that the index file is not modified
++			assertEquals(modified, new File(indexFilePath).lastModified());
++			
++			simulateExitRestart();
++			getJavaModel().refreshExternalArchives(null,null);
++			waitUntilIndexesReady();
++			
++			// Test that specified index file is really used
++			indexFile = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexFile();
++			assertEquals("Specified index file is not being used", indexFilePath,indexFile.toString());
++			
++			// Test that search works properly
++			this.resultCollector = new JavaSearchResultCollector();
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			// Ensure that the index file is not modified
++			assertEquals(modified, new File(indexFilePath).lastModified());
++		} finally {
++			deleteProject("P");
++			new File(indexFilePath).delete();
++			new File(jarFilePath).delete();
++		}		
++	}
++	
++	// Test that it works if the index file is in the jar file
++	public void testIndexInJar() throws IOException, CoreException {
++		String indexFilePath = getExternalResourcePath("Test.index");
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		String indexZipPath =  getExternalResourcePath("TestIndex.zip");
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			Util.zipFiles(new File[]{new File(indexFilePath)}, indexZipPath);
++			
++			IJavaProject p = createJavaProject("P");
++			Path libPath = new Path(jarFilePath);
++			String url = "jar:file:/"+indexZipPath+"!/Test.index";
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, url);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			
++			assertEquals(url,JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexLocation().getUrl().toString());
++			
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			simulateExitRestart();
++			getJavaModel().refreshExternalArchives(null,null);
++			waitUntilIndexesReady();
++			
++			this.resultCollector = new JavaSearchResultCollector();
++			assertEquals(url,JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexLocation().getUrl().toString());
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++		} finally {
++			deleteProject("P");
++			new File(indexZipPath).delete();
++			new File(jarFilePath).delete();
++		}
++	}
++
++	// Test index file in platform
++	public void testPlatformJarIndexFile() throws CoreException, IOException {
++		String indexFilePath = null;
++		String jarFilePath = getExternalResourcePath("Test.jar");
++		String indexUrl = "platform:/resource/ForIndex/Test.index.zip!/Test.index";
++		try {
++			createJar(new String[] {
++					"pkg/Test.java",
++					"package pkg;\n" +
++					"public class Test {\n" +
++					"  protected Test(int i) {}\n" +
++					"}"}, jarFilePath);
++			
++			IProject indexProj = createProject("ForIndex");
++			indexFilePath = indexProj.getProject().getLocation().append("Test.index").toFile().getAbsolutePath();
++			JavaIndexer.generateIndexForJar(jarFilePath, indexFilePath);
++			Util.zipFiles(new File[]{new File(indexFilePath)}, indexFilePath+".zip");
++			
++			IJavaProject p = createJavaProject("P");
++			Path libPath = new Path(jarFilePath);
++			IClasspathAttribute attribute = JavaCore.newClasspathAttribute(IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME, indexUrl);
++			IClasspathEntry entry = JavaCore.newLibraryEntry(libPath, null, null, null, new IClasspathAttribute[]{attribute}, false);
++			setClasspath(p, new IClasspathEntry[] {entry});
++			waitUntilIndexesReady();
++			
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			URL url = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexLocation().getUrl();
++			assertEquals(indexUrl, url.toString());
++			
++			simulateExitRestart();
++			getJavaModel().refreshExternalArchives(null,null);
++			waitUntilIndexesReady();
++			
++			this.resultCollector = new JavaSearchResultCollector();
++			search("Test", TYPE, DECLARATIONS, EXACT_RULE, SearchEngine.createJavaSearchScope(new IJavaElement[]{p}));
++			assertSearchResults(getExternalPath() + "Test.jar pkg.Test");
++			
++			url = JavaModelManager.getIndexManager().getIndex(libPath, false, false).getIndexLocation().getUrl();
++			assertEquals(indexUrl, url.toString());
++		} finally {
++			deleteProject("P");
++			if (indexFilePath != null) {
++				new File(indexFilePath).delete();
++				new File(indexFilePath+".zip").delete();
++			}
++			new File(jarFilePath).delete();
++			deleteProject("ForIndex");
++		}
++	}
++}
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/JavaSearchScopeTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/JavaSearchScopeTests.java
+index deb70fd..52af315 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/JavaSearchScopeTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/JavaSearchScopeTests.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2008 IBM Corporation and others.
++ * Copyright (c) 2000, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -1025,7 +1025,7 @@ public void testBug179199() throws CoreException {
+ 
+ 		// Index the output location as it is a library for the project
+ 		IndexManager indexManager = JavaModelManager.getIndexManager();
+-		indexManager.indexLibrary(new Path("/P1/bin"), project.getProject());
++		indexManager.indexLibrary(new Path("/P1/bin"), project.getProject(), null);
+ 		waitUntilIndexesReady();
+ 
+ 		// Search for all types
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/RunJavaSearchTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/RunJavaSearchTests.java
+index 8917c29..2d7d864 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/RunJavaSearchTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/RunJavaSearchTests.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2009 IBM Corporation and others.
++ * Copyright (c) 2000, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -62,6 +62,7 @@ public class RunJavaSearchTests extends junit.framework.TestCase {
+ 		allClasses.add(SearchTests.class);
+ 		allClasses.add(JavaSearchScopeTests.class);
+ 		allClasses.add(MatchingRegionsTest.class);
++		allClasses.add(JavaIndexTests.class);
+ 
+ 		// Reset forgotten subsets of tests
+ 		TestCase.TESTS_PREFIX = null;
+diff --git a/org.eclipse.jdt.core/META-INF/MANIFEST.MF b/org.eclipse.jdt.core/META-INF/MANIFEST.MF
+index 2df1e90..1cc07ca 100644
+--- a/org.eclipse.jdt.core/META-INF/MANIFEST.MF
++++ b/org.eclipse.jdt.core/META-INF/MANIFEST.MF
+@@ -17,6 +17,7 @@ Export-Package: org.eclipse.jdt.core,
+  org.eclipse.jdt.core.jdom,
+  org.eclipse.jdt.core.search,
+  org.eclipse.jdt.core.util,
++ org.eclipse.jdt.core.index,
+  org.eclipse.jdt.internal.codeassist;x-internal:=true,
+  org.eclipse.jdt.internal.codeassist.complete;x-internal:=true,
+  org.eclipse.jdt.internal.codeassist.impl;x-internal:=true,
+diff --git a/org.eclipse.jdt.core/antadapter/org/eclipse/jdt/core/BuildJarIndex.java b/org.eclipse.jdt.core/antadapter/org/eclipse/jdt/core/BuildJarIndex.java
+new file mode 100644
+index 0000000..cd7238a
+--- /dev/null
++++ b/org.eclipse.jdt.core/antadapter/org/eclipse/jdt/core/BuildJarIndex.java
+@@ -0,0 +1,62 @@
++/*******************************************************************************
++ * Copyright (c) 2011 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.core;
++
++import java.io.IOException;
++
++import org.apache.tools.ant.BuildException;
++import org.apache.tools.ant.Task;
++import org.eclipse.jdt.core.index.JavaIndexer;
++import org.eclipse.jdt.internal.antadapter.AntAdapterMessages;
++
++/**
++ * <p>
++ * An Ant task to generate the index file for the given jar path.
++ * </p>
++ * <p>
++ * <code>&lt;eclipse.buildJarIndex jarPath="Test.jar" indexPath="Test.index"/&gt;</code>
++ * </p>
++ * <p>
++ * For more information on Ant check out the website at http://jakarta.apache.org/ant/ .
++ * </p>
++ * <p>
++ * This is not intended to be subclassed by users.
++ * </p>
++ * @since 3.8
++ */
++public class BuildJarIndex extends Task {
++
++	private String jarPath;
++	private String indexPath;
++
++	public void execute() throws BuildException {
++		if (this.jarPath == null) {
++			throw new BuildException(AntAdapterMessages.getString("buildJarIndex.jarFile.cannot.be.null")); //$NON-NLS-1$
++		}
++		if (this.indexPath == null) {
++			throw new BuildException(AntAdapterMessages.getString("buildJarIndex.indexFile.cannot.be.null")); //$NON-NLS-1$
++		}
++
++		try {
++			JavaIndexer.generateIndexForJar(this.jarPath, this.indexPath);
++		} catch (IOException e) {
++			throw new BuildException(AntAdapterMessages.getString("buildJarIndex.ioexception.occured", e.getLocalizedMessage())); //$NON-NLS-1$
++		}
++	}
++
++	public void setJarPath(String path) {
++		this.jarPath = path;
++	}
++
++	public void setIndexPath(String path) {
++		this.indexPath = path;
++	}
++}
+diff --git a/org.eclipse.jdt.core/antadapter/org/eclipse/jdt/internal/antadapter/messages.properties b/org.eclipse.jdt.core/antadapter/org/eclipse/jdt/internal/antadapter/messages.properties
+index df61656..9cb9be2 100644
+--- a/org.eclipse.jdt.core/antadapter/org/eclipse/jdt/internal/antadapter/messages.properties
++++ b/org.eclipse.jdt.core/antadapter/org/eclipse/jdt/internal/antadapter/messages.properties
+@@ -1,5 +1,5 @@
+ ###############################################################################
+-# Copyright (c) 2000, 2006 IBM Corporation and others.
++# Copyright (c) 2000, 2011 IBM Corporation and others.
+ # All rights reserved. This program and the accompanying materials
+ # are made available under the terms of the Eclipse Public License v1.0
+ # which accompanies this distribution, and is available at
+@@ -19,3 +19,7 @@ checkDebugAttributes.file.argument.cannot.be.null=The file argument cannot be nu
+ checkDebugAttributes.property.argument.cannot.be.null=The property argument cannot be null
+ checkDebugAttributes.ioexception.occured=IOException occurred while reading 
+ checkDebugAttributes.file.argument.must.be.a.classfile.or.a.jarfile=The file argument must be a .class or a .jar file
++
++buildJarIndex.jarFile.cannot.be.null=The jar file argument cannot be null
++buildJarIndex.indexFile.cannot.be.null=The index file argument cannot be null
++buildJarIndex.ioexception.occured=IOException - {0}
+diff --git a/org.eclipse.jdt.core/build.properties b/org.eclipse.jdt.core/build.properties
+index ff520f9..8e3f678 100644
+--- a/org.eclipse.jdt.core/build.properties
++++ b/org.eclipse.jdt.core/build.properties
+@@ -1,5 +1,5 @@
+ ###############################################################################
+-# Copyright (c) 2000, 2010 IBM Corporation and others.
++# Copyright (c) 2000, 2011 IBM Corporation and others.
+ # All rights reserved. This program and the accompanying materials
+ # are made available under the terms of the Eclipse Public License v1.0
+ # which accompanies this distribution, and is available at
+@@ -24,7 +24,8 @@ javadoc.packages = org.eclipse.jdt.core.*,\
+                    org.eclipse.jdt.core.jdom.*,\
+                    org.eclipse.jdt.core.dom.*,\
+                    org.eclipse.jdt.core.dom.rewrite.*,\
+-                   org.eclipse.jdt.core.search.*
++                   org.eclipse.jdt.core.search.*,\
++                   org.eclipse.jdt.core.index.*
+ source.. =   batch/,\
+ 	         codeassist/,\
+ 	         compiler/,\
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+index d90ab15..685c1a3 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2005, 2010 IBM Corporation and others.
++ * Copyright (c) 2005, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -58,6 +58,16 @@ public interface IClasspathAttribute {
+ 	 * @since 3.1
+ 	 */
+ 	String JAVADOC_LOCATION_ATTRIBUTE_NAME = "javadoc_location"; //$NON-NLS-1$
++	
++	/**
++	 * Constant for the name of the index location attribute.
++	 * 
++	 * <p>The value for this attribute has to be the string representation of a URL.
++	 * It should point to an existing index file in a folder or a jar. The URL can also be of platform protocol.</p>
++	 * 
++	 * @since 3.8
++	 */
++	String INDEX_LOCATION_ATTRIBUTE_NAME = "index_location"; //$NON-NLS-1$
+ 
+ 	/**
+ 	 * Constant for the name of the optional attribute. The possible values
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathChange.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathChange.java
+index b96cd44..7a461df 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathChange.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathChange.java
+@@ -10,6 +10,7 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
++import java.net.URL;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -335,7 +336,7 @@ public class ClasspathChange {
+ 							boolean found = false;
+ 							for (int j = 0; j < accumulatedRoots.size(); j++) {
+ 								IPackageFragmentRoot root = (IPackageFragmentRoot) accumulatedRoots.elementAt(j);
+-								if (!root.getPath().equals(oldRoot.getPath())) {
++								if (root.getPath().equals(oldRoot.getPath())) {
+ 									found = true;
+ 									break;
+ 								}
+@@ -511,7 +512,7 @@ public class ClasspathChange {
+ 
+ 		for (int i = 0; i < newLength; i++) {
+ 			int index = classpathContains(this.oldResolvedClasspath, newResolvedClasspath[i]);
+-			if (index == -1) {
++			if (index == -1 || newResolvedClasspath[i].getEntryKind() == IClasspathEntry.CPE_LIBRARY) {
+ 				// remote projects are not indexed in this project
+ 				if (newResolvedClasspath[i].getEntryKind() == IClasspathEntry.CPE_PROJECT){
+ 					continue;
+@@ -519,6 +520,7 @@ public class ClasspathChange {
+ 
+ 				// Request indexing
+ 				int entryKind = newResolvedClasspath[i].getEntryKind();
++				URL newurl = ((ClasspathEntry)newResolvedClasspath[i]).getLibraryIndexLocation();
+ 				switch (entryKind) {
+ 					case IClasspathEntry.CPE_LIBRARY:
+ 						boolean pathHasChanged = true;
+@@ -526,12 +528,19 @@ public class ClasspathChange {
+ 						for (int j = 0; j < oldLength; j++) {
+ 							IClasspathEntry oldEntry = this.oldResolvedClasspath[j];
+ 							if (oldEntry.getPath().equals(newPath)) {
+-								pathHasChanged = false;
++								URL oldurl = ((ClasspathEntry)oldEntry).getLibraryIndexLocation();
++								if (oldurl == null && newurl == null) {
++									pathHasChanged = false;
++								} else if (oldurl != null && newurl != null) {
++									pathHasChanged = !(newurl.equals(oldurl));
++								} else if (oldurl != null) {
++									indexManager.removeIndex(newPath);
++								}
+ 								break;
+ 							}
+ 						}
+ 						if (pathHasChanged) {
+-							indexManager.indexLibrary(newPath, this.project.getProject());
++							indexManager.indexLibrary(newPath, this.project.getProject(), newurl);
+ 						}
+ 						break;
+ 					case IClasspathEntry.CPE_SOURCE:
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
+index 5656323..810a6b2 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
+@@ -17,6 +17,8 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStreamWriter;
+ import java.io.UnsupportedEncodingException;
++import java.net.MalformedURLException;
++import java.net.URL;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -1524,6 +1526,33 @@ public class ClasspathEntry implements IClasspathEntry {
+ 
+ 		return JavaCore.getResolvedClasspathEntry(this);
+ 	}
++	
++	/**
++	 * This function computes the URL of the index location for this classpath entry. It returns null if the URL is
++	 * invalid.
++	 */
++	public URL getLibraryIndexLocation() {
++		switch(getEntryKind()) {
++			case IClasspathEntry.CPE_LIBRARY :
++			case IClasspathEntry.CPE_VARIABLE :
++				break;
++			default :
++				return null;
++		}
++		if (this.extraAttributes == null) return null;
++		for (int i= 0; i < this.extraAttributes.length; i++) {
++			IClasspathAttribute attrib= this.extraAttributes[i];
++			if (IClasspathAttribute.INDEX_LOCATION_ATTRIBUTE_NAME.equals(attrib.getName())) {
++				String value = attrib.getValue();
++				try {
++					return new URL(value);
++				} catch (MalformedURLException e) {
++					return null;
++				}
++			}
++		}
++		return null;
++	}	
+ 
+ 	/**
+ 	 * Validate a given classpath and output location for a project, using the following rules:
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+index 126fcc9..c36e288 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+@@ -13,6 +13,7 @@
+ package org.eclipse.jdt.internal.core;
+ 
+ import java.io.File;
++import java.net.URL;
+ import java.util.*;
+ 
+ import org.eclipse.core.resources.IContainer;
+@@ -997,8 +998,12 @@ public class DeltaProcessor {
+ 									// first remove the index so that it is forced to be re-indexed
+ 									this.manager.indexManager.removeIndex(entryPath);
+ 									// then index the jar
+-									this.manager.indexManager.indexLibrary(entryPath, project.getProject());
++									this.manager.indexManager.indexLibrary(entryPath, project.getProject(), ((ClasspathEntry)entries[j]).getLibraryIndexLocation());
+ 								} else {
++									URL indexLocation = ((ClasspathEntry)entries[j]).getLibraryIndexLocation();
++									if (indexLocation != null) { // force reindexing, this could be faster rather than maintaining the list
++										this.manager.indexManager.indexLibrary(entryPath, project.getProject(), indexLocation);
++									}
+ 									externalArchivesStatus.put(entryPath, EXTERNAL_JAR_UNCHANGED);
+ 								}
+ 							} else {
+@@ -1009,7 +1014,7 @@ public class DeltaProcessor {
+ 									this.state.getExternalLibTimeStamps().put(entryPath, new Long(newTimeStamp));
+ 									// index the new jar
+ 									this.manager.indexManager.removeIndex(entryPath);
+-									this.manager.indexManager.indexLibrary(entryPath, project.getProject());
++									this.manager.indexManager.indexLibrary(entryPath, project.getProject(), ((ClasspathEntry)entries[j]).getLibraryIndexLocation());
+ 								}
+ 							}
+ 						} else { // internal JAR
+@@ -2629,13 +2634,13 @@ public class DeltaProcessor {
+ 					switch (delta.getKind()) {
+ 						case IResourceDelta.ADDED:
+ 							// index the new jar
+-							indexManager.indexLibrary(jarPath, root.getJavaProject().getProject());
++							indexManager.indexLibrary(jarPath, root.getJavaProject().getProject(), root.getIndexPath());
+ 							break;
+ 						case IResourceDelta.CHANGED:
+ 							// first remove the index so that it is forced to be re-indexed
+ 							indexManager.removeIndex(jarPath);
+ 							// then index the jar
+-							indexManager.indexLibrary(jarPath, root.getJavaProject().getProject());
++							indexManager.indexLibrary(jarPath, root.getJavaProject().getProject(), root.getIndexPath());
+ 							break;
+ 						case IResourceDelta.REMOVED:
+ 							// the jar was physically removed: remove the index
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+index 5b18c19..3cd4d07 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+@@ -10,6 +10,7 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
++import java.net.URL;
+ import java.util.*;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipException;
+@@ -292,4 +293,15 @@ public class JarPackageFragmentRoot extends PackageFragmentRoot {
+ 			return;
+ 		super.toStringAncestors(buffer);
+ 	}
++
++	public URL getIndexPath() {
++		try {
++			IClasspathEntry entry = ((JavaProject) getParent()).getClasspathEntryFor(getPath());
++			if (entry != null) return ((ClasspathEntry)entry).getLibraryIndexLocation();	
++		} catch (JavaModelException e) {
++			// ignore exception
++		}
++		return null;
++	}
++
+ }
+diff --git a/org.eclipse.jdt.core/plugin.xml b/org.eclipse.jdt.core/plugin.xml
+index 3784256..5d69788 100644
+--- a/org.eclipse.jdt.core/plugin.xml
++++ b/org.eclipse.jdt.core/plugin.xml
+@@ -1,7 +1,7 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+ <?eclipse version="3.0"?>
+ <!--
+-    Copyright (c) 2004, 2010 IBM Corporation and others.
++    Copyright (c) 2004, 2011 IBM Corporation and others.
+     All rights reserved. This program and the accompanying materials
+     are made available under the terms of the Eclipse Public License v1.0
+     which accompanies this distribution, and is available at
+@@ -158,6 +158,11 @@
+ 		class="org.eclipse.jdt.core.CheckDebugAttributes"
+ 		library="jdtCompilerAdapter.jar">
+ 	</antTask>
++	<antTask
++		name="eclipse.buildJarIndex"
++		class="org.eclipse.jdt.core.BuildJarIndex"
++		library="jdtCompilerAdapter.jar">
++	</antTask>
+ </extension>
+       
+ <!-- =================================================================================== -->
+@@ -196,6 +201,17 @@
+ </extension>
+ 
+ <!-- =================================================================================== -->
++<!-- Extension: Java Generate Indexer                                                    -->
++<!-- =================================================================================== -->
++<extension
++      id="JavaIndexer"
++      point="org.eclipse.core.runtime.applications">
++   		<application>
++      		<run class="org.eclipse.jdt.core.index.JavaIndexerApplication" />
++   		</application>
++</extension>
++
++<!-- =================================================================================== -->
+ <!-- Extension: Java Content Types                                                       -->
+ <!-- =================================================================================== -->
+ <extension point="org.eclipse.core.contenttype.contentTypes">
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/JavaIndexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/JavaIndexer.java
+new file mode 100644
+index 0000000..4fa991a
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/JavaIndexer.java
+@@ -0,0 +1,42 @@
++/*******************************************************************************
++ * Copyright (c) 2011 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.core.index;
++
++import java.io.IOException;
++
++import org.eclipse.jdt.core.search.SearchEngine;
++import org.eclipse.jdt.internal.core.search.indexing.DefaultJavaIndexer;
++
++/**
++ * {@link JavaIndexer} provides functionality to generate index files which can be used by the JDT {@link SearchEngine}.
++ * The generated index files can be used as a classpath attribute for the particular classpath entry.
++ * 
++ * <p> The search engine indexes all the elements referred in the classpath entries of the project into
++ * index files. These index files are used to search the elements faster. Indexing for bigger jars could
++ * take some time. To avoid this time, one can generate the index file and specify it when the jar is added
++ * to the classpath of the project. </p>
++ *
++ * @since 3.8
++ */
++public final class JavaIndexer {
++
++	/**
++	 * Generates the index file for the specified jar.
++	 * @param pathToJar The full path to the jar that needs to be indexed
++	 * @param pathToIndexFile The full path to the index file that needs to be generated
++	 * @throws IOException if the jar is not found or could not write into the index file
++	 * @since 3.8
++	 */
++	public static void generateIndexForJar(String pathToJar, String pathToIndexFile) throws IOException {
++		new DefaultJavaIndexer().generateIndexForJar(pathToJar, pathToIndexFile);
++	}
++
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/JavaIndexerApplication.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/JavaIndexerApplication.java
+new file mode 100644
+index 0000000..7aae18a
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/JavaIndexerApplication.java
+@@ -0,0 +1,158 @@
++/*******************************************************************************
++ *  Copyright (c) 2011 IBM Corporation and others.
++ *  All rights reserved. This program and the accompanying materials
++ *  are made available under the terms of the Eclipse Public License v1.0
++ *  which accompanies this distribution, and is available at
++ *  http://www.eclipse.org/legal/epl-v10.html
++ * 
++ *  Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.core.index;
++
++import java.io.File;
++import java.io.IOException;
++import java.text.MessageFormat;
++import java.util.ArrayList;
++
++import org.eclipse.equinox.app.IApplication;
++import org.eclipse.equinox.app.IApplicationContext;
++import org.eclipse.osgi.util.NLS;
++
++/**
++ * Implements an Eclipse Application for {@link org.eclipse.jdt.core.index.JavaIndexer}.
++ * 
++ * <p>
++ * On MacOS, when invoked using the Eclipse executable, the "user.dir" property is set to the folder in which the
++ * eclipse.ini file is located. This makes it harder to use relative paths to point to the files to be jar'd or to
++ * the index file that is generated.
++ * </p>
++ * 
++ * 
++ * @since 3.8
++ * @noinstantiate This class is not intended to be instantiated by clients.
++ * @noextend This class is not intended to be subclassed by clients.
++ */
++public class JavaIndexerApplication implements IApplication {
++
++	private final static class Messages extends NLS {
++		private static final String MESSAGES_NAME = "org.eclipse.jdt.core.index.messages";//$NON-NLS-1$
++
++		public static String CommandLineProcessing;
++		public static String CommandLineUsage;
++		public static String CommandLineOnlyOneOutputError;
++		public static String CommandLineOutputTakesArgs;
++		public static String CommandLineOnlyOneJarError;
++		public static String CommandLineJarNotSpecified;
++		public static String CommandLineIndexFileNotSpecified;
++		public static String CaughtException;
++		public static String CommandLineJarFileNotExist;
++
++		static {
++			NLS.initializeMessages(MESSAGES_NAME, Messages.class);
++		}
++
++		public static String bind(String message) {
++			return bind(message, null);
++		}
++
++		public static String bind(String message, Object binding) {
++			return bind(message, new Object[] { binding });
++		}
++
++		public static String bind(String message, Object binding1, Object binding2) {
++			return bind(message, new Object[] { binding1, binding2 });
++		}
++
++		public static String bind(String message, Object[] bindings) {
++			return MessageFormat.format(message, bindings);
++		}
++	}
++
++	private String jarToIndex;
++	private String indexFile;
++	private boolean verbose = false;
++	private static final String PDE_LAUNCH = "-pdelaunch"; //$NON-NLS-1$
++	private static final String ARG_HELP = "-help"; //$NON-NLS-1$
++	private static final String ARG_VERBOSE = "-verbose"; //$NON-NLS-1$
++	private static final String ARG_OUTPUT = "-output"; //$NON-NLS-1$
++
++	private void displayHelp() {
++		System.out.println(Messages.bind(Messages.CommandLineUsage));
++	}
++
++	private void displayError(String message) {
++		System.out.println(message);
++		System.out.println();
++		displayHelp();
++	}
++
++	private boolean processCommandLine(String[] argsArray) {
++		ArrayList args = new ArrayList();
++		for (int i = 0, max = argsArray.length; i < max; i++) {
++			args.add(argsArray[i]);
++		}
++		int index = 0;
++		final int argCount = argsArray.length;
++
++		loop: while (index < argCount) {
++			String currentArg = argsArray[index++];
++			if (PDE_LAUNCH.equals(currentArg)) {
++				continue loop;
++			} else if (ARG_HELP.equals(currentArg)) {
++				displayHelp();
++				return false;
++			} else if (ARG_VERBOSE.equals(currentArg)) {
++				this.verbose = true;
++				continue loop;
++			} else if (ARG_OUTPUT.equals(currentArg)) {
++				if (this.indexFile != null) {
++					displayError(Messages.bind(Messages.CommandLineOnlyOneOutputError));
++					return false;
++				} else if (index == argCount) {
++					displayError(Messages.bind(Messages.CommandLineOutputTakesArgs));
++					return false;
++				}
++				this.indexFile = argsArray[index++];
++			} else {
++				if (this.jarToIndex != null) {
++					displayError(Messages.bind(Messages.CommandLineOnlyOneJarError));
++					return false;
++				}
++				this.jarToIndex = currentArg;
++			}
++		}
++		return true;
++	}
++
++	public Object start(IApplicationContext context) throws Exception {
++		boolean execute = processCommandLine((String[]) context.getArguments().get(IApplicationContext.APPLICATION_ARGS));
++		if (execute) {
++			if (this.jarToIndex != null && this.indexFile != null) {
++				File f = new File(this.jarToIndex);
++				if (f.exists()) {
++					if (this.verbose) {
++						System.out.println(Messages.bind(Messages.CommandLineProcessing, this.indexFile, this.jarToIndex));
++					}
++					try {
++						JavaIndexer.generateIndexForJar(this.jarToIndex, this.indexFile);
++					} catch (IOException e) {
++						System.out.println(Messages.bind(Messages.CaughtException, "IOException", e.getLocalizedMessage())); //$NON-NLS-1$
++					}
++				} else {
++						System.out.println(Messages.bind(Messages.CommandLineJarFileNotExist, this.jarToIndex));
++				}
++			} else if (this.jarToIndex == null) {
++				System.out.println(Messages.bind(Messages.CommandLineJarNotSpecified));
++			} else if (this.indexFile == null) {
++				System.out.println(Messages.bind(Messages.CommandLineIndexFileNotSpecified));
++			}
++		}
++		return IApplication.EXIT_OK;
++	}
++
++	public void stop() {
++		// do nothing
++	}
++
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/messages.properties b/org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/messages.properties
+new file mode 100644
+index 0000000..139ce10
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/core/index/messages.properties
+@@ -0,0 +1,29 @@
++###############################################################################
++# Copyright (c) 2000, 2006 IBM Corporation and others.
++# All rights reserved. This program and the accompanying materials
++# are made available under the terms of the Eclipse Public License v1.0
++# which accompanies this distribution, and is available at
++# http://www.eclipse.org/legal/epl-v10.html
++#
++# Contributors:
++#     IBM Corporation - initial API and implementation
++###############################################################################
++CommandLineUsage=Usage: eclipse -application org.eclipse.jdt.core.JavaIndexer [ OPTIONS ] -output <indexFile> <jarfile>\n\
++\n\
++\   -output <indexFile> Path to the index file to be generated.\n\
++\
++\   <jarfile>   Path to the jar for which index needs to be generated.\n\
++\
++\n\
++\ OPTIONS:\n\
++\n\
++\   -help                Display this message.\n\
++\   -verbose             Be verbose about the job.
++CommandLineProcessing=Generating index {0} for the jar {1}.
++CommandLineOnlyOneOutputError=Only one output needs to be specified.
++CommandLineOutputTakesArgs=-output should be followed by the path to the index file.
++CommandLineOnlyOneJarError=Only one jar file needs to be specified.
++CommandLineJarNotSpecified=No jar file is specified.
++CommandLineIndexFileNotSpecified=No index file is specified.
++CaughtException=Exception {0} - {1}.
++CommandLineJarFileNotExist={0} does not exist.
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/core/search/SearchParticipant.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/core/search/SearchParticipant.java
+index 4e3f6c4..2a87b52 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/core/search/SearchParticipant.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/core/search/SearchParticipant.java
+@@ -14,6 +14,8 @@ import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.jdt.internal.core.JavaModel;
+ import org.eclipse.jdt.internal.core.JavaModelManager;
++import org.eclipse.jdt.internal.core.index.FileIndexLocation;
++import org.eclipse.jdt.internal.core.index.IndexLocation;
+ import org.eclipse.jdt.internal.core.search.indexing.IndexManager;
+ 
+ /**
+@@ -192,9 +194,9 @@ public abstract class SearchParticipant {
+ 	 * </p>
+ 	 *
+ 	 * @param document the document to index
+-	 * @param indexLocation the location on the file system of the index
++	 * @param indexPath the location on the file system of the index
+ 	 */
+-	public final void scheduleDocumentIndexing(SearchDocument document, IPath indexLocation) {
++	public final void scheduleDocumentIndexing(SearchDocument document, IPath indexPath) {
+ 		IPath documentPath = new Path(document.getPath());
+ 		Object file = JavaModel.getTarget(documentPath, true);
+ 		IPath containerPath = documentPath;
+@@ -205,11 +207,13 @@ public abstract class SearchParticipant {
+ 		}
+ 		IndexManager manager = JavaModelManager.getIndexManager();
+ 		// TODO (frederic) should not have to create index manually, should expose API that recreates index instead
++		IndexLocation indexLocation;
++		indexLocation = new FileIndexLocation(indexPath.toFile(), true);
+ 		manager.ensureIndexExists(indexLocation, containerPath);
+ 		manager.scheduleDocumentIndexing(document, containerPath, indexLocation, this);
+-		if (!indexLocation.equals(this.lastIndexLocation)) {
+-			manager.updateParticipant(indexLocation, containerPath);
+-			this.lastIndexLocation = indexLocation;
++		if (!indexPath.equals(this.lastIndexLocation)) {
++			manager.updateParticipant(indexPath, containerPath);
++			this.lastIndexLocation = indexPath;
+ 		}
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/DiskIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/DiskIndex.java
+index 7644036..f4a3afd 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/DiskIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/DiskIndex.java
+@@ -23,7 +23,7 @@ import org.eclipse.jdt.internal.compiler.util.SimpleSetOfCharArray;
+ 
+ public class DiskIndex {
+ 
+-File indexFile;
++IndexLocation indexLocation;
+ 
+ private int headerInfoOffset;
+ private int numberOfChunks;
+@@ -82,12 +82,7 @@ int[] asArray() {
+ }
+ 
+ 
+-DiskIndex(String fileName) {
+-	if (fileName == null)
+-		throw new java.lang.IllegalArgumentException();
+-	this.indexFile = new File(fileName);
+-
+-	// clear cached items
++DiskIndex() {
+ 	this.headerInfoOffset = -1;
+ 	this.numberOfChunks = -1;
+ 	this.sizeOfLastChunk = -1;
+@@ -100,6 +95,13 @@ DiskIndex(String fileName) {
+ 	this.categoryOffsets = null;
+ 	this.categoryEnds = null;
+ }
++DiskIndex(IndexLocation location) throws IOException {
++	this();
++	if (location == null) {
++		throw new IllegalArgumentException();
++	}
++	this.indexLocation = location;
++}
+ SimpleSet addDocumentNames(String substring, MemoryIndex memoryIndex) throws IOException {
+ 	// must skip over documents which have been added/changed/deleted in the memory index
+ 	String[] docNames = readAllDocumentNames();
+@@ -230,7 +232,7 @@ HashtableOfObject addQueryResults(char[][] categories, char[] key, int matchRule
+ private void cacheDocumentNames() throws IOException {
+ 	// will need all document names so get them now
+ 	this.cachedChunks = new String[this.numberOfChunks][];
+-	FileInputStream stream = new FileInputStream(this.indexFile);
++	InputStream stream = this.indexLocation.getInputStream();
+ 	try {
+ 		if (this.numberOfChunks > 5) BUFFER_READ_SIZE <<= 1;
+ 		int offset = this.chunkOffsets[0];
+@@ -370,9 +372,9 @@ private void copyQueryResults(HashtableOfObject categoryToWords, int newPosition
+ 	}
+ }
+ void initialize(boolean reuseExistingFile) throws IOException {
+-	if (this.indexFile.exists()) {
++	if (this.indexLocation.exists()) {
+ 		if (reuseExistingFile) {
+-			FileInputStream stream = new FileInputStream(this.indexFile);
++			InputStream stream = this.indexLocation.getInputStream();
+ 			this.streamBuffer = new byte[BUFFER_READ_SIZE];
+ 			this.bufferIndex = 0;
+ 			this.bufferEnd = stream.read(this.streamBuffer, 0, 128);
+@@ -393,14 +395,14 @@ void initialize(boolean reuseExistingFile) throws IOException {
+ 			}
+ 			return;
+ 		}
+-		if (!this.indexFile.delete()) {
++		if (!this.indexLocation.delete()) {
+ 			if (DEBUG)
+-				System.out.println("initialize - Failed to delete index " + this.indexFile); //$NON-NLS-1$
+-			throw new IOException("Failed to delete index " + this.indexFile); //$NON-NLS-1$
++				System.out.println("initialize - Failed to delete index " + this.indexLocation); //$NON-NLS-1$
++			throw new IOException("Failed to delete index " + this.indexLocation); //$NON-NLS-1$
+ 		}
+ 	}
+-	if (this.indexFile.createNewFile()) {
+-		FileOutputStream stream = new FileOutputStream(this.indexFile, false);
++	if (this.indexLocation.createNewFile()) {
++		FileOutputStream stream = new FileOutputStream(this.indexLocation.getIndexFile(), false);
+ 		try {
+ 			this.streamBuffer = new byte[BUFFER_READ_SIZE];
+ 			this.bufferIndex = 0;
+@@ -416,18 +418,18 @@ void initialize(boolean reuseExistingFile) throws IOException {
+ 		}
+ 	} else {
+ 		if (DEBUG)
+-			System.out.println("initialize - Failed to create new index " + this.indexFile); //$NON-NLS-1$
+-		throw new IOException("Failed to create new index " + this.indexFile); //$NON-NLS-1$
++			System.out.println("initialize - Failed to create new index " + this.indexLocation); //$NON-NLS-1$
++		throw new IOException("Failed to create new index " + this.indexLocation); //$NON-NLS-1$
+ 	}
+ }
+ private void initializeFrom(DiskIndex diskIndex, File newIndexFile) throws IOException {
+ 	if (newIndexFile.exists() && !newIndexFile.delete()) { // delete the temporary index file
+ 		if (DEBUG)
+-			System.out.println("initializeFrom - Failed to delete temp index " + this.indexFile); //$NON-NLS-1$
++			System.out.println("initializeFrom - Failed to delete temp index " + this.indexLocation); //$NON-NLS-1$
+ 	} else if (!newIndexFile.createNewFile()) {
+ 		if (DEBUG)
+-			System.out.println("initializeFrom - Failed to create temp index " + this.indexFile); //$NON-NLS-1$
+-		throw new IOException("Failed to create temp index " + this.indexFile); //$NON-NLS-1$
++			System.out.println("initializeFrom - Failed to create temp index " + this.indexLocation); //$NON-NLS-1$
++		throw new IOException("Failed to create temp index " + this.indexLocation); //$NON-NLS-1$
+ 	}
+ 
+ 	int size = diskIndex.categoryOffsets == null ? 8 : diskIndex.categoryOffsets.elementSize;
+@@ -500,6 +502,9 @@ private void mergeCategory(char[] categoryName, DiskIndex onDisk, int[] position
+ DiskIndex mergeWith(MemoryIndex memoryIndex) throws IOException {
+  	// assume write lock is held
+ 	// compute & write out new docNames
++	if (this.indexLocation == null) {
++		throw new IOException("Pre-built index file not writeable");  //$NON-NLS-1$
++	}
+ 	String[] docNames = readAllDocumentNames();
+ 	int previousLength = docNames.length;
+ 	int[] positions = new int[previousLength]; // keeps track of the position of each document in the new sorted docNames
+@@ -509,15 +514,16 @@ DiskIndex mergeWith(MemoryIndex memoryIndex) throws IOException {
+ 		if (previousLength == 0) return this; // nothing to do... memory index contained deleted documents that had never been saved
+ 
+ 		// index is now empty since all the saved documents were removed
+-		DiskIndex newDiskIndex = new DiskIndex(this.indexFile.getPath());
++		DiskIndex newDiskIndex = new DiskIndex(this.indexLocation);
+ 		newDiskIndex.initialize(false);
+ 		return newDiskIndex;
+ 	}
+-
+-	DiskIndex newDiskIndex = new DiskIndex(this.indexFile.getPath() + ".tmp"); //$NON-NLS-1$
++	File oldIndexFile = this.indexLocation.getIndexFile();
++	DiskIndex newDiskIndex = new DiskIndex(new FileIndexLocation(new File(oldIndexFile.getPath() + ".tmp"))); //$NON-NLS-1$
++	File newIndexFile = newDiskIndex.indexLocation.getIndexFile();
+ 	try {
+-		newDiskIndex.initializeFrom(this, newDiskIndex.indexFile);
+-		FileOutputStream stream = new FileOutputStream(newDiskIndex.indexFile, false);
++		newDiskIndex.initializeFrom(this, newIndexFile);
++		FileOutputStream stream = new FileOutputStream(newIndexFile, false);
+ 		int offsetToHeader = -1;
+ 		try {
+ 			newDiskIndex.writeAllDocumentNames(docNames, stream);
+@@ -549,31 +555,31 @@ DiskIndex mergeWith(MemoryIndex memoryIndex) throws IOException {
+ 		newDiskIndex.writeOffsetToHeader(offsetToHeader);
+ 
+ 		// rename file by deleting previous index file & renaming temp one
+-		if (this.indexFile.exists() && !this.indexFile.delete()) {
++		if (oldIndexFile.exists() && !oldIndexFile.delete()) {
+ 			if (DEBUG)
+-				System.out.println("mergeWith - Failed to delete " + this.indexFile); //$NON-NLS-1$
+-			throw new IOException("Failed to delete index file " + this.indexFile); //$NON-NLS-1$
++				System.out.println("mergeWith - Failed to delete " + this.indexLocation); //$NON-NLS-1$
++			throw new IOException("Failed to delete index file " + this.indexLocation); //$NON-NLS-1$
+ 		}
+-		if (!newDiskIndex.indexFile.renameTo(this.indexFile)) {
++		if (!newIndexFile.renameTo(oldIndexFile)) {
+ 			if (DEBUG)
+-				System.out.println("mergeWith - Failed to rename " + this.indexFile); //$NON-NLS-1$
+-			throw new IOException("Failed to rename index file " + this.indexFile); //$NON-NLS-1$
++				System.out.println("mergeWith - Failed to rename " + this.indexLocation); //$NON-NLS-1$
++			throw new IOException("Failed to rename index file " + this.indexLocation); //$NON-NLS-1$
+ 		}
+ 	} catch (IOException e) {
+-		if (newDiskIndex.indexFile.exists() && !newDiskIndex.indexFile.delete())
++		if (newIndexFile.exists() && !newIndexFile.delete())
+ 			if (DEBUG)
+-				System.out.println("mergeWith - Failed to delete temp index " + newDiskIndex.indexFile); //$NON-NLS-1$
++				System.out.println("mergeWith - Failed to delete temp index " + newDiskIndex.indexLocation); //$NON-NLS-1$
+ 		throw e;
+ 	}
+ 
+-	newDiskIndex.indexFile = this.indexFile;
++	newDiskIndex.indexLocation = this.indexLocation;
+ 	return newDiskIndex;
+ }
+ private synchronized String[] readAllDocumentNames() throws IOException {
+ 	if (this.numberOfChunks <= 0)
+ 		return CharOperation.NO_STRINGS;
+ 
+-	FileInputStream stream = new FileInputStream(this.indexFile);
++	InputStream stream = this.indexLocation.getInputStream();
+ 	try {
+ 		int offset = this.chunkOffsets[0];
+ 		stream.skip(offset);
+@@ -612,7 +618,7 @@ private synchronized HashtableOfObject readCategoryTable(char[] categoryName, bo
+ 		}
+ 	}
+ 
+-	FileInputStream stream = new FileInputStream(this.indexFile);
++	InputStream stream = this.indexLocation.getInputStream();
+ 	HashtableOfObject categoryTable = null;
+ 	char[][] matchingWords = null;
+ 	int count = 0;
+@@ -626,7 +632,7 @@ private synchronized HashtableOfObject readCategoryTable(char[] categoryName, bo
+ 		try {
+ 			if (size < 0) { // DEBUG
+ 				System.err.println("-------------------- DEBUG --------------------"); //$NON-NLS-1$
+-				System.err.println("file = "+this.indexFile); //$NON-NLS-1$
++				System.err.println("file = "+this.indexLocation); //$NON-NLS-1$
+ 				System.err.println("offset = "+offset); //$NON-NLS-1$
+ 				System.err.println("size = "+size); //$NON-NLS-1$
+ 				System.err.println("--------------------   END   --------------------"); //$NON-NLS-1$
+@@ -636,7 +642,7 @@ private synchronized HashtableOfObject readCategoryTable(char[] categoryName, bo
+ 			// DEBUG
+ 			oom.printStackTrace();
+ 			System.err.println("-------------------- DEBUG --------------------"); //$NON-NLS-1$
+-			System.err.println("file = "+this.indexFile); //$NON-NLS-1$
++			System.err.println("file = "+this.indexLocation); //$NON-NLS-1$
+ 			System.err.println("offset = "+offset); //$NON-NLS-1$
+ 			System.err.println("size = "+size); //$NON-NLS-1$
+ 			System.err.println("--------------------   END   --------------------"); //$NON-NLS-1$
+@@ -678,7 +684,7 @@ private synchronized HashtableOfObject readCategoryTable(char[] categoryName, bo
+ 	}
+ 
+ 	if (matchingWords != null && count > 0) {
+-		stream = new FileInputStream(this.indexFile);
++		stream = this.indexLocation.getInputStream();
+ 		try {
+ 			stream.skip(firstOffset);
+ 			this.bufferIndex = 0;
+@@ -696,7 +702,7 @@ private synchronized HashtableOfObject readCategoryTable(char[] categoryName, bo
+ 	this.streamBuffer = null;
+ 	return categoryTable;
+ }
+-private void readChunk(String[] docNames, FileInputStream stream, int index, int size) throws IOException {
++private void readChunk(String[] docNames, InputStream stream, int index, int size) throws IOException {
+ 	String current = new String(readStreamChars(stream));
+ 	docNames[index++] = current;
+ 	for (int i = 1; i < size; i++) {
+@@ -734,7 +740,7 @@ synchronized String readDocumentName(int docNumber) throws IOException {
+ 			throw new IllegalArgumentException();
+ 		this.streamBuffer = new byte[numberOfBytes];
+ 		this.bufferIndex = 0;
+-		FileInputStream file = new FileInputStream(this.indexFile);
++		InputStream file = this.indexLocation.getInputStream();
+ 		try {
+ 			file.skip(start);
+ 			if (file.read(this.streamBuffer, 0, numberOfBytes) != numberOfBytes)
+@@ -763,7 +769,7 @@ synchronized int[] readDocumentNumbers(Object arrayOffset) throws IOException {
+ 	if (arrayOffset instanceof int[])
+ 		return (int[]) arrayOffset;
+ 
+-	FileInputStream stream = new FileInputStream(this.indexFile);
++	InputStream stream = this.indexLocation.getInputStream();
+ 	try {
+ 		int offset = ((Integer) arrayOffset).intValue();
+ 		stream.skip(offset);
+@@ -776,19 +782,19 @@ synchronized int[] readDocumentNumbers(Object arrayOffset) throws IOException {
+ 		this.streamBuffer = null;
+ 	}
+ }
+-private void readHeaderInfo(FileInputStream stream) throws IOException {
++private void readHeaderInfo(InputStream stream) throws IOException {
+ 
+ 	// must be same order as writeHeaderInfo()
+ 	this.numberOfChunks = readStreamInt(stream);
+ 	this.sizeOfLastChunk = this.streamBuffer[this.bufferIndex++] & 0xFF;
+ 	this.documentReferenceSize = this.streamBuffer[this.bufferIndex++] & 0xFF;
+ 	this.separator = (char) (this.streamBuffer[this.bufferIndex++] & 0xFF);
+-	long fileLength = this.indexFile.length();
+-	if (this.numberOfChunks > fileLength ) {
++	long length = this.indexLocation.length();
++	if (length != -1 && this.numberOfChunks > length) {
+ 		// not an accurate check, but good enough https://bugs.eclipse.org/bugs/show_bug.cgi?id=350612
+ 		if (DEBUG)
+-			System.out.println("Index file is corrupted " + this.indexFile); //$NON-NLS-1$
+-		throw new IOException("Index file is corrupted " + this.indexFile); //$NON-NLS-1$
++			System.out.println("Index file is corrupted " + this.indexLocation); //$NON-NLS-1$
++		throw new IOException("Index file is corrupted " + this.indexLocation); //$NON-NLS-1$
+ 	}
+ 	this.chunkOffsets = new int[this.numberOfChunks];
+ 	for (int i = 0; i < this.numberOfChunks; i++)
+@@ -799,11 +805,11 @@ private void readHeaderInfo(FileInputStream stream) throws IOException {
+ 	int size = readStreamInt(stream);
+ 	this.categoryOffsets = new HashtableOfIntValues(size);
+ 	this.categoryEnds = new HashtableOfIntValues(size);
+-	if (size > fileLength) {
++	if (length != -1 && size > length) {
+ 		//  not an accurate check, but good enough  https://bugs.eclipse.org/bugs/show_bug.cgi?id=350612
+ 		if (DEBUG)
+-			System.out.println("Index file is corrupted " + this.indexFile); //$NON-NLS-1$
+-		throw new IOException("Index file is corrupted " + this.indexFile); //$NON-NLS-1$
++			System.out.println("Index file is corrupted " + this.indexLocation); //$NON-NLS-1$
++		throw new IOException("Index file is corrupted " + this.indexLocation); //$NON-NLS-1$
+ 	}
+ 	char[] previousCategory = null;
+ 	int offset = -1;
+@@ -840,11 +846,13 @@ synchronized void stopQuery() {
+ 		}
+ 	}
+ }
+-private void readStreamBuffer(FileInputStream stream) throws IOException {
++private void readStreamBuffer(InputStream stream) throws IOException {
+ 	// if we're about to read a known amount at the end of the existing buffer, but it does not completely fit
+ 	// so we need to shift the remaining bytes to be read, and fill the buffer from the stream
+-	if (this.bufferEnd < this.streamBuffer.length)
+-		return; // we're at the end of the stream - nothing left to read
++	if (this.bufferEnd < this.streamBuffer.length) {
++		if (stream.available() == 0)
++			return; // we're at the end of the stream - nothing left to read
++	}
+ 
+ 	int bytesInBuffer = this.bufferEnd - this.bufferIndex;
+ 	if (bytesInBuffer > 0)
+@@ -872,7 +880,7 @@ private void readStreamBuffer(FileInputStream stream) throws IOException {
+  * @exception  UTFDataFormatException  if the bytes do not represent a
+  *               valid UTF-8 encoding of a Unicode string.
+  */
+-private char[] readStreamChars(FileInputStream stream) throws IOException {
++private char[] readStreamChars(InputStream stream) throws IOException {
+ 	// read chars array length
+ 	if (stream != null && this.bufferIndex + 2 >= this.bufferEnd)
+ 		readStreamBuffer(stream);
+@@ -886,7 +894,7 @@ private char[] readStreamChars(FileInputStream stream) throws IOException {
+ 		// how many characters can be decoded without refilling the buffer?
+ 		int charsInBuffer = i + ((this.bufferEnd - this.bufferIndex) / 3);
+ 		// all the characters must already be in the buffer if we're at the end of the stream
+-		if (charsInBuffer > length || this.bufferEnd != this.streamBuffer.length || stream == null)
++		if (charsInBuffer > length || stream == null  || (this.bufferEnd != this.streamBuffer.length && stream.available() == 0))
+ 			charsInBuffer = length;
+ 		while (i < charsInBuffer) {
+ 			byte b = this.streamBuffer[this.bufferIndex++];
+@@ -931,7 +939,7 @@ private char[] readStreamChars(FileInputStream stream) throws IOException {
+ 	}
+ 	return word;
+ }
+-private int[] readStreamDocumentArray(FileInputStream stream, int arraySize) throws IOException {
++private int[] readStreamDocumentArray(InputStream stream, int arraySize) throws IOException {
+ 	int[] indexes = new int[arraySize];
+ 	if (arraySize == 0) return indexes;
+ 
+@@ -972,7 +980,7 @@ private int[] readStreamDocumentArray(FileInputStream stream, int arraySize) thr
+ 	}
+ 	return indexes;
+ }
+-private int readStreamInt(FileInputStream stream) throws IOException {
++private int readStreamInt(InputStream stream) throws IOException {
+ 	if (this.bufferIndex + 4 >= this.bufferEnd) {
+ 		readStreamBuffer(stream);
+ 	}
+@@ -1182,7 +1190,7 @@ private void writeHeaderInfo(FileOutputStream stream) throws IOException {
+ }
+ private void writeOffsetToHeader(int offsetToHeader) throws IOException {
+ 	if (offsetToHeader > 0) {
+-		RandomAccessFile file = new RandomAccessFile(this.indexFile, "rw"); //$NON-NLS-1$
++		RandomAccessFile file = new RandomAccessFile(this.indexLocation.getIndexFile(), "rw"); //$NON-NLS-1$
+ 		try {
+ 			file.seek(this.headerInfoOffset); // offset to position in header
+ 			file.writeInt(offsetToHeader);
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/FileIndexLocation.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/FileIndexLocation.java
+new file mode 100644
+index 0000000..67fc9ae
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/FileIndexLocation.java
+@@ -0,0 +1,98 @@
++/*******************************************************************************
++ * Copyright (c) 2011 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core.index;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.URL;
++
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.Path;
++
++public class FileIndexLocation extends IndexLocation {
++	File indexFile;
++
++	public FileIndexLocation(File file) {
++		super(file);
++		this.indexFile = file;
++	}
++
++	public FileIndexLocation(URL url, File file) {
++		super(url);
++		this.indexFile = file;
++	}
++
++	public FileIndexLocation(File file, boolean participantIndex) {
++		this(file);
++		this.participantIndex = true;
++	}
++
++	public boolean createNewFile() throws IOException {
++		return this.indexFile.createNewFile();
++	}
++
++	public boolean delete() {
++		return this.indexFile.delete();
++	}
++
++	public boolean equals(Object other) {
++		if (!(other instanceof FileIndexLocation)) return false;
++		return this.indexFile.equals(((FileIndexLocation) other).indexFile);
++	}
++
++	public boolean exists() {
++		return this.indexFile.exists();
++	}
++
++	public String fileName() {
++		return this.indexFile.getName();
++	}
++	
++	public File getIndexFile() {
++		return this.indexFile;
++	}
++
++	InputStream getInputStream() throws IOException {
++		return new FileInputStream(this.indexFile);
++	}
++
++	public String getCanonicalFilePath() {
++		try {
++			return this.indexFile.getCanonicalPath();
++		} catch (IOException e) {
++			// ignore
++		}
++		return null;
++	}
++
++	public int hashCode() {
++		return this.indexFile.hashCode();
++	}
++
++	public long lastModified() {
++		return this.indexFile.lastModified();
++	}
++
++	public long length() {
++		return this.indexFile.length();
++	}
++
++	public boolean startsWith(IPath path) {
++		try {
++			return path.isPrefixOf(new Path(this.indexFile.getCanonicalPath()));
++		} catch (IOException e) {
++			return false;
++		}
++	}
++
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/Index.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/Index.java
+index 3d32607..8caa73c 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/Index.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/Index.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2009 IBM Corporation and others.
++ * Copyright (c) 2000, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -88,12 +88,12 @@ public static boolean isMatch(char[] pattern, char[] word, int matchRule) {
+ }
+ 
+ 
+-public Index(String fileName, String containerPath, boolean reuseExistingFile) throws IOException {
++public Index(IndexLocation location, String containerPath, boolean reuseExistingFile) throws IOException {
+ 	this.containerPath = containerPath;
+ 	this.monitor = new ReadWriteMonitor();
+ 
+ 	this.memoryIndex = new MemoryIndex();
+-	this.diskIndex = new DiskIndex(fileName);
++	this.diskIndex = new DiskIndex(location);
+ 	this.diskIndex.initialize(reuseExistingFile);
+ 	if (reuseExistingFile) this.separator = this.diskIndex.separator;
+ }
+@@ -110,7 +110,13 @@ public String containerRelativePath(String documentPath) {
+ 	return documentPath.substring(index + 1);
+ }
+ public File getIndexFile() {
+-	return this.diskIndex == null ? null : this.diskIndex.indexFile;
++	return this.diskIndex == null ? null : this.diskIndex.indexLocation.getIndexFile();
++}
++public IndexLocation getIndexLocation() {
++	return this.diskIndex == null ? null : this.diskIndex.indexLocation;
++}
++public long getIndexLastModified() {
++	return this.diskIndex == null? -1 : this.diskIndex.indexLocation.lastModified();
+ }
+ public boolean hasChanged() {
+ 	return this.memoryIndex.hasChanged();
+@@ -180,7 +186,7 @@ public void remove(String containerRelativePath) {
+  */
+ public void reset() throws IOException {
+ 	this.memoryIndex = new MemoryIndex();
+-	this.diskIndex = new DiskIndex(this.diskIndex.indexFile.getCanonicalPath());
++	this.diskIndex = new DiskIndex(this.diskIndex.indexLocation);
+ 	this.diskIndex.initialize(false/*do not reuse the index file*/);
+ }
+ public void save() throws IOException {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/IndexLocation.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/IndexLocation.java
+new file mode 100644
+index 0000000..d410f72
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/IndexLocation.java
+@@ -0,0 +1,124 @@
++/*******************************************************************************
++ * Copyright (c) 2011 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core.index;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++
++import java.net.MalformedURLException;
++import java.net.URL;
++
++import org.eclipse.core.runtime.FileLocator;
++import org.eclipse.core.runtime.IPath;
++
++/**
++ * The location of the index files are represented as {@link IndexLocation}
++ * 
++ * This is an abstract class to allow different implementation for a jar entry and a file
++ * on the disk. Some of these functions could mean different for a jar entry or a file
++ * 
++ */
++public abstract class IndexLocation {
++	
++	public static IndexLocation createIndexLocation(URL url) {
++		URL localUrl;
++		try {
++			localUrl = FileLocator.resolve(url);
++		} catch (IOException e) {
++			return null;
++		}
++		if (localUrl.getProtocol().equals("file")) { //$NON-NLS-1$
++			return new FileIndexLocation(url, new File(localUrl.getPath()));
++		}
++		return new JarIndexLocation(url, localUrl);
++	}
++	
++	private final URL url; // url of the given index location
++
++	/**
++	 * Set to true if this index location is of an index file specified
++	 * by a participant through 
++	 * {@link org.eclipse.jdt.core.search.SearchParticipant#scheduleDocumentIndexing}
++	 */
++	protected boolean participantIndex;
++	
++	protected IndexLocation(File file) {
++		URL tempUrl = null;
++		try {
++			tempUrl = file.toURI().toURL();
++		} catch (MalformedURLException e) {
++			// should not happen
++		}
++		this.url = tempUrl;
++	}
++	
++	public IndexLocation(URL url) {
++		this.url = url;
++	}
++
++	/**
++	 * Closes any open streams.
++	 */
++	public void close() {
++		// default nothing to do
++	}
++
++	/**
++	 * Creates a new file for the given index location
++	 * @return true if the file is created
++	 * @throws IOException
++	 */
++	public abstract boolean createNewFile() throws IOException;
++
++	public abstract boolean delete();
++
++	public abstract boolean exists();
++	
++	public abstract String fileName();
++
++	/**
++	 * @return the canonical file path if the location is a file or null otherwise
++	 */
++	public abstract String getCanonicalFilePath();
++
++	public abstract File getIndexFile();
++
++	abstract InputStream getInputStream() throws IOException;
++
++	public URL getUrl() {
++		return this.url;
++	}
++
++	public int hashCode() {
++		return this.url.hashCode();
++	}
++
++	public boolean isParticipantIndex() {
++		return this.participantIndex;
++	}
++
++	/**
++	 * @return the last modified time if the location is a file or -1 otherwise
++	 */
++	public abstract long lastModified();
++
++	/**
++	 * @return the length of the file if the location is a file or -1 otherwise
++	 */
++	public abstract long length();
++
++	public abstract boolean startsWith(IPath path);
++
++	public String toString() {
++		return this.url.toString();
++	}
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/JarIndexLocation.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/JarIndexLocation.java
+new file mode 100644
+index 0000000..a93a264
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/index/JarIndexLocation.java
+@@ -0,0 +1,108 @@
++/*******************************************************************************
++ * Copyright (c) 2011 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core.index;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.JarURLConnection;
++import java.net.URL;
++import java.util.jar.JarEntry;
++import java.util.jar.JarFile;
++
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.Path;
++
++public class JarIndexLocation extends IndexLocation {
++	private JarFile jarFile = null;
++	private JarEntry jarEntry = null;
++	private URL localUrl;
++
++	public JarIndexLocation(URL url, URL localUrl2) {
++		super(url);
++		this.localUrl = localUrl2;
++	}
++
++	public boolean createNewFile() throws IOException {
++		return false;
++	}
++
++	public void close() {
++		if (this.jarFile != null) {
++			try {
++				this.jarFile.close();
++			} catch (IOException e) {
++				// ignore
++			}
++			this.jarFile = null;
++		}
++	}
++
++	public boolean delete() {
++		return false;
++	}
++
++	public boolean equals(Object other) {
++		if (!(other instanceof JarIndexLocation)) return false;
++		return this.localUrl.equals(((JarIndexLocation) other).localUrl);
++	}
++
++	public boolean exists() {
++		try {
++			if (this.jarFile == null) {
++				JarURLConnection connection = (JarURLConnection) this.localUrl.openConnection();
++				JarFile file = connection.getJarFile();
++				if (file == null)
++					return false;
++				file.close();
++			}
++		} catch (IOException e) {
++			return false;
++		}
++		return true;
++	}
++
++	public String fileName() {
++		return null;
++	}
++
++	public File getIndexFile() {
++		return null;
++	}
++
++	InputStream getInputStream() throws IOException {
++		if (this.jarFile == null) {
++			JarURLConnection connection = (JarURLConnection) this.localUrl.openConnection();
++			this.jarFile = connection.getJarFile();
++			this.jarEntry = connection.getJarEntry();
++		}
++		if (this.jarFile == null || this.jarEntry == null)
++			return null;
++		return this.jarFile.getInputStream(this.jarEntry);
++	}
++
++	public String getCanonicalFilePath() {
++		return null;
++	}
++
++	public long lastModified() {
++		return -1;
++	}
++
++	public long length() {
++		return -1;
++	}
++
++	public boolean startsWith(IPath path) {
++		return (path.isPrefixOf(new Path(this.localUrl.getPath())));
++	}
++
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/IndexSelector.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/IndexSelector.java
+index 4e584f2..20990c9 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/IndexSelector.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/IndexSelector.java
+@@ -27,6 +27,7 @@ import org.eclipse.jdt.internal.core.JavaModelManager;
+ import org.eclipse.jdt.internal.core.JavaProject;
+ import org.eclipse.jdt.internal.core.builder.ReferenceCollection;
+ import org.eclipse.jdt.internal.core.builder.State;
++import org.eclipse.jdt.internal.core.index.IndexLocation;
+ import org.eclipse.jdt.internal.core.search.indexing.IndexManager;
+ import org.eclipse.jdt.internal.core.search.matching.MatchLocator;
+ import org.eclipse.jdt.internal.core.search.matching.MethodPattern;
+@@ -38,7 +39,7 @@ import org.eclipse.jdt.internal.core.search.matching.MethodPattern;
+ public class IndexSelector {
+ 	IJavaSearchScope searchScope;
+ 	SearchPattern pattern;
+-	IPath[] indexLocations; // cache of the keys for looking index up
++	IndexLocation[] indexLocations; // cache of the keys for looking index up
+ 
+ public IndexSelector(
+ 		IJavaSearchScope searchScope,
+@@ -267,10 +268,10 @@ private void initializeIndexLocations() {
+ 	}
+ 
+ 	locations.remove(null); // Ensure no nulls
+-	this.indexLocations = (IPath[]) locations.toArray(new IPath[locations.size()]);
++	this.indexLocations = (IndexLocation[]) locations.toArray(new IndexLocation[locations.size()]);
+ }
+ 
+-public IPath[] getIndexLocations() {
++public IndexLocation[] getIndexLocations() {
+ 	if (this.indexLocations == null) {
+ 		initializeIndexLocations();
+ 	}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchParticipant.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchParticipant.java
+index 13d6820..cf970b3 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchParticipant.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchParticipant.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2009 IBM Corporation and others.
++ * Copyright (c) 2000, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -12,6 +12,7 @@ package org.eclipse.jdt.internal.core.search;
+ 
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.jdt.core.search.*;
++import org.eclipse.jdt.internal.core.index.IndexLocation;
+ import org.eclipse.jdt.internal.core.search.indexing.BinaryIndexer;
+ import org.eclipse.jdt.internal.core.search.indexing.SourceIndexer;
+ import org.eclipse.jdt.internal.core.search.matching.MatchLocator;
+@@ -98,7 +99,20 @@ public class JavaSearchParticipant extends SearchParticipant {
+ 	 * @see org.eclipse.jdt.core.search.SearchParticipant#selectIndexes(org.eclipse.jdt.core.search.SearchQuery, org.eclipse.jdt.core.search.SearchContext)
+ 	 */
+ 	public IPath[] selectIndexes(SearchPattern pattern, IJavaSearchScope scope) {
++		IndexSelector selector = (IndexSelector) this.indexSelector.get();
++		if (selector == null) {
++			selector = new IndexSelector(scope, pattern);
++			this.indexSelector.set(selector);
++		}
++		IndexLocation[] urls = selector.getIndexLocations();
++		IPath[] paths = new IPath[urls.length];
++		for (int i = 0; i < urls.length; i++) {
++			paths[i] = new Path(urls[i].getIndexFile().getPath());
++		}
++		return paths;
++	}
+ 
++	public IndexLocation[] selectIndexURLs(SearchPattern pattern, IJavaSearchScope scope) {
+ 		IndexSelector selector = (IndexSelector) this.indexSelector.get();
+ 		if (selector == null) {
+ 			selector = new IndexSelector(scope, pattern);
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/PatternSearchJob.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/PatternSearchJob.java
+index 459730c..c83c2f1 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/PatternSearchJob.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/PatternSearchJob.java
+@@ -17,7 +17,9 @@ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.OperationCanceledException;
+ import org.eclipse.jdt.core.search.*;
+ import org.eclipse.jdt.internal.core.JavaModelManager;
++import org.eclipse.jdt.internal.core.index.FileIndexLocation;
+ import org.eclipse.jdt.internal.core.index.Index;
++import org.eclipse.jdt.internal.core.index.IndexLocation;
+ import org.eclipse.jdt.internal.core.search.indexing.ReadWriteMonitor;
+ import org.eclipse.jdt.internal.core.search.matching.MatchLocator;
+ import org.eclipse.jdt.internal.core.search.processing.IJob;
+@@ -76,8 +78,19 @@ public boolean execute(IProgressMonitor progressMonitor) {
+ }
+ public Index[] getIndexes(IProgressMonitor progressMonitor) {
+ 	// acquire the in-memory indexes on the fly
+-	IPath[] indexLocations = this.participant.selectIndexes(this.pattern, this.scope);
+-	int length = indexLocations.length;
++	IndexLocation[] indexLocations;
++	int length;
++	if (this.participant instanceof JavaSearchParticipant) {
++		indexLocations = ((JavaSearchParticipant)this.participant).selectIndexURLs(this.pattern, this.scope);
++		length = indexLocations.length;
++	} else {
++		IPath[] paths = this.participant.selectIndexes(this.pattern, this.scope);
++		length = paths.length;
++		indexLocations = new IndexLocation[paths.length];
++		for (int i = 0, len = paths.length; i < len; i++) {
++			indexLocations[i] = new FileIndexLocation(paths[i].toFile(), true);
++		}
++	}
+ 	Index[] indexes = JavaModelManager.getIndexManager().getIndexes(indexLocations, progressMonitor);
+ 	this.areIndexesReady = indexes.length == length;
+ 	return indexes;
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
+index 168904f..812c462 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2010 IBM Corporation and others.
++ * Copyright (c) 2000, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -34,6 +34,7 @@ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.compiler.util.Util;
+ import org.eclipse.jdt.internal.core.JavaModelManager;
+ import org.eclipse.jdt.internal.core.index.Index;
++import org.eclipse.jdt.internal.core.index.IndexLocation;
+ import org.eclipse.jdt.internal.core.search.JavaSearchDocument;
+ import org.eclipse.jdt.internal.core.search.processing.JobManager;
+ 
+@@ -42,14 +43,17 @@ class AddJarFileToIndex extends IndexRequest {
+ 	private static final char JAR_SEPARATOR = IJavaSearchScope.JAR_FILE_ENTRY_SEPARATOR.charAt(0);
+ 	IFile resource;
+ 	Scanner scanner;
++	private IndexLocation indexFileURL;
+ 
+-	public AddJarFileToIndex(IFile resource, IndexManager manager) {
++	public AddJarFileToIndex(IFile resource, IndexLocation indexFile, IndexManager manager) {
+ 		super(resource.getFullPath(), manager);
+ 		this.resource = resource;
++		this.indexFileURL = indexFile;
+ 	}
+-	public AddJarFileToIndex(IPath jarPath, IndexManager manager) {
++	public AddJarFileToIndex(IPath jarPath, IndexLocation indexFile, IndexManager manager) {
+ 		// external JAR scenario - no resource
+ 		super(jarPath, manager);
++		this.indexFileURL = indexFile;
+ 	}
+ 	public boolean equals(Object o) {
+ 		if (o instanceof AddJarFileToIndex) {
+@@ -71,6 +75,12 @@ class AddJarFileToIndex extends IndexRequest {
+ 
+ 		if (this.isCancelled || progressMonitor != null && progressMonitor.isCanceled()) return true;
+ 
++		if (this.indexFileURL != null) {
++			boolean added = this.manager.addIndex(this.containerPath, this.indexFileURL);
++			if (added) return true;	
++			this.indexFileURL = null;
++		}
++
+ 		try {
+ 			// if index is already cached, then do not perform any check
+ 			// MUST reset the IndexManager if a jar file is changed
+@@ -192,7 +202,11 @@ class AddJarFileToIndex extends IndexRequest {
+ 					return false;
+ 				}
+ 				index.separator = JAR_SEPARATOR;
+-
++				IPath indexPath = null;
++				IndexLocation indexLocation;
++				if ((indexLocation = index.getIndexLocation()) != null) {
++					indexPath = new Path(indexLocation.getCanonicalFilePath());
++				}
+ 				for (Enumeration e = zip.entries(); e.hasMoreElements();) {
+ 					if (this.isCancelled) {
+ 						if (JobManager.VERBOSE)
+@@ -208,7 +222,7 @@ class AddJarFileToIndex extends IndexRequest {
+ 						// index only classes coming from valid packages - https://bugs.eclipse.org/bugs/show_bug.cgi?id=293861
+ 						final byte[] classFileBytes = org.eclipse.jdt.internal.compiler.util.Util.getZipEntryByteContent(ze, zip);
+ 						JavaSearchDocument entryDocument = new JavaSearchDocument(ze, zipFilePath, classFileBytes, participant);
+-						this.manager.indexDocument(entryDocument, participant, index, this.containerPath);
++						this.manager.indexDocument(entryDocument, participant, index, indexPath);
+ 					}
+ 				}
+ 				this.manager.saveIndex(index);
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/DefaultJavaIndexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/DefaultJavaIndexer.java
+new file mode 100644
+index 0000000..a548c45
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/DefaultJavaIndexer.java
+@@ -0,0 +1,61 @@
++/*******************************************************************************
++ * Copyright (c) 2011 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core.search.indexing;
++
++import java.io.File;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.util.Enumeration;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
++import org.eclipse.core.runtime.Path;
++import org.eclipse.jdt.core.search.IJavaSearchScope;
++import org.eclipse.jdt.core.search.SearchEngine;
++import org.eclipse.jdt.core.search.SearchParticipant;
++import org.eclipse.jdt.internal.compiler.util.Util;
++import org.eclipse.jdt.internal.core.index.FileIndexLocation;
++import org.eclipse.jdt.internal.core.index.Index;
++import org.eclipse.jdt.internal.core.index.IndexLocation;
++import org.eclipse.jdt.internal.core.search.JavaSearchDocument;
++
++public class DefaultJavaIndexer {
++	private static final char JAR_SEPARATOR = IJavaSearchScope.JAR_FILE_ENTRY_SEPARATOR.charAt(0);
++	
++	public void generateIndexForJar(String pathToJar, String pathToIndexFile) throws IOException {
++		File f = new File(pathToJar);
++		if (!f.exists()) {
++			throw new FileNotFoundException(pathToJar + " not found"); //$NON-NLS-1$
++		}
++		IndexLocation indexLocation = new FileIndexLocation(new File(pathToIndexFile));
++		Index index = new Index(indexLocation, pathToJar, false /*reuse index file*/);
++		SearchParticipant participant = SearchEngine.getDefaultSearchParticipant();
++		index.separator = JAR_SEPARATOR;
++		ZipFile zip = new ZipFile(pathToJar);
++		try {
++			for (Enumeration e = zip.entries(); e.hasMoreElements();) {
++				// iterate each entry to index it
++				ZipEntry ze = (ZipEntry) e.nextElement();
++				String zipEntryName = ze.getName();
++				if (Util.isClassFileName(zipEntryName)) {
++					final byte[] classFileBytes = org.eclipse.jdt.internal.compiler.util.Util.getZipEntryByteContent(ze, zip);
++					JavaSearchDocument entryDocument = new JavaSearchDocument(ze, new Path(pathToJar), classFileBytes, participant);
++					entryDocument.setIndex(index);
++					new BinaryIndexer(entryDocument).indexDocument();
++				}
++			}
++			index.save();
++		} finally {
++			zip.close();
++		}
++		return;
++	}
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexAllProject.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexAllProject.java
+index 4313621..96aa904 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexAllProject.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexAllProject.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2009 IBM Corporation and others.
++ * Copyright (c) 2000, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -77,7 +77,7 @@ public class IndexAllProject extends IndexRequest {
+ 					if (entry.getEntryKind() == IClasspathEntry.CPE_LIBRARY && entry.getPath().equals(projectPath)) {
+ 						// the project is also a library folder (see https://bugs.eclipse.org/bugs/show_bug.cgi?id=89815)
+ 						// ensure a job exists to index it as a binary folder
+-						this.manager.indexLibrary(projectPath, this.project);
++						this.manager.indexLibrary(projectPath, this.project, ((ClasspathEntry)entry).getLibraryIndexLocation());
+ 						return true;
+ 					}
+ 				}
+@@ -107,7 +107,7 @@ public class IndexAllProject extends IndexRequest {
+ 				for (int i = 0; i < max; i++)
+ 					indexedFileNames.put(paths[i], DELETED);
+ 			}
+-			final long indexLastModified = max == 0 ? 0L : index.getIndexFile().lastModified();
++			final long indexLastModified = max == 0 ? 0L : index.getIndexLastModified();
+ 
+ 			IWorkspaceRoot root = this.project.getWorkspace().getRoot();
+ 			for (int i = 0; i < sourceEntriesNumber; i++) {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexBinaryFolder.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexBinaryFolder.java
+index 7bb90f9..b06e0df 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexBinaryFolder.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexBinaryFolder.java
+@@ -80,7 +80,7 @@ public class IndexBinaryFolder extends IndexRequest {
+ 				for (int i = 0; i < max; i++) {
+ 					indexedFileNames.put(paths[i], DELETED);
+ 				}
+-				final long indexLastModified = index.getIndexFile().lastModified();
++				final long indexLastModified = index.getIndexLastModified();
+ 				this.folder.accept(
+ 					new IResourceProxyVisitor() {
+ 						public boolean visit(IResourceProxy proxy) throws CoreException {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+index f08c249..75f441f 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2010 IBM Corporation and others.
++ * Copyright (c) 2000, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -11,6 +11,7 @@
+ package org.eclipse.jdt.internal.core.search.indexing;
+ 
+ import java.io.*;
++import java.net.URL;
+ import java.util.*;
+ import java.util.zip.CRC32;
+ 
+@@ -59,6 +60,7 @@ public class IndexManager extends JobManager implements IIndexConstants {
+ 	public static final Integer UPDATING_STATE = new Integer(1);
+ 	public static final Integer UNKNOWN_STATE = new Integer(2);
+ 	public static final Integer REBUILDING_STATE = new Integer(3);
++	public static final Integer REUSE_STATE = new Integer(4);
+ 	
+ 	// search participants who register indexes with the index manager
+ 	private SimpleLookupTable participantsContainers = null;
+@@ -70,10 +72,10 @@ public class IndexManager extends JobManager implements IIndexConstants {
+ 	public synchronized void aboutToUpdateIndex(IPath containerPath, Integer newIndexState) {
+ 	// newIndexState is either UPDATING_STATE or REBUILDING_STATE
+ 	// must tag the index as inconsistent, in case we exit before the update job is started
+-	IPath indexLocation = computeIndexLocation(containerPath);
++	IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 	Object state = getIndexStates().get(indexLocation);
+ 	Integer currentIndexState = state == null ? UNKNOWN_STATE : (Integer) state;
+-	if (currentIndexState.equals(REBUILDING_STATE)) return; // already rebuilding the index
++	if (currentIndexState.compareTo(REBUILDING_STATE) >= 0) return; // already rebuilding the index
+ 
+ 	int compare = newIndexState.compareTo(currentIndexState);
+ 	if (compare > 0) {
+@@ -92,7 +94,7 @@ public void addBinary(IFile resource, IPath containerPath) {
+ 	if (JavaCore.getPlugin() == null) return;
+ 	SearchParticipant participant = SearchEngine.getDefaultSearchParticipant();
+ 	SearchDocument document = participant.getDocument(resource.getFullPath().toString());
+-	IPath indexLocation = computeIndexLocation(containerPath);
++	IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 	scheduleDocumentIndexing(document, containerPath, indexLocation, participant);
+ }
+ /**
+@@ -104,7 +106,7 @@ public void addSource(IFile resource, IPath containerPath, SourceElementParser p
+ 	SearchParticipant participant = SearchEngine.getDefaultSearchParticipant();
+ 	SearchDocument document = participant.getDocument(resource.getFullPath().toString());
+ 	document.setParser(parser);
+-	IPath indexLocation = computeIndexLocation(containerPath);
++	IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 	scheduleDocumentIndexing(document, containerPath, indexLocation, participant);
+ }
+ /*
+@@ -116,17 +118,17 @@ public void cleanUpIndexes() {
+ 	PatternSearchJob job = new PatternSearchJob(null, SearchEngine.getDefaultSearchParticipant(), scope, null);
+ 	Index[] selectedIndexes = job.getIndexes(null);
+ 	for (int i = 0, l = selectedIndexes.length; i < l; i++) {
+-		String path = selectedIndexes[i].getIndexFile().getAbsolutePath();
+-		knownPaths.add(path);
++		IndexLocation IndexLocation = selectedIndexes[i].getIndexLocation();
++		knownPaths.add(IndexLocation);
+ 	}
+ 
+ 	if (this.indexStates != null) {
+ 		Object[] keys = this.indexStates.keyTable;
+-		IPath[] locations = new IPath[this.indexStates.elementSize];
++		IndexLocation[] locations = new IndexLocation[this.indexStates.elementSize];
+ 		int count = 0;
+ 		for (int i = 0, l = keys.length; i < l; i++) {
+-			IPath key = (IPath) keys[i];
+-			if (key != null && !knownPaths.includes(key.toOSString()))
++			IndexLocation key = (IndexLocation) keys[i];
++			if (key != null && !knownPaths.includes(key))
+ 				locations[count++] = key;
+ 		}
+ 		if (count > 0)
+@@ -134,8 +136,8 @@ public void cleanUpIndexes() {
+ 	}
+ 	deleteIndexFiles(knownPaths);
+ }
+-public synchronized IPath computeIndexLocation(IPath containerPath) {
+-	IPath indexLocation = (IPath) this.indexLocations.get(containerPath);
++public synchronized IndexLocation computeIndexLocation(IPath containerPath) {
++	IndexLocation indexLocation = (IndexLocation) this.indexLocations.get(containerPath);
+ 	if (indexLocation == null) {
+ 		String pathString = containerPath.toOSString();
+ 		CRC32 checksumCalculator = new CRC32();
+@@ -144,7 +146,7 @@ public synchronized IPath computeIndexLocation(IPath containerPath) {
+ 		if (VERBOSE)
+ 			Util.verbose("-> index name for " + pathString + " is " + fileName); //$NON-NLS-1$ //$NON-NLS-2$
+ 		// to share the indexLocation between the indexLocations and indexStates tables, get the key from the indexStates table
+-		indexLocation = (IPath) getIndexStates().getKey(getJavaPluginWorkingLocation().append(fileName));
++		indexLocation = (IndexLocation) getIndexStates().getKey(new FileIndexLocation(new File(getSavedIndexesDirectory(), fileName)));
+ 		this.indexLocations.put(containerPath, indexLocation);
+ 	}
+ 	return indexLocation;
+@@ -161,7 +163,7 @@ private void deleteIndexFiles(SimpleSet pathsToKeep) {
+ 
+ 	for (int i = 0, l = indexesFiles.length; i < l; i++) {
+ 		String fileName = indexesFiles[i].getAbsolutePath();
+-		if (pathsToKeep != null && pathsToKeep.includes(fileName)) continue;
++		if (pathsToKeep != null && pathsToKeep.includes(new FileIndexLocation(indexesFiles[i]))) continue;
+ 		String suffix = ".index"; //$NON-NLS-1$
+ 		if (fileName.regionMatches(true, fileName.length() - suffix.length(), suffix, 0, suffix.length())) {
+ 			if (VERBOSE || DEBUG)
+@@ -173,7 +175,7 @@ private void deleteIndexFiles(SimpleSet pathsToKeep) {
+ /*
+  * Creates an empty index at the given location, for the given container path, if none exist.
+  */
+-public synchronized void ensureIndexExists(IPath indexLocation, IPath containerPath) {
++public synchronized void ensureIndexExists(IndexLocation indexLocation, IPath containerPath) {
+ 	SimpleLookupTable states = getIndexStates();
+ 	Object state = states.get(indexLocation);
+ 	if (state == null) {
+@@ -207,7 +209,7 @@ public SourceElementParser getSourceElementParser(IJavaProject project, ISourceE
+  * @param indexLocation The path of the index file
+  * @return The corresponding index or <code>null</code> if not found
+  */
+-public synchronized Index getIndex(IPath indexLocation) {
++public synchronized Index getIndex(IndexLocation indexLocation) {
+ 	return (Index) this.indexes.get(indexLocation); // is null if unknown, call if the containerPath must be computed
+ }
+ /**
+@@ -219,7 +221,7 @@ public synchronized Index getIndex(IPath indexLocation) {
+  * Warning: Does not check whether index is consistent (not being used)
+  */
+ public synchronized Index getIndex(IPath containerPath, boolean reuseExistingFile, boolean createIfMissing) {
+-	IPath indexLocation = computeIndexLocation(containerPath);
++	IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 	return getIndex(containerPath, indexLocation, reuseExistingFile, createIfMissing);
+ }
+ /**
+@@ -230,7 +232,7 @@ public synchronized Index getIndex(IPath containerPath, boolean reuseExistingFil
+  *
+  * Warning: Does not check whether index is consistent (not being used)
+  */
+-public synchronized Index getIndex(IPath containerPath, IPath indexLocation, boolean reuseExistingFile, boolean createIfMissing) {
++public synchronized Index getIndex(IPath containerPath, IndexLocation indexLocation, boolean reuseExistingFile, boolean createIfMissing) {
+ 	// Path is already canonical per construction
+ 	Index index = getIndex(indexLocation);
+ 	if (index == null) {
+@@ -245,19 +247,17 @@ public synchronized Index getIndex(IPath containerPath, IPath indexLocation, boo
+ 
+ 		// index isn't cached, consider reusing an existing index file
+ 		String containerPathString = containerPath.getDevice() == null ? containerPath.toString() : containerPath.toOSString();
+-		String indexLocationString = indexLocation.toOSString();
+ 		if (reuseExistingFile) {
+-			File indexFile = new File(indexLocationString);
+-			if (indexFile.exists()) { // check before creating index so as to avoid creating a new empty index if file is missing
++			if (indexLocation.exists()) { // check before creating index so as to avoid creating a new empty index if file is missing
+ 				try {
+-					index = new Index(indexLocationString, containerPathString, true /*reuse index file*/);
++					index = new Index(indexLocation, containerPathString, true /*reuse index file*/);
+ 					this.indexes.put(indexLocation, index);
+ 					return index;
+ 				} catch (IOException e) {
+ 					// failed to read the existing file or its no longer compatible
+-					if (currentIndexState != REBUILDING_STATE) { // rebuild index if existing file is corrupt, unless the index is already being rebuilt
++					if (currentIndexState != REBUILDING_STATE && currentIndexState != REUSE_STATE) { // rebuild index if existing file is corrupt, unless the index is already being rebuilt
+ 						if (VERBOSE)
+-							Util.verbose("-> cannot reuse existing index: "+indexLocationString+" path: "+containerPathString); //$NON-NLS-1$ //$NON-NLS-2$
++							Util.verbose("-> cannot reuse existing index: "+indexLocation+" path: "+containerPathString); //$NON-NLS-1$ //$NON-NLS-2$
+ 						rebuildIndex(indexLocation, containerPath);
+ 						return null;
+ 					}
+@@ -268,18 +268,27 @@ public synchronized Index getIndex(IPath containerPath, IPath indexLocation, boo
+ 				rebuildIndex(indexLocation, containerPath);
+ 				return null;
+ 			}
++			if (currentIndexState == REUSE_STATE) {
++				// supposed to be in reuse state but error in the index file, so reindex.
++				if (VERBOSE)
++					Util.verbose("-> cannot reuse given index: "+indexLocation+" path: "+containerPathString); //$NON-NLS-1$ //$NON-NLS-2$
++				this.indexLocations.put(containerPath, null);
++				indexLocation = computeIndexLocation(containerPath);
++				rebuildIndex(indexLocation, containerPath);
++				return null;
++			}
+ 		}
+ 		// index wasn't found on disk, consider creating an empty new one
+ 		if (createIfMissing) {
+ 			try {
+ 				if (VERBOSE)
+-					Util.verbose("-> create empty index: "+indexLocationString+" path: "+containerPathString); //$NON-NLS-1$ //$NON-NLS-2$
+-				index = new Index(indexLocationString, containerPathString, false /*do not reuse index file*/);
++					Util.verbose("-> create empty index: "+indexLocation+" path: "+containerPathString); //$NON-NLS-1$ //$NON-NLS-2$
++				index = new Index(indexLocation, containerPathString, false /*do not reuse index file*/);
+ 				this.indexes.put(indexLocation, index);
+ 				return index;
+ 			} catch (IOException e) {
+ 				if (VERBOSE)
+-					Util.verbose("-> unable to create empty index: "+indexLocationString+" path: "+containerPathString); //$NON-NLS-1$ //$NON-NLS-2$
++					Util.verbose("-> unable to create empty index: "+indexLocation+" path: "+containerPathString); //$NON-NLS-1$ //$NON-NLS-2$
+ 				// The file could not be created. Possible reason: the project has been deleted.
+ 				return null;
+ 			}
+@@ -295,7 +304,7 @@ public synchronized Index getIndex(IPath containerPath, IPath indexLocation, boo
+  * @param locations The list of of the index files path
+  * @return The corresponding indexes list.
+  */
+-public Index[] getIndexes(IPath[] locations, IProgressMonitor progressMonitor) {
++public Index[] getIndexes(IndexLocation[] locations, IProgressMonitor progressMonitor) {
+ 	// acquire the in-memory indexes on the fly
+ 	int length = locations.length;
+ 	Index[] locatedIndexes = new Index[length];
+@@ -308,7 +317,7 @@ public Index[] getIndexes(IPath[] locations, IProgressMonitor progressMonitor) {
+ 			throw new OperationCanceledException();
+ 		}
+ 		// may trigger some index recreation work
+-		IPath indexLocation = locations[i];
++		IndexLocation indexLocation = locations[i];
+ 		Index index = getIndex(indexLocation);
+ 		if (index == null) {
+ 			// only need containerPath if the index must be built
+@@ -330,18 +339,16 @@ public Index[] getIndexes(IPath[] locations, IProgressMonitor progressMonitor) {
+ 					index = null;
+ 				}
+ 			} else {
+-				if (!getJavaPluginWorkingLocation().isPrefixOf(indexLocation)) { // the index belongs to non-jdt search participant
+-					if (indexLocation.toFile().exists()) { 
+-						try {
+-							IPath container = getParticipantsContainer(indexLocation);
+-							if (container != null) {
+-								index = new Index(indexLocation.toOSString(), container.toOSString(), true /*reuse index file*/);
+-								this.indexes.put(indexLocation, index);
+-							}
+-						} catch (IOException e) {
+-							// ignore
++				if (indexLocation.isParticipantIndex() && indexLocation.exists()) { // the index belongs to non-jdt search participant
++					try {
++						IPath container = getParticipantsContainer(indexLocation);
++						if (container != null) {
++							index = new Index(indexLocation, container.toOSString(), true /*reuse index file*/);
++							this.indexes.put(indexLocation, index);
+ 						}
+-					} 
++					} catch (IOException e) {
++						// ignore
++					}
+ 				}
+ 			}
+ 		}
+@@ -358,7 +365,7 @@ public Index[] getIndexes(IPath[] locations, IProgressMonitor progressMonitor) {
+ 	return locatedIndexes;
+ }
+ public synchronized Index getIndexForUpdate(IPath containerPath, boolean reuseExistingFile, boolean createIfMissing) {
+-	IPath indexLocation = computeIndexLocation(containerPath);
++	IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 	if (getIndexStates().get(indexLocation) == REBUILDING_STATE)
+ 		return getIndex(containerPath, indexLocation, reuseExistingFile, createIfMissing);
+ 
+@@ -368,13 +375,13 @@ private SimpleLookupTable getIndexStates() {
+ 	if (this.indexStates != null) return this.indexStates;
+ 
+ 	this.indexStates = new SimpleLookupTable();
+-	IPath indexesDirectoryPath = getJavaPluginWorkingLocation();
+-	char[][] savedNames = readIndexState(indexesDirectoryPath.toOSString());
++	File indexesDirectoryPath = getSavedIndexesDirectory();
++	char[][] savedNames = readIndexState(getJavaPluginWorkingLocation().toOSString());
+ 	if (savedNames != null) {
+ 		for (int i = 1, l = savedNames.length; i < l; i++) { // first name is saved signature, see readIndexState()
+ 			char[] savedName = savedNames[i];
+ 			if (savedName.length > 0) {
+-				IPath indexLocation = indexesDirectoryPath.append(new String(savedName)); // shares indexesDirectoryPath's segments
++				IndexLocation indexLocation = new FileIndexLocation(new File(indexesDirectoryPath, String.valueOf(savedName))); // shares indexesDirectoryPath's segments
+ 				if (VERBOSE)
+ 					Util.verbose("Reading saved index file " + indexLocation); //$NON-NLS-1$
+ 				this.indexStates.put(indexLocation, SAVED_STATE);
+@@ -389,7 +396,7 @@ private SimpleLookupTable getIndexStates() {
+ 	}
+ 	return this.indexStates;
+ }
+-private IPath getParticipantsContainer(IPath indexLocation) {
++private IPath getParticipantsContainer(IndexLocation indexLocation) {
+ 	if (this.participantsContainers == null) {
+ 		readParticipantsIndexNamesFile();
+ 	}
+@@ -474,7 +481,7 @@ public void indexAll(IProject project) {
+ 		for (int i = 0; i < entries.length; i++) {
+ 			IClasspathEntry entry= entries[i];
+ 			if (entry.getEntryKind() == IClasspathEntry.CPE_LIBRARY)
+-				indexLibrary(entry.getPath(), project);
++				indexLibrary(entry.getPath(), project, ((ClasspathEntry)entry).getLibraryIndexLocation());
+ 		}
+ 	} catch(JavaModelException e){ // cannot retrieve classpath info
+ 	}
+@@ -488,16 +495,16 @@ public void indexAll(IProject project) {
+  * Trigger addition of a library to an index
+  * Note: the actual operation is performed in background
+  */
+-public void indexLibrary(IPath path, IProject requestingProject) {
++public void indexLibrary(IPath path, IProject requestingProject, URL indexURL) {
+ 	// requestingProject is no longer used to cancel jobs but leave it here just in case
++	IndexLocation indexFile = indexURL != null ? IndexLocation.createIndexLocation(indexURL): null;
+ 	if (JavaCore.getPlugin() == null) return;
+-
+-	Object target = JavaModel.getTarget(path, true);
+ 	IndexRequest request = null;
++	Object target = JavaModel.getTarget(path, true);
+ 	if (target instanceof IFile) {
+-		request = new AddJarFileToIndex((IFile) target, this);
++		request = new AddJarFileToIndex((IFile) target, indexFile, this);
+ 	} else if (target instanceof File) {
+-		request = new AddJarFileToIndex(path, this);
++		request = new AddJarFileToIndex(path, indexFile, this);
+ 	} else if (target instanceof IContainer) {
+ 		request = new IndexBinaryFolder((IContainer) target, this);
+ 	} else {
+@@ -508,6 +515,19 @@ public void indexLibrary(IPath path, IProject requestingProject) {
+ 	if (!isJobWaiting(request))
+ 		request(request);
+ }
++
++synchronized boolean addIndex(IPath containerPath, IndexLocation indexFile) {
++	this.indexStates.put(indexFile, REUSE_STATE);
++	this.indexLocations.put(containerPath, indexFile);
++	Index index = getIndex(containerPath, indexFile, true, false);
++	if (index == null) {
++		indexFile.close();
++		this.indexLocations.put(containerPath, null);
++		return false;
++	}
++	return true;
++}
++
+ /**
+  * Index the content of the given source folder.
+  */
+@@ -522,7 +542,7 @@ public void indexSourceFolder(JavaProject javaProject, IPath sourceFolder, char[
+ 	request(new AddFolderToIndex(sourceFolder, project, inclusionPatterns, exclusionPatterns, this));
+ }
+ public synchronized void jobWasCancelled(IPath containerPath) {
+-	IPath indexLocation = computeIndexLocation(containerPath);
++	IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 	Index index = getIndex(indexLocation);
+ 	if (index != null) {
+ 		index.monitor = null;
+@@ -568,7 +588,7 @@ private char[][] readJavaLikeNamesFile() {
+ 	}
+ 	return null;
+ }
+-private void rebuildIndex(IPath indexLocation, IPath containerPath) {
++private void rebuildIndex(IndexLocation indexLocation, IPath containerPath) {
+ 	Object target = JavaModel.getTarget(containerPath, true);
+ 	if (target == null) return;
+ 
+@@ -584,9 +604,9 @@ private void rebuildIndex(IPath indexLocation, IPath containerPath) {
+ 	} else if (target instanceof IFolder) {
+ 		request = new IndexBinaryFolder((IFolder) target, this);
+ 	} else if (target instanceof IFile) {
+-		request = new AddJarFileToIndex((IFile) target, this);
++		request = new AddJarFileToIndex((IFile) target, null, this);
+ 	} else if (target instanceof File) {
+-		request = new AddJarFileToIndex(containerPath, this);
++		request = new AddJarFileToIndex(containerPath, null, this);
+ 	}
+ 	if (request != null)
+ 		request(request);
+@@ -601,13 +621,13 @@ public synchronized Index recreateIndex(IPath containerPath) {
+ 	String containerPathString = containerPath.getDevice() == null ? containerPath.toString() : containerPath.toOSString();
+ 	try {
+ 		// Path is already canonical
+-		IPath indexLocation = computeIndexLocation(containerPath);
++		IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 		Index index = getIndex(indexLocation);
+ 		ReadWriteMonitor monitor = index == null ? null : index.monitor;
+ 
+ 		if (VERBOSE)
+ 			Util.verbose("-> recreating index: "+indexLocation+" for path: "+containerPathString); //$NON-NLS-1$ //$NON-NLS-2$
+-		index = new Index(indexLocation.toOSString(), containerPathString, false /*do not reuse index file*/);
++		index = new Index(indexLocation, containerPathString, false /*do not reuse index file*/);
+ 		this.indexes.put(indexLocation, index);
+ 		index.monitor = monitor;
+ 		return index;
+@@ -634,7 +654,7 @@ public void remove(String containerRelativePath, IPath indexedContainer){
+ public synchronized void removeIndex(IPath containerPath) {
+ 	if (VERBOSE || DEBUG)
+ 		Util.verbose("removing index " + containerPath); //$NON-NLS-1$
+-	IPath indexLocation = computeIndexLocation(containerPath);
++	IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 	Index index = getIndex(indexLocation);
+ 	File indexFile = null;
+ 	if (index != null) {
+@@ -642,8 +662,11 @@ public synchronized void removeIndex(IPath containerPath) {
+ 		indexFile = index.getIndexFile();
+ 	}
+ 	if (indexFile == null)
+-		indexFile = new File(indexLocation.toOSString()); // index is not cached yet, but still want to delete the file
+-	if (indexFile.exists()) {
++		indexFile = indexLocation.getIndexFile(); // index is not cached yet, but still want to delete the file
++	if (this.indexStates.get(indexLocation) == REUSE_STATE) {
++		indexLocation.close();
++		this.indexLocations.put(containerPath, null);
++	} else if (indexFile != null && indexFile.exists()) {
+ 		if (DEBUG)
+ 			Util.verbose("removing index file " + indexFile); //$NON-NLS-1$
+ 		indexFile.delete();
+@@ -659,24 +682,25 @@ public synchronized void removeIndexPath(IPath path) {
+ 		Util.verbose("removing index path " + path); //$NON-NLS-1$
+ 	Object[] keyTable = this.indexes.keyTable;
+ 	Object[] valueTable = this.indexes.valueTable;
+-	IPath[] locations = null;
++	IndexLocation[] locations = null;
+ 	int max = this.indexes.elementSize;
+ 	int count = 0;
+ 	for (int i = 0, l = keyTable.length; i < l; i++) {
+-		IPath indexLocation = (IPath) keyTable[i];
++		IndexLocation indexLocation = (IndexLocation) keyTable[i];
+ 		if (indexLocation == null)
+ 			continue;
+-		if (path.isPrefixOf(indexLocation)) {
++		if (indexLocation.startsWith(path)) {
+ 			Index index = (Index) valueTable[i];
+ 			index.monitor = null;
+ 			if (locations == null)
+-				locations = new IPath[max];
++				locations = new IndexLocation[max];
+ 			locations[count++] = indexLocation;
+-			File indexFile = index.getIndexFile();
+-			if (indexFile.exists()) {
++			if (this.indexStates.get(indexLocation) == REUSE_STATE) {
++				indexLocation.close();
++			} else {
+ 				if (DEBUG)
+-					Util.verbose("removing index file " + indexFile); //$NON-NLS-1$
+-				indexFile.delete();
++					Util.verbose("removing index file " + indexLocation); //$NON-NLS-1$
++				indexLocation.delete();
+ 			}
+ 		} else {
+ 			max--;
+@@ -686,9 +710,15 @@ public synchronized void removeIndexPath(IPath path) {
+ 		for (int i = 0; i < count; i++)
+ 			this.indexes.removeKey(locations[i]);
+ 		removeIndexesState(locations);
+-		if (this.participantsContainers != null && this.participantsContainers.get(path.toOSString()) != null) {
+-			this.participantsContainers.removeKey(path.toOSString());	
+-			writeParticipantsIndexNamesFile();
++		if (this.participantsContainers != null) {
++			boolean update = false;
++			for (int i = 0; i < count; i++) {
++				if (this.participantsContainers.get(locations[i]) != null) {
++					update = true;
++					this.participantsContainers.removeKey(locations[i]);
++				}
++			}
++			if (update) writeParticipantsIndexNamesFile();
+ 		}
+ 	}
+ }
+@@ -746,7 +776,7 @@ public synchronized boolean resetIndex(IPath containerPath) {
+ 	String containerPathString = containerPath.getDevice() == null ? containerPath.toString() : containerPath.toOSString();
+ 	try {
+ 		// Path is already canonical
+-		IPath indexLocation = computeIndexLocation(containerPath);
++		IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 		Index index = getIndex(indexLocation);
+ 		if (VERBOSE) {
+ 			Util.verbose("-> reseting index: "+indexLocation+" for path: "+containerPathString); //$NON-NLS-1$ //$NON-NLS-2$
+@@ -770,7 +800,7 @@ public void saveIndex(Index index) throws IOException {
+ 	// must have permission to write from the write monitor
+ 	if (index.hasChanged()) {
+ 		if (VERBOSE)
+-			Util.verbose("-> saving index " + index.getIndexFile()); //$NON-NLS-1$
++			Util.verbose("-> saving index " + index.getIndexLocation()); //$NON-NLS-1$
+ 		index.save();
+ 	}
+ 	synchronized (this) {
+@@ -782,7 +812,7 @@ public void saveIndex(Index index) throws IOException {
+ 					if (((IndexRequest) job).containerPath.equals(containerPath)) return;
+ 			}
+ 		}
+-		IPath indexLocation = computeIndexLocation(containerPath);
++		IndexLocation indexLocation = computeIndexLocation(containerPath);
+ 		updateIndexState(indexLocation, SAVED_STATE);
+ 	}
+ }
+@@ -837,7 +867,7 @@ public void saveIndexes() {
+ 	}
+ 	this.needToSave = !allSaved;
+ }
+-public void scheduleDocumentIndexing(final SearchDocument searchDocument, IPath container, final IPath indexLocation, final SearchParticipant searchParticipant) {
++public void scheduleDocumentIndexing(final SearchDocument searchDocument, IPath container, final IndexLocation indexLocation, final SearchParticipant searchParticipant) {
+ 	request(new IndexRequest(container, this) {
+ 		public boolean execute(IProgressMonitor progressMonitor) {
+ 			if (this.isCancelled || progressMonitor != null && progressMonitor.isCanceled()) return true;
+@@ -850,7 +880,7 @@ public void scheduleDocumentIndexing(final SearchDocument searchDocument, IPath
+ 
+ 			try {
+ 				monitor.enterWrite(); // ask permission to write
+-				indexDocument(searchDocument, searchParticipant, index, indexLocation);
++				indexDocument(searchDocument, searchParticipant, index, new Path(indexLocation.getCanonicalFilePath()));
+ 			} finally {
+ 				monitor.exitWrite(); // free write lock
+ 			}
+@@ -904,7 +934,8 @@ private void readParticipantsIndexNamesFile() {
+ 				// First line is DiskIndex signature  (see writeParticipantsIndexNamesFile())
+ 				if (DiskIndex.SIGNATURE.equals(new String(names[0]))) {					
+ 					for (int i = 1, l = names.length-1 ; i < l ; i+=2) {
+-						containers.put(new Path(new String(names[i])), new Path(new String(names[i+1])));
++						IndexLocation indexLocation = new FileIndexLocation(new File(new String(names[i])), true);
++						containers.put(indexLocation, new Path(new String(names[i+1])));
+ 					}
+ 				}				
+ 			}
+@@ -916,7 +947,7 @@ private void readParticipantsIndexNamesFile() {
+ 	this.participantsContainers = containers;
+ 	return;
+ }
+-private synchronized void removeIndexesState(IPath[] locations) {
++private synchronized void removeIndexesState(IndexLocation[] locations) {
+ 	getIndexStates(); // ensure the states are initialized
+ 	int length = locations.length;
+ 	boolean changed = false;
+@@ -933,8 +964,8 @@ private synchronized void removeIndexesState(IPath[] locations) {
+ 
+ 	writeSavedIndexNamesFile();
+ }
+-private synchronized void updateIndexState(IPath indexLocation, Integer indexState) {
+-	if (indexLocation.isEmpty())
++private synchronized void updateIndexState(IndexLocation indexLocation, Integer indexState) {
++	if (indexLocation == null)
+ 		throw new IllegalArgumentException();
+ 
+ 	getIndexStates(); // ensure the states are initialized
+@@ -962,10 +993,11 @@ private synchronized void updateIndexState(IPath indexLocation, Integer indexSta
+ 	}
+ 
+ }
+-public void updateParticipant(IPath indexLocation, IPath containerPath) {
++public void updateParticipant(IPath indexPath, IPath containerPath) {
+ 	if (this.participantsContainers == null) {
+ 		readParticipantsIndexNamesFile();
+-	} 
++	}
++	IndexLocation indexLocation = new FileIndexLocation(indexPath.toFile(), true);
+ 	if (this.participantsContainers.get(indexLocation) == null) {
+ 		this.participantsContainers.put(indexLocation, containerPath);
+ 		this.participantUpdated  = true;
+@@ -1014,9 +1046,9 @@ private void writeParticipantsIndexNamesFile() {
+ 		Object[] indexFiles = this.participantsContainers.keyTable;
+ 		Object[] containers = this.participantsContainers.valueTable;
+ 		for (int i = 0, l = indexFiles.length; i < l; i++) {
+-			IPath indexFile = (IPath)indexFiles[i];
++			IndexLocation indexFile = (IndexLocation)indexFiles[i];
+ 			if (indexFile != null) {
+-				writer.write(indexFile.toOSString());
++				writer.write(indexFile.getIndexFile().getPath());
+ 				writer.write('\n');
+ 				writer.write(((IPath)containers[i]).toOSString());
+ 				writer.write('\n');
+@@ -1046,9 +1078,9 @@ private void writeSavedIndexNamesFile() {
+ 		Object[] keys = this.indexStates.keyTable;
+ 		Object[] states = this.indexStates.valueTable;
+ 		for (int i = 0, l = states.length; i < l; i++) {
+-			IPath key = (IPath) keys[i];
+-			if (key != null && !key.isEmpty() && states[i] == SAVED_STATE) {
+-				writer.write(key.lastSegment());
++			IndexLocation key = (IndexLocation) keys[i];
++			if (key != null && states[i] == SAVED_STATE) {
++				writer.write(key.fileName());
+ 				writer.write('\n');
+ 			}
+ 		}

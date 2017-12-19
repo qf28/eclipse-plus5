@@ -1,0 +1,359 @@
+commit 7b5011661f834d7b694ec46b2df63f185f1639df
+Author: Jim Des Rivieres <jeem>
+Date:   Wed Jan 5 17:53:24 2005 +0000
+
+    Add TargetSourceRangeComputer to ASTRewrite (bug 80839)
+
+12	4	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/CompilationUnit.java
+17	2	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/InternalASTRewrite.java
+41	2	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/rewrite/ASTRewrite.java
+126	0	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/rewrite/TargetSourceRangeComputer.java
+20	6	org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/CompilationUnit.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/CompilationUnit.java
+index aed0638..a7f7afa 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/CompilationUnit.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/CompilationUnit.java
+@@ -484,8 +484,12 @@ public class CompilationUnit extends ASTNode {
+ 	 * @since 3.0
+ 	 */
+ 	public int getExtendedStartPosition(ASTNode node) {
+-		if (this.commentMapper == null) {
+-			return -1;
++		if (node == null) {
++			throw new IllegalArgumentException();
++		}
++		if (this.commentMapper == null || node.getAST() != getAST()) {
++			// fall back: use best info available
++			return node.getStartPosition();
+ 		} else {
+ 			return this.commentMapper.getExtendedStartPosition(node);
+ 		}
+@@ -504,8 +508,12 @@ public class CompilationUnit extends ASTNode {
+ 	 * @since 3.0
+ 	 */
+ 	public int getExtendedLength(ASTNode node) {
+-		if (this.commentMapper == null) {
+-			return 0;
++		if (node == null) {
++			throw new IllegalArgumentException();
++		}
++		if (this.commentMapper == null || node.getAST() != getAST()) {
++			// fall back: use best info available
++			return node.getLength();
+ 		} else {
+ 			return this.commentMapper.getExtendedLength(node);
+ 		}
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/InternalASTRewrite.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/InternalASTRewrite.java
+index 73c4a45..d3af09f 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/InternalASTRewrite.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/InternalASTRewrite.java
+@@ -20,6 +20,7 @@ import org.eclipse.jface.text.IDocument;
+ 
+ import org.eclipse.jdt.core.dom.SimplePropertyDescriptor;
+ import org.eclipse.jdt.core.dom.StructuralPropertyDescriptor;
++import org.eclipse.jdt.core.dom.rewrite.TargetSourceRangeComputer;
+ import org.eclipse.jdt.internal.core.dom.rewrite.ASTRewriteAnalyzer;
+ import org.eclipse.jdt.internal.core.dom.rewrite.ListRewriteEvent;
+ import org.eclipse.jdt.internal.core.dom.rewrite.NodeInfoStore;
+@@ -65,9 +66,23 @@ class InternalASTRewrite extends NodeEventHandler {
+ 	public TextEdit rewriteAST(IDocument document, Map options) {
+ 		TextEdit result = new MultiTextEdit();
+ 		
+-		CompilationUnit rootNode = getRootNode();
++		final CompilationUnit rootNode = getRootNode();
+ 		if (rootNode != null) {
+-			ASTRewriteAnalyzer visitor = new ASTRewriteAnalyzer(document, rootNode, result, this.eventStore, this.nodeStore, options);
++			TargetSourceRangeComputer xsrComputer = new TargetSourceRangeComputer() {
++				/** 
++				 * This implementation of
++				 * {@link TargetSourceRangeComputer#computeSourceRange(ASTNode)}
++				 * is specialized to work in the case of internal AST rewriting, where the
++				 * original AST has been modified from its original form. This means that
++				 * one cannot trust that the root of the given node is the compilation unit.
++				 */
++				public SourceRange computeSourceRange(ASTNode node) {
++					int extendedStartPosition = rootNode.getExtendedStartPosition(node);
++					int extendedLength = rootNode.getExtendedLength(node);
++					return new SourceRange(extendedStartPosition, extendedLength);
++				}
++			};
++			ASTRewriteAnalyzer visitor = new ASTRewriteAnalyzer(document, result, this.eventStore, this.nodeStore, options, xsrComputer);
+ 			rootNode.accept(visitor);
+ 		}
+ 		return result;
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/rewrite/ASTRewrite.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/rewrite/ASTRewrite.java
+index 1c56637..d56b525 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/rewrite/ASTRewrite.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/rewrite/ASTRewrite.java
+@@ -85,6 +85,13 @@ public class ASTRewrite {
+ 	private final NodeInfoStore nodeStore;
+ 	
+ 	/**
++	 * Target source range computer; null means uninitialized;
++	 * lazy initialized to <code>new TargetSourceRangeComputer()</code>.
++	 * @since 3.1
++	 */
++	private TargetSourceRangeComputer targetSourceRangeComputer = null;
++	
++	/**
+ 	 * Creates a new instance for describing manipulations of
+ 	 * the given AST.
+ 	 * 
+@@ -140,6 +147,11 @@ public class ASTRewrite {
+ 	 * edits to the given document containing the original source
+ 	 * code. The document itself is not modified.
+ 	 * <p>
++	 * For nodes in the original that are being replaced or deleted,
++	 * this rewriter computes the adjusted source ranges
++	 * by calling <code>getTargetSourceRangeComputer().computeSourceRange(node)</code>.
++	 * </p>
++	 * <p>
+ 	 * Calling this methods does not discard the modifications
+ 	 * on record. Subsequence modifications are added to the ones
+ 	 * already on record. If this method is called again later,
+@@ -169,8 +181,7 @@ public class ASTRewrite {
+ 			
+ 			getRewriteEventStore().markMovedNodesRemoved();
+ 
+-			CompilationUnit astRoot= (CompilationUnit) rootNode.getRoot();
+-			ASTRewriteAnalyzer visitor= new ASTRewriteAnalyzer(document, astRoot, result, this.eventStore, this.nodeStore, options);
++			ASTRewriteAnalyzer visitor= new ASTRewriteAnalyzer(document, result, this.eventStore, this.nodeStore, options, getExtendedSourceRangeComputer());
+ 			rootNode.accept(visitor); // throws IllegalArgumentException
+ 		}
+ 		return result;
+@@ -499,6 +510,34 @@ public class ASTRewrite {
+ 	public final ASTNode createMoveTarget(ASTNode node) {
+ 		return createTargetNode(node, true);
+ 	}	
++
++	/**
++	 * Returns the extended source range computer for this AST rewriter.
++	 * The default value is a <code>new ExtendedSourceRangeComputer()</code>.
++	 * 
++	 * @return an extended source range computer
++	 * @since 3.1
++	 */
++	public final TargetSourceRangeComputer getExtendedSourceRangeComputer() {
++		if (this.targetSourceRangeComputer == null) {
++			// lazy initialize
++			this.targetSourceRangeComputer = new TargetSourceRangeComputer(); 
++		}
++		return this.targetSourceRangeComputer;
++	}
++	
++	/**
++	 * Sets the target source range computer for this AST rewriter.
++	 * 
++	 * @param computer a target source range computer,
++	 * or <code>null</code> to restore the default value of
++	 * <code>new TargetSourceRangeComputer()</code>
++	 * @since 3.1
++	 */
++	public final void setTargetSourceRangeComputer(TargetSourceRangeComputer computer) {
++		// if computer==null, rely on lazy init code in getTargetSourceRangeComputer()
++		this.targetSourceRangeComputer = computer;
++	}
+ 	
+ 	/**
+ 	 * Returns a string suitable for debugging purposes (only).
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/rewrite/TargetSourceRangeComputer.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/rewrite/TargetSourceRangeComputer.java
+new file mode 100644
+index 0000000..69e73b4
+--- /dev/null
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/rewrite/TargetSourceRangeComputer.java
+@@ -0,0 +1,126 @@
++/*******************************************************************************
++ * Copyright (c) 2005 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials 
++ * are made available under the terms of the Common Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/cpl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.core.dom.rewrite;
++
++import org.eclipse.jdt.core.dom.ASTNode;
++import org.eclipse.jdt.core.dom.CompilationUnit;
++
++/**
++ * An object for computing adjusted source ranges for AST nodes
++ * that are being replaced or deleted.
++ * <p>
++ * For example, a refactoring like inline method may choose to replace
++ * calls to the method but leave intact any comments immediately preceding
++ * the calls. On the other hand, a refactoring like extract method may choose
++ * to extract not only the nodes for the selected code but also any
++ * comments preceding or following them.
++ * </p>
++ * <p>
++ * Clients should subclass if they need to influence the 
++ * the source range to be affected when replacing or deleting a particular node.
++ * An instance of the subclass should be registered with
++ * {@link ASTRewrite#setTargetSourceRangeComputer(TargetSourceRangeComputer)}.
++ * During a call to {@link ASTRewrite#rewriteAST(org.eclipse.jface.text.IDocument, java.util.Map)},
++ * the {@link #computeSourceRange(ASTNode)} method on this object will be
++ * used to compute the source range for a node being deleted or replaced.
++ * </p>
++ * 
++ * @since 3.1
++ */
++public class TargetSourceRangeComputer {
++	
++	/**
++	 * Reified source range. Instances are &quot;value&quot; object
++	 * (cannot be modified).
++	 * 
++	 * @since 3.1
++	 */
++	public static final class SourceRange {
++		/**
++		 * 0-based character index, or <code>-1</code>
++		 * if no source position information is known.
++		 */
++		private int startPosition;
++		
++		/**
++		 * (possibly 0) length, or <code>0</code>
++		 * if no source position information is known.
++		 */
++		private int length;
++		
++		/**
++		 * Creates a new source range.
++		 * 
++		 * @param startPosition the 0-based character index, or <code>-1</code>
++		 *    if no source position information is known
++		 * @param length the (possibly 0) length, or <code>0</code>
++		 *    if no source position information is known
++		 */
++		public SourceRange(int startPosition, int length) {
++			this.startPosition = startPosition;
++			this.length = length;
++		}
++		
++		/**
++		 * Returns the start position.
++		 * 
++		 * @return the 0-based character index, or <code>-1</code>
++		 *    if no source position information is known
++		 */
++		public int getStartPosition() {
++			return this.startPosition;
++		}
++
++		/**
++		 * Returns the source length.
++		 * 
++		 * @return a (possibly 0) length, or <code>0</code>
++		 *    if no source position information is known
++		 */
++		public int getLength() {
++			return this.length;
++		}
++	}
++
++	/**
++	 * Creates a new target source range computer.
++	 */
++	public TargetSourceRangeComputer() {
++		// do nothing
++	}
++
++	/**
++	 * Returns the target source range of the given node. Unlike
++	 * {@link ASTNode#getStartPosition()} and {@link ASTNode#getLength()},
++	 * the extended source range may include comments and whitespace
++	 * immediately before or after the normal source range for the node.
++	 * <p>
++	 * The default implementation uses
++	 * {@link CompilationUnit#getExtendedStartPosition(ASTNode)}
++	 * and {@link CompilationUnit#getExtendedLength(ASTNode)}
++	 * to compute the target source range. Clients may override or
++	 * extend this method to expand or contract the source range of the
++	 * given node. The resulting source range must cover at least the
++	 * original source range of the node.
++	 * </p>
++	 * 
++	 * @param node the node with a known source range in the compilation unit
++	 * being rewritten
++	 * @return the exact source range in the compilation unit being rewritten
++	 * that should be replaced (or deleted)
++	 */
++	public SourceRange computeSourceRange(ASTNode node) {
++		CompilationUnit cu = (CompilationUnit) node.getRoot();
++		return new SourceRange(
++				cu.getExtendedStartPosition(node),
++				cu.getExtendedLength(node));
++	}
++}
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+index cb1e8ea..a1528f8 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+@@ -41,6 +41,7 @@ import org.eclipse.jdt.core.compiler.IScanner;
+ import org.eclipse.jdt.core.compiler.ITerminalSymbols;
+ 
+ import org.eclipse.jdt.core.dom.*;
++import org.eclipse.jdt.core.dom.rewrite.TargetSourceRangeComputer;
+ 
+ import org.eclipse.jdt.internal.core.dom.rewrite.ASTRewriteFormatter.BlockContext;
+ import org.eclipse.jdt.internal.core.dom.rewrite.ASTRewriteFormatter.NodeMarker;
+@@ -72,13 +73,12 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 	private final IDocument document;
+ 	private final ASTRewriteFormatter formatter;
+ 	private final NodeInfoStore nodeInfos;
+-	private final CompilationUnit astRoot;
++	private final TargetSourceRangeComputer extendedSourceRangeComputer;
+ 	
+ 	/*
+ 	 * Constructor for ASTRewriteAnalyzer.
+ 	 */
+-	public ASTRewriteAnalyzer(IDocument document, CompilationUnit astRoot, TextEdit rootEdit, RewriteEventStore eventStore, NodeInfoStore nodeInfos, Map options) {
+-		this.astRoot= astRoot;
++	public ASTRewriteAnalyzer(IDocument document, TextEdit rootEdit, RewriteEventStore eventStore, NodeInfoStore nodeInfos, Map options, TargetSourceRangeComputer extendedSourceRangeComputer) {
+ 		this.eventStore= eventStore;
+ 		this.document= document;
+ 		this.nodeInfos= nodeInfos;
+@@ -88,6 +88,8 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 		this.sourceCopyEndNodes= new Stack();
+ 		
+ 		this.formatter= new ASTRewriteFormatter(nodeInfos, eventStore, options, getLineDelimiter());
++		
++		this.extendedSourceRangeComputer = extendedSourceRangeComputer;
+ 	}
+ 		
+ 	final TokenScanner getScanner() {
+@@ -103,16 +105,28 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 		return this.document;
+ 	}
+ 	
++	/**
++	 * Returns the extended source range computer for this AST rewriter.
++	 * 
++	 * @return an extended source range computer (never null)
++	 * @since 3.1
++	 */
++	private TargetSourceRangeComputer getExtendedSourceRangeComputer() {
++		return this.extendedSourceRangeComputer;
++	}
++	
+ 	final int getExtendedOffset(ASTNode node) {
+-		return this.astRoot.getExtendedStartPosition(node);
++		return getExtendedSourceRangeComputer().computeSourceRange(node).getStartPosition();
+ 	}
+ 	
+ 	final int getExtendedLength(ASTNode node) {
+-		return this.astRoot.getExtendedLength(node);
++		return getExtendedSourceRangeComputer().computeSourceRange(node).getLength();
+ 	}
+ 	
+ 	final int getExtendedEnd(ASTNode node) {
+-		return this.astRoot.getExtendedStartPosition(node) + this.astRoot.getExtendedLength(node);
++		TargetSourceRangeComputer.SourceRange range =
++			getExtendedSourceRangeComputer().computeSourceRange(node);
++		return range.getStartPosition() + range.getLength();
+ 	}
+ 	
+ 	final TextEdit getCopySourceEdit(CopySourceInfo info) {

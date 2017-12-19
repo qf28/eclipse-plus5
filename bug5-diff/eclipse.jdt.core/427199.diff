@@ -1,0 +1,386 @@
+commit 4ec04ec7ec987de2e86c2ac8cdacbf6a8acd72a4
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Tue Feb 18 19:15:17 2014 +0100
+
+    Bug 427199 - [1.8][resource] avoid resource leak warnings on Streams
+    that have no resource
+
+106	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
+26	10	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
+4	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
+5	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ClassScope.java
+14	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+16	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+5	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeConstants.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
+index 4e72d73..f5387ca 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
+@@ -4683,4 +4683,110 @@ public void testBug411098_comment19() {
+ 		options
+ 		);
+ }
++// normal java.util.stream.Stream doesn't hold on to any resources
++public void testStream1() {
++	if (this.complianceLevel < ClassFileConstants.JDK1_8)
++		return; // uses JRE 8 API
++	Map options = getCompilerOptions();
++	options.put(CompilerOptions.OPTION_ReportPotentiallyUnclosedCloseable, CompilerOptions.ERROR);
++	options.put(CompilerOptions.OPTION_ReportUnclosedCloseable, CompilerOptions.ERROR);
++	runConformTest(
++		new String[] {
++			"A.java",
++			"import java.util.*;\n" +
++			"import java.util.stream.Stream;\n" + 
++			"class A {\n" + 
++			"  long test(List<String> ss) {\n" + 
++			"    Stream<String> stream = ss.stream();\n" + 
++			"    return stream.count();\n" + 
++			"  }\n" + 
++			"}"
++		},
++		options
++		);
++}
++// Functions java.nio.file.Files.x() returning *Stream* do produce a resource needing closing
++public void testStream2() {
++	if (this.complianceLevel < ClassFileConstants.JDK1_8)
++		return; // uses JRE 8 API
++	Map options = getCompilerOptions();
++	options.put(CompilerOptions.OPTION_ReportPotentiallyUnclosedCloseable, CompilerOptions.ERROR);
++	options.put(CompilerOptions.OPTION_ReportUnclosedCloseable, CompilerOptions.ERROR);
++	runNegativeTest(
++		new String[] {
++			"A.java",
++			"import java.util.stream.Stream;\n" + 
++			"import java.nio.file.*;\n" + 
++			"class A {\n" + 
++			"  long test(Path start, FileVisitOption... options) throws java.io.IOException {\n" + 
++			"    Stream<Path> stream = Files.walk(start, options);\n" + 
++			"    return stream.count();\n" + 
++			"  }\n" + 
++			"}"
++		},
++		"----------\n" + 
++		"1. ERROR in A.java (at line 5)\n" + 
++		"	Stream<Path> stream = Files.walk(start, options);\n" + 
++		"	             ^^^^^^\n" + 
++		"Resource leak: \'stream\' is never closed\n" + 
++		"----------\n",
++		null,
++		true,
++		options
++		);
++}
++// closeable, but Stream, but produced by Files.m, but only potentially closed:
++public void testStream3() {
++	if (this.complianceLevel < ClassFileConstants.JDK1_8)
++		return; // uses JRE 8 API
++	Map options = getCompilerOptions();
++	options.put(CompilerOptions.OPTION_ReportPotentiallyUnclosedCloseable, CompilerOptions.ERROR);
++	options.put(CompilerOptions.OPTION_ReportUnclosedCloseable, CompilerOptions.ERROR);
++	runNegativeTest(
++		new String[] {
++			"A.java",
++			"import java.util.stream.Stream;\n" + 
++			"import java.nio.file.*;\n" + 
++			"class A {\n" + 
++			"  void test(Path file) throws java.io.IOException {\n" + 
++			"    Stream<String> lines = Files.lines(file);\n" +
++			"    if (lines.count() > 0)" + 
++			"    	lines.close();\n" + 
++			"  }\n" + 
++			"}"
++		},
++		"----------\n" + 
++		"1. ERROR in A.java (at line 5)\n" + 
++		"	Stream<String> lines = Files.lines(file);\n" + 
++		"	               ^^^^^\n" + 
++		"Potential resource leak: \'lines\' may not be closed\n" + 
++		"----------\n",
++		null,
++		true,
++		options
++		);
++}
++// special stream from Files.m is properly handled by t-w-r
++public void testStream4() {
++	if (this.complianceLevel < ClassFileConstants.JDK1_8)
++		return; // uses JRE 8 API
++	Map options = getCompilerOptions();
++	options.put(CompilerOptions.OPTION_ReportPotentiallyUnclosedCloseable, CompilerOptions.ERROR);
++	options.put(CompilerOptions.OPTION_ReportUnclosedCloseable, CompilerOptions.ERROR);
++	runConformTest(
++		new String[] {
++			"A.java",
++			"import java.util.stream.Stream;\n" + 
++			"import java.nio.file.*;\n" + 
++			"class A {\n" + 
++			"  void test(Path dir) throws java.io.IOException {\n" + 
++			"    try (Stream<Path> list = Files.list(dir)) {\n" +
++			"    	list.forEach(child -> System.out.println(child));\n" + 
++			"    }\n" + 
++			"  }\n" + 
++			"}"
++		},
++		options
++		);
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
+index 3e9fcc6..45b882b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
+@@ -29,6 +29,7 @@ import org.eclipse.jdt.internal.compiler.impl.ReferenceContext;
+ import org.eclipse.jdt.internal.compiler.lookup.Binding;
+ import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
+ import org.eclipse.jdt.internal.compiler.lookup.LocalVariableBinding;
++import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.MethodScope;
+ import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.Scope;
+@@ -400,8 +401,8 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 	}
+ 
+ 	/** 
+-	 * Check if the rhs of an assignment or local declaration is an (Auto)Closeable.
+-	 * If so create or re-use a tracking variable, and wire and initialize everything.
++	 * Given the rhs of an assignment or local declaration has a (Auto)Closeable type (or null), setup for leak analysis now:
++	 * Create or re-use a tracking variable, and wire and initialize everything.
+ 	 * @param scope scope containing the assignment
+ 	 * @param upstreamInfo info without analysis of the rhs, use this to determine the status of a resource being disconnected
+ 	 * @param flowInfo info with analysis of the rhs, use this for recording resource status because this will be passed downstream
+@@ -523,6 +524,17 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 				break;
+ 		}
+ 
++		boolean isResourceProducer = false;
++		if (expression.resolvedType instanceof ReferenceBinding) {
++			ReferenceBinding resourceType = (ReferenceBinding) expression.resolvedType;
++			if (resourceType.hasTypeBit(TypeIds.BitResourceFreeCloseable)) {
++				if (isBlacklistedMethod(expression))
++					isResourceProducer = true;
++				else
++					return null; // (a) resource-free closeable: -> null
++			}
++		}
++
+ 		// analyze by node type:
+ 		if (expression instanceof AllocationExpression) {
+ 			// allocation expressions already have their tracking variables analyzed by analyseCloseableAllocation(..)
+@@ -537,7 +549,8 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 		{
+ 			// we *might* be responsible for the resource obtained
+ 			FakedTrackingVariable tracker = new FakedTrackingVariable(local, location, flowInfo, flowContext, FlowInfo.POTENTIALLY_NULL); // shed some doubt
+-			tracker.globalClosingState |= SHARED_WITH_OUTSIDE;
++			if (!isResourceProducer)
++				tracker.globalClosingState |= SHARED_WITH_OUTSIDE;
+ 			return tracker;
+ 		} else if (
+ 				(expression.bits & RestrictiveFlagMASK) == Binding.FIELD
+@@ -551,13 +564,6 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 			return tracker;			
+ 		}
+ 
+-		if (expression.resolvedType instanceof ReferenceBinding) {
+-			ReferenceBinding resourceType = (ReferenceBinding) expression.resolvedType;
+-			if (resourceType.hasTypeBit(TypeIds.BitResourceFreeCloseable)) {
+-				// (a) resource-free closeable: -> null
+-				return null;
+-			}
+-		}
+ 		if (local.closeTracker != null)
+ 			// (c): inner has already been analyzed: -> re-use track var
+ 			return local.closeTracker;
+@@ -569,6 +575,16 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 		return newTracker;
+ 	}
+ 
++	private static boolean isBlacklistedMethod(Expression expression) {
++		if (expression instanceof MessageSend) {
++			MethodBinding method = ((MessageSend) expression).binding;
++			if (method != null && method.isValidBinding())
++				// for all methods in java.nio.file.Files that return a resource (Stream) it really needs closing
++				return CharOperation.equals(method.declaringClass.compoundName, TypeConstants.JAVA_NIO_FILE_FILES);
++		}
++		return false;
++	}
++
+ 	public static void cleanUpAfterAssignment(BlockScope currentScope, int lhsBits, Expression expression) {
+ 		// remove all remaining track vars with no original binding
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
+index acbfe01..96d20bd 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
+@@ -26,6 +26,7 @@
+  *								Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099
+  *								Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *								Bug 417295 - [1.8[[null] Massage type annotated null analysis to gel well with deep encoded type bindings.
++ *								Bug 427199 - [1.8][resource] avoid resource leak warnings on Streams that have no resource
+  *    Jesper Steen Moller - Contributions for
+  *								Bug 412150 [1.8] [compiler] Enable reflected parameter names during annotation processing
+  *								Bug 412153 - [1.8][compiler] Check validity of annotations which may be repeatable
+@@ -1697,7 +1698,7 @@ public ReferenceBinding superclass() {
+ 	}
+ 	this.typeBits |= (this.superclass.typeBits & TypeIds.InheritableBits);
+ 	if ((this.typeBits & (TypeIds.BitAutoCloseable|TypeIds.BitCloseable)) != 0) // avoid the side-effects of hasTypeBit()! 
+-		this.typeBits |= applyCloseableWhitelists();
++		this.typeBits |= applyCloseableClassWhitelists();
+ 	return this.superclass;
+ }
+ // NOTE: superInterfaces of binary types are resolved when needed
+@@ -1725,6 +1726,8 @@ public ReferenceBinding[] superInterfaces() {
+ 			}	
+ 		}
+ 		this.typeBits |= (this.superInterfaces[i].typeBits & TypeIds.InheritableBits);
++		if ((this.typeBits & (TypeIds.BitAutoCloseable|TypeIds.BitCloseable)) != 0) // avoid the side-effects of hasTypeBit()! 
++			this.typeBits |= applyCloseableInterfaceWhitelists();
+ 	}
+ 	this.tagBits &= ~TagBits.HasUnresolvedSuperinterfaces;
+ 	return this.superInterfaces;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ClassScope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ClassScope.java
+index 7309dc7..48c295f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ClassScope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ClassScope.java
+@@ -20,6 +20,7 @@
+  *							Bug 395977 - [compiler][resource] Resource leak warning behavior possibly incorrect for anonymous inner class
+  *							Bug 395002 - Self bound generic class doesn't resolve bounds properly for wildcards for certain parametrisation.
+  *							Bug 416176 - [1.8][compiler][null] null type annotations cause grief on type variables
++ *							Bug 427199 - [1.8][resource] avoid resource leak warnings on Streams that have no resource
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 415821 - [1.8][compiler] CLASS_EXTENDS target type annotation missing for anonymous classes
+  *******************************************************************************/
+@@ -947,7 +948,7 @@ public class ClassScope extends Scope {
+ 				sourceType.typeBits |= (superclass.typeBits & TypeIds.InheritableBits);
+ 				// further analysis against white lists for the unlikely case we are compiling java.io.*:
+ 				if ((sourceType.typeBits & (TypeIds.BitAutoCloseable|TypeIds.BitCloseable)) != 0)
+-					sourceType.typeBits |= sourceType.applyCloseableWhitelists();
++					sourceType.typeBits |= sourceType.applyCloseableClassWhitelists();
+ 				return true;
+ 			}
+ 		}
+@@ -1064,6 +1065,9 @@ public class ClassScope extends Scope {
+ 			}
+ 			// only want to reach here when no errors are reported
+ 			sourceType.typeBits |= (superInterface.typeBits & TypeIds.InheritableBits);
++			// further analysis against white lists for the unlikely case we are compiling java.util.stream.Stream:
++			if ((sourceType.typeBits & (TypeIds.BitAutoCloseable|TypeIds.BitCloseable)) != 0)
++				sourceType.typeBits |= sourceType.applyCloseableInterfaceWhitelists();
+ 			interfaceBindings[count++] = superInterface;
+ 		}
+ 		// hold onto all correctly resolved superinterfaces
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+index 911829d..66c51e5 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+@@ -34,6 +34,7 @@
+  *								Bug 426563 - [1.8] AIOOBE when method with error invoked with lambda expression as argument
+  *								Bug 426792 - [1.8][inference][impl] generify new type inference engine
+  *								Bug 428294 - [1.8][compiler] Type mismatch: cannot convert from List<Object> to Collection<Object[]>
++ *								Bug 427199 - [1.8][resource] avoid resource leak warnings on Streams that have no resource
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -1195,6 +1196,9 @@ public class ParameterizedTypeBinding extends ReferenceBinding implements Substi
+ 	        ReferenceBinding genericSuperclass = this.type.superclass();
+ 	        if (genericSuperclass == null) return null; // e.g. interfaces
+ 		    this.superclass = (ReferenceBinding) Scope.substitute(this, genericSuperclass);
++			this.typeBits |= (this.superclass.typeBits & TypeIds.InheritableBits);
++			if ((this.typeBits & (TypeIds.BitAutoCloseable|TypeIds.BitCloseable)) != 0) // avoid the side-effects of hasTypeBit()! 
++				this.typeBits |= applyCloseableClassWhitelists();
+ 	    }
+ 		return this.superclass;
+ 	}
+@@ -1204,9 +1208,16 @@ public class ParameterizedTypeBinding extends ReferenceBinding implements Substi
+ 	 */
+ 	public ReferenceBinding[] superInterfaces() {
+ 	    if (this.superInterfaces == null) {
+-	    		if (this.type.isHierarchyBeingConnected())
+-	    			return Binding.NO_SUPERINTERFACES; // prevent superinterfaces from being assigned before they are connected
+-	    		this.superInterfaces = Scope.substitute(this, this.type.superInterfaces());
++    		if (this.type.isHierarchyBeingConnected())
++    			return Binding.NO_SUPERINTERFACES; // prevent superinterfaces from being assigned before they are connected
++    		this.superInterfaces = Scope.substitute(this, this.type.superInterfaces());
++    		if (this.superInterfaces != null) {
++	    		for (int i = this.superInterfaces.length; --i >= 0;) {
++	    			this.typeBits |= (this.superInterfaces[i].typeBits & TypeIds.InheritableBits);
++	    			if ((this.typeBits & (TypeIds.BitAutoCloseable|TypeIds.BitCloseable)) != 0) // avoid the side-effects of hasTypeBit()! 
++	    				this.typeBits |= applyCloseableInterfaceWhitelists();
++	    		}
++    		}
+ 	    }
+ 		return this.superInterfaces;
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+index 59b5ce6..42343ce 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+@@ -31,6 +31,7 @@
+  *								Bug 423504 - [1.8] Implement "18.5.3 Functional Interface Parameterization Inference"
+  *								Bug 426792 - [1.8][inference][impl] generify new type inference engine
+  *								Bug 428019 - [1.8][compiler] Type inference failure with nested generic invocation.
++ *								Bug 427199 - [1.8][resource] avoid resource leak warnings on Streams that have no resource
+  *      Jesper S Moller - Contributions for
+  *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *								bug 412153 - [1.8][compiler] Check validity of annotations which may be repeatable
+@@ -1796,7 +1797,7 @@ public FieldBinding[] unResolvedFields() {
+  * If a type - known to be a Closeable - is mentioned in one of our white lists
+  * answer the typeBit for the white list (BitWrapperCloseable or BitResourceFreeCloseable).
+  */
+-protected int applyCloseableWhitelists() {
++protected int applyCloseableClassWhitelists() {
+ 	switch (this.compoundName.length) {
+ 		case 3:
+ 			if (CharOperation.equals(TypeConstants.JAVA, this.compoundName[0])) {
+@@ -1839,6 +1840,20 @@ protected int applyCloseableWhitelists() {
+ }
+ 
+ 
++/*
++ * If a type - known to be a Closeable - is mentioned in one of our white lists
++ * answer the typeBit for the white list (BitWrapperCloseable or BitResourceFreeCloseable).
++ */
++protected int applyCloseableInterfaceWhitelists() {
++	switch (this.compoundName.length) {
++		case 4:
++			if (CharOperation.equals(this.compoundName, TypeConstants.RESOURCE_FREE_CLOSEABLE_STREAM))
++				return TypeIds.BitResourceFreeCloseable;
++			break;
++	}
++	return 0;
++}
++
+ private MethodBinding [] getInterfaceAbstractContracts(Scope scope) throws InvalidInputException {
+ 	
+ 	if (!isInterface() || !isValidBinding()) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeConstants.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeConstants.java
+index 3b1f386..dd01e30 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeConstants.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeConstants.java
+@@ -18,6 +18,7 @@
+  *								bug 400421 - [compiler] Null analysis for fields does not take @com.google.inject.Inject into account
+  *								bug 382069 - [null] Make the null analysis consider JUnit's assertNotNull similarly to assertions
+  *								Bug 405569 - Resource leak check false positive when using DbUtils.closeQuietly
++ *								Bug 427199 - [1.8][resource] avoid resource leak warnings on Streams that have no resource
+  *    Jesper S Moller - Contributions for
+  *								Bug 405066 - [1.8][compiler][codegen] Implement code generation infrastructure for JSR335
+  *								Bug 412153 - [1.8][compiler] Check validity of annotations which may be repeatable
+@@ -173,6 +174,7 @@ public interface TypeConstants {
+ 	char[][] JAVA_IO_IOEXCEPTION = new char[][] { JAVA, IO, "IOException".toCharArray()};//$NON-NLS-1$
+ 	char[][] JAVA_IO_OBJECTOUTPUTSTREAM = new char[][] { JAVA, IO, "ObjectOutputStream".toCharArray()}; //$NON-NLS-1$
+ 	char[][] JAVA_IO_OBJECTINPUTSTREAM = new char[][] { JAVA, IO, "ObjectInputStream".toCharArray()}; //$NON-NLS-1$
++	char[][] JAVA_NIO_FILE_FILES = new char[][] { JAVA, "nio".toCharArray(), "file".toCharArray(), "Files".toCharArray() };   //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$
+ 	// javax.rmi.CORBA.Stub
+ 	char[][] JAVAX_RMI_CORBA_STUB = new char[][] {
+ 			JAVAX,
+@@ -279,6 +281,9 @@ public interface TypeConstants {
+ 		"CharArrayWriter".toCharArray(), //$NON-NLS-1$
+ 		"StringBufferInputStream".toCharArray(), //$NON-NLS-1$
+ 	};
++	char[][] RESOURCE_FREE_CLOSEABLE_STREAM = new char[][] {
++		JAVA, UTIL, "stream".toCharArray(), "Stream".toCharArray() //$NON-NLS-1$ //$NON-NLS-2$
++	};
+ 	
+ 	// different assertion utilities:
+ 	char[] ASSERT_CLASS = "Assert".toCharArray(); //$NON-NLS-1$

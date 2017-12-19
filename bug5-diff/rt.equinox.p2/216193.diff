@@ -1,0 +1,560 @@
+commit 950be716f52f8aba6c60cb952e2a332ac7ce87ec
+Author: John Arthorne <johna>
+Date:   Tue Jan 22 20:53:21 2008 +0000
+
+    Bug 216193 [prov] Add support to the installer for shared install
+
+1	0	bundles/org.eclipse.equinox.p2.installer/config.ini
+11	3	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallApplication.java
+19	11	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
+12	5	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
+172	29	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/ui/InstallDialog.java
+4	12	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/ui/SWTInstallAdvisor.java
+26	2	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/provisional/p2/installer/InstallDescription.java
+diff --git a/bundles/org.eclipse.equinox.p2.installer/config.ini b/bundles/org.eclipse.equinox.p2.installer/config.ini
+index d9ac473..11ef142 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/config.ini
++++ b/bundles/org.eclipse.equinox.p2.installer/config.ini
+@@ -56,6 +56,7 @@ osgi.bundles=\
+ 	org.eclipse.equinox.p2.download,\
+ 	org.eclipse.equinox.p2.engine,\
+ 	org.eclipse.equinox.p2.exemplarysetup,\
++	org.eclipse.equinox.p2.garbagecollector,\
+ 	org.eclipse.equinox.p2.installer,\
+ 	org.eclipse.equinox.p2.metadata,\
+ 	org.eclipse.equinox.p2.metadata.repository,\
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallApplication.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallApplication.java
+index f2c7710..609735e 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallApplication.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallApplication.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -21,6 +21,7 @@ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.installer.ui.SWTInstallAdvisor;
+ import org.eclipse.equinox.internal.provisional.p2.installer.InstallAdvisor;
+ import org.eclipse.equinox.internal.provisional.p2.installer.InstallDescription;
++import org.eclipse.osgi.util.NLS;
+ 
+ /**
+  * This is a simple installer application built using P2.  The application must be given
+@@ -106,6 +107,7 @@ public class InstallApplication implements IApplication {
+ 	}
+ 
+ 	private void launchProduct(InstallDescription description) throws CoreException {
++		advisor.setResult(new Status(IStatus.INFO, InstallerActivator.PI_INSTALLER, NLS.bind("Launching {0}", description.getProductName())));
+ 		IPath installLocation = description.getInstallLocation();
+ 		IPath toRun = installLocation.append(description.getLauncherName());
+ 		try {
+@@ -113,6 +115,12 @@ public class InstallApplication implements IApplication {
+ 		} catch (IOException e) {
+ 			throw fail("Failed to launch the product: " + toRun, e);
+ 		}
++		//wait a few seconds to give the user a chance to read the message
++		try {
++			Thread.sleep(3000);
++		} catch (InterruptedException e) {
++			//ignore
++		}
+ 	}
+ 
+ 	/* (non-Javadoc)
+@@ -129,9 +137,9 @@ public class InstallApplication implements IApplication {
+ 
+ 				//perform long running install operation
+ 				InstallUpdateProductOperation operation = new InstallUpdateProductOperation(InstallerActivator.getDefault().getContext(), description);
+-				advisor.performInstall(operation);
+-				IStatus result = operation.getResult();
++				IStatus result = advisor.performInstall(operation);
+ 				if (!result.isOK()) {
++					LogHelper.log(result);
+ 					advisor.setResult(result);
+ 					return IApplication.EXIT_OK;
+ 				}
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
+index d8b409e..def187e 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallDescriptionParser.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -19,18 +19,20 @@ import org.eclipse.equinox.internal.provisional.p2.installer.InstallDescription;
+ import org.osgi.framework.Version;
+ 
+ /**
+- * This class is responsible for loading install descriptions from various file formats.
++ * This class is responsible for loading install descriptions from a stream.
+  */
+ public class InstallDescriptionParser {
+-	private static final String PROP_ARTIFACT_REPOSITORY = "artifactRepository";
+-	private static final String PROP_INSTALL_LOCATION = "installLocation";
+-	private static final String PROP_IS_AUTO_START = "autoStart";
+-	private static final String PROP_LAUNCHER_NAME = "launcherName";
+-	private static final String PROP_METADATA_REPOSITORY = "metadataRepository";
+-	private static final String PROP_PROFILE_FLAVOR = "flavor";
+-	private static final String PROP_PROFILE_NAME = "profileName";
+-	private static final String PROP_ROOT_ID = "rootId";
+-	private static final String PROP_ROOT_VERSION = "rootVersion";
++	private static final String PROP_AGENT_LOCATION = "eclipse.p2.agentLocation"; //$NON-NLS-1$
++	private static final String PROP_ARTIFACT_REPOSITORY = "eclipse.p2.artifacts";//$NON-NLS-1$
++	private static final String PROP_BUNDLE_LOCATION = "eclipse.p2.bundleLocation";//$NON-NLS-1$
++	private static final String PROP_INSTALL_LOCATION = "eclipse.p2.installLocation";//$NON-NLS-1$
++	private static final String PROP_IS_AUTO_START = "eclipse.p2.autoStart";//$NON-NLS-1$
++	private static final String PROP_LAUNCHER_NAME = "eclipse.p2.launcherName";//$NON-NLS-1$
++	private static final String PROP_METADATA_REPOSITORY = "eclipse.p2.metadata";//$NON-NLS-1$
++	private static final String PROP_PROFILE_FLAVOR = "eclipse.p2.flavor";//$NON-NLS-1$
++	private static final String PROP_PROFILE_NAME = "eclipse.p2.profileName";//$NON-NLS-1$
++	private static final String PROP_ROOT_ID = "eclipse.p2.rootId";//$NON-NLS-1$
++	private static final String PROP_ROOT_VERSION = "eclipse.p2.rootVersion";//$NON-NLS-1$
+ 
+ 	/**
+ 	 * Loads and returns an install description that is stored in a properties file.
+@@ -54,6 +56,12 @@ public class InstallDescriptionParser {
+ 			String locationString = properties.getProperty(PROP_INSTALL_LOCATION);
+ 			if (locationString != null)
+ 				description.setInstallLocation(new Path(locationString));
++			locationString = properties.getProperty(PROP_AGENT_LOCATION);
++			if (locationString != null)
++				description.setAgentLocation(new Path(locationString));
++			locationString = properties.getProperty(PROP_BUNDLE_LOCATION);
++			if (locationString != null)
++				description.setBundleLocation(new Path(locationString));
+ 			description.setRootId(properties.getProperty(PROP_ROOT_ID));
+ 			String versionString = properties.getProperty(PROP_ROOT_VERSION);
+ 			Version version = versionString == null ? null : new Version(versionString);
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
+index c6041c7..ab40c5a 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
+@@ -212,14 +212,21 @@ public class InstallUpdateProductOperation implements IInstallOperation {
+ 	}
+ 
+ 	private void preInstall() throws CoreException {
+-		if (System.getProperty("eclipse.p2.data.area") == null) //$NON-NLS-1$
+-			System.setProperty("eclipse.p2.data.area", installDescription.getInstallLocation().append("installer").toString()); //$NON-NLS-1$ //$NON-NLS-2$
+-		if (System.getProperty("eclipse.p2.cache") == null) //$NON-NLS-1$
+-			System.setProperty("eclipse.p2.cache", installDescription.getInstallLocation().toString()); //$NON-NLS-1$
++		IPath installLocation = installDescription.getInstallLocation();
++		if (installLocation == null)
++			throw fail("Install failed because the install location was not set");
++		//set agent location if specified
++		IPath agentLocation = installDescription.getAgentLocation();
++		if (agentLocation != null && System.getProperty("eclipse.p2.data.area") == null) //$NON-NLS-1$
++			System.setProperty("eclipse.p2.data.area", agentLocation.toOSString()); //$NON-NLS-1$ 
++		//set bundle pool location if specified
++		IPath bundleLocation = installDescription.getBundleLocation();
++		if (bundleLocation != null && System.getProperty(Profile.PROP_CACHE) == null)
++			System.setProperty(Profile.PROP_CACHE, bundleLocation.toString());
+ 
+ 		//start up p2
+ 		try {
+-			InstallerActivator.getDefault().getBundle("org.eclipse.equinox.p2.exemplarysetup").start(Bundle.START_TRANSIENT);
++			InstallerActivator.getDefault().getBundle("org.eclipse.equinox.p2.exemplarysetup").start(Bundle.START_TRANSIENT); //$NON-NLS-1$
+ 		} catch (BundleException e) {
+ 			throw fail("Unable to start p2", e);
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/ui/InstallDialog.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/ui/InstallDialog.java
+index b7c1406..44eb97a 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/ui/InstallDialog.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/ui/InstallDialog.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -13,6 +13,8 @@ package org.eclipse.equinox.internal.p2.installer.ui;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.installer.InstallerActivator;
+ import org.eclipse.equinox.internal.provisional.p2.installer.IInstallOperation;
++import org.eclipse.equinox.internal.provisional.p2.installer.InstallDescription;
++import org.eclipse.osgi.util.NLS;
+ import org.eclipse.swt.SWT;
+ import org.eclipse.swt.events.SelectionAdapter;
+ import org.eclipse.swt.events.SelectionEvent;
+@@ -20,8 +22,9 @@ import org.eclipse.swt.layout.*;
+ import org.eclipse.swt.widgets.*;
+ 
+ /**
+- * A simple implementation of a progress monitor dialog, used for running
+- * an install operation.
++ * The install wizard that drives the install. This dialog is used for user input
++ * prior to the install, progress feedback during the install, and displaying results
++ * at the end of the install.
+  */
+ public class InstallDialog {
+ 	/**
+@@ -133,66 +136,158 @@ public class InstallDialog {
+ 		}
+ 	}
+ 
++	private static final String EXPLAIN_SHARED = "In a shared install, common components are stored together, allowing them to be shared across multiple products.";
++
++	private static final String EXPLAIN_STANDALONE = "In a stand-alone install, each product is installed in its own directory without any sharing between products";
++
+ 	private Button closeButton;
+ 	private Composite contents;
++	private Label installKindExplanation;
++
++	private Composite installSettingsGroup;
++	private Text locationField;
+ 	/**
+ 	 * Flag indicating whether the user has indicated if it is ok to close the dialog
+ 	 */
+ 	private boolean okToClose;
++
+ 	ProgressBar progress;
++	private Button sharedButton;
+ 	private Shell shell;
++	private Button standaloneButton;
+ 	Label subTaskLabel;
+-
+ 	Label taskLabel;
+ 
+ 	/**
+ 	 * Creates and opens a progress monitor dialog.
+ 	 */
+ 	public InstallDialog() {
+-		shell = new Shell(SWT.DIALOG_TRIM | SWT.APPLICATION_MODAL);
+-		shell.setBounds(300, 200, 600, 400);
+-		shell.setText("Installer");
+-		shell.setLayout(new FillLayout());
+-		contents = new Composite(shell, SWT.NONE);
+-		GridLayout layout = new GridLayout();
+-		layout.marginWidth = 15;
+-		layout.marginHeight = 15;
+-		contents.setLayout(layout);
++		createShell();
+ 		taskLabel = new Label(contents, SWT.WRAP | SWT.LEFT);
+ 		taskLabel.setLayoutData(new GridData(GridData.FILL_HORIZONTAL));
+-		progress = new ProgressBar(contents, SWT.HORIZONTAL | SWT.SMOOTH);
+-		progress.setLayoutData(new GridData(GridData.FILL_HORIZONTAL));
+-		progress.setVisible(false);
+-		subTaskLabel = new Label(contents, SWT.WRAP | SWT.LEFT);
+-		subTaskLabel.setLayoutData(new GridData(GridData.FILL_HORIZONTAL));
++		createInstallSettingsControls();
++		createProgressControls();
++		createCloseButton();
+ 
+-		//spacer
+-		Label spacer = new Label(contents, SWT.NONE);
+-		spacer.setLayoutData(new GridData(GridData.FILL_BOTH));
++		shell.layout();
++		shell.open();
++	}
++
++	protected void browsePressed() {
++		DirectoryDialog dirDialog = new DirectoryDialog(shell);
++		dirDialog.setMessage("Select the install location");
++		String location = dirDialog.open();
++		if (location == null)
++			location = ""; //$NON-NLS-1$
++		locationField.setText(location);
++		validateInstallSettings();
++	}
++
++	private synchronized boolean canClose() {
++		return okToClose;
++	}
++
++	public void close() {
++		shell.dispose();
++		shell = null;
++	}
+ 
++	private void createCloseButton() {
+ 		closeButton = new Button(contents, SWT.PUSH);
+ 		GridData data = new GridData(80, SWT.DEFAULT);
+ 		data.verticalAlignment = SWT.END;
+ 		data.horizontalAlignment = SWT.RIGHT;
+ 		closeButton.setLayoutData(data);
+-		closeButton.setText("OK");
+ 		closeButton.setVisible(false);
+ 		closeButton.addSelectionListener(new SelectionAdapter() {
+ 			public void widgetSelected(SelectionEvent e) {
+ 				setOkToClose();
+ 			}
+ 		});
+-		shell.layout();
+-		shell.open();
+ 	}
+ 
+-	private synchronized boolean canClose() {
+-		return okToClose;
++	/**
++	 * Creates the controls to prompt for the agent and install locations.
++	 */
++	private void createInstallSettingsControls() {
++		installSettingsGroup = new Composite(contents, SWT.NONE);
++		GridLayout layout = new GridLayout();
++		installSettingsGroup.setLayout(layout);
++		installSettingsGroup.setLayoutData(new GridData(GridData.FILL_BOTH));
++
++		Listener validateListener = new Listener() {
++			public void handleEvent(Event event) {
++				validateInstallSettings();
++			}
++		};
++
++		//The group asking for the product install directory
++		Group installLocationGroup = new Group(installSettingsGroup, SWT.NONE);
++		installLocationGroup.setLayout(new GridLayout());
++		installLocationGroup.setLayoutData(new GridData(GridData.FILL_BOTH));
++		installLocationGroup.setText("Location");
++		Label installLocationLabel = new Label(installLocationGroup, SWT.NONE);
++		installLocationLabel.setLayoutData(new GridData(GridData.FILL_HORIZONTAL));
++		installLocationLabel.setText("Select the product install directory:");
++
++		//The sub-group with text entry field and browse button
++		Composite locationFieldGroup = new Composite(installLocationGroup, SWT.NONE);
++		locationFieldGroup.setLayoutData(new GridData(GridData.FILL_BOTH));
++		layout = new GridLayout();
++		layout.numColumns = 2;
++		layout.makeColumnsEqualWidth = false;
++		locationFieldGroup.setLayout(layout);
++		locationField = new Text(locationFieldGroup, SWT.SINGLE | SWT.BORDER);
++		locationField.setLayoutData(new GridData(GridData.FILL_HORIZONTAL));
++		locationField.addListener(SWT.Modify, validateListener);
++		Button browseButton = new Button(locationFieldGroup, SWT.PUSH);
++		browseButton.setText("Browse...");
++		browseButton.addListener(SWT.Selection, new Listener() {
++			public void handleEvent(Event event) {
++				browsePressed();
++			}
++		});
++
++		//Create the radio button group asking for the kind of install (shared vs. standalone)
++		Group installKindGroup = new Group(installSettingsGroup, SWT.NONE);
++		installKindGroup.setText("Layout");
++		installKindGroup.setLayoutData(new GridData(GridData.FILL_BOTH));
++		installKindGroup.setLayout(new GridLayout());
++		standaloneButton = new Button(installKindGroup, SWT.RADIO);
++		standaloneButton.setText("Stand-alone install");
++		standaloneButton.addListener(SWT.Selection, validateListener);
++		standaloneButton.setSelection(true);
++		sharedButton = new Button(installKindGroup, SWT.RADIO);
++		sharedButton.setText("Shared install");
++		sharedButton.addListener(SWT.Selection, validateListener);
++		installKindExplanation = new Label(installKindGroup, SWT.WRAP);
++		GridData data = new GridData(SWT.DEFAULT, 40);
++		data.grabExcessHorizontalSpace = true;
++		installKindExplanation.setLayoutData(data);
++		installKindExplanation.setText(EXPLAIN_STANDALONE);
++
++		//make the entire group invisible until we actually need to prompt for locations
++		installSettingsGroup.setVisible(false);
+ 	}
+ 
+-	public void close() {
+-		shell.dispose();
+-		shell = null;
++	private void createProgressControls() {
++		progress = new ProgressBar(contents, SWT.HORIZONTAL | SWT.SMOOTH);
++		progress.setLayoutData(new GridData(GridData.FILL_HORIZONTAL));
++		progress.setVisible(false);
++		subTaskLabel = new Label(contents, SWT.WRAP | SWT.LEFT);
++		subTaskLabel.setLayoutData(new GridData(GridData.FILL_HORIZONTAL));
++	}
++
++	private void createShell() {
++		shell = new Shell(SWT.DIALOG_TRIM | SWT.APPLICATION_MODAL);
++		shell.setBounds(300, 200, 600, 400);
++		shell.setText("Installer");
++		shell.setLayout(new FillLayout());
++		contents = new Composite(shell, SWT.NONE);
++		GridLayout layout = new GridLayout();
++		layout.marginWidth = 15;
++		layout.marginHeight = 15;
++		contents.setLayout(layout);
+ 	}
+ 
+ 	public Display getDisplay() {
+@@ -216,6 +311,7 @@ public class InstallDialog {
+ 		taskLabel.setText(message);
+ 		subTaskLabel.setText(""); //$NON-NLS-1$
+ 		progress.setVisible(false);
++		closeButton.setText("OK");
+ 		closeButton.setVisible(true);
+ 		while (!canClose()) {
+ 			if (!display.readAndDispatch())
+@@ -224,6 +320,35 @@ public class InstallDialog {
+ 
+ 	}
+ 
++	public void promptForLocations(InstallDescription description) {
++		taskLabel.setText(NLS.bind("Select where you want {0} to be installed", description.getProductName()));
++		closeButton.setText("Install");
++		closeButton.setVisible(true);
++		installSettingsGroup.setVisible(true);
++		validateInstallSettings();
++		Display display = getDisplay();
++		while (!okToClose && !shell.isDisposed()) {
++			if (!display.readAndDispatch())
++				display.sleep();
++		}
++		if (shell.isDisposed())
++			throw new OperationCanceledException();
++		Path location = new Path(locationField.getText());
++		description.setInstallLocation(location);
++		if (standaloneButton.getSelection()) {
++			description.setAgentLocation(location.append("p2")); //$NON-NLS-1$
++			description.setBundleLocation(location.append("plugins")); //$NON-NLS-1$
++		} else {
++			String home = System.getProperty("user.home"); //$NON-NLS-1$
++			description.setAgentLocation(new Path(home).append(".p2/")); //$NON-NLS-1$
++			//setting bundle location to null will cause it to use default bundle location under agent location
++			description.setBundleLocation(null);
++		}
++		okToClose = false;
++		installSettingsGroup.setVisible(false);
++		closeButton.setVisible(false);
++	}
++
+ 	/**
+ 	 * This method runs the given operation in the context of a progress dialog.
+ 	 * The dialog is opened automatically prior to starting the operation, and closed
+@@ -283,4 +408,22 @@ public class InstallDialog {
+ 		okToClose = true;
+ 	}
+ 
++	/**
++	 * Validates that the user has correctly entered all required install settings.
++	 */
++	void validateInstallSettings() {
++		boolean enabled = standaloneButton.getSelection() || sharedButton.getSelection();
++		enabled &= Path.ROOT.isValidPath(locationField.getText());
++		if (enabled) {
++			//make sure the install location is an absolute path
++			IPath location = new Path(locationField.getText());
++			enabled &= location.isAbsolute();
++		}
++		closeButton.setEnabled(enabled);
++
++		if (standaloneButton.getSelection())
++			installKindExplanation.setText(EXPLAIN_STANDALONE);
++		else
++			installKindExplanation.setText(EXPLAIN_SHARED);
++	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/ui/SWTInstallAdvisor.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/ui/SWTInstallAdvisor.java
+index e596ff9..cfea6ee 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/ui/SWTInstallAdvisor.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/ui/SWTInstallAdvisor.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -10,10 +10,8 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.installer.ui;
+ 
+-import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.internal.provisional.p2.installer.*;
+-import org.eclipse.osgi.util.NLS;
+-import org.eclipse.swt.widgets.DirectoryDialog;
+ import org.eclipse.swt.widgets.Display;
+ 
+ /**
+@@ -29,14 +27,8 @@ public class SWTInstallAdvisor extends InstallAdvisor {
+ 	}
+ 
+ 	public InstallDescription prepareInstallDescription(InstallDescription description) {
+-		if (description.getInstallLocation() == null) {
+-			DirectoryDialog dirDialog = new DirectoryDialog(dialog.getShell());
+-			dirDialog.setMessage(NLS.bind("Where do you want to install {0}?", description.getProductName()));
+-			String location = dirDialog.open();
+-			if (location == null)
+-				throw new OperationCanceledException();
+-			description.setInstallLocation(new Path(location));
+-		}
++		if (description.getInstallLocation() == null)
++			dialog.promptForLocations(description);
+ 		return description;
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/provisional/p2/installer/InstallDescription.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/provisional/p2/installer/InstallDescription.java
+index 205aa19..6879926 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/provisional/p2/installer/InstallDescription.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/provisional/p2/installer/InstallDescription.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -21,7 +21,7 @@ import org.osgi.framework.Version;
+  */
+ public class InstallDescription {
+ 	private URL artifactRepo;
+-	private IPath installLocation;
++	private IPath installLocation, agentLocation, bundleLocation;
+ 	private boolean isAutoStart;
+ 	private String launcherName;
+ 	private URL metadataRepo;
+@@ -34,6 +34,14 @@ public class InstallDescription {
+ 	}
+ 
+ 	/**
++	 * Returns the p2 agent location, or <code>null</code> to indicate
++	 * the default agent location.
++	 */
++	public IPath getAgentLocation() {
++		return agentLocation;
++	}
++
++	/**
+ 	 * Returns the location of the artifact repository to install from
+ 	 * @return an artifact repository URL
+ 	 */
+@@ -42,6 +50,14 @@ public class InstallDescription {
+ 	}
+ 
+ 	/**
++	 * Returns the bundle pool location, or <code>null</code> to
++	 * indicate the default bundle pool location.
++	 */
++	public IPath getBundleLocation() {
++		return bundleLocation;
++	}
++
++	/**
+ 	 * Returns the flavor used to configure the product being installed.
+ 	 * @return the install flavor
+ 	 */
+@@ -107,6 +123,10 @@ public class InstallDescription {
+ 		return isAutoStart;
+ 	}
+ 
++	public void setAgentLocation(IPath agentLocation) {
++		this.agentLocation = agentLocation;
++	}
++
+ 	public void setArtifactRepository(URL repository) {
+ 		this.artifactRepo = repository;
+ 	}
+@@ -115,6 +135,10 @@ public class InstallDescription {
+ 		this.isAutoStart = value;
+ 	}
+ 
++	public void setBundleLocation(IPath bundleLocation) {
++		this.bundleLocation = bundleLocation;
++	}
++
+ 	public void setFlavor(String flavor) {
+ 		this.flavor = flavor;
+ 	}

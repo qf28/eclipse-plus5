@@ -1,0 +1,422 @@
+commit f2f5b0275d4f2724da924ba67932b47004b1e101
+Author: Susan McCourt <susan@rapicorp.com>
+Date:   Fri Apr 11 09:12:56 2014 -0700
+
+    Bug 432634 - [Product][Editors] Add support for p2 repo
+    
+    Change-Id: I2630ca336e6f2301973410cdcbb2572fb64caf27
+
+7	0	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/internal/p2/publisher/eclipse/IProductDescriptor.java
+41	1	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/internal/p2/publisher/eclipse/ProductFile.java
+12	4	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigAdvice.java
+13	1	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigCUsAction.java
+6	1	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/IConfigAdvice.java
+8	1	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ProductFileAdvice.java
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/internal/p2/publisher/eclipse/IProductDescriptor.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/internal/p2/publisher/eclipse/IProductDescriptor.java
+index d2fa18a..8bdc4be 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/internal/p2/publisher/eclipse/IProductDescriptor.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/internal/p2/publisher/eclipse/IProductDescriptor.java
+@@ -17,6 +17,7 @@ import java.util.List;
+ import java.util.Map;
+ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.p2.metadata.IVersionedId;
++import org.eclipse.equinox.p2.repository.IRepositoryReference;
+ 
+ /**
+  * Represents a product file.  
+@@ -163,4 +164,10 @@ public interface IProductDescriptor {
+ 	 */
+ 	public String getLicenseText();
+ 
++	/**
++	 * Returns a List<IRepositoryReference> for each update repository used by the product.
++	 * @return A List<IRepositoryReference>
++	 */
++	public List<IRepositoryReference> getRepositoryEntries();
++
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/internal/p2/publisher/eclipse/ProductFile.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/internal/p2/publisher/eclipse/ProductFile.java
+index ef80838..73fd078 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/internal/p2/publisher/eclipse/ProductFile.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/internal/p2/publisher/eclipse/ProductFile.java
+@@ -17,6 +17,8 @@
+ package org.eclipse.equinox.internal.p2.publisher.eclipse;
+ 
+ import java.io.*;
++import java.net.URI;
++import java.net.URISyntaxException;
+ import java.util.*;
+ import java.util.Map.Entry;
+ import javax.xml.parsers.*;
+@@ -27,6 +29,9 @@ import org.eclipse.equinox.internal.p2.core.helpers.URLUtil;
+ import org.eclipse.equinox.p2.metadata.IVersionedId;
+ import org.eclipse.equinox.p2.metadata.VersionedId;
+ import org.eclipse.equinox.p2.publisher.eclipse.FeatureEntry;
++import org.eclipse.equinox.p2.repository.IRepository;
++import org.eclipse.equinox.p2.repository.IRepositoryReference;
++import org.eclipse.equinox.p2.repository.spi.RepositoryReference;
+ import org.eclipse.osgi.service.datalocation.Location;
+ import org.eclipse.osgi.util.NLS;
+ import org.eclipse.pde.internal.publishing.Activator;
+@@ -55,6 +60,7 @@ public class ProductFile extends DefaultHandler implements IProductDescriptor {
+ 	private static final String ATTRIBUTE_CONTENT_TYPE = "type"; //$NON-NLS-1$
+ 	private static final String ATTRIBUTE_OS = "os"; //$NON-NLS-1$
+ 	private static final String ATTRIBUTE_ARCH = "arch"; //$NON-NLS-1$
++	private static final String ATTRIBUTE_ENABLED = "enabled"; //$NON-NLS-1$
+ 
+ 	private static final String PROPERTY_ECLIPSE_APPLICATION = "eclipse.application"; //$NON-NLS-1$
+ 	private static final String PROPERTY_ECLIPSE_PRODUCT = "eclipse.product"; //$NON-NLS-1$
+@@ -121,6 +127,8 @@ public class ProductFile extends DefaultHandler implements IProductDescriptor {
+ 	private static final String EL_ARCH_IA_64_32 = "argsIA_64_32"; //$NON-NLS-1$
+ 	private static final String EL_ARCH_PA_RISC = "argsPA_RISC"; //$NON-NLS-1$
+ 	private static final String EL_ARCH_SPARC = "argsSPARC"; //$NON-NLS-1$
++	private static final String EL_REPOSITORIES = "repositories"; //$NON-NLS-1$
++	private static final String EL_REPOSITORY = "repository"; //$NON-NLS-1$
+ 
+ 	//These constants form a small state machine to parse the .product file
+ 	private static final int STATE_START = 0;
+@@ -151,6 +159,7 @@ public class ProductFile extends DefaultHandler implements IProductDescriptor {
+ 	private static final int STATE_ARCH_IA_64_32 = 25;
+ 	private static final int STATE_ARCH_PA_RISC = 26;
+ 	private static final int STATE_ARCH_SPARC = 27;
++	private static final int STATE_REPOSITORIES = 28;
+ 
+ 	private static final String PI_PDEBUILD = "org.eclipse.pde.build"; //$NON-NLS-1$
+ 	private final static int EXCEPTION_PRODUCT_FORMAT = 23;
+@@ -187,6 +196,7 @@ public class ProductFile extends DefaultHandler implements IProductDescriptor {
+ 	private String licenseURL;
+ 	private String licenseText = null;
+ 	private String currentOS;
++	private final List<IRepositoryReference> repositories = new ArrayList<IRepositoryReference>();
+ 
+ 	private static String normalize(String text) {
+ 		if (text == null || text.trim().length() == 0)
+@@ -663,6 +673,10 @@ public class ProductFile extends DefaultHandler implements IProductDescriptor {
+ 		return licenseURL;
+ 	}
+ 
++	public List<IRepositoryReference> getRepositoryEntries() {
++		return repositories;
++	}
++
+ 	@Override
+ 	public void startElement(String uri, String localName, String qName, Attributes attributes) {
+ 		switch (state) {
+@@ -692,6 +706,8 @@ public class ProductFile extends DefaultHandler implements IProductDescriptor {
+ 					state = STATE_CONFIGURATIONS;
+ 				} else if (EL_LICENSE.equals(localName)) {
+ 					state = STATE_LICENSE;
++				} else if (EL_REPOSITORIES.equals(localName)) {
++					state = STATE_REPOSITORIES;
+ 				}
+ 				break;
+ 
+@@ -799,6 +815,12 @@ public class ProductFile extends DefaultHandler implements IProductDescriptor {
+ 				}
+ 				break;
+ 
++			case STATE_REPOSITORIES :
++				if (EL_REPOSITORY.equals(localName)) {
++					processRepositoryInformation(attributes);
++				}
++				break;
++
+ 			case STATE_LICENSE :
+ 				if (EL_URL.equals(localName)) {
+ 					state = STATE_LICENSE_URL;
+@@ -897,6 +919,19 @@ public class ProductFile extends DefaultHandler implements IProductDescriptor {
+ 		bundleInfos.add(info);
+ 	}
+ 
++	private void processRepositoryInformation(Attributes attributes) {
++		try {
++			URI uri = URIUtil.fromString(attributes.getValue(ATTRIBUTE_LOCATION));
++			boolean enabled = Boolean.parseBoolean(attributes.getValue(ATTRIBUTE_ENABLED));
++			// First add a metadata repository
++			repositories.add(new RepositoryReference(uri, null, IRepository.TYPE_METADATA, enabled ? IRepository.ENABLED : IRepository.NONE));
++			// Now a colocated artifact repository
++			repositories.add(new RepositoryReference(uri, null, IRepository.TYPE_ARTIFACT, enabled ? IRepository.ENABLED : IRepository.NONE));
++		} catch (URISyntaxException e) {
++			// ignore malformed URI's. These should have already been caught by the UI
++		}
++	}
++
+ 	@Override
+ 	public void endElement(String uri, String localName, String qName) {
+ 		switch (state) {
+@@ -958,6 +993,12 @@ public class ProductFile extends DefaultHandler implements IProductDescriptor {
+ 				else
+ 					processConfigIniPlatform(localName, false);
+ 				break;
++
++			case STATE_REPOSITORIES :
++				if (EL_REPOSITORIES.equals(localName))
++					state = STATE_PRODUCT;
++				break;
++
+ 		}
+ 	}
+ 
+@@ -1026,7 +1067,6 @@ public class ProductFile extends DefaultHandler implements IProductDescriptor {
+ 				if (licenseText != null)
+ 					licenseText += String.valueOf(ch, start, length);
+ 				break;
+-
+ 		}
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigAdvice.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigAdvice.java
+index 005b305..d01e30f 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigAdvice.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigAdvice.java
+@@ -1,24 +1,26 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2011 Code 9 and others. All rights reserved. This
++ * Copyright (c) 2008, 2014 Code 9 and others. All rights reserved. This
+  * program and the accompanying materials are made available under the terms of
+  * the Eclipse Public License v1.0 which accompanies this distribution, and is
+  * available at http://www.eclipse.org/legal/epl-v10.html
+  * 
+  * Contributors: 
+  *   Code 9 - initial API and implementation
++ *   Rapicorp - ongoing enhancements
+  ******************************************************************************/
+ package org.eclipse.equinox.p2.publisher.eclipse;
+ 
+-import java.util.Map;
++import java.util.*;
+ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.internal.p2.core.helpers.CollectionUtils;
+ import org.eclipse.equinox.internal.provisional.frameworkadmin.ConfigData;
+ import org.eclipse.equinox.p2.publisher.AbstractAdvice;
++import org.eclipse.equinox.p2.repository.IRepositoryReference;
+ 
+ public class ConfigAdvice extends AbstractAdvice implements IConfigAdvice {
+ 
+-	private ConfigData data;
+-	private String configSpec;
++	private final ConfigData data;
++	private final String configSpec;
+ 
+ 	public ConfigAdvice(ConfigData data, String configSpec) {
+ 		this.data = data;
+@@ -29,6 +31,7 @@ public class ConfigAdvice extends AbstractAdvice implements IConfigAdvice {
+ 		return data.getBundles();
+ 	}
+ 
++	@Override
+ 	protected String getConfigSpec() {
+ 		return configSpec;
+ 	}
+@@ -37,4 +40,9 @@ public class ConfigAdvice extends AbstractAdvice implements IConfigAdvice {
+ 		return CollectionUtils.toMap(data.getProperties());
+ 	}
+ 
++	public List<IRepositoryReference> getUpdateRepositories() {
++		// The config data does not carry repository info so we return an empty list
++		return new ArrayList<IRepositoryReference>();
++	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigCUsAction.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigCUsAction.java
+index 38a7eaa..6a8bcc5 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigCUsAction.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigCUsAction.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2011 Code 9 and others. All rights reserved. This
++ * Copyright (c) 2008, 2014 Code 9 and others. All rights reserved. This
+  * program and the accompanying materials are made available under the terms of
+  * the Eclipse Public License v1.0 which accompanies this distribution, and is
+  * available at http://www.eclipse.org/legal/epl-v10.html
+@@ -7,6 +7,7 @@
+  * Contributors: 
+  *   Code 9 - initial API and implementation
+  *   IBM - ongoing development
++ *   Rapicorp - ongoing development
+  ******************************************************************************/
+ package org.eclipse.equinox.p2.publisher.eclipse;
+ 
+@@ -21,6 +22,8 @@ import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitDescription;
+ import org.eclipse.equinox.p2.metadata.expression.IMatchExpression;
+ import org.eclipse.equinox.p2.publisher.*;
++import org.eclipse.equinox.p2.repository.IRepository;
++import org.eclipse.equinox.p2.repository.IRepositoryReference;
+ import org.eclipse.equinox.spi.p2.publisher.PublisherHelper;
+ import org.eclipse.osgi.util.ManifestElement;
+ import org.osgi.framework.BundleException;
+@@ -256,6 +259,15 @@ public class ConfigCUsAction extends AbstractPublisherAction {
+ 					unconfigurationData += TouchpointInstruction.encodeAction("setProgramProperty", parameters); //$NON-NLS-1$
+ 				}
+ 			}
++			for (IRepositoryReference repo : advice.getUpdateRepositories()) {
++				Map<String, String> parameters = new LinkedHashMap<String, String>();
++				parameters.put("type", Integer.toString(repo.getType())); //$NON-NLS-1$
++				parameters.put("location", repo.getLocation().toString()); //$NON-NLS-1$
++				parameters.put("enabled", Boolean.toString((repo.getOptions() & IRepository.ENABLED) == IRepository.ENABLED)); //$NON-NLS-1$
++				configurationData += TouchpointInstruction.encodeAction("addRepository", parameters); //$NON-NLS-1$
++				parameters.remove("enabled"); //$NON-NLS-1$
++				unconfigurationData += TouchpointInstruction.encodeAction("removeRepository", parameters);//$NON-NLS-1$
++			}
+ 		}
+ 		return new String[] {configurationData, unconfigurationData};
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/IConfigAdvice.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/IConfigAdvice.java
+index ed976ee..6c5ef15 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/IConfigAdvice.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/IConfigAdvice.java
+@@ -1,21 +1,26 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2011 Code 9 and others. All rights reserved. This
++ * Copyright (c) 2008, 2014 Code 9 and others. All rights reserved. This
+  * program and the accompanying materials are made available under the terms of
+  * the Eclipse Public License v1.0 which accompanies this distribution, and is
+  * available at http://www.eclipse.org/legal/epl-v10.html
+  * 
+  * Contributors: 
+  *   Code 9 - initial API and implementation
++ *   Rapicorp Corporation - ongoing enhancements
+  ******************************************************************************/
+ package org.eclipse.equinox.p2.publisher.eclipse;
+ 
++import java.util.List;
+ import java.util.Map;
+ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.p2.publisher.IPublisherAdvice;
++import org.eclipse.equinox.p2.repository.IRepositoryReference;
+ 
+ public interface IConfigAdvice extends IPublisherAdvice {
+ 
+ 	public BundleInfo[] getBundles();
+ 
+ 	public Map<String, String> getProperties();
++
++	public List<IRepositoryReference> getUpdateRepositories();
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ProductFileAdvice.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ProductFileAdvice.java
+index 4e81161..3f87efa 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ProductFileAdvice.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ProductFileAdvice.java
+@@ -24,6 +24,7 @@ import org.eclipse.equinox.p2.metadata.Version;
+ import org.eclipse.equinox.p2.publisher.AbstractAdvice;
+ import org.eclipse.equinox.p2.publisher.AbstractPublisherAction;
+ import org.eclipse.equinox.p2.publisher.actions.ILicenseAdvice;
++import org.eclipse.equinox.p2.repository.IRepositoryReference;
+ 
+ /**
+  * Provide advice derived from the .product file.  The product can give some info on 
+@@ -157,6 +158,13 @@ public class ProductFileAdvice extends AbstractAdvice implements ILicenseAdvice,
+ 		return product.getLicenseText();
+ 	}
+ 
++	/**
++	 * Returns the update repositories for this product
++	 */
++	public List<IRepositoryReference> getUpdateRepositories() {
++		return product.getRepositoryEntries();
++	}
++
+ 	private ConfigData getConfigData() {
+ 		DataLoader loader = createDataLoader();
+ 		ConfigData result;
+@@ -167,7 +175,6 @@ public class ProductFileAdvice extends AbstractAdvice implements ILicenseAdvice,
+ 
+ 		addProductFileBundles(result); // these are the bundles specified in the <plugins/> tag
+ 		addProductFileConfigBundles(result); // these are the bundles specified in the <configurations> tag in the product file
+-
+ 		if (product.getProductId() != null)
+ 			result.setProperty("eclipse.product", product.getProductId()); //$NON-NLS-1$
+ 		if (product.getApplication() != null)
+commit 203823e336649d1ca4f21165f09e30ef7f43418e
+Author: Susan McCourt <susan@rapicorp.com>
+Date:   Mon Apr 14 01:25:28 2014 -0700
+
+    Bug 432634 - [Product][Editors] Add support for p2 repo
+    Remove API changes from IConfigAdvice
+    
+    Change-Id: I4ae827621752f41f0e983ba5cbeb4622bad1073a
+
+1	7	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigAdvice.java
+10	8	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigCUsAction.java
+0	3	bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/IConfigAdvice.java
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigAdvice.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigAdvice.java
+index d01e30f..446d70d 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigAdvice.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigAdvice.java
+@@ -10,12 +10,11 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.p2.publisher.eclipse;
+ 
+-import java.util.*;
++import java.util.Map;
+ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.internal.p2.core.helpers.CollectionUtils;
+ import org.eclipse.equinox.internal.provisional.frameworkadmin.ConfigData;
+ import org.eclipse.equinox.p2.publisher.AbstractAdvice;
+-import org.eclipse.equinox.p2.repository.IRepositoryReference;
+ 
+ public class ConfigAdvice extends AbstractAdvice implements IConfigAdvice {
+ 
+@@ -40,9 +39,4 @@ public class ConfigAdvice extends AbstractAdvice implements IConfigAdvice {
+ 		return CollectionUtils.toMap(data.getProperties());
+ 	}
+ 
+-	public List<IRepositoryReference> getUpdateRepositories() {
+-		// The config data does not carry repository info so we return an empty list
+-		return new ArrayList<IRepositoryReference>();
+-	}
+-
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigCUsAction.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigCUsAction.java
+index 6a8bcc5..c1ca730 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigCUsAction.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/ConfigCUsAction.java
+@@ -259,14 +259,16 @@ public class ConfigCUsAction extends AbstractPublisherAction {
+ 					unconfigurationData += TouchpointInstruction.encodeAction("setProgramProperty", parameters); //$NON-NLS-1$
+ 				}
+ 			}
+-			for (IRepositoryReference repo : advice.getUpdateRepositories()) {
+-				Map<String, String> parameters = new LinkedHashMap<String, String>();
+-				parameters.put("type", Integer.toString(repo.getType())); //$NON-NLS-1$
+-				parameters.put("location", repo.getLocation().toString()); //$NON-NLS-1$
+-				parameters.put("enabled", Boolean.toString((repo.getOptions() & IRepository.ENABLED) == IRepository.ENABLED)); //$NON-NLS-1$
+-				configurationData += TouchpointInstruction.encodeAction("addRepository", parameters); //$NON-NLS-1$
+-				parameters.remove("enabled"); //$NON-NLS-1$
+-				unconfigurationData += TouchpointInstruction.encodeAction("removeRepository", parameters);//$NON-NLS-1$
++			if (advice instanceof ProductFileAdvice) {
++				for (IRepositoryReference repo : ((ProductFileAdvice) advice).getUpdateRepositories()) {
++					Map<String, String> parameters = new LinkedHashMap<String, String>();
++					parameters.put("type", Integer.toString(repo.getType())); //$NON-NLS-1$
++					parameters.put("location", repo.getLocation().toString()); //$NON-NLS-1$
++					parameters.put("enabled", Boolean.toString((repo.getOptions() & IRepository.ENABLED) == IRepository.ENABLED)); //$NON-NLS-1$
++					configurationData += TouchpointInstruction.encodeAction("addRepository", parameters); //$NON-NLS-1$
++					parameters.remove("enabled"); //$NON-NLS-1$
++					unconfigurationData += TouchpointInstruction.encodeAction("removeRepository", parameters);//$NON-NLS-1$
++				}
+ 			}
+ 		}
+ 		return new String[] {configurationData, unconfigurationData};
+diff --git a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/IConfigAdvice.java b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/IConfigAdvice.java
+index 6c5ef15..7e65ab6 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/IConfigAdvice.java
++++ b/bundles/org.eclipse.equinox.p2.publisher.eclipse/src/org/eclipse/equinox/p2/publisher/eclipse/IConfigAdvice.java
+@@ -10,11 +10,9 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.p2.publisher.eclipse;
+ 
+-import java.util.List;
+ import java.util.Map;
+ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.p2.publisher.IPublisherAdvice;
+-import org.eclipse.equinox.p2.repository.IRepositoryReference;
+ 
+ public interface IConfigAdvice extends IPublisherAdvice {
+ 
+@@ -22,5 +20,4 @@ public interface IConfigAdvice extends IPublisherAdvice {
+ 
+ 	public Map<String, String> getProperties();
+ 
+-	public List<IRepositoryReference> getUpdateRepositories();
+ }

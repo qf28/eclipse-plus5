@@ -1,0 +1,1181 @@
+commit 82de88aed4ba693f08a99509f6d366e11110cdf4
+Author: John Arthorne <johna>
+Date:   Fri Feb 20 22:44:00 2009 +0000
+
+    Bug 265315 Profile Scoped Preferences
+
+2	1	bundles/org.eclipse.equinox.p2.core/META-INF/MANIFEST.MF
+92	39	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/AbstractRepositoryManager.java
+1	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Messages.java
+1	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/messages.properties
+3	0	bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
+4	0	bundles/org.eclipse.equinox.p2.engine/plugin.xml
+4	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+239	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
+66	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileScope.java
+4	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+3	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/ArtifactRepositoryManagerTest.java
+1	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/AllTests.java
+58	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfilePreferencesTest.java
+68	6	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/AddRepositoryActionTest.java
+2	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
+13	3	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddRepositoryAction.java
+1	1	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RemoveRepositoryAction.java
+117	57	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RepositoryAction.java
+diff --git a/bundles/org.eclipse.equinox.p2.core/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.core/META-INF/MANIFEST.MF
+index 8d96d57..7239560 100644
+--- a/bundles/org.eclipse.equinox.p2.core/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.core/META-INF/MANIFEST.MF
+@@ -168,4 +168,5 @@ Bundle-RequiredExecutionEnvironment: J2SE-1.4,
+  CDC-1.1/Foundation-1.1
+ Bundle-Activator: org.eclipse.equinox.internal.p2.core.Activator
+ Require-Bundle: org.eclipse.equinox.common;bundle-version="[3.5.0,4.0.0)",
+- org.eclipse.equinox.registry;bundle-version="[3.4.0,4.0.0)"
++ org.eclipse.equinox.registry;bundle-version="[3.4.0,4.0.0)",
++ org.eclipse.core.jobs;bundle-version="[3.4.0,4.0.0)"
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/AbstractRepositoryManager.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/AbstractRepositoryManager.java
+index eca6c27..2a40804 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/AbstractRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/AbstractRepositoryManager.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008 IBM Corporation and others.
++ * Copyright (c) 2008, 2009 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -14,7 +14,8 @@ import java.lang.ref.SoftReference;
+ import java.net.*;
+ import java.util.*;
+ import org.eclipse.core.runtime.*;
+-import org.eclipse.core.runtime.preferences.ConfigurationScope;
++import org.eclipse.core.runtime.jobs.Job;
++import org.eclipse.core.runtime.preferences.IPreferencesService;
+ import org.eclipse.equinox.internal.p2.core.Activator;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+@@ -43,6 +44,24 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 		}
+ 	}
+ 
++	private class SaveJob extends Job {
++		SaveJob() {
++			super(Messages.repoMan_save);
++			setSystem(true);
++		}
++
++		protected IStatus run(IProgressMonitor monitor) {
++			try {
++				Preferences node = getPreferences();
++				if (node != null)
++					node.flush();
++			} catch (BackingStoreException e) {
++				log("Error while saving repositories in preferences", e); //$NON-NLS-1$
++			}
++			return Status.OK_STATUS;
++		}
++	}
++
+ 	public static final String ATTR_SUFFIX = "suffix"; //$NON-NLS-1$
+ 	public static final String EL_FACTORY = "factory"; //$NON-NLS-1$
+ 	public static final String EL_FILTER = "filter"; //$NON-NLS-1$
+@@ -59,6 +78,7 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 	public static final String KEY_VERSION = "version"; //$NON-NLS-1$
+ 
+ 	public static final String NODE_REPOSITORIES = "repositories"; //$NON-NLS-1$
++	private static final long SAVE_SCHEDULE_DELAY = 500;
+ 
+ 	/**
+ 	 * Map of String->RepositoryInfo, where String is the repository key
+@@ -80,6 +100,8 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 	 */
+ 	private Map loadLocks = new HashMap();
+ 
++	private final Job saveJob = new SaveJob();
++
+ 	protected AbstractRepositoryManager() {
+ 		IProvisioningEventBus bus = (IProvisioningEventBus) ServiceHelper.getService(Activator.getContext(), IProvisioningEventBus.SERVICE_NAME);
+ 		if (bus != null)
+@@ -452,8 +474,14 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 	/**
+ 	 * Return the preference node which is the root for where we store the repository information.
+ 	 */
+-	private Preferences getPreferences() {
+-		return new ConfigurationScope().getNode(getBundleId()).node(NODE_REPOSITORIES);
++	Preferences getPreferences() {
++		IPreferencesService prefService = (IPreferencesService) ServiceHelper.getService(Activator.getContext(), IPreferencesService.class.getName());
++
++		try {
++			return prefService.getRootNode().node("/profile/_SELF_/" + getBundleId() + "/" + NODE_REPOSITORIES); //$NON-NLS-1$ //$NON-NLS-2$
++		} catch (IllegalArgumentException e) {
++			return null;
++		}
+ 	}
+ 
+ 	/**
+@@ -691,18 +719,27 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 	 */
+ 	private void remember(IRepository repository, String suffix) {
+ 		boolean changed = false;
+-		Preferences node = getPreferences().node(getKey(repository.getLocation()));
+-		changed |= putValue(node, KEY_URI, repository.getLocation().toString());
+-		changed |= putValue(node, KEY_URL, null);
+-		changed |= putValue(node, KEY_DESCRIPTION, repository.getDescription());
+-		changed |= putValue(node, KEY_NAME, repository.getName());
+-		changed |= putValue(node, KEY_PROVIDER, repository.getProvider());
+-		changed |= putValue(node, KEY_TYPE, repository.getType());
+-		changed |= putValue(node, KEY_VERSION, repository.getVersion());
+-		changed |= putValue(node, KEY_SYSTEM, (String) repository.getProperties().get(IRepository.PROP_SYSTEM));
+-		changed |= putValue(node, KEY_SUFFIX, suffix);
+-		if (changed)
+-			saveToPreferences();
++		Preferences node = getPreferences();
++		// Ensure we retrieved preferences
++		if (node == null)
++			return;
++		node = node.node(getKey(repository.getLocation()));
++
++		try {
++			changed |= putValue(node, KEY_URI, repository.getLocation().toString());
++			changed |= putValue(node, KEY_URL, null);
++			changed |= putValue(node, KEY_DESCRIPTION, repository.getDescription());
++			changed |= putValue(node, KEY_NAME, repository.getName());
++			changed |= putValue(node, KEY_PROVIDER, repository.getProvider());
++			changed |= putValue(node, KEY_TYPE, repository.getType());
++			changed |= putValue(node, KEY_VERSION, repository.getVersion());
++			changed |= putValue(node, KEY_SYSTEM, (String) repository.getProperties().get(IRepository.PROP_SYSTEM));
++			changed |= putValue(node, KEY_SUFFIX, suffix);
++			if (changed)
++				saveToPreferences();
++		} catch (IllegalStateException e) {
++			//the repository was removed concurrently, so we don't need to save it
++		}
+ 	}
+ 
+ 	/**
+@@ -714,18 +751,27 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 	 */
+ 	private boolean remember(RepositoryInfo info, boolean flush) {
+ 		boolean changed = false;
+-		Preferences node = getPreferences().node(getKey(info.location));
+-		changed |= putValue(node, KEY_URI, info.location.toString());
+-		changed |= putValue(node, KEY_URL, null);
+-		changed |= putValue(node, KEY_SYSTEM, Boolean.toString(info.isSystem));
+-		changed |= putValue(node, KEY_DESCRIPTION, info.description);
+-		changed |= putValue(node, KEY_NAME, info.name);
+-		changed |= putValue(node, KEY_NICKNAME, info.nickname);
+-		changed |= putValue(node, KEY_SUFFIX, info.suffix);
+-		changed |= putValue(node, KEY_ENABLED, Boolean.toString(info.isEnabled));
+-		if (changed && flush)
+-			saveToPreferences();
+-		return changed;
++		Preferences node = getPreferences();
++		// Ensure we retrieved preferences
++		if (node == null)
++			return changed;
++		node = node.node(getKey(info.location));
++		try {
++			changed |= putValue(node, KEY_URI, info.location.toString());
++			changed |= putValue(node, KEY_URL, null);
++			changed |= putValue(node, KEY_SYSTEM, Boolean.toString(info.isSystem));
++			changed |= putValue(node, KEY_DESCRIPTION, info.description);
++			changed |= putValue(node, KEY_NAME, info.name);
++			changed |= putValue(node, KEY_NICKNAME, info.nickname);
++			changed |= putValue(node, KEY_SUFFIX, info.suffix);
++			changed |= putValue(node, KEY_ENABLED, Boolean.toString(info.isEnabled));
++			if (changed && flush)
++				saveToPreferences();
++			return changed;
++		} catch (IllegalStateException e) {
++			//the repository was removed concurrently, so we don't need to save it
++			return false;
++		}
+ 	}
+ 
+ 	/**
+@@ -765,8 +811,11 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 				Tracing.debug(msg);
+ 				new Exception(msg).printStackTrace();
+ 			}
+-			getPreferences().node(repoKey).removeNode();
+-			saveToPreferences();
++			Preferences node = getPreferences();
++			if (node != null) {
++				getPreferences().node(repoKey).removeNode();
++				saveToPreferences();
++			}
+ 			clearNotFound(toRemove);
+ 		} catch (BackingStoreException e) {
+ 			log("Error saving preferences", e); //$NON-NLS-1$
+@@ -783,6 +832,8 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 	private void restoreFromPreferences() {
+ 		// restore the list of repositories from the preference store
+ 		Preferences node = getPreferences();
++		if (node == null)
++			return;
+ 		String[] children;
+ 		try {
+ 			children = node.childrenNames();
+@@ -846,11 +897,7 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 	 * Save the list of repositories to the file-system.
+ 	 */
+ 	private void saveToPreferences() {
+-		try {
+-			getPreferences().flush();
+-		} catch (BackingStoreException e) {
+-			log("Error while saving repositories in preferences", e); //$NON-NLS-1$
+-		}
++		saveJob.schedule(SAVE_SCHEDULE_DELAY);
+ 	}
+ 
+ 	/* (non-Javadoc)
+@@ -877,18 +924,24 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 		if (bus != null)
+ 			bus.removeListener(this);
+ 		//ensure all repository state in memory is written to disk
++		boolean changed = false;
+ 		synchronized (repositoryLock) {
+ 			if (repositories != null) {
+-				boolean changed = false;
+ 				for (Iterator it = repositories.values().iterator(); it.hasNext();) {
+ 					RepositoryInfo info = (RepositoryInfo) it.next();
+ 					changed |= remember(info, false);
+ 				}
+-				if (changed)
+-					saveToPreferences();
+ 			}
+ 		}
+-		saveToPreferences();
++		if (changed)
++			saveToPreferences();
++		//if there is a save job waiting, make sure it runs immediately before we discard state
++		saveJob.wakeUp();
++		try {
++			saveJob.join();
++		} catch (InterruptedException e) {
++			//ignore
++		}
+ 		repositories = null;
+ 		unavailableRepositories = null;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Messages.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Messages.java
+index 8b425b7..6a875f7 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Messages.java
+@@ -30,6 +30,7 @@ class Messages extends NLS {
+ 	public static String repoMan_failedRead;
+ 	public static String repoMan_internalError;
+ 	public static String repoMan_notExists;
++	public static String repoMan_save;
+ 	public static String repoMan_unknownType;
+ 
+ 	public static String Util_Invalid_Zip_File_Format;
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/messages.properties b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/messages.properties
+index 7e68ac0..d97e16f 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/messages.properties
+@@ -14,6 +14,7 @@ repoMan_exists=Repository already exists at {0}.
+ repoMan_failedRead=The repository could not be read: {0}.
+ repoMan_internalError=Internal error.
+ repoMan_notExists=No repository found at {0}.
++repoMan_save=Saving repository settings
+ repoMan_unknownType=Unknown repository type at {0}.
+ 
+ Util_Invalid_Zip_File_Format=Invalid zip file format
+diff --git a/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
+index 8246080..d25a809 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
+@@ -25,6 +25,8 @@ Export-Package: org.eclipse.equinox.internal.p2.engine;x-friends:="org.eclipse.e
+    org.eclipse.equinox.p2.repository.tools",
+  org.eclipse.equinox.internal.provisional.p2.engine.phases;x-friends:="org.eclipse.equinox.p2.ui,org.eclipse.equinox.p2.repository.tools"
+ Import-Package: javax.xml.parsers,
++ org.eclipse.core.internal.preferences,
++ org.eclipse.core.runtime.preferences,
+  org.eclipse.equinox.internal.p2.core.helpers,
+  org.eclipse.equinox.internal.p2.metadata,
+  org.eclipse.equinox.internal.p2.metadata.repository,
+@@ -46,6 +48,7 @@ Import-Package: javax.xml.parsers,
+  org.eclipse.osgi.signedcontent;version="1.0.0",
+  org.eclipse.osgi.util;version="1.0.0",
+  org.osgi.framework;version="1.3.0",
++ org.osgi.service.prefs,
+  org.osgi.util.tracker;version="1.3.3",
+  org.xml.sax
+ Bundle-Activator: org.eclipse.equinox.internal.p2.engine.EngineActivator
+diff --git a/bundles/org.eclipse.equinox.p2.engine/plugin.xml b/bundles/org.eclipse.equinox.p2.engine/plugin.xml
+index 5ec33d4..38f276c 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/plugin.xml
++++ b/bundles/org.eclipse.equinox.p2.engine/plugin.xml
+@@ -15,4 +15,8 @@
+     </filter>
+  </extension>
+ 
++	<extension id="preferences" point="org.eclipse.core.runtime.preferences" name="%preferencesExtPtName">
++		<scope name="profile" class="org.eclipse.equinox.internal.p2.engine.ProfilePreferences"/>
++	</extension>
++	
+ </plugin>
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+index 9bef218..7912a8d 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+@@ -38,6 +38,10 @@ class Messages extends NLS {
+ 	public static String Profile_Null_Profile_Id;
+ 	public static String Profile_Parent_Not_Found;
+ 
++	public static String ProfilePreferences_save_failed;
++	public static String ProfilePreferences_load_failed;
++	public static String ProfilePreferences_Profile_not_found;
++
+ 	public static String reg_dir_not_available;
+ 
+ 	public static String SimpleProfileRegistry_Parser_Error_Parsing_Registry;
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
+new file mode 100644
+index 0000000..0b0c89b
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
+@@ -0,0 +1,239 @@
++/*******************************************************************************
++ * Copyright (c) 2004, 2008, 2009 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.engine;
++
++import java.io.File;
++import java.util.*;
++import org.eclipse.core.internal.preferences.EclipsePreferences;
++import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.preferences.IEclipsePreferences;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
++import org.eclipse.equinox.internal.p2.core.helpers.URLUtil;
++import org.eclipse.equinox.internal.provisional.p2.core.location.AgentLocation;
++import org.eclipse.equinox.internal.provisional.p2.engine.*;
++import org.eclipse.osgi.util.NLS;
++import org.osgi.service.prefs.BackingStoreException;
++
++public class ProfilePreferences extends EclipsePreferences {
++	private int segmentCount;
++	private String qualifier;
++	//private IPath location;
++	private IEclipsePreferences loadLevel;
++	// cache which nodes have been loaded from disk
++	private static Set loadedNodes = new HashSet();
++
++	private Object profileLock;
++
++	public ProfilePreferences() {
++		this(null, null);
++	}
++
++	public ProfilePreferences(EclipsePreferences nodeParent, String nodeName) {
++		super(nodeParent, nodeName);
++
++		// cache the segment count
++		String path = absolutePath();
++		segmentCount = getSegmentCount(path);
++
++		if (segmentCount <= 1)
++			return;
++
++		if (segmentCount == 2)
++			profileLock = new Object();
++
++		// ensure profile exists
++		computeProfile(path);
++
++		if (segmentCount < 3)
++			return;
++		// cache the qualifier
++		qualifier = getSegment(path, 2);
++	}
++
++	private IProfile computeProfile(String path) {
++		String profileName = getSegment(path, 1);
++		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(EngineActivator.getContext(), IProfileRegistry.class.getName());
++		IProfile result = null;
++		if (profileName != null && profileRegistry != null)
++			result = profileRegistry.getProfile(profileName);
++		if (result == null && !profileName.equals(IProfileRegistry.SELF))
++			throw new IllegalArgumentException(NLS.bind(Messages.ProfilePreferences_Profile_not_found, profileName));
++		return result;
++	}
++
++	public void removeNode() throws BackingStoreException {
++		super.removeNode();
++		loadedNodes.remove(this.absolutePath());
++	}
++
++	protected IEclipsePreferences getLoadLevel() {
++		if (loadLevel == null) {
++			if (qualifier == null)
++				return null;
++			// Make it relative to this node rather than navigating to it from the root.
++			// Walk backwards up the tree starting at this node.
++			// This is important to avoid a chicken/egg thing on startup.
++			IEclipsePreferences node = this;
++			for (int i = 3; i < segmentCount; i++)
++				node = (EclipsePreferences) node.parent();
++			loadLevel = node;
++		}
++		return loadLevel;
++	}
++
++	protected synchronized boolean isAlreadyLoaded(IEclipsePreferences node) {
++		return loadedNodes.contains(node.absolutePath());
++	}
++
++	protected synchronized boolean isAlreadyLoaded(String path) {
++		return loadedNodes.contains(path);
++	}
++
++	protected synchronized void loaded() {
++		loadedNodes.add(name());
++	}
++
++	protected EclipsePreferences internalCreate(EclipsePreferences nodeParent, String nodeName, Object context) {
++		return new ProfilePreferences(nodeParent, nodeName);
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * Create an Engine phase to load profile preferences
++	 */
++	protected void load() throws BackingStoreException {
++		synchronized (((ProfilePreferences) parent).profileLock) {
++			IProfile profile = computeProfile(absolutePath());
++			//if there is no self profile, use a default location for preferences
++			if (profile == null) {
++				load(getDefaultLocation());
++				return;
++			}
++			IEngine engine = (IEngine) ServiceHelper.getService(EngineActivator.getContext(), IEngine.SERVICE_NAME);
++			if (engine == null) {
++				throw new BackingStoreException(NLS.bind(Messages.ProfilePreferences_load_failed, profile.getProfileId()));
++			}
++			PhaseSet set = new ProfilePreferencePhaseSet(new PreferenceLoad());
++			Exception failure;
++			try {
++				IStatus status = engine.perform(profile, set, new Operand[0], null, null);
++				// Check return status.
++				if (status.isOK())
++					return;
++				failure = (Exception) status.getException();
++			} catch (IllegalStateException e) {
++				failure = e;
++			}
++			if (failure != null && failure instanceof BackingStoreException)
++				throw (BackingStoreException) failure;
++			throw new BackingStoreException(NLS.bind(Messages.ProfilePreferences_load_failed, profile.getProfileId()), failure);
++		}
++	}
++
++	private File getDefaultLocation() {
++		//use engine agent location for preferences if there is no self profile
++		AgentLocation location = (AgentLocation) ServiceHelper.getService(EngineActivator.getContext(), AgentLocation.SERVICE_NAME);
++		return URLUtil.toFile(location.getDataArea(EngineActivator.ID));
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * Create an Engine phase to save profile preferences
++	 */
++	protected void save() throws BackingStoreException {
++		synchronized (((ProfilePreferences) parent).profileLock) {
++			IProfile profile = computeProfile(absolutePath());
++			//if there is no self profile, use a default location for preferences
++			if (profile == null) {
++				save(getDefaultLocation());
++				return;
++			}
++			IEngine engine = (IEngine) ServiceHelper.getService(EngineActivator.getContext(), IEngine.SERVICE_NAME);
++			if (engine == null) {
++				throw new BackingStoreException(NLS.bind(Messages.ProfilePreferences_save_failed, profile.getProfileId()));
++			}
++			PhaseSet set = new ProfilePreferencePhaseSet(new PreferenceFlush());
++			Exception failure;
++			try {
++				IStatus status = engine.perform(profile, set, new Operand[0], null, null);
++				// Check return status.
++				if (status.isOK())
++					return;
++				failure = (Exception) status.getException();
++			} catch (IllegalStateException e) {
++				failure = e;
++			}
++			if (failure != null && failure instanceof BackingStoreException)
++				throw (BackingStoreException) failure;
++			throw new BackingStoreException(NLS.bind(Messages.ProfilePreferences_save_failed, profile.getProfileId()), failure);
++		}
++	}
++
++	public void load(File directory) throws BackingStoreException {
++		super.load(computeLocation(new Path(directory.getAbsolutePath()), qualifier));
++	}
++
++	public void save(File directory) throws BackingStoreException {
++		super.save(computeLocation(new Path(directory.getAbsolutePath()), qualifier));
++	}
++
++	// Simple PhaseSet used when loading or saving profile preferences
++	private class ProfilePreferencePhaseSet extends PhaseSet {
++
++		public ProfilePreferencePhaseSet(Phase phase) {
++			super(new Phase[] {phase});
++		}
++	}
++
++	private class PreferenceFlush extends Phase {
++		private static final String PHASE_ID = "preferenceFlush"; //$NON-NLS-1$
++
++		public PreferenceFlush() {
++			super(PHASE_ID, 1);
++		}
++
++		protected ProvisioningAction[] getActions(Operand operand) {
++			return null;
++		}
++
++		protected IStatus completePhase(IProgressMonitor monitor, IProfile phaseProfile, Map parameters) {
++			File dataDirectory = (File) parameters.get(PARM_PROFILE_DATA_DIRECTORY);
++			try {
++				save(dataDirectory);
++			} catch (BackingStoreException e) {
++				return new Status(IStatus.ERROR, EngineActivator.ID, e.getMessage(), e);
++			}
++			return Status.OK_STATUS;
++		}
++	}
++
++	private class PreferenceLoad extends Phase {
++		private static final String PHASE_ID = "preferenceLoad"; //$NON-NLS-1$
++
++		public PreferenceLoad() {
++			super(PHASE_ID, 1);
++		}
++
++		protected ProvisioningAction[] getActions(Operand operand) {
++			return null;
++		}
++
++		protected IStatus completePhase(IProgressMonitor monitor, IProfile phaseProfile, Map parameters) {
++			File dataDirectory = (File) parameters.get(PARM_PROFILE_DATA_DIRECTORY);
++			try {
++				load(dataDirectory);
++			} catch (BackingStoreException e) {
++				return new Status(IStatus.ERROR, EngineActivator.ID, e.getMessage(), e);
++			}
++			return Status.OK_STATUS;
++		}
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileScope.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileScope.java
+new file mode 100644
+index 0000000..dfbed9a
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileScope.java
+@@ -0,0 +1,66 @@
++/*******************************************************************************
++ * Copyright (c) 2009 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.engine;
++
++import org.eclipse.core.internal.preferences.AbstractScope;
++import org.eclipse.core.runtime.IPath;
++
++public final class ProfileScope extends AbstractScope {
++
++	/*
++	 * String constant (value of <code>"profile"</code>) used for the 
++	 * scope name for this preference scope.
++	 */
++	public static final String SCOPE = "profile"; //$NON-NLS-1$
++
++	private String profileId;
++
++	/*
++	 * Create and return a new profile scope for the given profile. The given
++	 * profile must not be null.
++	 */
++	public ProfileScope(String profileId) {
++		super();
++		if (profileId == null)
++			throw new IllegalArgumentException();
++		this.profileId = profileId;
++	}
++
++	public IPath getLocation() {
++		// Null returned as the location should only be used when the profile is locked
++		return null;
++	}
++
++	public String getName() {
++		return SCOPE;
++	}
++
++	/* (non-Javadoc)
++	 * @see java.lang.Object#equals(java.lang.Object)
++	 */
++	public boolean equals(Object obj) {
++		if (this == obj)
++			return true;
++		if (!super.equals(obj))
++			return false;
++		if (!(obj instanceof ProfileScope))
++			return false;
++		ProfileScope other = (ProfileScope) obj;
++		return profileId.equals(other.profileId);
++	}
++
++	/* (non-Javadoc)
++	 * @see java.lang.Object#hashCode()
++	 */
++	public int hashCode() {
++		return super.hashCode() + profileId.hashCode();
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+index d060477..634ef05 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+@@ -47,3 +47,7 @@ profile_not_registered=Profile {0} not registered.
+ reg_dir_not_available=Registry Directory not available.
+ thread_not_owner=Thread not lock owner.
+ shared_profile_not_found=Shared profile {0} not found.
++
++ProfilePreferences_save_failed=An error occurred while saving preferences for profile {0}
++ProfilePreferences_load_failed=An error occurred while loading preferences for profile {0}
++ProfilePreferences_Profile_not_found=Requested profile {0} not located for preferences.
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/ArtifactRepositoryManagerTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/ArtifactRepositoryManagerTest.java
+index fd00c73..3ba5208 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/ArtifactRepositoryManagerTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/ArtifactRepositoryManagerTest.java
+@@ -17,7 +17,7 @@ import java.net.URISyntaxException;
+ import junit.framework.Test;
+ import junit.framework.TestSuite;
+ import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.preferences.ConfigurationScope;
++import org.eclipse.core.runtime.preferences.IPreferencesService;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
+@@ -106,7 +106,8 @@ public class ArtifactRepositoryManagerTest extends AbstractProvisioningTest {
+ 
+ 		//bash the repository preference file (don't try this at home, kids)
+ 		final String REPO_BUNDLE = "org.eclipse.equinox.p2.artifact.repository";
+-		Preferences prefs = new ConfigurationScope().getNode(REPO_BUNDLE).node("repositories");
++		IPreferencesService prefService = (IPreferencesService) ServiceHelper.getService(TestActivator.getContext(), IPreferencesService.class.getName());
++		Preferences prefs = prefService.getRootNode().node("/profile/_SELF_/" + REPO_BUNDLE + "/repositories"); //$NON-NLS-1$ //$NON-NLS-2$
+ 		try {
+ 			String[] children = prefs.childrenNames();
+ 			for (int i = 0; i < children.length; i++)
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/AllTests.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/AllTests.java
+index 97c0bdc..d55b55e 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/AllTests.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/AllTests.java
+@@ -28,6 +28,7 @@ public class AllTests extends TestCase {
+ 		suite.addTestSuite(ParameterizedProvisioningActionTest.class);
+ 		suite.addTestSuite(ProfileMetadataRepositoryTest.class);
+ 		suite.addTestSuite(ProfileTest.class);
++		suite.addTestSuite(ProfilePreferencesTest.class);
+ 		suite.addTestSuite(ProfileRegistryTest.class);
+ 		suite.addTestSuite(SurrogateProfileHandlerTest.class);
+ 		suite.addTestSuite(TouchpointManagerTest.class);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfilePreferencesTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfilePreferencesTest.java
+new file mode 100644
+index 0000000..542b46b
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfilePreferencesTest.java
+@@ -0,0 +1,58 @@
++package org.eclipse.equinox.p2.tests.engine;
++
++import org.eclipse.core.runtime.preferences.IPreferencesService;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
++import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
++import org.eclipse.equinox.p2.tests.TestActivator;
++import org.osgi.service.prefs.BackingStoreException;
++import org.osgi.service.prefs.Preferences;
++
++public class ProfilePreferencesTest extends AbstractProvisioningTest {
++	private IPreferencesService prefServ;
++
++	protected void setUp() throws Exception {
++		super.setUp();
++
++		prefServ = (IPreferencesService) ServiceHelper.getService(TestActivator.context, IPreferencesService.class.getName());
++	}
++
++	public void testInvalidProfile() {
++
++		boolean exceptionThrown = false;
++		try {
++			prefServ.getRootNode().node("/profile/NonExistantProfile/testing");
++		} catch (IllegalArgumentException e) {
++			exceptionThrown = true;
++		}
++		assertTrue("IllegalArgumentException not thrown for non-existant profile", exceptionThrown);
++	}
++
++	public void testProfilePreference() {
++		Preferences pref = null;
++		String key = "Test";
++		String value = "Value";
++
++		try {
++			pref = prefServ.getRootNode().node("/profile/_SELF_/testing");
++		} catch (IllegalArgumentException e) {
++			fail("IllegalArgumentException when accessing preferences for self profile");
++		}
++
++		pref.put(key, value);
++		assertTrue("Unable to retrieve value from preferences", value.equals(pref.get(key, null)));
++
++		try {
++			pref.flush();
++		} catch (BackingStoreException e) {
++			fail("Unable to write to preferences: " + e.getMessage());
++		}
++
++		try {
++			pref.parent().removeNode();
++		} catch (BackingStoreException e) {
++			//
++		}
++		pref = prefServ.getRootNode().node("/profile/_SELF_/testing");
++		assertTrue("Value not present after load", value.equals(pref.get(key, null)));
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/AddRepositoryActionTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/AddRepositoryActionTest.java
+index acb49b1..5e9309a 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/AddRepositoryActionTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/AddRepositoryActionTest.java
+@@ -10,12 +10,14 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.touchpoint.eclipse;
+ 
+-import org.eclipse.equinox.internal.p2.metadata.TouchpointInstruction;
+-
+ import java.net.URI;
++import java.net.URISyntaxException;
+ import java.util.HashMap;
+ import java.util.Map;
+ import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.preferences.IPreferencesService;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
++import org.eclipse.equinox.internal.p2.metadata.TouchpointInstruction;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions.AddRepositoryAction;
+ import org.eclipse.equinox.internal.provisional.p2.core.Version;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+@@ -24,12 +26,15 @@ import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningContext;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+ import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
++import org.eclipse.equinox.p2.tests.TestActivator;
++import org.osgi.service.prefs.Preferences;
+ 
+ /**
+  * Tests for {@link org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions.AddRepositoryAction}.
+  */
+ public class AddRepositoryActionTest extends AbstractProvisioningTest {
+ 	private static final String TEST_LOCATION = "http://eclipse.org/eclipse/updates/AddRepositoryActionTest";
++	private static final String KEY_URI = "uri";
+ 	AddRepositoryAction action;
+ 	private URI locationURI;
+ 
+@@ -110,6 +115,38 @@ public class AddRepositoryActionTest extends AbstractProvisioningTest {
+ 		assertTrue("1.1", result.isOK());
+ 	}
+ 
++	public void testMultipleActionAdd() {
++		Map args = getValidArguments();
++		IStatus result = action.execute(args);
++		assertTrue("1.0", result.isOK());
++
++		result = action.execute(args);
++		assertTrue("1.1", result.isOK());
++
++		result = action.undo(args);
++		assertTrue("1.2", result.isOK());
++
++		assertTrue("2.0", locationExists(null, TEST_LOCATION));
++	}
++
++	public void testUserWins() {
++		try {
++			getArtifactRepositoryManager().addRepository(new URI(TEST_LOCATION));
++			assertTrue("0.1", locationExists(null, TEST_LOCATION));
++		} catch (URISyntaxException e) {
++			// Should not occur
++		}
++
++		Map args = getValidArguments();
++		IStatus result = action.execute(args);
++		assertTrue("1.0", result.isOK());
++
++		result = action.undo(args);
++		assertTrue("1.1", result.isOK());
++
++		assertTrue("2.0", locationExists(null, TEST_LOCATION));
++	}
++
+ 	/**
+ 	 * Tests for install of an IU that adds a repository.
+ 	 */
+@@ -131,9 +168,34 @@ public class AddRepositoryActionTest extends AbstractProvisioningTest {
+ 
+ 		//check that profile property is set
+ 		profile = getProfile(id);
+-		String value = profile.getProperty(IProfile.PROP_METADATA_REPOSITORIES);
+-		assertNull("2.0", value);
+-		value = profile.getProperty(IProfile.PROP_ARTIFACT_REPOSITORIES);
+-		assertEquals("2.1", TEST_LOCATION, value);
++		// Get Preference node associated with the profile
++		IPreferencesService prefService = (IPreferencesService) ServiceHelper.getService(TestActivator.getContext(), IPreferencesService.class.getName());
++		Preferences pref = prefService.getRootNode().node("/profile/" + profile.getProfileId() + "/org.eclipse.equinox.p2.artifact.repository/repositories/" + getKey(TEST_LOCATION)); //$NON-NLS-1$ //$NON-NLS-2$
++		String value = pref.get(KEY_URI, null);
++
++		assertEquals("2.0", value, TEST_LOCATION);
++	}
++
++	/*
++	 * Modified from AbstractRepositoryManager
++	 */
++	private String getKey(String location) {
++		String key = location.replace('/', '_');
++		//remove trailing slash
++		if (key.endsWith("_")) //$NON-NLS-1$
++			key = key.substring(0, key.length() - 1);
++		return key;
++	}
++
++	private boolean locationExists(IProfile profile, String location) {
++		IPreferencesService prefService = (IPreferencesService) ServiceHelper.getService(TestActivator.getContext(), IPreferencesService.class.getName());
++		Preferences pref;
++		if (profile != null)
++			pref = prefService.getRootNode().node("/profile/" + profile.getProfileId() + "/org.eclipse.equinox.p2.artifactRepositories/repositories/" + getKey(location));
++		else
++			pref = prefService.getRootNode().node("/profile/_SELF_/org.eclipse.equinox.p2.artifact.repository/repositories/" + getKey(location));
++		if (location.equals(pref.get(KEY_URI, null)))
++			return true;
++		return false;
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
+index 32474d9..56956e9 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
+@@ -6,6 +6,7 @@ Bundle-Vendor: %providerName
+ Bundle-Localization: plugin
+ Bundle-Version: 1.0.100.qualifier
+ Import-Package: javax.xml.parsers,
++ org.eclipse.core.runtime.preferences;version="3.2.0",
+  org.eclipse.equinox.internal.p2.core.helpers,
+  org.eclipse.equinox.internal.p2.engine,
+  org.eclipse.equinox.internal.p2.garbagecollector,
+@@ -29,6 +30,7 @@ Import-Package: javax.xml.parsers,
+  org.eclipse.osgi.service.resolver;version="1.2.0";resolution:=optional,
+  org.eclipse.osgi.util;version="1.1.0",
+  org.osgi.framework;version="1.3.0",
++ org.osgi.service.prefs;version="1.1.1",
+  org.osgi.util.tracker;version="1.3.2",
+  org.w3c.dom,
+  org.xml.sax
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddRepositoryAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddRepositoryAction.java
+index fa95c15..bb8c6af 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddRepositoryAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddRepositoryAction.java
+@@ -26,7 +26,7 @@ public class AddRepositoryAction extends RepositoryAction {
+ 			final RepositoryEvent event = createEvent(parameters);
+ 			Profile profile = (Profile) parameters.get(ActionConstants.PARM_PROFILE);
+ 			if (profile != null)
+-				addRepositoryToProfile(profile, event.getRepositoryLocation(), event.getRepositoryType());
++				addRepositoryToProfile(profile, event.getRepositoryLocation(), event.getRepositoryType(), event.isRepositoryEnabled());
+ 			//if provisioning into the current profile, broadcast an event to add this repository directly to the current repository managers.
+ 			if (isSelfProfile(profile))
+ 				addToSelf(event);
+@@ -41,7 +41,17 @@ public class AddRepositoryAction extends RepositoryAction {
+ 	}
+ 
+ 	public IStatus undo(Map parameters) {
+-		//TODO: we don't know if the repository was already present
+-		return Status.OK_STATUS;
++		try {
++			final RepositoryEvent event = createEvent(parameters);
++			Profile profile = (Profile) parameters.get(ActionConstants.PARM_PROFILE);
++			if (profile != null)
++				removeRepositoryFromProfile(profile, event.getRepositoryLocation(), event.getRepositoryType());
++			//if provisioning into the current profile, broadcast an event to add this repository directly to the current repository managers.
++			if (isSelfProfile(profile))
++				removeFromSelf(event);
++			return Status.OK_STATUS;
++		} catch (CoreException e) {
++			return e.getStatus();
++		}
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RemoveRepositoryAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RemoveRepositoryAction.java
+index 77d20ee..9ab8cde 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RemoveRepositoryAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RemoveRepositoryAction.java
+@@ -41,7 +41,7 @@ public class RemoveRepositoryAction extends RepositoryAction {
+ 			RepositoryEvent event = createEvent(parameters);
+ 			Profile profile = (Profile) parameters.get(ActionConstants.PARM_PROFILE);
+ 			if (profile != null)
+-				addRepositoryToProfile(profile, event.getRepositoryLocation(), event.getRepositoryType());
++				addRepositoryToProfile(profile, event.getRepositoryLocation(), event.getRepositoryType(), event.isRepositoryEnabled());
+ 			//if we are provisioning into the self profile, update the current set of repositories in this configuration
+ 			if (isSelfProfile(profile))
+ 				addToSelf(event);
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RepositoryAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RepositoryAction.java
+index 8ce1ce2..0407139 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RepositoryAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RepositoryAction.java
+@@ -13,8 +13,8 @@ package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.util.Map;
+-import java.util.StringTokenizer;
+ import org.eclipse.core.runtime.CoreException;
++import org.eclipse.core.runtime.preferences.IPreferencesService;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.engine.Profile;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Activator;
+@@ -24,6 +24,8 @@ import org.eclipse.equinox.internal.provisional.p2.core.repository.*;
+ import org.eclipse.equinox.internal.provisional.p2.engine.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
+ import org.eclipse.osgi.util.NLS;
++import org.osgi.service.prefs.BackingStoreException;
++import org.osgi.service.prefs.Preferences;
+ 
+ /**
+  * Helper base class for dealing with repositories associated with profiles. Repositories
+@@ -34,6 +36,14 @@ import org.eclipse.osgi.util.NLS;
+  */
+ abstract class RepositoryAction extends ProvisioningAction {
+ 
++	private static final String METADATA_REPOSITORY = "org.eclipse.equinox.p2.metadata.repository"; //$NON-NLS-1$
++	private static final String ARTIFACT_REPOSITORY = "org.eclipse.equinox.p2.artifact.repository"; //$NON-NLS-1$
++
++	private static final String NODE_REPOSITORIES = "repositories"; //$NON-NLS-1$
++	private static final String REPOSITORY_COUNT = "count"; //$NON-NLS-1$
++	private static final String KEY_URI = "uri"; //$NON-NLS-1$
++	private static final String KEY_ENABLED = "enabled"; //$NON-NLS-1$
++
+ 	/**
+ 	 * Returns the repository manager of the given type, or <code>null</code>
+ 	 * if not available.
+@@ -51,22 +61,25 @@ abstract class RepositoryAction extends ProvisioningAction {
+ 	 * Associates the repository described by the given event with the given profile.
+ 	 * Has no effect if the repository is already associated with this profile.
+ 	 */
+-	protected void addRepositoryToProfile(Profile profile, URI location, int type) {
+-		String key = type == IRepository.TYPE_METADATA ? IProfile.PROP_METADATA_REPOSITORIES : IProfile.PROP_ARTIFACT_REPOSITORIES;
+-		String encodedURI = encodeURI(location);
+-		String currentRepos = profile.getProperty(key);
+-		if (currentRepos == null) {
+-			currentRepos = encodedURI;
+-		} else {
+-			//if we already have the repository location, we are done
+-			StringTokenizer tokens = new StringTokenizer(currentRepos, ","); //$NON-NLS-1$
+-			while (tokens.hasMoreTokens())
+-				if (tokens.nextToken().equals(encodedURI))
+-					return;
+-			//add to comma-separated list
+-			currentRepos = currentRepos + ',' + encodedURI;
++	protected void addRepositoryToProfile(Profile profile, URI location, int type, boolean enabled) {
++		Preferences node = getRepositoryPreferenceNode(profile, location, type);
++		int count = 0;
++
++		if (repositoryExists(node)) {
++			count = getRepositoryCount(node);;
++			// If a user as added a repository we need to set the initial count manually
++			if (count == 0)
++				count = 1;
++		}
++		node.put(KEY_URI, location.toString());
++		node.put(KEY_ENABLED, Boolean.toString(enabled));
++		count++;
++		setRepositoryCount(node, count);
++		try {
++			node.flush();
++		} catch (BackingStoreException e) {
++			// TODO: perhaps an Exception should be passed backwards and associated with State
+ 		}
+-		profile.setProperty(key, currentRepos);
+ 	}
+ 
+ 	/**
+@@ -74,8 +87,21 @@ abstract class RepositoryAction extends ProvisioningAction {
+ 	 */
+ 	protected void addToSelf(RepositoryEvent event) {
+ 		IRepositoryManager manager = getRepositoryManager(event.getRepositoryType());
+-		if (manager != null)
+-			manager.addRepository(event.getRepositoryLocation());
++		Preferences node = getRepositoryPreferenceNode(null, event.getRepositoryLocation(), event.getRepositoryType());
++
++		int count = getRepositoryCount(node);
++		if (manager.contains(event.getRepositoryLocation())) {
++			// If a user as added a repository we need to set the initial count manually
++			if (count == 0)
++				count = 1;
++		} else {
++			if (manager != null)
++				manager.addRepository(event.getRepositoryLocation());
++		}
++		// increment the counter & send to preferences
++		count++;
++		setRepositoryCount(node, count);
++
+ 		if (!event.isRepositoryEnabled())
+ 			manager.setEnabled(event.getRepositoryLocation(), false);
+ 	}
+@@ -106,22 +132,6 @@ abstract class RepositoryAction extends ProvisioningAction {
+ 	}
+ 
+ 	/**
+-	 * Encodes a URI as a string, in a form suitable for storing in a comma-separated
+-	 * list of location strings. Any comma character in the local string is encoded.
+-	 */
+-	private String encodeURI(URI repositoryLocation) {
+-		char[] chars = repositoryLocation.toString().toCharArray();
+-		StringBuffer result = new StringBuffer(chars.length);
+-		for (int i = 0; i < chars.length; i++) {
+-			if (chars[i] == ',')
+-				result.append("${#").append(Integer.toString(chars[i])).append('}'); //$NON-NLS-1$
+-			else
+-				result.append(chars[i]);
+-		}
+-		return result.toString();
+-	}
+-
+-	/**
+ 	 * Returns the id of this action.
+ 	 */
+ 	protected abstract String getId();
+@@ -149,8 +159,11 @@ abstract class RepositoryAction extends ProvisioningAction {
+ 	 */
+ 	protected void removeFromSelf(RepositoryEvent event) {
+ 		IRepositoryManager manager = getRepositoryManager(event.getRepositoryType());
+-		if (manager != null)
++		Preferences node = getRepositoryPreferenceNode(null, event.getRepositoryLocation(), event.getRepositoryType());
++		int count = getRepositoryCount(node);
++		if ((--count < 1) && (manager != null))
+ 			manager.removeRepository(event.getRepositoryLocation());
++		setRepositoryCount(node, count);
+ 	}
+ 
+ 	/**
+@@ -159,29 +172,76 @@ abstract class RepositoryAction extends ProvisioningAction {
+ 	 * this profile.
+ 	 */
+ 	protected void removeRepositoryFromProfile(Profile profile, URI location, int type) {
+-		String key = type == IRepository.TYPE_METADATA ? IProfile.PROP_METADATA_REPOSITORIES : IProfile.PROP_ARTIFACT_REPOSITORIES;
+-		String encodedURI = encodeURI(location);
+-		String currentRepos = profile.getProperty(key);
+-		//if this profile has no associated repositories, we are done
+-		if (currentRepos == null)
+-			return;
+-		//find the matching location, if any
+-		StringTokenizer tokens = new StringTokenizer(currentRepos, ","); //$NON-NLS-1$
+-		StringBuffer result = new StringBuffer(currentRepos.length());
+-		boolean found = false;
+-		while (tokens.hasMoreTokens()) {
+-			final String nextLocation = tokens.nextToken();
+-			if (nextLocation.equals(encodedURI)) {
+-				found = true;
+-			} else {
+-				//add back any location not being removed
+-				result.append(nextLocation);
+-				if (tokens.hasMoreTokens())
+-					result.append(',');
++		Preferences node = getRepositoryPreferenceNode(profile, location, type);
++
++		int count = getRepositoryCount(node);
++		if (--count < 1) {
++			// TODO: Remove all associated values
++			try {
++				String[] keys = node.keys();
++
++				for (int i = 0; i < keys.length; i++)
++					node.remove(keys[i]);
++			} catch (BackingStoreException e) {
++				// TODO: Should this be passed back to be associated with State?
+ 			}
++
++		} else
++			setRepositoryCount(node, count);
++
++		try {
++			node.flush();
++		} catch (BackingStoreException e) {
++			// TODO: perhaps an Exception should be passed backwards and associated with State
+ 		}
+-		if (!found)
+-			return;
+-		profile.setProperty(key, result.toString());
++	}
++
++	/*
++	 * Get the counter associated with a repository 
++	 */
++	protected int getRepositoryCount(Preferences node) {
++		return node.getInt(REPOSITORY_COUNT, 0);
++	}
++
++	/*
++	 * Sets the counter associated with this repository to a specific value
++	 */
++	protected void setRepositoryCount(Preferences node, int count) {
++		if (count < 1)
++			node.remove(REPOSITORY_COUNT);
++		else
++			node.putInt(REPOSITORY_COUNT, count);
++	}
++
++	/*
++	 * Determine if a repository is already known
++	 */
++	protected boolean repositoryExists(Preferences node) {
++		if (node.get(KEY_URI, null) == null)
++			return false;
++		return true;
++	}
++
++	/*
++	 * Get the preference node associated with profile & location 
++	 */
++	protected Preferences getRepositoryPreferenceNode(Profile profile, URI location, int type) {
++		String key = type == IRepository.TYPE_METADATA ? METADATA_REPOSITORY : ARTIFACT_REPOSITORY;
++		IPreferencesService prefService = (IPreferencesService) ServiceHelper.getService(Activator.getContext(), IPreferencesService.class.getName());
++
++		if (profile != null)
++			return prefService.getRootNode().node("/profile/" + profile.getProfileId() + "/" + key + "/" + NODE_REPOSITORIES + "/" + getKey(location)); //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$//$NON-NLS-4$
++		return prefService.getRootNode().node("/profile/_SELF_/" + key + "/" + NODE_REPOSITORIES + "/" + getKey(location)); //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$
++	}
++
++	/*
++	 * Copied from AbstractRepositoryManager
++	 */
++	private String getKey(URI location) {
++		String key = location.toString().replace('/', '_');
++		//remove trailing slash
++		if (key.endsWith("_")) //$NON-NLS-1$
++			key = key.substring(0, key.length() - 1);
++		return key;
+ 	}
+ }

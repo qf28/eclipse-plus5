@@ -1,0 +1,622 @@
+commit b1643fb0dd4cc405c15575ca42415a27bfa710fd
+Author: Andrew Niefer <aniefer>
+Date:   Thu Feb 11 01:27:59 2010 +0000
+
+    bug 302283 - exclude artifacts from compare
+
+8	0	bundles/org.eclipse.equinox.p2.repository.tools/plugin.xml
+54	34	bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/mirroring/Mirroring.java
+8	2	bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/tools/MirrorApplication.java
+77	0	bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ArtifactDescription.java
+14	4	bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ComparatorDescription.java
+29	0	bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ElementList.java
+23	2	bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/MirrorTask.java
+15	1	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/p2/repository/artifact/ArtifactDescriptorQuery.java
+5	4	bundles/org.eclipse.equinox.p2.tests/All p2 Tests.launch
+9	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractAntProvisioningTest.java
+48	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ant/MirrorTaskTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/plugin.xml b/bundles/org.eclipse.equinox.p2.repository.tools/plugin.xml
+index db08b32..f48caf2 100644
+--- a/bundles/org.eclipse.equinox.p2.repository.tools/plugin.xml
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/plugin.xml
+@@ -151,5 +151,13 @@
+ 			</run>
+       </application>
+    </extension>
++ <extension
++       point="org.eclipse.ant.core.antTypes">
++    <antType
++          class="org.eclipse.equinox.p2.internal.repository.tools.tasks.ArtifactDescription"
++          library="lib/repository-tools-ant.jar"
++          name="artifact">
++    </antType>
++ </extension>
+ 
+ </plugin>
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/mirroring/Mirroring.java b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/mirroring/Mirroring.java
+index 8d2b993..c14a951 100644
+--- a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/mirroring/Mirroring.java
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/mirroring/Mirroring.java
+@@ -11,19 +11,20 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.internal.repository.mirroring;
+ 
+-import org.eclipse.equinox.p2.repository.tools.comparator.ArtifactComparatorFactory;
+-import org.eclipse.equinox.p2.repository.tools.comparator.IArtifactComparator;
+-
+ import java.util.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.artifact.repository.RawMirrorRequest;
++import org.eclipse.equinox.internal.p2.core.helpers.CollectionUtils;
+ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.internal.repository.tools.Activator;
+ import org.eclipse.equinox.p2.internal.repository.tools.Messages;
+ import org.eclipse.equinox.p2.metadata.IArtifactKey;
++import org.eclipse.equinox.p2.query.IQuery;
+ import org.eclipse.equinox.p2.query.IQueryResult;
+ import org.eclipse.equinox.p2.repository.artifact.*;
+ import org.eclipse.equinox.p2.repository.artifact.spi.ArtifactDescriptor;
++import org.eclipse.equinox.p2.repository.tools.comparator.ArtifactComparatorFactory;
++import org.eclipse.equinox.p2.repository.tools.comparator.IArtifactComparator;
+ import org.eclipse.osgi.util.NLS;
+ 
+ /**
+@@ -37,6 +38,8 @@ public class Mirroring {
+ 	private boolean compare = false;
+ 	private boolean validate = false;
+ 	private IArtifactComparator comparator;
++	private IQuery<IArtifactDescriptor> compareExclusionQuery = null;
++	private Set<IArtifactDescriptor> compareExclusions = CollectionUtils.<IArtifactDescriptor> emptySet();
+ 	private String comparatorID;
+ 	private List<IArtifactKey> keysToMirror;
+ 	private IArtifactMirrorLog comparatorLog;
+@@ -86,6 +89,12 @@ public class Mirroring {
+ 			IQueryResult<IArtifactKey> result = source.query(ArtifactKeyQuery.ALL_KEYS, null);
+ 			keys = result.iterator();
+ 		}
++
++		if (compareExclusionQuery != null) {
++			IQueryResult<IArtifactDescriptor> exclusions = source.descriptorQueryable().query(compareExclusionQuery, null);
++			compareExclusions = exclusions.unmodifiableSet();
++		}
++
+ 		while (keys.hasNext()) {
+ 			IArtifactKey key = keys.next();
+ 			IArtifactDescriptor[] descriptors = source.getArtifactDescriptors(key);
+@@ -108,44 +117,48 @@ public class Mirroring {
+ 		return multiStatus;
+ 	}
+ 
+-	private IStatus mirror(IArtifactDescriptor descriptor, boolean verbose) {
+-		IArtifactDescriptor newDescriptor = raw ? descriptor : new ArtifactDescriptor(descriptor);
++	private IStatus mirror(IArtifactDescriptor sourceDescriptor, boolean verbose) {
++		IArtifactDescriptor targetDescriptor = raw ? sourceDescriptor : new ArtifactDescriptor(sourceDescriptor);
++		IArtifactDescriptor baselineDescriptor = getBaselineDescriptor(sourceDescriptor);
+ 
+ 		if (verbose)
+-			System.out.println("Mirroring: " + descriptor.getArtifactKey() + " (Descriptor: " + descriptor + ")"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+-
+-		if (compare && baseline != null)
+-			if (baseline.contains(descriptor)) {
+-				// we have to create an output stream based on the descriptor found in the baseline otherwise all
+-				// the properties will be copied over from the wrong descriptor and our repository will be inconsistent.
+-				IArtifactDescriptor baselineDescriptor = getBaselineDescriptor(descriptor);
+-
+-				// if we found a descriptor in the baseline then we'll use it to copy the artifact
+-				if (baselineDescriptor != null) {
+-					MultiStatus status = new MultiStatus(Activator.ID, IStatus.OK, NLS.bind(Messages.Mirroring_compareAndDownload, descriptor), null);
+-					//Compare source against baseline
+-					IStatus comparison = getComparator().compare(baseline, baselineDescriptor, source, descriptor);
+-					if (comparatorLog != null)
+-						comparatorLog.log(baselineDescriptor, comparison);
+-					status.add(comparison);
+-					if (destination.contains(baselineDescriptor))
+-						return compareToDestination(baselineDescriptor);
+-
+-					//download artifact from baseline
+-					status.add(downloadArtifact(baseline, baselineDescriptor, baselineDescriptor));
+-					return status;
++			System.out.println("Mirroring: " + sourceDescriptor.getArtifactKey() + " (Descriptor: " + sourceDescriptor + ")"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++
++		MultiStatus compareStatus = new MultiStatus(Activator.ID, IStatus.OK, null, null);
++		boolean comparing = compare && !compareExclusions.contains(sourceDescriptor);
++		if (comparing) {
++			if (baselineDescriptor != null) {
++				//compare source & baseline
++				compareStatus.add(compare(baseline, baselineDescriptor, source, sourceDescriptor));
++				//compare baseline & destination
++				if (destination.contains(baselineDescriptor)) {
++					compareStatus.add(compareToDestination(baselineDescriptor));
++					return compareStatus;
+ 				}
++			} else if (destination.contains(targetDescriptor)) {
++				compareStatus.add(compareToDestination(sourceDescriptor));
++				return compareStatus;
+ 			}
++		}
+ 
+-		// Check if the destination already contains the file. 
+-		if (destination.contains(newDescriptor)) {
+-			if (compare)
+-				return compareToDestination(descriptor);
+-			String message = NLS.bind(Messages.mirror_alreadyExists, descriptor, destination);
+-			return new Status(IStatus.INFO, Activator.ID, ProvisionException.ARTIFACT_EXISTS, message, null);
++		//from source or baseline
++		IArtifactRepository sourceRepository = baselineDescriptor != null ? baseline : source;
++		sourceDescriptor = baselineDescriptor != null ? baselineDescriptor : sourceDescriptor;
++		targetDescriptor = baselineDescriptor != null ? baselineDescriptor : targetDescriptor;
++		IStatus status = null;
++		if (!destination.contains(targetDescriptor))
++			//actual download
++			status = downloadArtifact(sourceRepository, targetDescriptor, sourceDescriptor);
++		else {
++			String message = NLS.bind(Messages.mirror_alreadyExists, sourceDescriptor, destination);
++			status = new Status(IStatus.INFO, Activator.ID, ProvisionException.ARTIFACT_EXISTS, message, null);
+ 		}
+ 
+-		return downloadArtifact(source, newDescriptor, descriptor);
++		if (comparing) {
++			compareStatus.add(status);
++			return compareStatus;
++		}
++		return status;
+ 	}
+ 
+ 	/**
+@@ -195,6 +208,9 @@ public class Mirroring {
+ 	 *  Get the equivalent descriptor from the baseline repository
+ 	 */
+ 	private IArtifactDescriptor getBaselineDescriptor(IArtifactDescriptor descriptor) {
++		if (baseline == null || !baseline.contains(descriptor))
++			return null;
++
+ 		IArtifactDescriptor[] baselineDescriptors = baseline.getArtifactDescriptors(descriptor.getArtifactKey());
+ 		for (int i = 0; i < baselineDescriptors.length; i++) {
+ 			if (baselineDescriptors[i].equals(descriptor))
+@@ -288,4 +304,8 @@ public class Mirroring {
+ 			return -1;
+ 		}
+ 	}
++
++	public void setCompareExclusions(IQuery<IArtifactDescriptor> excludedKeys) {
++		compareExclusionQuery = excludedKeys;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/tools/MirrorApplication.java b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/tools/MirrorApplication.java
+index 40b2e01..9f5665b 100644
+--- a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/tools/MirrorApplication.java
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/tools/MirrorApplication.java
+@@ -25,8 +25,8 @@ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.internal.repository.mirroring.*;
+ import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+-import org.eclipse.equinox.p2.query.IQueryResult;
+-import org.eclipse.equinox.p2.query.IQueryable;
++import org.eclipse.equinox.p2.query.*;
++import org.eclipse.equinox.p2.repository.artifact.IArtifactDescriptor;
+ import org.eclipse.equinox.p2.repository.artifact.IArtifactRepository;
+ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepository;
+ import org.eclipse.osgi.util.NLS;
+@@ -39,6 +39,7 @@ public class MirrorApplication extends AbstractApplication implements IApplicati
+ 
+ 	private URI baseline;
+ 	private String comparatorID;
++	private IQuery<IArtifactDescriptor> compareExclusions = null;
+ 	private boolean compare = false;
+ 	private boolean failOnError = true;
+ 	private boolean raw = true;
+@@ -208,6 +209,7 @@ public class MirrorApplication extends AbstractApplication implements IApplicati
+ 		mirror.setComparatorId(comparatorID);
+ 		mirror.setBaseline(initializeBaseline());
+ 		mirror.setValidate(validate);
++		mirror.setCompareExclusions(compareExclusions);
+ 
+ 		// If IUs have been specified then only they should be mirrored, otherwise mirror everything.
+ 		if (keys.size() > 0)
+@@ -407,4 +409,8 @@ public class MirrorApplication extends AbstractApplication implements IApplicati
+ 	public void setValidate(boolean value) {
+ 		validate = value;
+ 	}
++
++	public void setComparatorExclusions(IQuery<IArtifactDescriptor> exclusions) {
++		compareExclusions = exclusions;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ArtifactDescription.java b/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ArtifactDescription.java
+new file mode 100644
+index 0000000..09d09b7
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ArtifactDescription.java
+@@ -0,0 +1,77 @@
++package org.eclipse.equinox.p2.internal.repository.tools.tasks;
++
++import java.util.Properties;
++import org.apache.tools.ant.types.DataType;
++import org.apache.tools.ant.types.Parameter;
++import org.eclipse.equinox.p2.metadata.*;
++import org.eclipse.equinox.p2.query.IQuery;
++import org.eclipse.equinox.p2.repository.artifact.*;
++
++public class ArtifactDescription extends DataType {
++
++	private String classifier = null;
++	private String id = null;
++	private String version = null;
++	private String range = null;
++	private Properties properties = null;
++
++	public void setClassifier(String classifier) {
++		this.classifier = classifier;
++	}
++
++	public void setId(String id) {
++		this.id = id;
++	}
++
++	public void setVersion(String version) {
++		this.version = version;
++	}
++
++	public void setRange(String range) {
++		this.range = range;
++	}
++
++	public void addConfiguredProperty(Parameter property) {
++		if (properties == null)
++			properties = new Properties();
++
++		properties.put(property.getName(), property.getValue());
++	}
++
++	public String getClassifier() {
++		return classifier;
++	}
++
++	public String getId() {
++		return id;
++	}
++
++	public String getVersion() {
++		return version;
++	}
++
++	public IQuery<IArtifactKey> createKeyQuery() {
++		VersionRange keyRange = null;
++		if (range != null)
++			keyRange = new VersionRange(range);
++		else if (version != null) {
++			Version keyVersion = Version.parseVersion(version);
++			keyRange = new VersionRange(keyVersion, true, keyVersion, true);
++		}
++		return new ArtifactKeyQuery(classifier, id, keyRange);
++	}
++
++	public IQuery<IArtifactDescriptor> createDescriptorQuery() {
++		VersionRange keyRange = null;
++		if (range != null)
++			keyRange = new VersionRange(range);
++		else if (version != null) {
++			Version keyVersion = Version.parseVersion(version);
++			keyRange = new VersionRange(keyVersion, true, keyVersion, true);
++		}
++
++		ArtifactDescriptorQuery query = new ArtifactDescriptorQuery(id, keyRange, null);
++		query.setProperties(properties);
++		return query;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ComparatorDescription.java b/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ComparatorDescription.java
+index 9ec3fc3..437a6dd 100644
+--- a/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ComparatorDescription.java
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ComparatorDescription.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- *  Copyright (c) 2009 IBM Corporation and others.
++ *  Copyright (c) 2009, 2010 IBM Corporation and others.
+  *  All rights reserved. This program and the accompanying materials
+  *  are made available under the terms of the Eclipse Public License v1.0
+  *  which accompanies this distribution, and is available at
+@@ -11,13 +11,15 @@
+ package org.eclipse.equinox.p2.internal.repository.tools.tasks;
+ 
+ import java.io.File;
++import java.util.List;
+ import org.apache.tools.ant.types.DataType;
+ 
+ public class ComparatorDescription extends DataType {
+ 
+-	DestinationRepository baseline;
+-	String comparatorId;
+-	File comparatorLog;
++	private DestinationRepository baseline;
++	private String comparatorId;
++	private File comparatorLog;
++	private List<ArtifactDescription> excludedArtifacts = null;
+ 
+ 	/*
+ 	 * Set the baseline repository to compare to
+@@ -26,6 +28,10 @@ public class ComparatorDescription extends DataType {
+ 		this.baseline = value;
+ 	}
+ 
++	public void addConfiguredExclude(ElementList<ArtifactDescription> excludeList) {
++		excludedArtifacts = excludeList.getElements();
++	}
++
+ 	/*
+ 	 * Set the comparator to use
+ 	 */
+@@ -51,4 +57,8 @@ public class ComparatorDescription extends DataType {
+ 	public File getComparatorLog() {
+ 		return comparatorLog;
+ 	}
++
++	public List<ArtifactDescription> getExcluded() {
++		return excludedArtifacts;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ElementList.java b/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ElementList.java
+new file mode 100644
+index 0000000..6968e42
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/ElementList.java
+@@ -0,0 +1,29 @@
++/*******************************************************************************
++ * Copyright (c) 2010 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials 
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++
++package org.eclipse.equinox.p2.internal.repository.tools.tasks;
++
++import java.util.ArrayList;
++import java.util.List;
++import org.apache.tools.ant.types.DataType;
++
++public class ElementList<T> extends DataType {
++
++	private List<T> elements = new ArrayList<T>();
++
++	public void addConfigured(T element) {
++		elements.add(element);
++	}
++
++	public List<T> getElements() {
++		return elements;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/MirrorTask.java b/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/MirrorTask.java
+index 71f2b8b..cb46620 100644
+--- a/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/MirrorTask.java
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src_ant/org/eclipse/equinox/p2/internal/repository/tools/tasks/MirrorTask.java
+@@ -10,15 +10,18 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.internal.repository.tools.tasks;
+ 
+-import org.eclipse.equinox.p2.core.ProvisionException;
+-
+ import java.io.File;
++import java.util.ArrayList;
+ import java.util.List;
+ import org.apache.tools.ant.BuildException;
+ import org.eclipse.core.runtime.IStatus;
++import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.internal.repository.tools.Messages;
+ import org.eclipse.equinox.p2.internal.repository.tools.MirrorApplication;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
++import org.eclipse.equinox.p2.query.CompoundQuery;
++import org.eclipse.equinox.p2.query.IQuery;
++import org.eclipse.equinox.p2.repository.artifact.IArtifactDescriptor;
+ 
+ public class MirrorTask extends AbstractRepositoryTask {
+ 
+@@ -48,6 +51,7 @@ public class MirrorTask extends AbstractRepositoryTask {
+ 				// Set comparator log
+ 				if (comparator.getComparatorLog() != null)
+ 					((MirrorApplication) application).setComparatorLog(comparator.getComparatorLog());
++				((MirrorApplication) application).setComparatorExclusions(createCompareExclusions());
+ 			}
+ 
+ 			prepareSourceRepos();
+@@ -65,6 +69,23 @@ public class MirrorTask extends AbstractRepositoryTask {
+ 		}
+ 	}
+ 
++	private IQuery<IArtifactDescriptor> createCompareExclusions() {
++		if (comparator == null || comparator.getExcluded() == null)
++			return null;
++
++		List<ArtifactDescription> artifacts = comparator.getExcluded();
++		List<IQuery<IArtifactDescriptor>> queries = new ArrayList<IQuery<IArtifactDescriptor>>();
++		for (ArtifactDescription artifactDescription : artifacts)
++			queries.add(artifactDescription.createDescriptorQuery());
++
++		if (queries.size() == 1)
++			return queries.get(0);
++
++		@SuppressWarnings("unchecked")
++		IQuery<IArtifactDescriptor>[] array = queries.toArray(new IQuery[queries.size()]);
++		return CompoundQuery.<IArtifactDescriptor> createCompoundQuery(array, false);
++	}
++
+ 	public SlicingOption createSlicingOptions() {
+ 		SlicingOption options = new SlicingOption();
+ 		((MirrorApplication) application).setSlicingOptions(options.getOptions());
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/p2/repository/artifact/ArtifactDescriptorQuery.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/p2/repository/artifact/ArtifactDescriptorQuery.java
+index 1347b8f..db9fd60 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/p2/repository/artifact/ArtifactDescriptorQuery.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/p2/repository/artifact/ArtifactDescriptorQuery.java
+@@ -11,8 +11,9 @@
+ 
+ package org.eclipse.equinox.p2.repository.artifact;
+ 
++import java.util.Iterator;
++import java.util.Properties;
+ import org.eclipse.equinox.p2.metadata.VersionRange;
+-
+ import org.eclipse.equinox.p2.query.MatchQuery;
+ import org.eclipse.equinox.p2.repository.artifact.spi.ArtifactDescriptor;
+ 
+@@ -27,6 +28,7 @@ public class ArtifactDescriptorQuery extends MatchQuery<IArtifactDescriptor> {
+ 	private String format = null;
+ 	private ArtifactDescriptor descriptor = null;
+ 	private IArtifactRepository repository = null;
++	private Properties properties = null;
+ 
+ 	/**
+ 	 * The query will match descriptors with the given id, version and format
+@@ -58,6 +60,10 @@ public class ArtifactDescriptorQuery extends MatchQuery<IArtifactDescriptor> {
+ 		//matches everything
+ 	}
+ 
++	public void setProperties(Properties properties) {
++		this.properties = properties;
++	}
++
+ 	/**
+ 	 * The query will match candidate descriptors where
+ 	 *          new ArtifactDescriptor(descriptor).equals(new ArtifactDescriptor(candidate))
+@@ -83,6 +89,14 @@ public class ArtifactDescriptorQuery extends MatchQuery<IArtifactDescriptor> {
+ 		if (repository != null && repository != candidate.getRepository())
+ 			return false;
+ 
++		if (properties != null) {
++			for (Iterator<Object> iterator = properties.keySet().iterator(); iterator.hasNext();) {
++				String key = (String) iterator.next();
++				String value = properties.getProperty(key);
++				if (value != null && !value.equals(candidate.getProperty(key)))
++					return false;
++			}
++		}
+ 		return true;
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/All p2 Tests.launch b/bundles/org.eclipse.equinox.p2.tests/All p2 Tests.launch
+index 3cd7574..1f4dd03 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/All p2 Tests.launch	
++++ b/bundles/org.eclipse.equinox.p2.tests/All p2 Tests.launch	
+@@ -1,5 +1,4 @@
+-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+-<launchConfiguration type="org.eclipse.pde.ui.JunitLaunchConfig">
++<?xml version="1.0" encoding="UTF-8"?><launchConfiguration type="org.eclipse.pde.ui.JunitLaunchConfig">
+ <booleanAttribute key="append.args" value="true"/>
+ <stringAttribute key="application" value="org.eclipse.pde.junit.runtime.coretestapplication"/>
+ <booleanAttribute key="askclear" value="false"/>
+@@ -53,18 +52,20 @@
+ <booleanAttribute key="org.eclipse.jdt.junit.KEEPRUNNING_ATTR" value="false"/>
+ <stringAttribute key="org.eclipse.jdt.junit.TESTNAME" value=""/>
+ <stringAttribute key="org.eclipse.jdt.junit.TEST_KIND" value="org.eclipse.jdt.junit.loader.junit4"/>
++<stringAttribute key="org.eclipse.jdt.launching.JRE_CONTAINER" value="org.eclipse.jdt.launching.JRE_CONTAINER/org.eclipse.jdt.internal.debug.ui.launcher.StandardVMType/IBM-1.6.0-20090519-SR5"/>
+ <stringAttribute key="org.eclipse.jdt.launching.MAIN_TYPE" value="org.eclipse.equinox.p2.tests.AutomatedTests"/>
+ <stringAttribute key="org.eclipse.jdt.launching.PROGRAM_ARGUMENTS" value="-os ${target.os} -ws ${target.ws} -arch ${target.arch} -nl ${target.nl} -consolelog -console"/>
+ <stringAttribute key="org.eclipse.jdt.launching.PROJECT_ATTR" value="org.eclipse.equinox.p2.tests"/>
+ <stringAttribute key="org.eclipse.jdt.launching.SOURCE_PATH_PROVIDER" value="org.eclipse.pde.ui.workbenchClasspathProvider"/>
+-<stringAttribute key="org.eclipse.jdt.launching.VM_ARGUMENTS" value="-Dorg.eclipse.equinox.p2.reconciler.tests.platform.archive=c:/builds/eclipse-platform-I20090811-0800-win32.zip&#13;&#10;-Dorg.eclipse.equinox.p2.reconciler.tests.35.platform.archive=c:/builds/eclipse-platform-3.5-win32.zip&#13;&#10;-Dorg.eclipse.equinox.p2.repository&#13;&#10;-Dorg.eclipse.equinox.p2.tests.current.build.repo=http://eclipsebuildserv/3.6-I-builds/&#13;&#13;&#10;-Xmx512m"/>
++<stringAttribute key="org.eclipse.jdt.launching.VM_ARGUMENTS" value="-Dorg.eclipse.equinox.p2.reconciler.tests.platform.archive=c:/dev/platform/zips/eclipse-platform-I20100119-0800-win32.zip&#13;&#10;-Dorg.eclipse.equinox.p2.reconciler.tests.35.platform.archive=c:/dev/platform/zips/eclipse-platform-3.5-win32.zip&#13;&#10;-Dorg.eclipse.equinox.p2.repository&#13;&#10;-Dorg.eclipse.equinox.p2.tests.current.build.repo=http://eclipsebuildserv/3.6-I-builds/&#13;&#13;&#10;-Xmx512m"/>
+ <stringAttribute key="pde.version" value="3.3"/>
+ <stringAttribute key="product" value="org.eclipse.sdk.ide"/>
+ <booleanAttribute key="run_in_ui_thread" value="true"/>
+ <booleanAttribute key="show_selected_only" value="false"/>
+ <stringAttribute key="templateConfig" value="${target_home}\configuration\config.ini"/>
+ <booleanAttribute key="tracing" value="false"/>
++<booleanAttribute key="useCustomFeatures" value="false"/>
+ <booleanAttribute key="useDefaultConfig" value="true"/>
+ <booleanAttribute key="useDefaultConfigArea" value="false"/>
+ <booleanAttribute key="useProduct" value="false"/>
+-</launchConfiguration>
++</launchConfiguration>
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractAntProvisioningTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractAntProvisioningTest.java
+index 0a82e05..b87b90e 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractAntProvisioningTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractAntProvisioningTest.java
+@@ -207,6 +207,15 @@ public class AbstractAntProvisioningTest extends AbstractProvisioningTest {
+ 			this.name = name;
+ 		}
+ 
++		public AntTaskElement(String name, String[] attributes) {
++			this.name = name;
++			if (attributes != null && attributes.length > 0) {
++				if (attributes.length % 2 != 0)
++					throw new IllegalStateException();
++				this.attributes.addAll(Arrays.asList(attributes));
++			}
++		}
++
+ 		public void addAttribute(String attribute, String value) {
+ 			attributes.add(attribute);
+ 			attributes.add(value);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ant/MirrorTaskTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ant/MirrorTaskTest.java
+index fd244eb..0d54161 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ant/MirrorTaskTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/ant/MirrorTaskTest.java
+@@ -15,9 +15,12 @@ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.util.Iterator;
+ import java.util.Properties;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipOutputStream;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.artifact.processors.md5.Messages;
+ import org.eclipse.equinox.internal.p2.director.PermissiveSlicer;
++import org.eclipse.equinox.internal.p2.metadata.ArtifactKey;
+ import org.eclipse.equinox.internal.p2.metadata.InstallableUnit;
+ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.internal.repository.comparator.MD5ArtifactComparator;
+@@ -587,6 +590,51 @@ public class MirrorTaskTest extends AbstractAntProvisioningTest {
+ 		assertArtifactKeyContentEquals("Different ArtifactKeys", result.query(InstallableUnitQuery.ANY, new NullProgressMonitor()), destinationRepo);
+ 	}
+ 
++	public void testMirrorCompareWithIgnore() throws Exception {
++		File testFolder = getTestFolder("mirrorWithIgnore");
++		File base = new File(testFolder, "base");
++		File source = new File(testFolder, "source");
++		File dest = new File(testFolder, "destination");
++
++		//some content for our fake bundles
++		Properties props = new Properties();
++		props.put("key", "value");
++
++		IArtifactKey key = new ArtifactKey("osgi.bundle", "a", Version.parseVersion("1.0.0"));
++		IArtifactRepository[] repos = new IArtifactRepository[] {createArtifactRepository(base.toURI(), null), createArtifactRepository(source.toURI(), null)};
++		for (int i = 0; i < 2; i++) {
++			ZipOutputStream stream = new ZipOutputStream(repos[i].getOutputStream(repos[i].createArtifactDescriptor(key)));
++			ZipEntry entry = new ZipEntry("file.properties");
++			stream.putNextEntry(entry);
++			props.store(stream, String.valueOf(i));
++			stream.closeEntry();
++			stream.close();
++		}
++		key = new ArtifactKey("osgi.bundle", "b", Version.parseVersion("1.0.0"));
++		for (int i = 0; i < 2; i++) {
++			ZipOutputStream stream = new ZipOutputStream(repos[i].getOutputStream(repos[i].createArtifactDescriptor(key)));
++			ZipEntry entry = new ZipEntry("file.properties");
++			stream.putNextEntry(entry);
++			props.put("boo", String.valueOf(i));
++			props.store(stream, String.valueOf(i));
++			stream.closeEntry();
++			stream.close();
++		}
++
++		AntTaskElement mirror = createMirrorTask(TYPE_ARTIFACT);
++		mirror.addElement(new AntTaskElement("source", new String[] {"location", URIUtil.toUnencodedString(source.toURI()), "kind", "artifact"}));
++		mirror.addElement(new AntTaskElement("destination", new String[] {"location", URIUtil.toUnencodedString(dest.toURI()), "kind", "artifact"}));
++		AntTaskElement comparator = new AntTaskElement("comparator");
++		comparator.addAttribute("comparator", "org.eclipse.equinox.p2.repository.tools.jar.comparator");
++		comparator.addAttribute("comparatorLog", new File(testFolder, "log.txt").getAbsolutePath());
++		comparator.addElement(new AntTaskElement("repository", new String[] {"location", URIUtil.toUnencodedString(base.toURI())}));
++		AntTaskElement exclude = new AntTaskElement("exclude");
++		exclude.addElement(new AntTaskElement("artifact", new String[] {"id", "b"}));
++		comparator.addElement(exclude);
++		mirror.addElement(comparator);
++		runAntTask();
++	}
++
+ 	/*
+ 	 * Test the ability to slice an IU and mirror only the artifacts
+ 	 */

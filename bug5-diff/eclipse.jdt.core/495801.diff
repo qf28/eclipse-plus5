@@ -1,0 +1,836 @@
+commit 667e56a9d9129b25d42167e15e3a2a5164190faa
+Author: Manoj Palat <manpalat@in.ibm.com>
+Date:   Thu Jun 9 22:18:50 2016 +0530
+
+    Fix for bug 495801 [1.9] [code completion] requires module reference
+    completion
+
+3	0	org.eclipse.jdt.core.tests.performance/src/org/eclipse/jdt/core/tests/performance/FullSourceWorkspaceModelTests.java
+47	11	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+2	0	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/ISearchRequestor.java
+9	0	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/InternalCompletionProposal.java
+4	0	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/MissingTypesGuesser.java
+6	0	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/SelectionEngine.java
+4	0	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionOnModuleReference.java
+18	4	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionParser.java
+67	0	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+34	0	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnModuleReference.java
+5	0	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
+9	9	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+13	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredElement.java
+2	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/IJavaElementRequestor.java
+3	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaElementRequestor.java
+18	6	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+13	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+4	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironmentRequestor.java
+7	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SingleTypeRequestor.java
+diff --git a/org.eclipse.jdt.core.tests.performance/src/org/eclipse/jdt/core/tests/performance/FullSourceWorkspaceModelTests.java b/org.eclipse.jdt.core.tests.performance/src/org/eclipse/jdt/core/tests/performance/FullSourceWorkspaceModelTests.java
+index 91ee0cd..2475f25 100644
+--- a/org.eclipse.jdt.core.tests.performance/src/org/eclipse/jdt/core/tests/performance/FullSourceWorkspaceModelTests.java
++++ b/org.eclipse.jdt.core.tests.performance/src/org/eclipse/jdt/core/tests/performance/FullSourceWorkspaceModelTests.java
+@@ -60,6 +60,7 @@ import org.eclipse.jdt.core.search.SearchRequestor;
+ import org.eclipse.jdt.core.search.TypeNameRequestor;
+ import org.eclipse.jdt.core.tests.model.AbstractJavaModelTests;
+ import org.eclipse.jdt.core.tests.model.AbstractJavaModelTests.ProblemRequestor;
++import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.core.DefaultWorkingCopyOwner;
+ import org.eclipse.jdt.internal.core.IJavaElementRequestor;
+ import org.eclipse.jdt.internal.core.JavaElement;
+@@ -1122,6 +1123,8 @@ public void testSeekPackageFragments() throws CoreException {
+ 		public boolean isCanceled() {
+ 			return false;
+ 		}
++		@Override
++		public void acceptModule(IModule module) {}
+ 	}
+ 
+ 	// first pass: ensure all class are loaded, and ensure that the test works as expected
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+index 2259b64..8603713 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+@@ -565,6 +565,7 @@ public final class CompletionEngine
+ 	String complianceLevel;
+ 	SimpleSetOfCharArray validPackageNames = new SimpleSetOfCharArray(10);
+ 	SimpleSetOfCharArray invalidPackageNames = new SimpleSetOfCharArray(1);
++	HashtableOfObject knownModules = new HashtableOfObject(10);
+ 	HashtableOfObject knownPkgs = new HashtableOfObject(10);
+ 	HashtableOfObject knownTypes = new HashtableOfObject(10);
+ 	
+@@ -1117,6 +1118,40 @@ public final class CompletionEngine
+ 			this.acceptedTypes = null; // reset
+ 		}
+ 	}
++	
++	/**
++	 * One result of the search consists of a new module.
++	 *
++	 * NOTE - All module names are presented in their readable form:
++	 *    Module names are in the form "a.b.c".
++	 *    The default module is represented by an empty array.
++	 */
++	public void acceptModule(char[] moduleName) {
++		if (this.knownModules.containsKey(moduleName)) return;
++		this.knownModules.put(moduleName, this);
++		char[] completion = moduleName;
++		int relevance = computeBaseRelevance();
++		relevance += computeRelevanceForResolution();
++		relevance += computeRelevanceForInterestingProposal();
++		relevance += computeRelevanceForCaseMatching(this.qualifiedCompletionToken == null ? this.completionToken : this.qualifiedCompletionToken, moduleName);
++		relevance += computeRelevanceForQualification(true);
++		relevance += computeRelevanceForRestrictions(IAccessRule.K_ACCESSIBLE);
++		this.noProposal = false;
++		if(!this.requestor.isIgnored(CompletionProposal.MODULE_REF)) {
++			InternalCompletionProposal proposal = createProposal(CompletionProposal.MODULE_REF, this.actualCompletionPosition);
++			proposal.setModuleName(moduleName);
++			proposal.setDeclarationSignature(moduleName);
++			proposal.setCompletion(completion);
++			proposal.setReplaceRange(this.startPosition - this.offset, this.endPosition - this.offset);
++			proposal.setTokenRange(this.tokenStart - this.offset, this.tokenEnd - this.offset);
++			proposal.setRelevance(relevance);
++			this.requestor.accept(proposal);
++			if(DEBUG) {
++				this.printDebug(proposal);
++			}
++		}
++		
++	}
+ 
+ 	/**
+ 	 * One result of the search consists of a new package.
+@@ -1881,9 +1916,10 @@ public final class CompletionEngine
+ 								ModuleReference target = targets[j];
+ 								if (target == null) break;
+ 								if (target instanceof CompletionOnModuleReference) {
++									this.requestor.setIgnored(CompletionProposal.MODULE_REF, false); //TODO: Hack until ui fixes this issue.
+ 									if(!this.requestor.isIgnored(CompletionProposal.MODULE_REF)) {
+ 										contextAccepted = true;
+-										findModules((CompletionOnModuleReference) target);//TODO: find Modules
++										findModules((CompletionOnModuleReference) target);
+ 									}
+ 									debugPrintf();
+ 									return;
+@@ -1901,6 +1937,7 @@ public final class CompletionEngine
+ 							if (reference instanceof CompletionOnModuleReference) {
+ 								contextAccepted = true;
+ 								buildContext(reference, null, parsedUnit, null, null);
++								this.requestor.setIgnored(CompletionProposal.MODULE_REF, false); //TODO: Hack until ui fixes this issue.
+ 								if(!this.requestor.isIgnored(CompletionProposal.MODULE_REF)) {
+ 									findModules((CompletionOnModuleReference) reference);
+ 								}
+@@ -10384,16 +10421,14 @@ public final class CompletionEngine
+ 	}
+ 	private void findModules(CompletionOnModuleReference moduleReference) {
+ 
+-		//TODO: Waiting for findModules lookup implementation.
+-		return;
+-//		this.completionToken = CharOperation.concatWith(moduleReference.tokens, '.');
+-//		if (this.completionToken.length == 0)
+-//			return;
+-//
+-//		setSourceRange(moduleReference.sourceStart, moduleReference.sourceEnd);
+-//		long completionPosition = moduleReference.sourcePositions[moduleReference.sourcePositions.length - 1];
+-//		setTokenRange((int) (completionPosition >>> 32), (int) completionPosition);
+-//		this.nameEnvironment.findModules(CharOperation.toLowerCase(this.completionToken), this);
++		this.completionToken = CharOperation.concatWith(moduleReference.tokens, '.');
++		if (this.completionToken.length == 0)
++			return;
++
++		setSourceRange(moduleReference.sourceStart, moduleReference.sourceEnd);
++		long completionPosition = moduleReference.sourcePositions[moduleReference.sourcePositions.length - 1];
++		setTokenRange((int) (completionPosition >>> 32), (int) completionPosition);
++		this.nameEnvironment.findModules(CharOperation.toLowerCase(this.completionToken), this);
+ 	}
+ 	private void findPackages(CompletionOnExportReference exportStatement) {
+ 
+@@ -13059,6 +13094,7 @@ public final class CompletionEngine
+ 		super.reset(false);
+ 		this.validPackageNames = new SimpleSetOfCharArray(10);
+ 		this.invalidPackageNames = new SimpleSetOfCharArray(1);
++		this.knownModules = new HashtableOfObject(10);
+ 		this.knownPkgs = new HashtableOfObject(10);
+ 		this.knownTypes = new HashtableOfObject(10);
+ 		if (this.noCacheNameEnvironment != null) {
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/ISearchRequestor.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/ISearchRequestor.java
+index 23beccc..f87241b 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/ISearchRequestor.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/ISearchRequestor.java
+@@ -90,4 +90,6 @@ public interface ISearchRequestor {
+ 	 *    The default package is represented by an empty array.
+ 	 */
+ 	public void acceptPackage(char[] packageName);
++	
++	public void acceptModule(char[] moduleName);
+ }
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/InternalCompletionProposal.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/InternalCompletionProposal.java
+index b2427c4..898d630 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/InternalCompletionProposal.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/InternalCompletionProposal.java
+@@ -50,6 +50,7 @@ public class InternalCompletionProposal extends CompletionProposal {
+ 
+ 	protected char[] declarationPackageName;
+ 	protected char[] declarationTypeName;
++	protected char[] moduleName;
+ 	protected char[] packageName;
+ 	protected char[] typeName;
+ 	protected char[][] parameterPackageNames;
+@@ -377,6 +378,10 @@ public class InternalCompletionProposal extends CompletionProposal {
+ 		return JavaModelManager.getJavaModelManager().getOpenableCacheSize() / 10;
+ 	}
+ 
++	protected char[] getModuleName() {
++		return this.moduleName;
++	}
++
+ 	protected char[] getPackageName() {
+ 		return this.packageName;
+ 	}
+@@ -402,6 +407,10 @@ public class InternalCompletionProposal extends CompletionProposal {
+ 		this.declarationTypeName = declarationTypeName;
+ 	}
+ 
++	protected void setModuleName(char[] moduleName) {
++		this.moduleName = moduleName;
++	}
++
+ 	protected void setPackageName(char[] packageName) {
+ 		this.packageName = packageName;
+ 	}
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/MissingTypesGuesser.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/MissingTypesGuesser.java
+index 1d2c010..16dcd1e 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/MissingTypesGuesser.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/MissingTypesGuesser.java
+@@ -477,6 +477,10 @@ public class MissingTypesGuesser extends ASTVisitor {
+ 					AccessRestriction access) {
+ 				// constructors aren't searched
+ 			}
++			@Override
++			public void acceptModule(char[] moduleName) {
++				// TODO Auto-generated method stub
++			}
+ 			public void acceptPackage(char[] packageName) {
+ 				// package aren't searched
+ 			}
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/SelectionEngine.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/SelectionEngine.java
+index ee14c30..c139857 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/SelectionEngine.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/SelectionEngine.java
+@@ -1851,4 +1851,10 @@ public final class SelectionEngine extends Engine implements ISearchRequestor {
+ 			return InheritDocVisitor.CONTINUE;
+ 		}
+ 	}
++
++	@Override
++	public void acceptModule(char[] moduleName) {
++		// TODO Auto-generated method stub
++		
++	}
+ }
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionOnModuleReference.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionOnModuleReference.java
+index 831c498..5b04de7 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionOnModuleReference.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionOnModuleReference.java
+@@ -25,6 +25,10 @@ public class CompletionOnModuleReference extends ModuleReference implements Comp
+ 	public CompletionOnModuleReference(char[][] tokens, long[] sourcePositions) {
+ 		super(tokens, sourcePositions);
+ 	}
++	public CompletionOnModuleReference(char[][] tokens, long[] sourcePositions, int modifiers) {
++		this(tokens, sourcePositions);
++		this.modifiers = modifiers;
++	}
+ 	@Override
+ 	public char[] getToken() {
+ 		// TODO Auto-generated method stub
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionParser.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionParser.java
+index 97ffd96..9b6eba5 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionParser.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionParser.java
+@@ -85,6 +85,7 @@ public class CompletionParser extends AssistParser {
+ 	// added for https://bugs.eclipse.org/bugs/show_bug.cgi?id=261534
+ 	protected static final int K_BETWEEN_INSTANCEOF_AND_RPAREN = COMPLETION_PARSER + 41;
+ 	protected static final int K_INSIDE_IMPORT_STATEMENT = COMPLETION_PARSER + 43;
++	protected static final int K_INSIDE_EXPORTS_STATEMENT = COMPLETION_PARSER + 44;
+ 
+ 
+ 	public final static char[] FAKE_TYPE_NAME = new char[]{' '};
+@@ -1568,8 +1569,9 @@ private boolean checkModuleInfoConstructs() {
+ 					}
+ 					break;
+ 				case REQUIRES_STATEMENT:
+-					module.add(new CompletionOnModuleReference(ident, pos), 0);
+-					return true;
++//					module.add(new CompletionOnModuleReference(ident, pos), 0);
++//					return true;
++					break;
+ 				case USES_STATEMENT:
+ 					formCompletionOnUsesTypeRef(index, length, module);
+ 					return true;
+@@ -3509,6 +3511,7 @@ protected void consumeRestoreDiet() {
+ protected void consumeExportsStatement() {
+ 	super.consumeExportsStatement();
+ 	this.moduleStatementId = MIStatementIdentity.DEFAULT_MI_STATEMENT;
++	popElement(K_INSIDE_EXPORTS_STATEMENT);
+ }
+ protected void consumeSingleExportsPkgName() {
+ 	super.consumeSingleExportsPkgName();
+@@ -3718,6 +3721,7 @@ protected void consumeToken(int token) {
+ 		pushOnElementStack(K_INSIDE_IMPORT_STATEMENT);
+ 	}	else if (token == TokenNameexports) {
+ 		this.moduleStatementId = MIStatementIdentity.SINGLE_EXPORTS;
++		pushOnElementStack(K_INSIDE_EXPORTS_STATEMENT);
+ 	}	else if (token == TokenNameto && this.moduleStatementId == MIStatementIdentity.SINGLE_EXPORTS) {
+ 		this.moduleStatementId = MIStatementIdentity.SINGLE_EXPORTS_TARGET;
+ 	}	else if (token == TokenNamerequires) {
+@@ -4516,6 +4520,9 @@ public ExportReference createAssistExportReference(char[][] tokens, long[] posit
+ public ImportReference createAssistImportReference(char[][] tokens, long[] positions, int mod){
+ 	return new CompletionOnImportReference(tokens, positions, mod);
+ }
++public ModuleReference createAssistModuleReference(char[][] tokens, long[] positions, int mod){
++	return new CompletionOnModuleReference(tokens, positions, mod);
++}
+ @Override
+ public ModuleDeclaration createAssistModuleDeclaration(CompilationResult compilationResult, char[][] tokens,
+ 		long[] positions) {
+@@ -5488,14 +5495,21 @@ protected boolean isInsideArrayInitializer(){
+ 	}
+ 	return false;	
+ }
+-protected boolean isInImportStatement() {
++private boolean foundToken(int token) {
+ 	int i = this.elementPtr;
+ 	while (i > -1) {
+-		if (this.elementKindStack[i] == K_INSIDE_IMPORT_STATEMENT) {
++		if (this.elementKindStack[i] == token) {
+ 			return true;
+ 		}
+ 		i--;
+ 	}
+ 	return false;
+ }
++
++protected boolean isInImportStatement() {
++	return foundToken(K_INSIDE_IMPORT_STATEMENT);
++}
++protected boolean isInExportsStatement() {
++	return foundToken(K_INSIDE_EXPORTS_STATEMENT);
++}
+ }
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+index 91d8016..b44708d 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+@@ -42,6 +42,7 @@ import org.eclipse.jdt.internal.compiler.ast.LocalDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.MessageSend;
+ import org.eclipse.jdt.internal.compiler.ast.MethodDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.ModuleDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.ModuleReference;
+ import org.eclipse.jdt.internal.compiler.ast.NameReference;
+ import org.eclipse.jdt.internal.compiler.ast.Statement;
+ import org.eclipse.jdt.internal.compiler.ast.SuperReference;
+@@ -1035,6 +1036,65 @@ protected void consumeSingleExportsPkgName() {
+ 		this.restartRecovery = true; // used to avoid branching back into the regular automaton
+ 	}
+ }
++protected void consumeSingleRequiresModuleName() {
++
++	int index = indexOfAssistIdentifier();
++	/* no need to take action if not inside assist identifiers */
++	if (index < 0) {
++		super.consumeSingleRequiresModuleName();
++		return;
++	}
++
++	/* retrieve identifiers subset and whole positions, the assist node positions
++	should include the entire replaced source. */
++	int length = this.identifierLengthStack[this.identifierLengthPtr];
++	char[][] subset = identifierSubSet(index+1); // include the assistIdentifier
++	this.identifierLengthPtr--;
++	this.identifierPtr -= length;
++	long[] positions = new long[length];
++	System.arraycopy(
++			this.identifierPositionStack,
++			this.identifierPtr + 1,
++			positions,
++			0,
++			length);
++		
++	int modifiers1 = this.intStack[this.intPtr--];
++	/* build specific assist node on requires statement */
++	ModuleReference reference = createAssistModuleReference(subset, positions, modifiers1);
++	this.assistNode = reference;
++	this.lastCheckPoint = reference.sourceEnd + 1;
++	pushOnAstStack(reference);
++
++	if (this.currentToken == TokenNameSEMICOLON){
++		reference.declarationSourceEnd = this.scanner.currentPosition - 1;
++	} else {
++		reference.declarationSourceEnd = (int) positions[length-1];
++	}
++	//endPosition is just before the ;
++	reference.declarationSourceStart = this.intStack[this.intPtr--];
++	// flush comments defined prior to import statements
++	reference.declarationSourceEnd = flushCommentsDefinedPriorTo(reference.declarationSourceEnd);
++
++	reference.declarationEnd = reference.declarationSourceEnd;
++	//this.endPosition is just before the ;
++	reference.modifiersSourceStart = this.intStack[this.intPtr--];
++//	reference.modifiers = modifiers; // already set in the constructor
++	reference.declarationSourceStart = reference.sourceStart;
++
++	if (reference.modifiersSourceStart >= 0) {
++		reference.declarationSourceStart = reference.modifiersSourceStart;
++	}
++	// recovery TBD
++	if (this.currentElement != null){
++		this.lastCheckPoint = reference.declarationSourceEnd+1;
++		this.currentElement = this.currentElement.add(reference, 0);
++		this.lastIgnoredToken = -1;
++		this.restartRecovery = true; // used to avoid branching back into the regular automaton
++	}
++
++}
++
+ protected void consumeSingleTypeImportDeclarationName() {
+ 	// SingleTypeImportDeclarationName ::= 'import' Name
+ 	/* push an ImportRef build from the last name
+@@ -1273,6 +1333,7 @@ protected void consumeTypeImportOnDemandDeclarationName() {
+ }
+ public abstract ExportReference createAssistExportReference(char[][] tokens, long[] positions);
+ public abstract ImportReference createAssistImportReference(char[][] tokens, long[] positions, int mod);
++public abstract ModuleReference createAssistModuleReference(char[][] tokens, long[] positions, int mod);
+ public abstract ImportReference createAssistPackageReference(char[][] tokens, long[] positions);
+ public abstract NameReference createQualifiedAssistNameReference(char[][] previousIdentifiers, char[] assistName, long[] positions);
+ public abstract TypeReference createQualifiedAssistTypeReference(char[][] previousIdentifiers, char[] assistName, long[] positions);
+@@ -2219,6 +2280,12 @@ protected int resumeAfterRecovery() {
+ 			prepareForBlockStatements();
+ 			goForBlockStatementsopt();
+ 		} else {
++			if (this.referenceContext instanceof CompilationUnitDeclaration) {
++				CompilationUnitDeclaration unit = (CompilationUnitDeclaration) this.referenceContext;
++				if (unit.isModuleInfo()) {
++					return RESTART;
++				}		
++			}
+ 			prepareForHeaders();
+ 			goForHeaders();
+ 			this.diet = true; // passed this point, will not consider method bodies
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnModuleReference.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnModuleReference.java
+new file mode 100644
+index 0000000..d2d3ac8
+--- /dev/null
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnModuleReference.java
+@@ -0,0 +1,34 @@
++/*******************************************************************************
++ * Copyright (c) 2016 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *     
++ *******************************************************************************/
++package org.eclipse.jdt.internal.codeassist.select;
++
++import org.eclipse.jdt.internal.compiler.ast.ModuleReference;
++
++public class SelectionOnModuleReference extends ModuleReference {
++
++	public SelectionOnModuleReference(char[][] tokens, long[] sourcePositions) {
++		super(tokens, sourcePositions);
++	}
++	public StringBuffer print(int tab, StringBuffer output, boolean withOnDemand) {
++		printIndent(tab, output).append("<SelectOnModuleReference:"); //$NON-NLS-1$
++		for (int i = 0; i < this.tokens.length; i++) {
++			if (i > 0) output.append('.');
++			output.append(this.tokens[i]);
++		}
++		return output.append('>');
++	}
++
++}
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
+index edafe02..d7dd33a 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
+@@ -43,6 +43,7 @@ import org.eclipse.jdt.internal.compiler.ast.MarkerAnnotation;
+ import org.eclipse.jdt.internal.compiler.ast.MemberValuePair;
+ import org.eclipse.jdt.internal.compiler.ast.MessageSend;
+ import org.eclipse.jdt.internal.compiler.ast.ModuleDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.ModuleReference;
+ import org.eclipse.jdt.internal.compiler.ast.NameReference;
+ import org.eclipse.jdt.internal.compiler.ast.NormalAnnotation;
+ import org.eclipse.jdt.internal.compiler.ast.QualifiedAllocationExpression;
+@@ -1601,4 +1602,8 @@ public  String toString() {
+ 	s = s + "}\n"; //$NON-NLS-1$
+ 	return s + super.toString();
+ }
++@Override
++public ModuleReference createAssistModuleReference(char[][] tokens, long[] positions, int mod) {
++	return new SelectionOnModuleReference(tokens, positions);
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+index d7cadaf..738658f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+@@ -5661,16 +5661,16 @@ protected void consumeSingleRequiresModuleName() {
+ 	impt.modifiersSourceStart = this.intStack[this.intPtr--];
+ 	impt.modifiers = this.intStack[this.intPtr--];
+ 	impt.declarationSourceStart = impt.sourceStart;
+-//	if (impt.modifiersSourceStart >= 0) {
+-//		impt.declarationSourceStart = impt.modifiersSourceStart;
+-//	}
++	if (impt.modifiersSourceStart >= 0) {
++		impt.declarationSourceStart = impt.modifiersSourceStart;
++	}
+ 	// recovery TBD
+-//	if (this.currentElement != null){
+-//		this.lastCheckPoint = impt.declarationSourceEnd+1;
+-//		this.currentElement = this.currentElement.add(impt, 0);
+-//		this.lastIgnoredToken = -1;
+-//		this.restartRecovery = true; // used to avoid branching back into the regular automaton
+-//	}
++	if (this.currentElement != null){
++		this.lastCheckPoint = impt.declarationSourceEnd+1;
++		this.currentElement = this.currentElement.add(impt, 0);
++		this.lastIgnoredToken = -1;
++		this.restartRecovery = true; // used to avoid branching back into the regular automaton
++	}
+ }
+ protected void consumeExportsStatement() {
+ 	ExportReference expt = (ExportReference) this.astStack[this.astPtr--];
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredElement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredElement.java
+index 2b2d0ec..bbc71e4 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredElement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredElement.java
+@@ -21,6 +21,7 @@ import org.eclipse.jdt.internal.compiler.ast.ExportReference;
+ import org.eclipse.jdt.internal.compiler.ast.FieldDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.ImportReference;
+ import org.eclipse.jdt.internal.compiler.ast.LocalDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.ModuleReference;
+ import org.eclipse.jdt.internal.compiler.ast.Statement;
+ import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
+ import org.eclipse.jdt.internal.compiler.util.Util;
+@@ -118,6 +119,18 @@ public RecoveredElement add(LocalDeclaration localDeclaration, int bracketBalanc
+ 	return this.parent.add(localDeclaration, bracketBalanceValue);
+ }
+ /*
++ *	Record a module reference
++ */
++public RecoveredElement add(ModuleReference moduleReference, int bracketBalanceValue){
++
++	/* default behavior is to delegate recording to parent if any */
++	resetPendingModifiers();
++	if (this.parent == null) return this; // ignore
++	this.updateSourceEndIfNecessary(previousAvailableLineEnd(moduleReference.declarationSourceStart - 1));
++	return this.parent.add(moduleReference, bracketBalanceValue);
++}
++
++/*
+  * Record a statement
+  */
+ public RecoveredElement add(Statement statement, int bracketBalanceValue) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/IJavaElementRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/IJavaElementRequestor.java
+index f054045..6dd6f82 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/IJavaElementRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/IJavaElementRequestor.java
+@@ -15,6 +15,7 @@ import org.eclipse.jdt.core.IInitializer;
+ import org.eclipse.jdt.core.IMethod;
+ import org.eclipse.jdt.core.IPackageFragment;
+ import org.eclipse.jdt.core.IType;
++import org.eclipse.jdt.internal.compiler.env.IModule;
+ 
+ /**
+  * This interface is used by IRequestorNameLookup. As results
+@@ -30,6 +31,7 @@ public void acceptMemberType(IType type);
+ public void acceptMethod(IMethod method);
+ public void acceptPackageFragment(IPackageFragment packageFragment);
+ public void acceptType(IType type);
++public void acceptModule(IModule module);
+ /**
+  * Returns <code>true</code> if this IJavaElementRequestor does
+  * not want to receive any more results.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaElementRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaElementRequestor.java
+index 675fde4..297d536 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaElementRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaElementRequestor.java
+@@ -140,12 +140,13 @@ public void acceptType(IType type) {
+ /**
+  * @see IJavaElementRequestor
+  */
+-public void acceptModuleDeclaration(IModule module) {
++public void acceptModule(IModule module) {
+ 	if (this.modules == null) {
+ 		this.modules= new ArrayList();
+ 	}
+-	this.modules.add(module);
++	this.modules.add(module);	
+ }
++
+ /**
+  * @see IJavaElementRequestor
+  */
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+index a110d1d..2b3fb80 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+@@ -980,8 +980,17 @@ public class NameLookup implements SuffixConstants {
+ 		seekTypes(name, pkg, partialMatch, acceptFlags, requestor, true);
+ 	}
+ 
+-	public void seekModules(String name, JavaElementRequestor requestor) {
++	private boolean isMatching(char[] needle, char[] haystack, boolean partialMatch) {
++		return partialMatch ? CharOperation.prefixEquals(needle, haystack, false)
++				:  CharOperation.equals(needle, haystack);
++	}
++	
++	public void seekModuleReferences(String name, IJavaElementRequestor requestor) {
++		seekModule(name, true /* prefix */, requestor);
++	}
++	public void seekModule(String name, boolean prefix, IJavaElementRequestor requestor) {
+ 		int count= this.packageFragmentRoots.length;
++		char[] nameArray = name.toCharArray();
+ 		for (int i= 0; i < count; i++) {
+ 			if (requestor.isCanceled())
+ 				return;
+@@ -989,7 +998,7 @@ public class NameLookup implements SuffixConstants {
+ 			IPackageFragmentRoot root= this.packageFragmentRoots[i];
+ 			IModule module = null;
+ 			if (root instanceof JarPackageFragmentRoot) {
+-				if (!root.getElementName().equals(name)) {
++				if (!isMatching(nameArray, root.getElementName().toCharArray(), prefix)) {
+ 					continue;
+ 				}
+ 			} else {
+@@ -1000,8 +1009,8 @@ public class NameLookup implements SuffixConstants {
+ 					continue;
+ 				}
+ 			}
+-			if (module != null && CharOperation.equals(module.name(), name.toCharArray()))
+-				requestor.acceptModuleDeclaration(module);
++			if (module != null && isMatching(nameArray, module.name(), prefix))
++				requestor.acceptModule(module);
+ 			else if (module == null) {
+ 				try {
+ 					IJavaElement[] compilationUnits = root.getChildren();
+@@ -1019,8 +1028,8 @@ public class NameLookup implements SuffixConstants {
+ 						} else {
+ 							module = (IModule)(((SourceType)type).getElementInfo());
+ 						}
+-						if (module != null && CharOperation.equals(module.name(), name.toCharArray()))
+-							requestor.acceptModuleDeclaration(module);
++						if (module != null && isMatching(nameArray, module.name(), prefix))
++							requestor.acceptModule(module);
+ 					}
+ 				} catch (JavaModelException e) {
+ 					//
+@@ -1028,6 +1037,9 @@ public class NameLookup implements SuffixConstants {
+ 			}
+ 		}
+ 	}
++	public void seekModules(String name, JavaElementRequestor requestor) {
++		seekModule(name, false, requestor);
++	}
+ 	/**
+ 	 * Notifies the given requestor of all types (classes and interfaces) in the
+ 	 * given package fragment with the given (unqualified) name.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+index 4d0785c..a5c92c4 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+@@ -166,6 +166,19 @@ public class SearchableEnvironment extends ModuleEnvironment
+ 	}
+ 
+ 	/**
++	 * Find the modules that start with the given prefix.
++	 * A valid prefix is a qualified name separated by periods
++	 * (ex. java.util).
++	 * The packages found are passed to:
++	 *    ISearchRequestor.acceptModule(char[][] moduleName)
++	 */
++	public void findModules(char[] prefix, ISearchRequestor requestor) {
++		this.nameLookup.seekModuleReferences(
++			new String(prefix),
++			new SearchableEnvironmentRequestor(requestor));
++	}
++
++	/**
+ 	 * Find the packages that start with the given prefix.
+ 	 * A valid prefix is a qualified name separated by periods
+ 	 * (ex. java.util).
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironmentRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironmentRequestor.java
+index 49bfd18..589265d 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironmentRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironmentRequestor.java
+@@ -21,6 +21,7 @@ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.codeassist.ISearchRequestor;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
++import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.AccessRestriction;
+ 
+ /**
+@@ -85,6 +86,9 @@ public void acceptInitializer(IInitializer initializer) {
+ public void acceptPackageFragment(IPackageFragment packageFragment) {
+ 	this.requestor.acceptPackage(packageFragment.getElementName().toCharArray());
+ }
++public void acceptModule(IModule module) {
++	this.requestor.acceptModule(module.name());
++}
+ /**
+  * @see IJavaElementRequestor
+  */
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SingleTypeRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SingleTypeRequestor.java
+index 4be663f..76b1cd4 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SingleTypeRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SingleTypeRequestor.java
+@@ -15,6 +15,7 @@ import org.eclipse.jdt.core.IInitializer;
+ import org.eclipse.jdt.core.IMethod;
+ import org.eclipse.jdt.core.IPackageFragment;
+ import org.eclipse.jdt.core.IType;
++import org.eclipse.jdt.internal.compiler.env.IModule;
+ 
+ /**
+  * The SingleTypeRequestor is an IJavaElementRequestor that
+@@ -52,6 +53,12 @@ public void acceptMethod(IMethod method) {
+ /**
+  * @see IJavaElementRequestor
+  */
++public void acceptModule(IModule module) {
++	// implements interface method	
++}
++/**
++ * @see IJavaElementRequestor
++ */
+ public void acceptPackageFragment(IPackageFragment packageFragment) {
+ 	// implements interface method
+ }
+commit b2d70fc49d7cd20c5e22c5ff840977725ef16de5
+Author: Manoj Palat <manpalat@in.ibm.com>
+Date:   Fri Jun 10 18:16:53 2016 +0530
+
+    javadoc changes for bug 495801 [1.9] [code completion] requires module
+    reference completion
+
+7	3	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/InternalCompletionProposal.java
+7	3	org.eclipse.jdt.core/model/org/eclipse/jdt/core/CompletionProposal.java
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/InternalCompletionProposal.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/InternalCompletionProposal.java
+index 898d630..9c6fbe8 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/InternalCompletionProposal.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/InternalCompletionProposal.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2004, 2015 IBM Corporation and others.
++ * Copyright (c) 2004, 2016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  * 
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Andreas Magnusson <andreas.ch.magnusson@gmail.com>- contribution for bug 151500
+@@ -835,7 +839,7 @@ public class InternalCompletionProposal extends CompletionProposal {
+ 	}
+ 
+ 	/**
+-	 * Sets the type or package signature of the relevant
++	 * Sets the type or package or module(1.9) signature of the relevant
+ 	 * declaration in the context, or <code>null</code> if none.
+ 	 * <p>
+ 	 * If not set, defaults to none.
+@@ -845,7 +849,7 @@ public class InternalCompletionProposal extends CompletionProposal {
+ 	 * its properties; this method is not intended to be used by other clients.
+ 	 * </p>
+ 	 *
+-	 * @param signature the type or package signature, or
++	 * @param signature the type or package or module(1.9) signature, or
+ 	 * <code>null</code> if none
+ 	 */
+ 	public void setDeclarationSignature(char[] signature) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/CompletionProposal.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/CompletionProposal.java
+index 0f42910..fe3f371 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/CompletionProposal.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/CompletionProposal.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2004, 2011 IBM Corporation and others.
++ * Copyright (c) 2004, 2016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  * 
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *******************************************************************************/
+@@ -1254,7 +1258,7 @@ public class CompletionProposal {
+ 	}
+ 
+ 	/**
+-	 * Sets the type or package signature of the relevant
++	 * Sets the type or package or module(1.9) signature of the relevant
+ 	 * declaration in the context, or <code>null</code> if none.
+ 	 * <p>
+ 	 * If not set, defaults to none.
+@@ -1264,7 +1268,7 @@ public class CompletionProposal {
+ 	 * its properties; this method is not intended to be used by other clients.
+ 	 * </p>
+ 	 *
+-	 * @param signature the type or package signature, or
++	 * @param signature the type or package  or module(1.9) signature, or
+ 	 * <code>null</code> if none
+ 	 */
+ 	public void setDeclarationSignature(char[] signature) {
+commit f423bd8740242fe78b48b52b7ce1f8495ba68b55
+Author: Manoj Palat <manpalat@in.ibm.com>
+Date:   Fri Jun 10 19:29:54 2016 +0530
+
+    javadoc changes in api for module references - bug 495801
+
+4	2	org.eclipse.jdt.core/model/org/eclipse/jdt/core/CompletionProposal.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/CompletionProposal.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/CompletionProposal.java
+index fe3f371..d696b02 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/CompletionProposal.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/CompletionProposal.java
+@@ -1183,7 +1183,7 @@ public class CompletionProposal {
+ 	}
+ 
+ 	/**
+-	 * Returns the type signature or package name of the relevant
++	 * Returns the type signature or package name or module name (1.9) of the relevant
+ 	 * declaration in the context, or <code>null</code> if none.
+ 	 * <p>
+ 	 * This field is available for the following kinds of
+@@ -1208,6 +1208,8 @@ public class CompletionProposal {
+ 	 * 	<li><code>METHOD_DECLARATION</code> - type signature
+ 	 * of the type that declares the method that is being
+ 	 * implemented or overridden</li>
++	 * 	<li><code>MODULE_REF</code> - 
++	 * name of the module that is referenced</li>
+ 	 * 	<li><code>PACKAGE_REF</code> - dot-based package
+ 	 * name of the package that is referenced</li>
+ 	 * 	<li><code>TYPE_IMPORT</code> - dot-based package
+@@ -1222,7 +1224,7 @@ public class CompletionProposal {
+ 	 * returned.
+ 	 * </p>
+ 	 *
+-	 * @return a type signature or a package name (depending
++	 * @return a type signature or a package name or module name (1.9) (depending
+ 	 * on the kind of completion), or <code>null</code> if none
+ 	 * @see Signature
+ 	 */

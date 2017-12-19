@@ -1,0 +1,338 @@
+commit 0c9fde111f8fe42d4e58860be47174bcb0329aeb
+Author: Henrik Lindberg <helindbe>
+Date:   Thu Apr 30 18:55:09 2009 +0000
+
+    Bug 274569 [transport] Exceptions for HTTP errors does not surface
+
+18	2	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatus.java
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatus.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatus.java
+index 7770002..f8ad8a4 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatus.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatus.java
+@@ -12,6 +12,7 @@
+ package org.eclipse.equinox.internal.p2.repository;
+ 
+ import java.io.FileNotFoundException;
++import java.io.IOException;
+ import java.net.*;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.ecf.core.identity.IDCreateException;
+@@ -125,8 +126,23 @@ public class RepositoryStatus {
+ 
+ 			return new DownloadStatus(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_INVALID_LOCATION, NLS.bind(Messages.TransportErrorTranslator_MalformedRemoteFileReference, toDownload), t);
+ 		}
+-		if (t instanceof IncomingFileTransferException) {
+-			int code = ((IncomingFileTransferException) t).getErrorCode();
++		int code = 0;
++		// (sigh) parse http code from IOException thrown by ECF
++		if (t instanceof IOException) {
++			String ioMsg = t.getMessage();
++			String prefix = "HttpClient connection error response code "; //$NON-NLS-1$
++			if (ioMsg != null && ioMsg.startsWith(prefix)) {
++				try {
++					code = new Integer(ioMsg.substring(prefix.length(), ioMsg.lastIndexOf("."))).intValue(); //$NON-NLS-1$
++				} catch (Throwable e) {
++					code = 0;
++				}
++			}
++		}
++
++		if (t instanceof IncomingFileTransferException || code != 0) {
++			if (code == 0)
++				code = ((IncomingFileTransferException) t).getErrorCode();
+ 			// Switch on error codes in the HTTP error code range 
+ 			if (code >= 400 && code <= 600) {
+ 				int provisionCode = ProvisionException.REPOSITORY_FAILED_READ;
+commit 6554687c631d1b35f8b8f637456968663e09c554
+Author: Henrik Lindberg <helindbe>
+Date:   Thu May 7 00:21:21 2009 +0000
+
+    Bug 274569 [transport] Exceptions for HTTP errors does not surface
+
+3	6	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/FileInfoReader.java
+4	7	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/FileReader.java
+3	34	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatus.java
+38	10	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatusHelper.java
+9	0	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryTransport.java
+4	8	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/HttpStatusTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/FileInfoReader.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/FileInfoReader.java
+index 4fe4643..20236bc 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/FileInfoReader.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/FileInfoReader.java
+@@ -209,16 +209,13 @@ public class FileInfoReader extends Job implements IRemoteFileSystemListener {
+ 			// if this is a authentication failure - it is not meaningful to continue
+ 			RepositoryStatusHelper.checkPermissionDenied(exception);
+ 
++			// if this is a file not found - it is not meaningful to continue
++			RepositoryStatusHelper.checkFileNotFound(exception, uri);
++
+ 			Throwable t = RepositoryStatusHelper.unwind(exception);
+ 			if (t instanceof CoreException)
+ 				throw RepositoryStatusHelper.unwindCoreException((CoreException) t);
+ 
+-			if (t instanceof FileNotFoundException)
+-				//
+-				// Connection succeeded but the target doesn't exist
+-				//
+-				throw (FileNotFoundException) t;
+-
+ 			if (t instanceof IOException && attemptCounter < connectionRetryCount) {
+ 				// TODO: Retry only certain exceptions or filter out
+ 				// some exceptions not worth retrying
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/FileReader.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/FileReader.java
+index 4d03dfd..12498a7 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/FileReader.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/FileReader.java
+@@ -276,19 +276,16 @@ public class FileReader extends FileTransferJob implements IFileTransferListener
+ 	private boolean checkException(URI uri, int attemptCounter) throws CoreException, FileNotFoundException, AuthenticationFailedException {
+ 		// note that 'exception' could have been captured in a callback
+ 		if (exception != null) {
+-			// if this is a authentication failure - it is not meaningful to continue
++			// if this is an 'authentication failure' - it is not meaningful to continue
+ 			RepositoryStatusHelper.checkPermissionDenied(exception);
+ 
++			// if this is a 'file not found' - it is not meaningful to continue
++			RepositoryStatusHelper.checkFileNotFound(exception, uri);
++
+ 			Throwable t = RepositoryStatusHelper.unwind(exception);
+ 			if (t instanceof CoreException)
+ 				throw RepositoryStatusHelper.unwindCoreException((CoreException) t);
+ 
+-			if (t instanceof FileNotFoundException)
+-				//
+-				// Connection succeeded but the target doesn't exist
+-				//
+-				throw (FileNotFoundException) t;
+-
+ 			if (t instanceof IOException && attemptCounter < connectionRetryCount) {
+ 				// TODO: Retry only certain exceptions or filter out
+ 				// some exceptions not worth retrying
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatus.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatus.java
+index a7d837a..67fbb9c 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatus.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatus.java
+@@ -12,10 +12,10 @@
+ package org.eclipse.equinox.internal.p2.repository;
+ 
+ import java.io.FileNotFoundException;
+-import java.io.IOException;
+ import java.net.*;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.ecf.core.identity.IDCreateException;
++import org.eclipse.ecf.filetransfer.BrowseFileTransferException;
+ import org.eclipse.ecf.filetransfer.IncomingFileTransferException;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.osgi.util.NLS;
+@@ -127,45 +127,14 @@ public class RepositoryStatus {
+ 			return new DownloadStatus(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_INVALID_LOCATION, NLS.bind(Messages.TransportErrorTranslator_MalformedRemoteFileReference, toDownload), t);
+ 		}
+ 		int code = 0;
+-		// (sigh) parse http code from IOException thrown by ECF
+-		if (t instanceof IOException) {
+-			String ioMsg = t.getMessage();
+-			String prefix = "HttpClient connection error response code "; //$NON-NLS-1$
+-			if (ioMsg != null && ioMsg.startsWith(prefix)) {
+-				try {
+-					code = new Integer(ioMsg.substring(prefix.length(), ioMsg.lastIndexOf("."))).intValue(); //$NON-NLS-1$
+-				} catch (Throwable e) {
+-					code = 0;
+-				}
+-			}
+-		}
+-		if (t.getClass().getName().equals("javax.security.auth.login.LoginException")) {//$NON-NLS-1$
+-			// we end up here on 401, 403, and 407 errors transformed to LoginException in ECF
+-			// file browser. Since 403 should be treated as a READ error - a check is made for "Forbidden"
+-			// to exclude it from being reported as auth fail.
+-
+-			// Ugly message parsing - see Bug 274821
+-			String exMsg = t.getMessage();
+-			if (exMsg != null) {
+-				if ("Forbidden".equals(t.getMessage())) //$NON-NLS-1$
+-					code = 403;
+-				else if (exMsg.indexOf("Proxy") != -1) //$NON-NLS-1$
+-					code = 407;
+-				else if ("Unauthorized".equals(exMsg)) //$NON-NLS-1$
+-					code = 401;
+-
+-				return new DownloadStatus(IStatus.ERROR, Activator.ID, //
+-						code == 401 ? ProvisionException.REPOSITORY_FAILED_AUTHENTICATION //
+-								: ProvisionException.REPOSITORY_FAILED_READ, //
+-						codeToMessage(code, toDownload.toString()), t);
+-			}
+-		}
+ 
+ 		// default to report as read repository error
+ 		int provisionCode = ProvisionException.REPOSITORY_FAILED_READ;
+ 
+ 		if (t instanceof IncomingFileTransferException)
+ 			code = ((IncomingFileTransferException) t).getErrorCode();
++		else if (t instanceof BrowseFileTransferException)
++			code = ((BrowseFileTransferException) t).getErrorCode();
+ 
+ 		// Switch on error codes in the HTTP error code range. 
+ 		// Note that 404 uses ARTIFACT_NOT_FOUND (as opposed to REPOSITORY_NOT_FOUND, which
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatusHelper.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatusHelper.java
+index 7b9258b..c5c2d5b 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatusHelper.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryStatusHelper.java
+@@ -10,10 +10,11 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.repository;
+ 
+-import java.io.IOException;
+-import java.io.PrintStream;
++import java.io.*;
+ import java.lang.reflect.InvocationTargetException;
++import java.net.URI;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.ecf.filetransfer.BrowseFileTransferException;
+ import org.eclipse.ecf.filetransfer.IncomingFileTransferException;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.osgi.util.NLS;
+@@ -230,24 +231,24 @@ public abstract class RepositoryStatusHelper {
+ 	 * and throw a AuthenticationFailedException if a permission failure was encountered.
+ 	 */
+ 	public static void checkPermissionDenied(Throwable t) throws AuthenticationFailedException {
++		// From Use of File Transfer
+ 		if (t instanceof IncomingFileTransferException) {
+ 			if (((IncomingFileTransferException) t).getErrorCode() == 401)
+ 				throw new AuthenticationFailedException();
+ 			IStatus status = ((IncomingFileTransferException) t).getStatus();
+ 			t = status.getException();
+-		}
+-		if (t.getClass().getName().equals("javax.security.auth.login.LoginException")) { //$NON-NLS-1$
+-			// Ugly, Ugly message parsing - see Bug 274821 (parsing out "Forbidden" as it is not NLS, and then scan for "Proxy" as this is
+-			// word is more likely to survive translation. The 401 message is simply "Unauthorized" in English, but is translatable.
+-
+-			// Only 401 should cause AuthenticationFailedException
+-			String exMsg = t.getMessage();
+-			if (exMsg != null && !"Forbidden".equals(exMsg) && exMsg.indexOf("Proxy") == -1) //$NON-NLS-1$ //$NON-NLS-2$
++			// From Use of Browse
++		} else if (t instanceof BrowseFileTransferException) {
++			if (((BrowseFileTransferException) t).getErrorCode() == 401)
+ 				throw new AuthenticationFailedException();
++			IStatus status = ((BrowseFileTransferException) t).getStatus();
++			t = status.getException();
+ 		}
++
+ 		if (t == null || !(t instanceof IOException))
+ 			return;
+ 
++		// TODO: is this needed (for 401) now that ECF throws exceptions with codes?
+ 		// try to figure out if we have a 401 by parsing the exception message
+ 		// There is unfortunately no specific exception for "redirected too many times" - which is commonly
+ 		// caused by a failed login.
+@@ -258,6 +259,33 @@ public abstract class RepositoryStatusHelper {
+ 	}
+ 
+ 	/**
++	 * Translates exceptions representing "FileNotFound" into FileNotFoundException.
++	 * @param t the throwable to check
++	 * @param toDownload the URI the exception was thrown for
++	 * @throws FileNotFoundException if 't' represents a file not found
++	 */
++	public static void checkFileNotFound(Throwable t, URI toDownload) throws FileNotFoundException {
++		if (t instanceof IncomingFileTransferException) {
++			IncomingFileTransferException e = (IncomingFileTransferException) t;
++			if (e.getErrorCode() == 404)
++				throw new FileNotFoundException(toDownload.toString());
++		}
++		if (t instanceof BrowseFileTransferException) {
++			BrowseFileTransferException e = (BrowseFileTransferException) t;
++			if (e.getErrorCode() == 404)
++				throw new FileNotFoundException(toDownload.toString());
++		}
++
++		if (t instanceof FileNotFoundException)
++			throw (FileNotFoundException) t;
++		if (t instanceof CoreException) {
++			Throwable e = ((CoreException) t).getStatus().getException();
++			if (e instanceof FileNotFoundException)
++				throw (FileNotFoundException) e;
++		}
++	}
++
++	/**
+ 	 * Get default "InternalError" ProvisionException.
+ 	 * @param t
+ 	 * @return a default "InternalError"
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryTransport.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryTransport.java
+index ae2ef09..d50c2f3 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryTransport.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/RepositoryTransport.java
+@@ -85,6 +85,8 @@ public class RepositoryTransport extends Transport {
+ 				statusOn(target, new DownloadStatus(IStatus.CANCEL, Activator.ID, 1, "", null), reader); //$NON-NLS-1$
+ 				throw e;
+ 			} catch (CoreException e) {
++				if (e.getStatus().getException() == null)
++					return statusOn(target, RepositoryStatus.forException(e, toDownload), reader);
+ 				return statusOn(target, RepositoryStatus.forStatus(e.getStatus(), toDownload), reader);
+ 			} catch (FileNotFoundException e) {
+ 				return statusOn(target, RepositoryStatus.forException(e, toDownload), reader);
+@@ -140,6 +142,11 @@ public class RepositoryTransport extends Transport {
+ 				throw new OperationCanceledException();
+ 			} catch (AuthenticationFailedException e) {
+ 				promptUser = true;
++			} catch (CoreException e) {
++				// must translate this core exception as it is most likely not informative to a user
++				if (e.getStatus().getException() == null)
++					throw new CoreException(RepositoryStatus.forException(e, toDownload));
++				throw new CoreException(RepositoryStatus.forStatus(e.getStatus(), toDownload));
+ 			}
+ 		}
+ 		throw new AuthenticationFailedException();
+@@ -190,6 +197,8 @@ public class RepositoryTransport extends Transport {
+ 				throw new OperationCanceledException();
+ 			} catch (CoreException e) {
+ 				// must translate this core exception as it is most likely not informative to a user
++				if (e.getStatus().getException() == null)
++					throw new CoreException(RepositoryStatus.forException(e, toDownload));
+ 				throw new CoreException(RepositoryStatus.forStatus(e.getStatus(), toDownload));
+ 			} catch (AuthenticationFailedException e) {
+ 				promptUser = true;
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/HttpStatusTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/HttpStatusTest.java
+index cbd5304..1cf9be7 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/HttpStatusTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/HttpStatusTest.java
+@@ -13,7 +13,8 @@ import java.net.URI;
+ import java.security.cert.Certificate;
+ import java.text.MessageFormat;
+ import java.text.ParseException;
+-import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.OperationCanceledException;
+ import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
+@@ -68,7 +69,7 @@ public class HttpStatusTest extends ServerBasedTestCase {
+ 		// undefined HTTP response codes.
+ 		runSequence(419, 421);
+ 		runSequence(427, 448);
+-		runSequence(510, 601);
++		runSequence(511, 601);
+ 	}
+ 
+ 	private void runSequence(int from, int to) throws Exception {
+@@ -82,10 +83,7 @@ public class HttpStatusTest extends ServerBasedTestCase {
+ 			} catch (ProvisionException e) {
+ 
+ 				IStatus status = e.getStatus();
+-				Throwable ex = status.getException();
+ 				String msg = e.getMessage();
+-				if (ex instanceof CoreException)
+-					msg = ((CoreException) ex).getStatus().getMessage();
+ 
+ 				// Print for human inspection
+ 				System.out.print(String.format("HTTP %d => %s e-message: [%s]\n", //
+@@ -97,10 +95,8 @@ public class HttpStatusTest extends ServerBasedTestCase {
+ 				//					String m = org.eclipse.equinox.internal.p2.repository.Messages.TransportErrorTranslator_400;
+ 				// Some codes have different message
+ 				switch (i) {
+-					case 401 : // fall through
++					case 401 :
+ 						// Authentication exception -
+-						// TODO: check details - The HTTP message should be retained - See Bug 274711
+-
+ 						// Assert the ProvisionException code
+ 						assertEquals("Expected Provision Exception code for: " + Integer.valueOf(i), //
+ 								ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, status.getCode());

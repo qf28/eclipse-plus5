@@ -1,0 +1,1398 @@
+commit ddc1f1abf62222545b0a3dab7410e6233fa9ed8f
+Author: John Arthorne <johna>
+Date:   Fri Feb 8 23:01:29 2008 +0000
+
+    Bug 207802 [prov] Add multi-threaded download and mirror selection into p2's artifact retrieval
+
+1	0	bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+82	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/DownloadJob.java
+41	13	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+index b12e2ea..faeb77c 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+@@ -12,6 +12,7 @@ Export-Package: org.eclipse.equinox.internal.p2.artifact.mirror;x-internal:=true
+  org.eclipse.equinox.p2.artifact.repository.processing,
+  org.eclipse.equinox.spi.p2.artifact.repository
+ Import-Package: javax.xml.parsers,
++ org.eclipse.core.runtime.jobs,
+  org.eclipse.core.runtime.preferences;resolution:=optional,
+  org.eclipse.equinox.app;version="1.0.0",
+  org.eclipse.equinox.internal.p2.core.helpers,
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/DownloadJob.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/DownloadJob.java
+new file mode 100644
+index 0000000..bd436dd
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/DownloadJob.java
+@@ -0,0 +1,82 @@
++/*******************************************************************************
++ * Copyright (c) 2008 Genuitec, LLC and others. All rights reserved. This
++ * program and the accompanying materials are made available under the terms of
++ * the Eclipse Public License v1.0 which accompanies this distribution, and is
++ * available at http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors: Genuitec, LLC - initial API and implementation
++ * 						IBM Corporation - ongoing maintenance
++ ******************************************************************************/
++package org.eclipse.equinox.internal.p2.artifact.repository.simple;
++
++import java.util.LinkedList;
++import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.jobs.Job;
++import org.eclipse.equinox.internal.p2.artifact.repository.ArtifactRequest;
++import org.eclipse.equinox.p2.artifact.repository.IArtifactRequest;
++import org.eclipse.osgi.util.NLS;
++
++public class DownloadJob extends Job {
++	static final Object FAMILY = new Object();
++
++	private LinkedList requestsPending;
++	private SimpleArtifactRepository repository;
++	private IProgressMonitor masterMonitor;
++	private MultiStatus overallStatus;
++
++	DownloadJob(String name) {
++		super(name);
++		setSystem(true);
++	}
++
++	void initialize(SimpleArtifactRepository repository, LinkedList requestsPending, IProgressMonitor masterMonitor, MultiStatus overallStatus) {
++		this.repository = repository;
++		this.requestsPending = requestsPending;
++		this.masterMonitor = masterMonitor;
++		this.overallStatus = overallStatus;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.core.runtime.jobs.Job#belongsTo(java.lang.Object)
++	 */
++	public boolean belongsTo(Object family) {
++		return family == FAMILY;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.core.runtime.jobs.Job#run(org.eclipse.core.runtime.IProgressMonitor)
++	 */
++	protected IStatus run(IProgressMonitor jobMonitor) {
++		jobMonitor.beginTask("Downloading artifacts", 1);
++		do {
++			// get the request we are going to process
++			IArtifactRequest request;
++			synchronized (requestsPending) {
++				if (requestsPending.isEmpty())
++					break;
++				request = (IArtifactRequest) requestsPending.removeFirst();
++			}
++			if (masterMonitor.isCanceled())
++				return Status.CANCEL_STATUS;
++
++			// prepare a progress monitor that reports to both the master monitor and for the job
++			IProgressMonitor monitor = new NullProgressMonitor();
++			// progress monitor updating from getArtifact() doesn't seem to be working
++			masterMonitor.subTask(NLS.bind("Downloading {0}.", request.getArtifactKey().getId()));
++
++			// process the actual request
++			IStatus status = repository.getArtifact((ArtifactRequest) request, monitor);
++			if (!status.isOK()) {
++				synchronized (overallStatus) {
++					overallStatus.add(status);
++				}
++			}
++
++			// update progress
++			masterMonitor.worked(1);
++		} while (true);
++
++		jobMonitor.done();
++		return Status.OK_STATUS;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+index 29e68da..38c20eb 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+@@ -5,6 +5,7 @@
+  * available at http://www.eclipse.org/legal/epl-v10.html
+  * 
+  * Contributors: IBM Corporation - initial API and implementation
++ * 						Genuitec, LLC - support for multi-threaded downloads
+  ******************************************************************************/
+ package org.eclipse.equinox.internal.p2.artifact.repository.simple;
+ 
+@@ -15,6 +16,7 @@ import java.util.*;
+ import java.util.jar.JarEntry;
+ import java.util.jar.JarOutputStream;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.jobs.Job;
+ import org.eclipse.equinox.internal.p2.artifact.repository.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+@@ -24,6 +26,7 @@ import org.eclipse.equinox.p2.artifact.repository.processing.ProcessingStepHandl
+ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.metadata.IArtifactKey;
+ import org.eclipse.equinox.spi.p2.artifact.repository.AbstractArtifactRepository;
++import org.eclipse.osgi.util.NLS;
+ 
+ public class SimpleArtifactRepository extends AbstractArtifactRepository implements IArtifactRepository, IFileArtifactRepository {
+ 
+@@ -379,7 +382,7 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		return super.getAdapter(adapter);
+ 	}
+ 
+-	private IStatus getArtifact(ArtifactRequest request, IProgressMonitor monitor) {
++	IStatus getArtifact(ArtifactRequest request, IProgressMonitor monitor) {
+ 		request.setSourceRepository(this);
+ 		request.perform(monitor);
+ 		return request.getResult();
+@@ -429,20 +432,45 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	}
+ 
+ 	public IStatus getArtifacts(IArtifactRequest[] requests, IProgressMonitor monitor) {
+-		SubMonitor subMonitor = SubMonitor.convert(monitor, requests.length);
+-		try {
+-			MultiStatus overallStatus = new MultiStatus(Activator.ID, IStatus.OK, null, null);
+-			for (int i = 0; i < requests.length; i++) {
+-				if (monitor.isCanceled())
+-					return Status.CANCEL_STATUS;
+-				IStatus result = getArtifact((ArtifactRequest) requests[i], subMonitor.newChild(1));
+-				if (!result.isOK())
+-					overallStatus.add(result);
++		final MultiStatus overallStatus = new MultiStatus(Activator.ID, IStatus.OK, null, null);
++		LinkedList requestsPending = new LinkedList(Arrays.asList(requests));
++
++		// TODO : Determine number of threads to use from a property
++		int numberOfJobs = Math.min(requests.length, 4); // magic number
++		if (numberOfJobs <= 1) {
++			SubMonitor subMonitor = SubMonitor.convert(monitor, requests.length);
++			try {
++				for (int i = 0; i < requests.length; i++) {
++					if (monitor.isCanceled())
++						return Status.CANCEL_STATUS;
++					IStatus result = getArtifact((ArtifactRequest) requests[i], subMonitor.newChild(1));
++					if (!result.isOK())
++						overallStatus.add(result);
++				}
++			} finally {
++				subMonitor.done();
++			}
++		} else {
++			// initialize the various jobs needed to process the get artifact requests
++			monitor.beginTask(NLS.bind("Download {0} artifacts", Integer.toString(requests.length)), requests.length);
++			try {
++				DownloadJob jobs[] = new DownloadJob[numberOfJobs];
++				for (int i = 0; i < numberOfJobs; i++) {
++					jobs[i] = new DownloadJob("Install download " + i);
++					jobs[i].initialize(this, requestsPending, monitor, overallStatus);
++					jobs[i].schedule();
++				}
++				// wait for all the jobs to complete
++				try {
++					Job.getJobManager().join(DownloadJob.FAMILY, null);
++				} catch (InterruptedException e) {
++					//ignore
++				}
++			} finally {
++				monitor.done();
+ 			}
+-			return (monitor.isCanceled() ? Status.CANCEL_STATUS : overallStatus);
+-		} finally {
+-			subMonitor.done();
+ 		}
++		return (monitor.isCanceled() ? Status.CANCEL_STATUS : overallStatus);
+ 	}
+ 
+ 	public synchronized IArtifactDescriptor getCompleteArtifactDescriptor(IArtifactKey key) {
+commit 98dae69b753d15e72cc06374907c37cb1ae216d9
+Author: John Arthorne <johna>
+Date:   Wed Feb 13 02:43:40 2008 +0000
+
+    Bug 207802 [prov] Add multi-threaded download and mirror selection into p2's artifact retrieval
+
+61	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/DownloadStatus.java
+23	7	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
+232	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Mirrors.java
+0	142	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/Mirrors.java
+34	2	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+4	1	bundles/org.eclipse.equinox.p2.core/.options
+2	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Tracing.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/DownloadStatus.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/DownloadStatus.java
+new file mode 100644
+index 0000000..3481849
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/DownloadStatus.java
+@@ -0,0 +1,61 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.artifact.repository;
++
++import org.eclipse.core.runtime.Status;
++
++/**
++ * A status object that optionally reports additional information about the
++ * result of a download.
++ */
++public class DownloadStatus extends Status {
++	public static final long UNKNOWN_RATE = -1;
++
++	private long speed = UNKNOWN_RATE;
++
++	/**
++	 * Constructs a new DownloadStatus with the given attributes.
++	 */
++	public DownloadStatus(int severity, String pluginId, int code, String message, Throwable exception) {
++		super(severity, pluginId, code, message, exception);
++	}
++
++	/**
++	 * Constructs a new DownloadStatus with the given attributes.
++	 */
++	public DownloadStatus(int severity, String pluginId, String message) {
++		super(severity, pluginId, message);
++	}
++
++	/**
++	 * Constructs a new DownloadStatus with the given attributes.
++	 */
++	public DownloadStatus(int severity, String pluginId, String message, Throwable exception) {
++		super(severity, pluginId, message, exception);
++	}
++
++	/**
++	 * Returns the download rate in bytes per second.  If the rate is unknown,
++	 * @{link {@link #UNKNOWN_RATE}} is returned.
++	 * @return the download rate in bytes per second
++	 */
++	public long getTransferRate() {
++		return speed;
++	}
++
++	/**
++	 * Sets the download rate of the transfer in bytes per second.
++	 * @param rate The download rate in bytes per second
++	 */
++	public void setTransferRate(long rate) {
++		this.speed = rate;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
+index 76f2d49..87a5bb5 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
+@@ -53,12 +53,26 @@ public class ECFTransport extends Transport {
+ 		retrievalFactoryTracker.open();
+ 	}
+ 
+-	protected IStatus convertToStatus(Exception failure) {
++	protected IStatus convertToStatus(IFileTransferEvent event, Exception failure, long startTime) {
++		long speed = DownloadStatus.UNKNOWN_RATE;
++		if (event instanceof IIncomingFileTransferEvent) {
++			long bytes = ((IIncomingFileTransferEvent) event).getSource().getBytesReceived();
++			if (bytes > 0) {
++				long elapsed = (System.currentTimeMillis() - startTime) / 1000;//in seconds
++				if (elapsed == 0)
++					elapsed = 1;
++				speed = bytes / elapsed;
++			}
++		}
++		DownloadStatus result = null;
+ 		if (failure == null)
+-			return Status.OK_STATUS;
+-		if (failure instanceof UserCancelledException)
+-			return new Status(IStatus.CANCEL, Activator.ID, failure.getMessage(), failure);
+-		return new Status(IStatus.ERROR, Activator.ID, "error during transfer", failure);
++			result = new DownloadStatus(IStatus.OK, Activator.ID, Status.OK_STATUS.getMessage());
++		else if (failure instanceof UserCancelledException)
++			result = new DownloadStatus(IStatus.CANCEL, Activator.ID, failure.getMessage(), failure);
++		else
++			result = new DownloadStatus(IStatus.ERROR, Activator.ID, "Error during transfer", failure);
++		result.setTransferRate(speed);
++		return result;
+ 	}
+ 
+ 	public IStatus download(String toDownload, OutputStream target, IProgressMonitor monitor) {
+@@ -71,6 +85,7 @@ public class ECFTransport extends Transport {
+ 
+ 	private IStatus transfer(final IRetrieveFileTransferContainerAdapter retrievalContainer, final String toDownload, final OutputStream target, final IProgressMonitor monitor) {
+ 		final IStatus[] result = new IStatus[1];
++		final long startTime = System.currentTimeMillis();
+ 		IFileTransferListener listener = new IFileTransferListener() {
+ 			public void handleTransferEvent(IFileTransferEvent event) {
+ 				if (event instanceof IIncomingFileTransferReceiveStartEvent) {
+@@ -80,7 +95,7 @@ public class ECFTransport extends Transport {
+ 							rse.receive(target);
+ 						}
+ 					} catch (IOException e) {
+-						IStatus status = convertToStatus(e);
++						IStatus status = convertToStatus(event, e, startTime);
+ 						synchronized (result) {
+ 							result[0] = status;
+ 							result.notify();
+@@ -95,7 +110,8 @@ public class ECFTransport extends Transport {
+ 					}
+ 				}
+ 				if (event instanceof IIncomingFileTransferReceiveDoneEvent) {
+-					IStatus status = convertToStatus(((IIncomingFileTransferReceiveDoneEvent) event).getException());
++					Exception exception = ((IIncomingFileTransferReceiveDoneEvent) event).getException();
++					IStatus status = convertToStatus(event, exception, startTime);
+ 					synchronized (result) {
+ 						result[0] = status;
+ 						result.notify();
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Mirrors.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Mirrors.java
+new file mode 100644
+index 0000000..24832ba
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Mirrors.java
+@@ -0,0 +1,232 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.artifact.repository;
++
++import java.net.*;
++import java.util.*;
++import javax.xml.parsers.DocumentBuilder;
++import javax.xml.parsers.DocumentBuilderFactory;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
++import org.eclipse.equinox.internal.p2.core.helpers.Tracing;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
++import org.w3c.dom.*;
++
++/**
++ * Mirror support class for repositories. This class implements
++ * mirror support equivalent to the mirroring of update manager sites. A repository 
++ * optionally provides a mirror URL via the {@link IRepository#PROP_MIRRORS_URL} key. 
++ * The contents of the file at this URL is expected to be an XML document 
++ * containing a list of <mirror> elements. The mirrors are assumed to be already 
++ * sorted geographically with closer mirrors first.
++ */
++public class Mirrors {
++	/**
++	 * Encapsulates information about a single mirror
++	 */
++	static class MirrorInfo implements Comparable {
++		long bytesPerSecond;
++		int failureCount;
++		private final int initialRank;
++		String locationString;
++
++		MirrorInfo(String location, int initialRank) {
++			this.initialRank = initialRank;
++			this.locationString = location;
++			if (!locationString.endsWith("/")) //$NON-NLS-1$
++				locationString = locationString + "/"; //$NON-NLS-1$
++			failureCount = 0;
++			bytesPerSecond = DownloadStatus.UNKNOWN_RATE;
++		}
++
++		/**
++		 * Comparison used to sort mirrors.
++		 */
++		public int compareTo(Object o) {
++			if (!(o instanceof MirrorInfo))
++				return 0;
++			MirrorInfo that = (MirrorInfo) o;
++			//less failures is better
++			if (this.failureCount != that.failureCount)
++				return this.failureCount - that.failureCount;
++			//faster is better
++			if (this.bytesPerSecond != that.bytesPerSecond)
++				return (int) (this.bytesPerSecond - that.failureCount);
++			//trust that initial rank indicates geographical proximity
++			return this.initialRank - that.initialRank;
++		}
++
++		public String toString() {
++			return "Mirror(" + locationString + ',' + failureCount + ',' + bytesPerSecond + ')'; //$NON-NLS-1$
++		}
++	}
++
++	/**
++	 * The URI of the base repository being mirrored.
++	 */
++	URI baseURI;
++
++	MirrorInfo[] mirrors;
++
++	private final IRepository repository;
++
++	/**
++	 * Constructs a mirror support class for the given repository. Mirrors are
++	 * not contacted and the mirrorsURL document is not parsed until a
++	 * mirror location request is sent.
++	 */
++	public Mirrors(IRepository repository) {
++		this.repository = repository;
++		try {
++			URL repositoryURL = repository.getLocation();
++			if (repositoryURL != null)
++				this.baseURI = new URI(repositoryURL.toExternalForm());
++		} catch (URISyntaxException e) {
++			log("Error initializing mirrors for: " + repository.getLocation(), e); //$NON-NLS-1$
++		}
++	}
++
++	/**
++	 * Parses the given mirror URL to obtain the list of mirrors. Returns the mirrors,
++	 * or null if mirrors could not be computed.
++	 * 
++	 * Originally copied from DefaultSiteParser.getMirrors in org.eclipse.update.core
++	 */
++	private MirrorInfo[] computeMirrors(String mirrorsURL) {
++		try {
++			String countryCode = Locale.getDefault().getCountry().toLowerCase();
++			int timeZone = (new GregorianCalendar()).get(Calendar.ZONE_OFFSET) / (60 * 60 * 1000);
++
++			if (mirrorsURL.indexOf('?') != -1) {
++				mirrorsURL = mirrorsURL + '&';
++			} else {
++				mirrorsURL = mirrorsURL + '?';
++			}
++			mirrorsURL = mirrorsURL + "countryCode=" + countryCode + "&timeZone=" + timeZone + "&responseType=xml"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++
++			DocumentBuilderFactory domFactory = DocumentBuilderFactory.newInstance();
++			DocumentBuilder builder = domFactory.newDocumentBuilder();
++			Document document = builder.parse(mirrorsURL);
++			if (document == null)
++				return null;
++			NodeList mirrorNodes = document.getElementsByTagName("mirror"); //$NON-NLS-1$
++			int mirrorCount = mirrorNodes.getLength();
++			MirrorInfo[] infos = new MirrorInfo[mirrorCount + 1];
++			for (int i = 0; i < mirrorCount; i++) {
++				Element mirrorNode = (Element) mirrorNodes.item(i);
++				String infoURL = mirrorNode.getAttribute("url"); //$NON-NLS-1$
++				infos[i] = new MirrorInfo(infoURL, i);
++			}
++			//p2: add the base site as the last resort mirror so we can track download speed and failure rate
++			infos[mirrorCount] = new MirrorInfo(repository.getLocation().toExternalForm(), mirrorCount);
++			return infos;
++		} catch (Exception e) {
++			// log if absolute url
++			if (mirrorsURL != null && (mirrorsURL.startsWith("http://") //$NON-NLS-1$
++					|| mirrorsURL.startsWith("https://") //$NON-NLS-1$
++					|| mirrorsURL.startsWith("file://") //$NON-NLS-1$
++					|| mirrorsURL.startsWith("ftp://") //$NON-NLS-1$
++			|| mirrorsURL.startsWith("jar://"))) //$NON-NLS-1$
++				log("Error processing mirrors URL: " + mirrorsURL, e); //$NON-NLS-1$
++			return null;
++		}
++	}
++
++	/**
++	 * Returns an equivalent location for the given artifact location in the base 
++	 * repository.  Always falls back to the given input location in case of failure
++	 * to compute mirrors. Never returns null.
++	 */
++	public synchronized String getMirrorLocation(String inputLocation) {
++		Assert.isNotNull(inputLocation);
++		if (baseURI == null)
++			return inputLocation;
++		URI relativeLocation = null;
++		try {
++			relativeLocation = baseURI.relativize(new URI(inputLocation));
++		} catch (URISyntaxException e) {
++			log("Unable to make location relative: " + inputLocation, e); //$NON-NLS-1$
++		}
++		//if we failed to relativize the location, we can't select a mirror
++		if (relativeLocation == null || relativeLocation.isAbsolute())
++			return inputLocation;
++		MirrorInfo selectedMirror = selectMirror();
++		if (selectedMirror == null)
++			return inputLocation;
++		if (Tracing.DEBUG_MIRRORS)
++			Tracing.debug("Selected mirror for artifact " + inputLocation + ": " + selectedMirror); //$NON-NLS-1$ //$NON-NLS-2$
++		try {
++			return new URL(selectedMirror.locationString + relativeLocation.getPath()).toExternalForm();
++		} catch (MalformedURLException e) {
++			log("Unable to make location " + inputLocation + " relative to mirror " + selectedMirror.locationString, e); //$NON-NLS-1$ //$NON-NLS-2$
++		}
++		return inputLocation;
++	}
++
++	/**
++	 * Returns the mirror locations for this repository, or <code>null</code> if
++	 * they could not be computed.
++	 */
++	private MirrorInfo[] initMirrors() {
++		if (mirrors != null)
++			return mirrors;
++		String mirrorsURL = (String) repository.getProperties().get(IRepository.PROP_MIRRORS_URL);
++		if (mirrorsURL != null)
++			mirrors = computeMirrors(mirrorsURL);
++		return mirrors;
++	}
++
++	private void log(String message, Throwable exception) {
++		LogHelper.log(new Status(IStatus.ERROR, Activator.ID, message, exception));
++	}
++
++	/**
++	 * Reports the result of a mirror download
++	 */
++	public synchronized void reportResult(String toDownload, IStatus result) {
++		if (mirrors == null)
++			return;
++		for (int i = 0; i < mirrors.length; i++) {
++			MirrorInfo mirror = mirrors[i];
++			if (toDownload.startsWith(mirror.locationString)) {
++				if (!result.isOK() && result.getSeverity() != IStatus.CANCEL)
++					mirror.failureCount++;
++				if (result instanceof DownloadStatus) {
++					long oldRate = mirror.bytesPerSecond;
++					long newRate = ((DownloadStatus) result).getTransferRate();
++					//average old and new rate so one slow download doesn't ruin the mirror's reputation
++					if (oldRate > 0)
++						newRate = (oldRate + newRate) / 2;
++					mirror.bytesPerSecond = newRate;
++				}
++				if (Tracing.DEBUG_MIRRORS)
++					Tracing.debug("Updated mirror " + mirror); //$NON-NLS-1$
++				Arrays.sort(mirrors);
++				return;
++			}
++		}
++	}
++
++	/**
++	 * Selects a mirror from the given list of mirrors. Returns null if a mirror
++	 * could not be found.
++	 */
++	private MirrorInfo selectMirror() {
++		initMirrors();
++		if (mirrors == null || mirrors.length == 0)
++			return null;
++		//for now, don't tolerate failing mirrors
++		if (mirrors[0].failureCount > 0)
++			return null;
++		return mirrors[0];
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/Mirrors.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/Mirrors.java
+deleted file mode 100644
+index 123f642..0000000
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/Mirrors.java
++++ /dev/null
+@@ -1,142 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- * 
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.artifact.repository.simple;
+-
+-import java.net.*;
+-import java.util.*;
+-import javax.xml.parsers.DocumentBuilder;
+-import javax.xml.parsers.DocumentBuilderFactory;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Status;
+-import org.eclipse.equinox.internal.p2.artifact.repository.Activator;
+-import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+-import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepository;
+-import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+-import org.w3c.dom.*;
+-
+-/**
+- * Mirror support class for {@link SimpleArtifactRepository}. This class implements
+- * mirror support equivalent to update manager. A mirror URL returns an XML document
+- * containing a list of mirrors, sorted geographically with closer mirrors first.
+- */
+-public class Mirrors {
+-	URI baseURI;
+-	URL[] locations;
+-	private final IArtifactRepository repository;
+-
+-	/**
+-	 * Parses the given mirror URL to obtain the list of mirrors. Returns the mirrors,
+-	 * or null if mirrors could not be computed.
+-	 * 
+-	 * Originally copied from DefaultSiteParser.getMirrors in org.eclipse.update.core
+-	 */
+-	static URL[] computeMirrors(String mirrorsURL) {
+-		try {
+-			String countryCode = Locale.getDefault().getCountry().toLowerCase();
+-			int timeZone = (new GregorianCalendar()).get(Calendar.ZONE_OFFSET) / (60 * 60 * 1000);
+-
+-			if (mirrorsURL.indexOf('?') != -1) {
+-				mirrorsURL = mirrorsURL + '&';
+-			} else {
+-				mirrorsURL = mirrorsURL + '?';
+-			}
+-			mirrorsURL = mirrorsURL + "countryCode=" + countryCode + "&timeZone=" + timeZone + "&responseType=xml"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+-
+-			DocumentBuilderFactory domFactory = DocumentBuilderFactory.newInstance();
+-			DocumentBuilder builder = domFactory.newDocumentBuilder();
+-			Document document = builder.parse(mirrorsURL);
+-			if (document == null)
+-				return null;
+-			NodeList mirrorNodes = document.getElementsByTagName("mirror"); //$NON-NLS-1$
+-			URL[] mirrors = new URL[mirrorNodes.getLength()];
+-			for (int i = 0; i < mirrorNodes.getLength(); i++) {
+-				Element mirrorNode = (Element) mirrorNodes.item(i);
+-				String infoURL = mirrorNode.getAttribute("url"); //$NON-NLS-1$
+-				mirrors[i] = new URL(infoURL);
+-			}
+-			return mirrors;
+-		} catch (Exception e) {
+-			// log if absolute url
+-			if (mirrorsURL != null && (mirrorsURL.startsWith("http://") //$NON-NLS-1$
+-					|| mirrorsURL.startsWith("https://") //$NON-NLS-1$
+-					|| mirrorsURL.startsWith("file://") //$NON-NLS-1$
+-					|| mirrorsURL.startsWith("ftp://") //$NON-NLS-1$
+-			|| mirrorsURL.startsWith("jar://"))) //$NON-NLS-1$
+-				log("Error processing mirrors URL: " + mirrorsURL, e); //$NON-NLS-1$
+-			return null;
+-		}
+-	}
+-
+-	private static void log(String message, Throwable exception) {
+-		LogHelper.log(new Status(IStatus.ERROR, Activator.ID, message, exception));
+-	}
+-
+-	public Mirrors(IArtifactRepository repository) {
+-		this.repository = repository;
+-		try {
+-			URL repositoryURL = repository.getLocation();
+-			this.baseURI = new URI(repositoryURL.toExternalForm());
+-		} catch (URISyntaxException e) {
+-			log("Error initializing mirrors for: " + repository.getLocation(), e); //$NON-NLS-1$
+-		}
+-	}
+-
+-	/**
+-	 * Returns an equivalent location for the given artifact location in the base 
+-	 * repository.  Always falls back to the given input location in case of failure
+-	 * to compute mirrors.
+-	 */
+-	public String getMirrorLocation(String inputLocation) {
+-		URI relativeLocation = null;
+-		try {
+-			relativeLocation = baseURI.relativize(new URI(inputLocation));
+-		} catch (URISyntaxException e) {
+-			log("Unable to make location relative: " + inputLocation, e); //$NON-NLS-1$
+-		}
+-		//if we failed to relativize the location, we can't select a mirror
+-		if (relativeLocation == null || relativeLocation.isAbsolute())
+-			return inputLocation;
+-		URL[] mirrorLocations = getMirrorLocations();
+-		if (mirrorLocations == null)
+-			return inputLocation;
+-		URL selectedMirror = selectMirror(mirrorLocations);
+-		if (selectedMirror == null)
+-			return inputLocation;
+-		try {
+-			return new URL(selectedMirror, relativeLocation.getPath()).toExternalForm();
+-		} catch (MalformedURLException e) {
+-			log("Unable to make location " + inputLocation + " relative to mirror " + selectedMirror.toExternalForm(), e); //$NON-NLS-1$ //$NON-NLS-2$
+-		}
+-		return inputLocation;
+-	}
+-
+-	/**
+-	 * Returns the mirror locations for this repository, or <code>null</code> if
+-	 * they could not be computed.
+-	 */
+-	private URL[] getMirrorLocations() {
+-		if (locations != null)
+-			return locations;
+-		String mirrorsURL = (String) repository.getProperties().get(IRepository.PROP_MIRRORS_URL);
+-		if (mirrorsURL != null && baseURI != null)
+-			locations = computeMirrors(mirrorsURL);
+-		return locations;
+-	}
+-
+-	/**
+-	 * Selects a mirror from the given list of mirrors
+-	 */
+-	private URL selectMirror(URL[] mirrorLocations) {
+-		//TODO mirror weighting and dynamic selection
+-		return mirrorLocations[0];
+-	}
+-
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+index 04c5b09..50ba8f7 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+@@ -29,6 +29,7 @@ import org.eclipse.equinox.internal.provisional.spi.p2.artifact.repository.Abstr
+ import org.eclipse.osgi.util.NLS;
+ 
+ public class SimpleArtifactRepository extends AbstractArtifactRepository implements IArtifactRepository, IFileArtifactRepository {
++	private static final boolean MIRRORS_ENABLED = "true".equals(Activator.getContext().getProperty("eclipse.p2.mirrors")); //$NON-NLS-1$//$NON-NLS-2$
+ 
+ 	public class ArtifactOutputStream extends OutputStream implements IStateful {
+ 		private boolean closed;
+@@ -169,6 +170,7 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	protected String[][] mappingRules = DEFAULT_MAPPING_RULES;
+ 
+ 	private boolean signatureVerification = false;
++	private Mirrors mirrors;
+ 
+ 	static void delete(File toDelete) {
+ 		if (toDelete.isFile()) {
+@@ -370,8 +372,29 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 			return Status.OK_STATUS;
+ 		}
+ 
+-		String toDownload = getLocation(descriptor);
+-		return getTransport().download(toDownload, destination, monitor);
++		//download from the best available mirror
++		String baseLocation = getLocation(descriptor);
++		String mirrorLocation = getMirror(baseLocation);
++		IStatus result = getTransport().download(mirrorLocation, destination, monitor);
++		if (mirrors != null)
++			mirrors.reportResult(mirrorLocation, result);
++		if (result.isOK() || baseLocation.equals(mirrorLocation))
++			return result;
++		//maybe we hit a bad mirror - try the base location
++		return getTransport().download(baseLocation, destination, monitor);
++	}
++
++	/**
++	 * Returns an equivalent mirror location for the given artifact location.
++	 * @param baseLocation The location of the artifact in this repository
++	 * @return the Location of the artifact in this repository, or an equivalent mirror
++	 */
++	private synchronized String getMirror(String baseLocation) {
++		if (!MIRRORS_ENABLED || isLocal())
++			return baseLocation;
++		if (mirrors == null)
++			mirrors = new Mirrors(this);
++		return mirrors.getMirrorLocation(baseLocation);
+ 	}
+ 
+ 	public Object getAdapter(Class adapter) {
+@@ -487,10 +510,19 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		return artifactDescriptors;
+ 	}
+ 
++	/**
++	 * Typically non-canonical forms of the artifact are stored in the blob store.
++	 * However, we support having the pack200 files alongside the canonical artifact
++	 * for compatibility with the format used in optimized update sites.  We call
++	 * this arrangement "flat but packed".
++	 */
+ 	private boolean flatButPackedEnabled(IArtifactDescriptor descriptor) {
+ 		return Boolean.TRUE.toString().equals(getProperties().get(PUBLISH_PACK_FILES_AS_SIBLINGS)) && PACKED_FORMAT.equals(descriptor.getProperty(IArtifactDescriptor.FORMAT));
+ 	}
+ 
++	/**
++	 * @see #flatButPackedEnabled(IArtifactDescriptor)
++	 */
+ 	private String getLocationForPackedButFlatArtifacts(IArtifactDescriptor descriptor) {
+ 		IArtifactKey key = descriptor.getArtifactKey();
+ 		return mapper.map(location.toExternalForm(), key.getNamespace(), key.getClassifier(), key.getId(), key.getVersion().toString(), descriptor.getProperty(IArtifactDescriptor.FORMAT));
+diff --git a/bundles/org.eclipse.equinox.p2.core/.options b/bundles/org.eclipse.equinox.p2.core/.options
+index 52f004d..6af42a3 100644
+--- a/bundles/org.eclipse.equinox.p2.core/.options
++++ b/bundles/org.eclipse.equinox.p2.core/.options
+@@ -11,4 +11,7 @@ org.eclipse.equinox.p2.core/generator/parsing=false
+ org.eclipse.equinox.p2.core/engine/installregistry=false
+ 
+ #Detailed debugging information while saving/restoring metadata repositories
+-org.eclipse.equinox.p2.core/metadata/parsing=false
+\ No newline at end of file
++org.eclipse.equinox.p2.core/metadata/parsing=false
++
++#Detailed debugging information about mirror selection
++org.eclipse.equinox.p2.core/artifacts/mirrors=false
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Tracing.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Tracing.java
+index b64842c..6f81df5 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Tracing.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Tracing.java
+@@ -27,6 +27,7 @@ public class Tracing {
+ 	public static boolean DEBUG_GENERATOR_PARSING = false;
+ 	public static boolean DEBUG_INSTALL_REGISTRY = false;
+ 	public static boolean DEBUG_METADATA_PARSING = false;
++	public static boolean DEBUG_MIRRORS = false;
+ 
+ 	static {
+ 		DebugOptions options = (DebugOptions) ServiceHelper.getService(Activator.context, DebugOptions.class.getName());
+@@ -37,6 +38,7 @@ public class Tracing {
+ 				DEBUG_GENERATOR_PARSING = options.getBooleanOption(Activator.ID + "/generator/parsing", false); //$NON-NLS-1$
+ 				DEBUG_INSTALL_REGISTRY = options.getBooleanOption(Activator.ID + "/engine/installregistry", false); //$NON-NLS-1$
+ 				DEBUG_METADATA_PARSING = options.getBooleanOption(Activator.ID + "/metadata/parsing", false); //$NON-NLS-1$
++				DEBUG_MIRRORS = options.getBooleanOption(Activator.ID + "/artifacts/mirrors", false); //$NON-NLS-1$
+ 			}
+ 		}
+ 	}
+commit 00c489ad4d03312428f474be62715b7e2a53c4ab
+Author: John Arthorne <johna>
+Date:   Tue Feb 19 02:13:02 2008 +0000
+
+    Bug 207802 [prov] Add multi-threaded download and mirror selection into p2's artifact retrieval
+
+248	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorSelector.java
+0	232	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Mirrors.java
+6	3	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorSelector.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorSelector.java
+new file mode 100644
+index 0000000..214a47b
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorSelector.java
+@@ -0,0 +1,248 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.artifact.repository;
++
++import java.net.*;
++import java.util.*;
++import javax.xml.parsers.DocumentBuilder;
++import javax.xml.parsers.DocumentBuilderFactory;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
++import org.eclipse.equinox.internal.p2.core.helpers.Tracing;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
++import org.w3c.dom.*;
++
++/**
++ * Mirror support class for repositories. This class implements
++ * mirror support equivalent to the mirroring of update manager sites. A repository 
++ * optionally provides a mirror URL via the {@link IRepository#PROP_MIRRORS_URL} key. 
++ * The contents of the file at this URL is expected to be an XML document 
++ * containing a list of <mirror> elements. The mirrors are assumed to be already 
++ * sorted geographically with closer mirrors first.
++ */
++public class MirrorSelector {
++	private static final double LOG2 = Math.log(2);
++
++	/**
++	 * Encapsulates information about a single mirror
++	 */
++	static class MirrorInfo implements Comparable {
++		long bytesPerSecond;
++		int failureCount;
++		private final int initialRank;
++		String locationString;
++
++		MirrorInfo(String location, int initialRank) {
++			this.initialRank = initialRank;
++			this.locationString = location;
++			if (!locationString.endsWith("/")) //$NON-NLS-1$
++				locationString = locationString + "/"; //$NON-NLS-1$
++			failureCount = 0;
++			bytesPerSecond = DownloadStatus.UNKNOWN_RATE;
++		}
++
++		/**
++		 * Comparison used to sort mirrors.
++		 */
++		public int compareTo(Object o) {
++			if (!(o instanceof MirrorInfo))
++				return 0;
++			MirrorInfo that = (MirrorInfo) o;
++			//less failures is better
++			if (this.failureCount != that.failureCount)
++				return this.failureCount - that.failureCount;
++			//faster is better
++			if (this.bytesPerSecond != that.bytesPerSecond)
++				return (int) (this.bytesPerSecond - that.failureCount);
++			//trust that initial rank indicates geographical proximity
++			return this.initialRank - that.initialRank;
++		}
++
++		public String toString() {
++			return "Mirror(" + locationString + ',' + failureCount + ',' + bytesPerSecond + ')'; //$NON-NLS-1$
++		}
++	}
++
++	/**
++	 * The URI of the base repository being mirrored.
++	 */
++	URI baseURI;
++
++	MirrorInfo[] mirrors;
++
++	private final IRepository repository;
++
++	private final Random random = new Random();
++
++	/**
++	 * Constructs a mirror support class for the given repository. Mirrors are
++	 * not contacted and the mirrorsURL document is not parsed until a
++	 * mirror location request is sent.
++	 */
++	public MirrorSelector(IRepository repository) {
++		this.repository = repository;
++		try {
++			URL repositoryURL = repository.getLocation();
++			if (repositoryURL != null)
++				this.baseURI = new URI(repositoryURL.toExternalForm());
++		} catch (URISyntaxException e) {
++			log("Error initializing mirrors for: " + repository.getLocation(), e); //$NON-NLS-1$
++		}
++	}
++
++	/**
++	 * Parses the given mirror URL to obtain the list of mirrors. Returns the mirrors,
++	 * or null if mirrors could not be computed.
++	 * 
++	 * Originally copied from DefaultSiteParser.getMirrors in org.eclipse.update.core
++	 */
++	private MirrorInfo[] computeMirrors(String mirrorsURL) {
++		try {
++			String countryCode = Locale.getDefault().getCountry().toLowerCase();
++			int timeZone = (new GregorianCalendar()).get(Calendar.ZONE_OFFSET) / (60 * 60 * 1000);
++
++			if (mirrorsURL.indexOf('?') != -1) {
++				mirrorsURL = mirrorsURL + '&';
++			} else {
++				mirrorsURL = mirrorsURL + '?';
++			}
++			mirrorsURL = mirrorsURL + "countryCode=" + countryCode + "&timeZone=" + timeZone + "&responseType=xml"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++
++			DocumentBuilderFactory domFactory = DocumentBuilderFactory.newInstance();
++			DocumentBuilder builder = domFactory.newDocumentBuilder();
++			Document document = builder.parse(mirrorsURL);
++			if (document == null)
++				return null;
++			NodeList mirrorNodes = document.getElementsByTagName("mirror"); //$NON-NLS-1$
++			int mirrorCount = mirrorNodes.getLength();
++			MirrorInfo[] infos = new MirrorInfo[mirrorCount + 1];
++			for (int i = 0; i < mirrorCount; i++) {
++				Element mirrorNode = (Element) mirrorNodes.item(i);
++				String infoURL = mirrorNode.getAttribute("url"); //$NON-NLS-1$
++				infos[i] = new MirrorInfo(infoURL, i);
++			}
++			//p2: add the base site as the last resort mirror so we can track download speed and failure rate
++			infos[mirrorCount] = new MirrorInfo(repository.getLocation().toExternalForm(), mirrorCount);
++			return infos;
++		} catch (Exception e) {
++			// log if absolute url
++			if (mirrorsURL != null && (mirrorsURL.startsWith("http://") //$NON-NLS-1$
++					|| mirrorsURL.startsWith("https://") //$NON-NLS-1$
++					|| mirrorsURL.startsWith("file://") //$NON-NLS-1$
++					|| mirrorsURL.startsWith("ftp://") //$NON-NLS-1$
++			|| mirrorsURL.startsWith("jar://"))) //$NON-NLS-1$
++				log("Error processing mirrors URL: " + mirrorsURL, e); //$NON-NLS-1$
++			return null;
++		}
++	}
++
++	/**
++	 * Returns an equivalent location for the given artifact location in the base 
++	 * repository.  Always falls back to the given input location in case of failure
++	 * to compute mirrors. Never returns null.
++	 */
++	public synchronized String getMirrorLocation(String inputLocation) {
++		Assert.isNotNull(inputLocation);
++		if (baseURI == null)
++			return inputLocation;
++		URI relativeLocation = null;
++		try {
++			relativeLocation = baseURI.relativize(new URI(inputLocation));
++		} catch (URISyntaxException e) {
++			log("Unable to make location relative: " + inputLocation, e); //$NON-NLS-1$
++		}
++		//if we failed to relativize the location, we can't select a mirror
++		if (relativeLocation == null || relativeLocation.isAbsolute())
++			return inputLocation;
++		MirrorInfo selectedMirror = selectMirror();
++		if (selectedMirror == null)
++			return inputLocation;
++		if (Tracing.DEBUG_MIRRORS)
++			Tracing.debug("Selected mirror for artifact " + inputLocation + ": " + selectedMirror); //$NON-NLS-1$ //$NON-NLS-2$
++		try {
++			return new URL(selectedMirror.locationString + relativeLocation.getPath()).toExternalForm();
++		} catch (MalformedURLException e) {
++			log("Unable to make location " + inputLocation + " relative to mirror " + selectedMirror.locationString, e); //$NON-NLS-1$ //$NON-NLS-2$
++		}
++		return inputLocation;
++	}
++
++	/**
++	 * Returns the mirror locations for this repository, or <code>null</code> if
++	 * they could not be computed.
++	 */
++	private MirrorInfo[] initMirrors() {
++		if (mirrors != null)
++			return mirrors;
++		String mirrorsURL = (String) repository.getProperties().get(IRepository.PROP_MIRRORS_URL);
++		if (mirrorsURL != null)
++			mirrors = computeMirrors(mirrorsURL);
++		return mirrors;
++	}
++
++	private void log(String message, Throwable exception) {
++		LogHelper.log(new Status(IStatus.ERROR, Activator.ID, message, exception));
++	}
++
++	/**
++	 * Reports the result of a mirror download
++	 */
++	public synchronized void reportResult(String toDownload, IStatus result) {
++		if (mirrors == null)
++			return;
++		for (int i = 0; i < mirrors.length; i++) {
++			MirrorInfo mirror = mirrors[i];
++			if (toDownload.startsWith(mirror.locationString)) {
++				if (!result.isOK() && result.getSeverity() != IStatus.CANCEL)
++					mirror.failureCount++;
++				if (result instanceof DownloadStatus) {
++					long oldRate = mirror.bytesPerSecond;
++					long newRate = ((DownloadStatus) result).getTransferRate();
++					//average old and new rate so one slow download doesn't ruin the mirror's reputation
++					if (oldRate > 0)
++						newRate = (oldRate + newRate) / 2;
++					mirror.bytesPerSecond = newRate;
++				}
++				if (Tracing.DEBUG_MIRRORS)
++					Tracing.debug("Updated mirror " + mirror); //$NON-NLS-1$
++				Arrays.sort(mirrors);
++				return;
++			}
++		}
++	}
++
++	/**
++	 * Selects a mirror from the given list of mirrors. Returns null if a mirror
++	 * could not be found.
++	 */
++	private MirrorInfo selectMirror() {
++		initMirrors();
++		int mirrorCount;
++		if (mirrors == null || (mirrorCount = mirrors.length) == 0)
++			return null;
++		//this is a function that randomly selects a mirror based on a logarithmic
++		//distribution. Mirror 0 has a 1/2 chance of being selected, mirror 1 has a 1/4 chance, 
++		// mirror 2 has a 1/8 chance, etc. This introduces some variation in the mirror 
++		//selection, while still favoring better mirrors
++		int result = (int) (Math.log(random.nextInt(1 << Math.min(15, mirrorCount)) + 1) / LOG2);
++		if (result >= mirrorCount)
++			result = mirrorCount - 1;
++		MirrorInfo selected = mirrors[mirrorCount - 1 - result];
++		//if we selected a mirror that has failed in the past, revert to best available mirror
++		if (selected.failureCount > 0)
++			selected = mirrors[0];
++		//for now, don't tolerate failing mirrors
++		if (mirrors[0].failureCount > 0)
++			return null;
++		return mirrors[0];
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Mirrors.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Mirrors.java
+deleted file mode 100644
+index 24832ba..0000000
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Mirrors.java
++++ /dev/null
+@@ -1,232 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- * 
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.artifact.repository;
+-
+-import java.net.*;
+-import java.util.*;
+-import javax.xml.parsers.DocumentBuilder;
+-import javax.xml.parsers.DocumentBuilderFactory;
+-import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+-import org.eclipse.equinox.internal.p2.core.helpers.Tracing;
+-import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+-import org.w3c.dom.*;
+-
+-/**
+- * Mirror support class for repositories. This class implements
+- * mirror support equivalent to the mirroring of update manager sites. A repository 
+- * optionally provides a mirror URL via the {@link IRepository#PROP_MIRRORS_URL} key. 
+- * The contents of the file at this URL is expected to be an XML document 
+- * containing a list of <mirror> elements. The mirrors are assumed to be already 
+- * sorted geographically with closer mirrors first.
+- */
+-public class Mirrors {
+-	/**
+-	 * Encapsulates information about a single mirror
+-	 */
+-	static class MirrorInfo implements Comparable {
+-		long bytesPerSecond;
+-		int failureCount;
+-		private final int initialRank;
+-		String locationString;
+-
+-		MirrorInfo(String location, int initialRank) {
+-			this.initialRank = initialRank;
+-			this.locationString = location;
+-			if (!locationString.endsWith("/")) //$NON-NLS-1$
+-				locationString = locationString + "/"; //$NON-NLS-1$
+-			failureCount = 0;
+-			bytesPerSecond = DownloadStatus.UNKNOWN_RATE;
+-		}
+-
+-		/**
+-		 * Comparison used to sort mirrors.
+-		 */
+-		public int compareTo(Object o) {
+-			if (!(o instanceof MirrorInfo))
+-				return 0;
+-			MirrorInfo that = (MirrorInfo) o;
+-			//less failures is better
+-			if (this.failureCount != that.failureCount)
+-				return this.failureCount - that.failureCount;
+-			//faster is better
+-			if (this.bytesPerSecond != that.bytesPerSecond)
+-				return (int) (this.bytesPerSecond - that.failureCount);
+-			//trust that initial rank indicates geographical proximity
+-			return this.initialRank - that.initialRank;
+-		}
+-
+-		public String toString() {
+-			return "Mirror(" + locationString + ',' + failureCount + ',' + bytesPerSecond + ')'; //$NON-NLS-1$
+-		}
+-	}
+-
+-	/**
+-	 * The URI of the base repository being mirrored.
+-	 */
+-	URI baseURI;
+-
+-	MirrorInfo[] mirrors;
+-
+-	private final IRepository repository;
+-
+-	/**
+-	 * Constructs a mirror support class for the given repository. Mirrors are
+-	 * not contacted and the mirrorsURL document is not parsed until a
+-	 * mirror location request is sent.
+-	 */
+-	public Mirrors(IRepository repository) {
+-		this.repository = repository;
+-		try {
+-			URL repositoryURL = repository.getLocation();
+-			if (repositoryURL != null)
+-				this.baseURI = new URI(repositoryURL.toExternalForm());
+-		} catch (URISyntaxException e) {
+-			log("Error initializing mirrors for: " + repository.getLocation(), e); //$NON-NLS-1$
+-		}
+-	}
+-
+-	/**
+-	 * Parses the given mirror URL to obtain the list of mirrors. Returns the mirrors,
+-	 * or null if mirrors could not be computed.
+-	 * 
+-	 * Originally copied from DefaultSiteParser.getMirrors in org.eclipse.update.core
+-	 */
+-	private MirrorInfo[] computeMirrors(String mirrorsURL) {
+-		try {
+-			String countryCode = Locale.getDefault().getCountry().toLowerCase();
+-			int timeZone = (new GregorianCalendar()).get(Calendar.ZONE_OFFSET) / (60 * 60 * 1000);
+-
+-			if (mirrorsURL.indexOf('?') != -1) {
+-				mirrorsURL = mirrorsURL + '&';
+-			} else {
+-				mirrorsURL = mirrorsURL + '?';
+-			}
+-			mirrorsURL = mirrorsURL + "countryCode=" + countryCode + "&timeZone=" + timeZone + "&responseType=xml"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+-
+-			DocumentBuilderFactory domFactory = DocumentBuilderFactory.newInstance();
+-			DocumentBuilder builder = domFactory.newDocumentBuilder();
+-			Document document = builder.parse(mirrorsURL);
+-			if (document == null)
+-				return null;
+-			NodeList mirrorNodes = document.getElementsByTagName("mirror"); //$NON-NLS-1$
+-			int mirrorCount = mirrorNodes.getLength();
+-			MirrorInfo[] infos = new MirrorInfo[mirrorCount + 1];
+-			for (int i = 0; i < mirrorCount; i++) {
+-				Element mirrorNode = (Element) mirrorNodes.item(i);
+-				String infoURL = mirrorNode.getAttribute("url"); //$NON-NLS-1$
+-				infos[i] = new MirrorInfo(infoURL, i);
+-			}
+-			//p2: add the base site as the last resort mirror so we can track download speed and failure rate
+-			infos[mirrorCount] = new MirrorInfo(repository.getLocation().toExternalForm(), mirrorCount);
+-			return infos;
+-		} catch (Exception e) {
+-			// log if absolute url
+-			if (mirrorsURL != null && (mirrorsURL.startsWith("http://") //$NON-NLS-1$
+-					|| mirrorsURL.startsWith("https://") //$NON-NLS-1$
+-					|| mirrorsURL.startsWith("file://") //$NON-NLS-1$
+-					|| mirrorsURL.startsWith("ftp://") //$NON-NLS-1$
+-			|| mirrorsURL.startsWith("jar://"))) //$NON-NLS-1$
+-				log("Error processing mirrors URL: " + mirrorsURL, e); //$NON-NLS-1$
+-			return null;
+-		}
+-	}
+-
+-	/**
+-	 * Returns an equivalent location for the given artifact location in the base 
+-	 * repository.  Always falls back to the given input location in case of failure
+-	 * to compute mirrors. Never returns null.
+-	 */
+-	public synchronized String getMirrorLocation(String inputLocation) {
+-		Assert.isNotNull(inputLocation);
+-		if (baseURI == null)
+-			return inputLocation;
+-		URI relativeLocation = null;
+-		try {
+-			relativeLocation = baseURI.relativize(new URI(inputLocation));
+-		} catch (URISyntaxException e) {
+-			log("Unable to make location relative: " + inputLocation, e); //$NON-NLS-1$
+-		}
+-		//if we failed to relativize the location, we can't select a mirror
+-		if (relativeLocation == null || relativeLocation.isAbsolute())
+-			return inputLocation;
+-		MirrorInfo selectedMirror = selectMirror();
+-		if (selectedMirror == null)
+-			return inputLocation;
+-		if (Tracing.DEBUG_MIRRORS)
+-			Tracing.debug("Selected mirror for artifact " + inputLocation + ": " + selectedMirror); //$NON-NLS-1$ //$NON-NLS-2$
+-		try {
+-			return new URL(selectedMirror.locationString + relativeLocation.getPath()).toExternalForm();
+-		} catch (MalformedURLException e) {
+-			log("Unable to make location " + inputLocation + " relative to mirror " + selectedMirror.locationString, e); //$NON-NLS-1$ //$NON-NLS-2$
+-		}
+-		return inputLocation;
+-	}
+-
+-	/**
+-	 * Returns the mirror locations for this repository, or <code>null</code> if
+-	 * they could not be computed.
+-	 */
+-	private MirrorInfo[] initMirrors() {
+-		if (mirrors != null)
+-			return mirrors;
+-		String mirrorsURL = (String) repository.getProperties().get(IRepository.PROP_MIRRORS_URL);
+-		if (mirrorsURL != null)
+-			mirrors = computeMirrors(mirrorsURL);
+-		return mirrors;
+-	}
+-
+-	private void log(String message, Throwable exception) {
+-		LogHelper.log(new Status(IStatus.ERROR, Activator.ID, message, exception));
+-	}
+-
+-	/**
+-	 * Reports the result of a mirror download
+-	 */
+-	public synchronized void reportResult(String toDownload, IStatus result) {
+-		if (mirrors == null)
+-			return;
+-		for (int i = 0; i < mirrors.length; i++) {
+-			MirrorInfo mirror = mirrors[i];
+-			if (toDownload.startsWith(mirror.locationString)) {
+-				if (!result.isOK() && result.getSeverity() != IStatus.CANCEL)
+-					mirror.failureCount++;
+-				if (result instanceof DownloadStatus) {
+-					long oldRate = mirror.bytesPerSecond;
+-					long newRate = ((DownloadStatus) result).getTransferRate();
+-					//average old and new rate so one slow download doesn't ruin the mirror's reputation
+-					if (oldRate > 0)
+-						newRate = (oldRate + newRate) / 2;
+-					mirror.bytesPerSecond = newRate;
+-				}
+-				if (Tracing.DEBUG_MIRRORS)
+-					Tracing.debug("Updated mirror " + mirror); //$NON-NLS-1$
+-				Arrays.sort(mirrors);
+-				return;
+-			}
+-		}
+-	}
+-
+-	/**
+-	 * Selects a mirror from the given list of mirrors. Returns null if a mirror
+-	 * could not be found.
+-	 */
+-	private MirrorInfo selectMirror() {
+-		initMirrors();
+-		if (mirrors == null || mirrors.length == 0)
+-			return null;
+-		//for now, don't tolerate failing mirrors
+-		if (mirrors[0].failureCount > 0)
+-			return null;
+-		return mirrors[0];
+-	}
+-
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+index 396275f..05b7ddb 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+@@ -29,7 +29,10 @@ import org.eclipse.equinox.internal.provisional.spi.p2.artifact.repository.Abstr
+ import org.eclipse.osgi.util.NLS;
+ 
+ public class SimpleArtifactRepository extends AbstractArtifactRepository implements IArtifactRepository, IFileArtifactRepository {
+-	private static final boolean MIRRORS_ENABLED = "true".equals(Activator.getContext().getProperty("eclipse.p2.mirrors")); //$NON-NLS-1$//$NON-NLS-2$
++	/** 
++	 * A boolean property controlling whether mirroring is enabled.
++	 */
++	public static final boolean MIRRORS_ENABLED = !"false".equals(Activator.getContext().getProperty("eclipse.p2.mirrors")); //$NON-NLS-1$//$NON-NLS-2$
+ 
+ 	/** 
+ 	 * The key for a integer property controls the maximum number
+@@ -179,7 +182,7 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	protected String[][] mappingRules = DEFAULT_MAPPING_RULES;
+ 
+ 	private boolean signatureVerification = false;
+-	private Mirrors mirrors;
++	private MirrorSelector mirrors;
+ 
+ 	static void delete(File toDelete) {
+ 		if (toDelete.isFile()) {
+@@ -402,7 +405,7 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		if (!MIRRORS_ENABLED || isLocal())
+ 			return baseLocation;
+ 		if (mirrors == null)
+-			mirrors = new Mirrors(this);
++			mirrors = new MirrorSelector(this);
+ 		return mirrors.getMirrorLocation(baseLocation);
+ 	}
+ 
+commit 23f3f40cc40a7de12cf65a7d2948d1986da6812d
+Author: John Arthorne <johna>
+Date:   Tue Feb 19 03:15:37 2008 +0000
+
+    Bug 207802 [prov] Add multi-threaded download and mirror selection into p2's artifact retrieval
+
+2	2	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorSelector.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorSelector.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorSelector.java
+index 214a47b..896aef2 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorSelector.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/MirrorSelector.java
+@@ -240,9 +240,9 @@ public class MirrorSelector {
+ 		if (selected.failureCount > 0)
+ 			selected = mirrors[0];
+ 		//for now, don't tolerate failing mirrors
+-		if (mirrors[0].failureCount > 0)
++		if (selected.failureCount > 0)
+ 			return null;
+-		return mirrors[0];
++		return selected;
+ 	}
+ 
+ }

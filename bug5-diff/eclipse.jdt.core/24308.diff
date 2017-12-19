@@ -1,0 +1,349 @@
+commit f850238096d0e6e37fbf42c72e3eea2d357ec53f
+Author: Jerome lanneluc <jlanneluc>
+Date:   Tue Nov 26 15:40:06 2002 +0000
+
+    Fix for bug 24308
+
+2	0	org.eclipse.jdt.core/buildnotes_jdt-core.html
+2	2	org.eclipse.jdt.core/search/org/eclipse/jdt/core/search/SearchEngine.java
+38	15	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+45	41	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchSet.java
+1	11	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchingOpenable.java
+6	13	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/SuperTypeNamesCollector.java
+diff --git a/org.eclipse.jdt.core/buildnotes_jdt-core.html b/org.eclipse.jdt.core/buildnotes_jdt-core.html
+index 0104320..6983061 100644
+--- a/org.eclipse.jdt.core/buildnotes_jdt-core.html
++++ b/org.eclipse.jdt.core/buildnotes_jdt-core.html
+@@ -46,6 +46,8 @@ What's new in this drop</h2>
+ </ul> 
+ 
+ <h3>Problem Reports Fixed</h3>
++<a href="http://bugs.eclipse.org/bugs/show_bug.cgi?id=24308">24308</a>
++Performance - Optimization of search in hierarchy 
+ 
+ <h3>Problem Reports Closed</h3>
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/core/search/SearchEngine.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/core/search/SearchEngine.java
+index 4a60850..5383390 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/core/search/SearchEngine.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/core/search/SearchEngine.java
+@@ -393,11 +393,11 @@ public void search(IWorkspace workspace, ISearchPattern searchPattern, IJavaSear
+ 		
+ 		// In the case of a hierarchy scope make sure that the hierarchy is not computed.
+ 		// MatchLocator will filter out elements not in the hierarchy
+-/*		if (scope instanceof HierarchyScope && searchPattern instanceof SearchPattern) {
++		if (scope instanceof HierarchyScope && searchPattern instanceof SearchPattern) {
+ 			((HierarchyScope)scope).needsRefresh = false;
+ 			((SearchPattern)searchPattern).needsResolve = true; // force resolve to compute type bindings
+ 		}
+-*/
++
+ 		IndexManager indexManager = ((JavaModelManager)JavaModelManager.getJavaModelManager())
+ 										.getIndexManager();
+ 		int detailLevel = IInfoConstants.PathInfo | IInfoConstants.PositionInfo;
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+index f383334..577828f 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+@@ -41,6 +41,7 @@ import org.eclipse.jdt.internal.compiler.problem.ProblemReporter;
+ import org.eclipse.jdt.internal.compiler.util.HashtableOfObject;
+ import org.eclipse.jdt.internal.core.*;
+ import org.eclipse.jdt.internal.core.hierarchy.HierarchyResolver;
++import org.eclipse.jdt.internal.core.search.HierarchyScope;
+ /**
+  * Locate matches in compilation units.
+  */
+@@ -369,21 +370,6 @@ public class MatchLocator implements ITypeRequestor {
+ 		
+ 		// remember project's name lookup
+ 		this.nameLookup = project.getNameLookup();
+-
+-		// create hierarchy resolver if scope is a hierarchy scope
+-/*	if (this.scope instanceof HierarchyScope) {
+-			IType focusType = ((HierarchyScope)this.scope).focusType;
+-			if (focusType != null) {
+-					char[] fullyQualifiedName = focusType.getFullyQualifiedName().toCharArray();
+-					this.hierarchyResolver = new HierarchyResolver(this.lookupEnvironment, null/*hierarchy is not going to be computed);
+-					this.hierarchyResolver.setFocusType(CharOperation.splitOn('.', fullyQualifiedName));
+-			} else {
+-				this.hierarchyResolver = null;
+-			}
+-		} else {
+-			this.hierarchyResolver = null;
+-		}
+-*/
+ 	}
+ 
+ 	public void initializeNameEnvironment(JavaProject project) throws JavaModelException {
+@@ -1086,6 +1072,29 @@ private void addMatchingOpenable(IResource resource, Openable openable)
+ 		this.matchingOpenables.add(matchingOpenable);
+ 	}
+ }
++/*
++ * Caches the given binary type in the lookup environment and returns it.
++ * Returns the existing one if already cached.
++ * Returns null if source type binding was cached.
++ */
++BinaryTypeBinding cacheBinaryType(IType type) throws JavaModelException {
++	IType enclosingType = type.getDeclaringType();
++	if (enclosingType != null) {
++		// force caching of enclosing types first, so that binary type can be found in lookup enviroment
++		this.cacheBinaryType(enclosingType);
++	}
++	IBinaryType binaryType = (IBinaryType)((BinaryType)type).getRawInfo();
++	BinaryTypeBinding binding = this.lookupEnvironment.cacheBinaryType(binaryType);
++	if (binding == null) { // it was already cached as a result of a previous query
++		char[][] compoundName = CharOperation.splitOn('.', type.getFullyQualifiedName().toCharArray());
++		ReferenceBinding referenceBinding = this.lookupEnvironment.getCachedType(compoundName);
++		if (referenceBinding != null && (referenceBinding instanceof BinaryTypeBinding)) {
++			// if the binding could be found and if it comes from a binary type,
++			binding = (BinaryTypeBinding)referenceBinding;
++		}
++	}
++	return binding;
++}
+ 
+ 
+ 	private INameEnvironment getNameEnvironment(JavaProject project) throws JavaModelException {
+@@ -1192,6 +1201,20 @@ public IBinaryType getBinaryInfo(org.eclipse.jdt.internal.core.ClassFile classFi
+ 			this.createAndResolveBindings(openables);
+ 		}
+ 
++		// create hierarchy resolver if scope is a hierarchy scope
++		if (this.scope instanceof HierarchyScope) {
++			IType focusType = ((HierarchyScope)this.scope).focusType;
++			if (focusType != null) {
++					char[] fullyQualifiedName = focusType.getFullyQualifiedName().toCharArray();
++					this.hierarchyResolver = new HierarchyResolver(this.lookupEnvironment, null/*hierarchy is not going to be computed*/);
++					this.hierarchyResolver.setFocusType(CharOperation.splitOn('.', fullyQualifiedName));
++			} else {
++				this.hierarchyResolver = null;
++			}
++		} else {
++			this.hierarchyResolver = null;
++		}
++
+ 		// matching openable resolution
+ 		for (int i = 0, length = openables.length; i < length; i++) { 
+ 			if (progressMonitor != null && progressMonitor.isCanceled()) {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchSet.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchSet.java
+index 2ecaf67..ee1658f 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchSet.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchSet.java
+@@ -182,7 +182,7 @@ public Integer removeTrustedMatch(AstNode node) {
+  * search pattern (ie. the ones in the matching nodes set)
+  * Note that the method declaration has already been checked.
+  */
+-private void reportMatching(AbstractMethodDeclaration method, IJavaElement parent) throws CoreException {
++private void reportMatching(AbstractMethodDeclaration method, IJavaElement parent, boolean typeInHierarchy) throws CoreException {
+ 	// declaration in this method
+ 	// (NB: declarations must be searched first (see bug 20631 Declaration of local binary type not found)
+ 	if ((method.bits & AstNode.HasLocalTypeMASK) != 0) {
+@@ -199,24 +199,26 @@ private void reportMatching(AbstractMethodDeclaration method, IJavaElement paren
+ 	}
+ 	
+ 	// references in this method
+-	AstNode[] nodes = this.matchingNodes(method.declarationSourceStart, method.declarationSourceEnd);
+-	for (int i = 0; i < nodes.length; i++) {
+-		AstNode node = nodes[i];
+-		Integer level = (Integer)this.matchingNodes.get(node);
+-		if ((this.matchContainer & SearchPattern.METHOD) != 0) {
+-			this.locator.reportReference(
+-				node, 
+-				method, 
+-				parent, 
+-				level.intValue() == SearchPattern.ACCURATE_MATCH ?
+-					IJavaSearchResultCollector.EXACT_MATCH :
+-					IJavaSearchResultCollector.POTENTIAL_MATCH);
+-			this.matchingNodes.remove(node);
++	if (typeInHierarchy) {
++		AstNode[] nodes = this.matchingNodes(method.declarationSourceStart, method.declarationSourceEnd);
++		for (int i = 0; i < nodes.length; i++) {
++			AstNode node = nodes[i];
++			Integer level = (Integer)this.matchingNodes.get(node);
++			if ((this.matchContainer & SearchPattern.METHOD) != 0) {
++				this.locator.reportReference(
++					node, 
++					method, 
++					parent, 
++					level.intValue() == SearchPattern.ACCURATE_MATCH ?
++						IJavaSearchResultCollector.EXACT_MATCH :
++						IJavaSearchResultCollector.POTENTIAL_MATCH);
++				this.matchingNodes.remove(node);
++			}
++		}
++		if (this.potentialMatchingNodes(method.declarationSourceStart, method.declarationSourceEnd).length == 0) {
++			// no need to resolve the statements in the method
++			method.statements = null;
+ 		}
+-	}
+-	if (this.potentialMatchingNodes(method.declarationSourceStart, method.declarationSourceEnd).length == 0) {
+-		// no need to resolve the statements in the method
+-		method.statements = null;
+ 	}
+ }
+ /**
+@@ -314,21 +316,23 @@ public void reportMatching(CompilationUnitDeclaration unit) throws CoreException
+  * search pattern (ie. the ones in the matching nodes set)
+  * Note that the field declaration has already been checked.
+  */
+-private void reportMatching(FieldDeclaration field, IJavaElement parent, TypeDeclaration type) throws CoreException {
+-	AstNode[] nodes = this.matchingNodes(field.declarationSourceStart, field.declarationSourceEnd);
+-	for (int i = 0; i < nodes.length; i++) {
+-		AstNode node = nodes[i];
+-		Integer level = (Integer)this.matchingNodes.get(node);
+-		if ((this.matchContainer & SearchPattern.FIELD) != 0) {
+-			this.locator.reportReference(
+-				node, 
+-				type, 
+-				field, 
+-				parent, 
+-				level.intValue() == SearchPattern.ACCURATE_MATCH ?
+-					IJavaSearchResultCollector.EXACT_MATCH :
+-					IJavaSearchResultCollector.POTENTIAL_MATCH);
+-			this.matchingNodes.remove(node);
++private void reportMatching(FieldDeclaration field, IJavaElement parent, TypeDeclaration type, boolean typeInHierarchy) throws CoreException {
++	if (typeInHierarchy) {
++		AstNode[] nodes = this.matchingNodes(field.declarationSourceStart, field.declarationSourceEnd);
++		for (int i = 0; i < nodes.length; i++) {
++			AstNode node = nodes[i];
++			Integer level = (Integer)this.matchingNodes.get(node);
++			if ((this.matchContainer & SearchPattern.FIELD) != 0) {
++				this.locator.reportReference(
++					node, 
++					type, 
++					field, 
++					parent, 
++					level.intValue() == SearchPattern.ACCURATE_MATCH ?
++						IJavaSearchResultCollector.EXACT_MATCH :
++						IJavaSearchResultCollector.POTENTIAL_MATCH);
++				this.matchingNodes.remove(node);
++			}
+ 		}
+ 	}
+ 	if ((field.bits & AstNode.HasLocalTypeMASK) != 0) {
+@@ -376,17 +380,17 @@ public void reportMatching(TypeDeclaration type, IJavaElement parent) throws Cor
+ 	if (fields != null && typeInHierarchy) {
+ 		for (int i = 0; i < fields.length; i++) {
+ 			FieldDeclaration field = fields[i];
+-			if ((level = (Integer)this.matchingNodes.remove(field)) != null) {
+-				if ((this.matchContainer & SearchPattern.CLASS) != 0) {
++			if ((level = (Integer)this.matchingNodes.remove(field)) != null
++				&& typeInHierarchy
++				&& (this.matchContainer & SearchPattern.CLASS) != 0) {
+ 					this.locator.reportFieldDeclaration(
+ 						field, 
+ 						enclosingElement, 
+ 						level.intValue() == SearchPattern.ACCURATE_MATCH ?
+ 							IJavaSearchResultCollector.EXACT_MATCH :
+ 							IJavaSearchResultCollector.POTENTIAL_MATCH);
+-				}
+ 			}
+-			this.reportMatching(field, enclosingElement, type);
++			this.reportMatching(field, enclosingElement, type, typeInHierarchy);
+ 		}
+ 	}
+ 
+@@ -395,17 +399,17 @@ public void reportMatching(TypeDeclaration type, IJavaElement parent) throws Cor
+ 	if (methods != null && typeInHierarchy) {
+ 		for (int i = 0; i < methods.length; i++) {
+ 			AbstractMethodDeclaration method = methods[i];
+-			if ((level = (Integer)this.matchingNodes.remove(method)) != null) {
+-				if ((this.matchContainer & SearchPattern.CLASS) != 0) {
++			if ((level = (Integer)this.matchingNodes.remove(method)) != null
++				&& typeInHierarchy
++				&& (this.matchContainer & SearchPattern.CLASS) != 0) {
+ 					this.locator.reportMethodDeclaration(
+ 						method, 
+ 						enclosingElement, 
+ 						level.intValue() == SearchPattern.ACCURATE_MATCH ?
+ 							IJavaSearchResultCollector.EXACT_MATCH :
+ 							IJavaSearchResultCollector.POTENTIAL_MATCH);
+-				}
+ 			}
+-			this.reportMatching(method, enclosingElement);
++			this.reportMatching(method, enclosingElement, typeInHierarchy);
+ 		}
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchingOpenable.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchingOpenable.java
+index fd13762..e88d9bf 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchingOpenable.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchingOpenable.java
+@@ -14,7 +14,6 @@ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.jdt.core.*;
+-import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.core.compiler.IProblem;
+ import org.eclipse.jdt.core.search.IJavaSearchResultCollector;
+ import org.eclipse.jdt.internal.compiler.CompilationResult;
+@@ -187,16 +186,7 @@ private void locateMatchesInClassFile() throws CoreException, JavaModelException
+ 		// resolve
+ 		BinaryTypeBinding binding = null;
+ 		try {
+-			binding = this.locator.lookupEnvironment.cacheBinaryType(info);
+-			if (binding == null) { // it was already cached as a result of a previous query
+-				char[][] compoundName = CharOperation.splitOn('.', binaryType.getFullyQualifiedName().toCharArray());
+-				ReferenceBinding referenceBinding = this.locator.lookupEnvironment.getCachedType(compoundName);
+-				if (referenceBinding != null && (referenceBinding instanceof BinaryTypeBinding)) {
+-					// if the binding could be found and if it comes from a binary type,
+-					binding = (BinaryTypeBinding)referenceBinding;
+-				}
+-			}
+-
++			binding = this.locator.cacheBinaryType(binaryType);
+ 			if (binding != null) {
+ 				// filter out element not in hierarchy scope
+ 				if (this.locator.hierarchyResolver != null 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/SuperTypeNamesCollector.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/SuperTypeNamesCollector.java
+index e79e199..d44e978 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/SuperTypeNamesCollector.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/SuperTypeNamesCollector.java
+@@ -46,7 +46,6 @@ import org.eclipse.jdt.internal.compiler.lookup.PackageBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+ import org.eclipse.jdt.internal.compiler.parser.SourceTypeConverter;
+ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+-import org.eclipse.jdt.internal.core.BinaryType;
+ import org.eclipse.jdt.internal.core.JavaModelManager;
+ import org.eclipse.jdt.internal.core.JavaProject;
+ import org.eclipse.jdt.internal.core.Openable;
+@@ -178,15 +177,7 @@ private CompilationUnitDeclaration buildBindings(ICompilationUnit compilationUni
+ 	}
+ 	return unit;
+ }
+-private BinaryTypeBinding cacheBinaryType(IType type) throws JavaModelException {
+-	IType enclosingType = type.getDeclaringType();
+-	if (enclosingType != null) {
+-		// force caching of enclosing types first, so that binary type can be found in lookup enviroment
+-		this.cacheBinaryType(enclosingType);
+-	}
+-	IBinaryType binaryType = (IBinaryType)((BinaryType)type).getRawInfo();
+-	return this.locator.lookupEnvironment.cacheBinaryType(binaryType);
+-}
++
+ 
+ protected char[][][] collect() throws JavaModelException {
+ 	
+@@ -201,8 +192,10 @@ protected char[][][] collect() throws JavaModelException {
+ 			this.locator.nameLookup.setUnitsToLookInside(this.locator.workingCopies);
+ 			try {
+ 				if (this.type.isBinary()) {
+-					BinaryTypeBinding binding = this.cacheBinaryType(this.type);
+-					this.collectSuperTypeNames(binding);
++					BinaryTypeBinding binding = this.locator.cacheBinaryType(this.type);
++					if (binding != null) {
++						this.collectSuperTypeNames(binding);
++					}
+ 				} else {
+ 					ICompilationUnit unit = this.type.getCompilationUnit();
+ 					CompilationUnitDeclaration parsedUnit = this.buildBindings(unit);
+@@ -254,7 +247,7 @@ protected char[][][] collect() throws JavaModelException {
+ 							}
+ 						} else if (openable instanceof IClassFile) {
+ 							IClassFile classFile = (IClassFile)openable;
+-							BinaryTypeBinding binding = this.cacheBinaryType(classFile.getType());
++							BinaryTypeBinding binding = this.locator.cacheBinaryType(classFile.getType());
+ 							if (this.matches(binding)) {
+ 								this.collectSuperTypeNames(binding);
+ 							}

@@ -1,0 +1,943 @@
+commit 220fb52a9b325af429abec698baf0082be4dab47
+Author: Pascal Rapicault (JBoss) <pascal@rapicault.net>
+Date:   Wed May 8 23:59:58 2013 -0400
+
+    Bug 406984 - [ui][remediation] Rework presentation of the solutions
+
+80	1	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemediationOperation.java
+24	1	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/Remedy.java
+68	0	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemedyIUDetail.java
+-	-	bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_downgraded.gif
+-	-	bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_downgraded.png
+-	-	bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_info.gif
+-	-	bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_notadd.gif
+-	-	bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_upgraded.gif
+-	-	bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_upgraded.png
+5	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+8	2	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIImages.java
+8	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/InstallWizard.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
+164	22	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationGroup.java
+56	11	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ResolutionResultsWizardPage.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
+8	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+15	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/AvailableIUElement.java
+41	25	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ElementUtils.java
+39	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RemedyElementCategory.java
+2	3	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/ProvisioningUI.java
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemediationOperation.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemediationOperation.java
+index ae02400..d64dc67 100644
+--- a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemediationOperation.java
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemediationOperation.java
+@@ -15,6 +15,8 @@ import org.eclipse.core.runtime.*;
+ import org.eclipse.core.runtime.jobs.Job;
+ import org.eclipse.equinox.internal.p2.director.ProfileChangeRequest;
+ import org.eclipse.equinox.internal.p2.operations.*;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
++import org.eclipse.equinox.p2.metadata.Version;
+ import org.eclipse.equinox.p2.planner.IPlanner;
+ import org.eclipse.equinox.p2.planner.IProfileChangeRequest;
+ import org.eclipse.equinox.p2.repository.IRunnableWithProgress;
+@@ -137,7 +139,7 @@ public class RemediationOperation extends ProfileChangeOperation {
+ 	}
+ 
+ 	private Remedy computeRemedy(RemedyConfig configuration, IProgressMonitor monitor) {
+-		Remedy remedy = new Remedy();
++		Remedy remedy = new Remedy(originalRequest);
+ 		remedy.setConfig(configuration);
+ 		IPlanner planner = session.getPlanner();
+ 		RequestFlexer av = new RequestFlexer(planner);
+@@ -168,6 +170,7 @@ public class RemediationOperation extends ProfileChangeOperation {
+ 		} else {
+ 			remedy.setBeingInstalledRelaxedWeight(ZERO_WEIGHT);
+ 		}
++		computeRemedyDetails(remedy);
+ 		return remedy;
+ 	}
+ 
+@@ -230,4 +233,80 @@ public class RemediationOperation extends ProfileChangeOperation {
+ 			return super.getResolutionResult();
+ 		return remedies.size() > 0 ? Status.OK_STATUS : new Status(IStatus.ERROR, Activator.ID, Messages.RemediationOperation_NoRemedyFound);
+ 	}
++
++	private void computeRemedyDetails(Remedy remedy) {
++		ArrayList<String> updateIds = new ArrayList<String>();
++		for (IInstallableUnit addedIU : remedy.getRequest().getAdditions()) {
++			for (IInstallableUnit removedIU : remedy.getRequest().getRemovals()) {
++				if (removedIU.getId().equals(addedIU.getId())) {
++					createModificationRemedyDetail(addedIU, removedIU, remedy);
++					updateIds.add(addedIU.getId());
++					break;
++				}
++			}
++			if (!updateIds.contains(addedIU.getId())) {
++				createAdditionRemedyDetail(addedIU, remedy);
++			}
++		}
++
++		for (IInstallableUnit removedIU : remedy.getRequest().getRemovals()) {
++			if (!updateIds.contains(removedIU.getId())) {
++				createRemovalRemedyDetail(removedIU, remedy);
++			}
++		}
++
++		for (IInstallableUnit addedIUinOriginalRequest : originalRequest.getAdditions()) {
++			boolean found = false;
++			for (IInstallableUnit addedIU : remedy.getRequest().getAdditions()) {
++				if (addedIU.getId().equals(addedIUinOriginalRequest.getId())) {
++					found = true;
++					break;
++				}
++			}
++			if (!found) {
++				createNotAddedRemedyDetail(addedIUinOriginalRequest, remedy);
++				found = false;
++			}
++		}
++
++	}
++
++	private void createNotAddedRemedyDetail(IInstallableUnit iu, Remedy remedy) {
++		RemedyIUDetail iuDetail = new RemedyIUDetail(iu);
++		iuDetail.setStatus(RemedyIUDetail.STATUS_NOT_ADDED);
++		iuDetail.setRequestedVersion(iu.getVersion());
++		remedy.addRemedyIUDetail(iuDetail);
++	}
++
++	private void createRemovalRemedyDetail(IInstallableUnit iu, Remedy remedy) {
++		RemedyIUDetail iuDetail = new RemedyIUDetail(iu);
++		iuDetail.setStatus(RemedyIUDetail.STATUS_REMOVED);
++		iuDetail.setInstalledVersion(iu.getVersion());
++		remedy.addRemedyIUDetail(iuDetail);
++	}
++
++	private void createAdditionRemedyDetail(IInstallableUnit iu, Remedy remedy) {
++		RemedyIUDetail iuDetail = new RemedyIUDetail(iu);
++		iuDetail.setStatus(RemedyIUDetail.STATUS_ADDED);
++		iuDetail.setBeingInstalledVersion(iu.getVersion());
++		iuDetail.setRequestedVersion(searchInOriginalRequest(iu.getId()));
++		remedy.addRemedyIUDetail(iuDetail);
++	}
++
++	private void createModificationRemedyDetail(IInstallableUnit beingInstalledIU, IInstallableUnit installedIU, Remedy remedy) {
++		RemedyIUDetail iuDetail = new RemedyIUDetail(beingInstalledIU);
++		iuDetail.setStatus(RemedyIUDetail.STATUS_CHANGED);
++		iuDetail.setBeingInstalledVersion(beingInstalledIU.getVersion());
++		iuDetail.setInstalledVersion(installedIU.getVersion());
++		iuDetail.setRequestedVersion(searchInOriginalRequest(beingInstalledIU.getId()));
++		remedy.addRemedyIUDetail(iuDetail);
++	}
++
++	private Version searchInOriginalRequest(String id) {
++		for (IInstallableUnit iu : originalRequest.getAdditions()) {
++			if (iu.getId() == id)
++				return iu.getVersion();
++		}
++		return null;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/Remedy.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/Remedy.java
+index 4c2e0dd..02ad85a 100644
+--- a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/Remedy.java
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/Remedy.java
+@@ -10,7 +10,10 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.operations;
+ 
++import java.util.ArrayList;
++import java.util.List;
+ import org.eclipse.equinox.internal.p2.director.ProfileChangeRequest;
++import org.eclipse.equinox.p2.planner.IProfileChangeRequest;
+ 
+ /**
+  * <p>
+@@ -27,6 +30,22 @@ public class Remedy {
+ 	private ProfileChangeRequest request;
+ 	private int beingInstalledRelaxedWeight;
+ 	private int installationRelaxedWeight;
++	private IProfileChangeRequest originalRequest;
++	private List<RemedyIUDetail> iusDetails;
++
++	public List<RemedyIUDetail> getIusDetails() {
++		return iusDetails;
++	}
++
++	public IProfileChangeRequest getOriginalRequest() {
++		return originalRequest;
++
++	}
++
++	public Remedy(IProfileChangeRequest originalRequest) {
++		this.originalRequest = originalRequest;
++		this.iusDetails = new ArrayList<RemedyIUDetail>();
++	}
+ 
+ 	public RemedyConfig getConfig() {
+ 		return config;
+@@ -60,4 +79,8 @@ public class Remedy {
+ 		this.installationRelaxedWeight = installationRelaxedWeight;
+ 	}
+ 
+-}
++	public void addRemedyIUDetail(RemedyIUDetail iuDetail) {
++		iusDetails.add(iuDetail);
++	}
++
++}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemedyIUDetail.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemedyIUDetail.java
+new file mode 100644
+index 0000000..1d060a5
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemedyIUDetail.java
+@@ -0,0 +1,68 @@
++/*******************************************************************************
++ * Copyright (c) 2013 Red Hat, Inc. and others
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ *  Contributors:
++ *     Red Hat, Inc. - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.p2.operations;
++
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
++import org.eclipse.equinox.p2.metadata.Version;
++
++public class RemedyIUDetail {
++
++	public static final int STATUS_ADDED = 1;
++	public static final int STATUS_REMOVED = 2;
++	public static final int STATUS_NOT_ADDED = 3;
++	public static final int STATUS_CHANGED = 4;
++
++	private int status;
++	private Version installedVersion;
++	private Version requestedVersion;
++	private Version beingInstalledVersion;
++	private IInstallableUnit iu;
++
++	public RemedyIUDetail(IInstallableUnit iu) {
++		this.iu = iu;
++	}
++
++	public void setStatus(int status) {
++		this.status = status;
++	}
++
++	public int getStatus() {
++		return status;
++	}
++
++	public Version getRequestedVersion() {
++		return requestedVersion;
++	}
++
++	public void setRequestedVersion(Version requestedVersion) {
++		this.requestedVersion = requestedVersion;
++	}
++
++	public Version getBeingInstalledVersion() {
++		return beingInstalledVersion;
++	}
++
++	public void setBeingInstalledVersion(Version beingInstalledVersion) {
++		this.beingInstalledVersion = beingInstalledVersion;
++	}
++
++	public IInstallableUnit getIu() {
++		return iu;
++	}
++
++	public Version getInstalledVersion() {
++		return installedVersion;
++	}
++
++	public void setInstalledVersion(Version installedVersion) {
++		this.installedVersion = installedVersion;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_downgraded.gif b/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_downgraded.gif
+deleted file mode 100755
+index cd84203..0000000
+Binary files a/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_downgraded.gif and /dev/null differ
+diff --git a/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_downgraded.png b/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_downgraded.png
+new file mode 100644
+index 0000000..533fee8
+Binary files /dev/null and b/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_downgraded.png differ
+diff --git a/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_info.gif b/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_info.gif
+new file mode 100644
+index 0000000..ee2dac4
+Binary files /dev/null and b/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_info.gif differ
+diff --git a/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_notadd.gif b/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_notadd.gif
+new file mode 100644
+index 0000000..dfbf68f
+Binary files /dev/null and b/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_notadd.gif differ
+diff --git a/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_upgraded.gif b/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_upgraded.gif
+deleted file mode 100755
+index a53606b..0000000
+Binary files a/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_upgraded.gif and /dev/null differ
+diff --git a/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_upgraded.png b/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_upgraded.png
+new file mode 100644
+index 0000000..4354c6f
+Binary files /dev/null and b/bundles/org.eclipse.equinox.p2.ui/icons/obj/iu_upgraded.png differ
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+index 9853b58..5129174 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIActivator.java
+@@ -117,6 +117,11 @@ public class ProvUIActivator extends AbstractUIPlugin {
+ 		createImageDescriptor(ProvUIImages.IMG_DISABLED_PATCH_IU, reg);
+ 		createImageDescriptor(ProvUIImages.IMG_CATEGORY, reg);
+ 		createImageDescriptor(ProvUIImages.IMG_PROFILE, reg);
++		createImageDescriptor(ProvUIImages.IMG_INFO, reg);
++		createImageDescriptor(ProvUIImages.IMG_ADDED, reg);
++		createImageDescriptor(ProvUIImages.IMG_REMOVED, reg);
++		createImageDescriptor(ProvUIImages.IMG_CHANGED, reg);
++		createImageDescriptor(ProvUIImages.IMG_NOTADDED, reg);
+ 		createImageDescriptor(ProvUIImages.WIZARD_BANNER_INSTALL, reg);
+ 		createImageDescriptor(ProvUIImages.WIZARD_BANNER_REVERT, reg);
+ 		createImageDescriptor(ProvUIImages.WIZARD_BANNER_UNINSTALL, reg);
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIImages.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIImages.java
+index d9e0c69..dd3114d 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIImages.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIImages.java
+@@ -39,15 +39,21 @@ public class ProvUIImages {
+ 	public final static String IMG_METADATA_REPOSITORY = "obj/metadata_repo_obj.gif"; //$NON-NLS-1$
+ 	public final static String IMG_IU = "obj/iu_obj.gif"; //$NON-NLS-1$
+ 	public final static String IMG_DISABLED_IU = "obj/iu_disabled_obj.gif"; //$NON-NLS-1$
++	public final static String IMG_ADDED = "obj/iu_add.gif"; //$NON-NLS-1$
++	public final static String IMG_REMOVED = "obj/iu_remove.gif"; //$NON-NLS-1$
++	public final static String IMG_CHANGED = "obj/iu_update_obj.gif"; //$NON-NLS-1$
++	public final static String IMG_NOTADDED = "obj/iu_notadd.gif"; //$NON-NLS-1$
++
+ 	public final static String IMG_UPDATED_IU = "obj/iu_update_obj.gif"; //$NON-NLS-1$
+-	public final static String IMG_UPGRADED_IU = "obj/iu_upgraded.gif"; //$NON-NLS-1$
+-	public final static String IMG_DOWNGRADED_IU = "obj/iu_downgraded.gif"; //$NON-NLS-1$
++	public final static String IMG_UPGRADED_IU = "obj/iu_upgraded.png"; //$NON-NLS-1$
++	public final static String IMG_DOWNGRADED_IU = "obj/iu_downgraded.png"; //$NON-NLS-1$
+ 	public final static String IMG_ADDED_OVERLAY = "obj/added_overlay.gif"; //$NON-NLS-1$
+ 	public final static String IMG_REMOVED_OVERLAY = "obj/removed_overlay.gif"; //$NON-NLS-1$
+ 	public final static String IMG_PATCH_IU = "obj/iu_patch_obj.gif"; //$NON-NLS-1$
+ 	public final static String IMG_DISABLED_PATCH_IU = "obj/iu_disabled_patch_obj.gif"; //$NON-NLS-1$
+ 	public final static String IMG_PROFILE = "obj/profile_obj.gif"; //$NON-NLS-1$
+ 	public final static String IMG_CATEGORY = "obj/category_obj.gif"; //$NON-NLS-1$
++	public final static String IMG_INFO = "obj/iu_info.gif"; //$NON-NLS-1$
+ 
+ 	// wizard graphics
+ 	public final static String WIZARD_BANNER_INSTALL = "wizban/install_wiz.gif"; //$NON-NLS-1$
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+index 69044f1..df3f59e 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+@@ -254,6 +254,14 @@ public class ProvUIMessages extends NLS {
+ 	public static String RemediationPage_BestSolutionInstallationRelaxed;
+ 	public static String RemediationPage_BestSolutionBuilt;
+ 	public static String RemediationPage_SolutionDetails;
++	public static String RemedyCategoryAdded;
++	public static String RemedyCategoryRemoved;
++	public static String RemedyCategoryChanged;
++	public static String RemedyCategoryNotAdded;
++	public static String RemedyElementInstalledVersion;
++	public static String RemedyElementRequestedVersion;
++	public static String RemedyElementBeingInstalledVersion;
++	public static String RemedyElementNotHighestVersion;
+ 
+ 	public static String TrustCertificateDialog_Details;
+ 	public static String TrustCertificateDialog_Title;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/InstallWizard.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/InstallWizard.java
+index e22b513..e31f053 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/InstallWizard.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/InstallWizard.java
+@@ -65,7 +65,7 @@ public class InstallWizard extends WizardWithLicenses {
+ 			return;
+ 		root = new IUElementListRoot();
+ 		if (operation instanceof RemediationOperation) {
+-			AvailableIUElement[] elements = ElementUtils.requestToElement(((RemediationOperation) operation).getCurrentRemedy());
++			AvailableIUElement[] elements = ElementUtils.requestToElement(((RemediationOperation) operation).getCurrentRemedy(), true);
+ 			root.setChildren(elements);
+ 			planSelections = elements;
+ 		} else {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
+index 1681d66..62af90b 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
+@@ -144,7 +144,7 @@ public abstract class ProvisioningOperationWizard extends Wizard {
+ 				couldNotResolve(null);
+ 			}
+ 			operation = remediationOperation;
+-			initializeResolutionModelElements(ElementUtils.requestToElement(((RemediationOperation) operation).getCurrentRemedy()));
++			initializeResolutionModelElements(ElementUtils.requestToElement(((RemediationOperation) operation).getCurrentRemedy(), !(this instanceof UpdateWizard)));
+ 			planChanged();
+ 			return resolutionPage;
+ 		} else if (page == mainPage || page == errorPage) {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationGroup.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationGroup.java
+index f469644..c64eff5 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationGroup.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationGroup.java
+@@ -12,15 +12,17 @@ package org.eclipse.equinox.internal.p2.ui.dialogs;
+ 
+ import java.util.*;
+ import java.util.List;
+-import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
++import org.eclipse.equinox.internal.p2.ui.*;
+ import org.eclipse.equinox.internal.p2.ui.model.*;
+-import org.eclipse.equinox.internal.p2.ui.viewers.*;
+-import org.eclipse.equinox.p2.operations.RemediationOperation;
+-import org.eclipse.equinox.p2.operations.Remedy;
+-import org.eclipse.jface.viewers.TreeViewer;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
++import org.eclipse.equinox.p2.metadata.Version;
++import org.eclipse.equinox.p2.operations.*;
++import org.eclipse.jface.resource.ImageDescriptor;
++import org.eclipse.jface.viewers.*;
+ import org.eclipse.jface.wizard.WizardPage;
+ import org.eclipse.swt.SWT;
+ import org.eclipse.swt.custom.StackLayout;
++import org.eclipse.swt.graphics.Image;
+ import org.eclipse.swt.layout.GridData;
+ import org.eclipse.swt.layout.GridLayout;
+ import org.eclipse.swt.widgets.*;
+@@ -54,6 +56,41 @@ public class RemediationGroup {
+ 	HashMap<String, String[]> CONSTRAINTS;
+ 	private WizardPage containerPage;
+ 
++	public class RemedyContentProvider implements ITreeContentProvider {
++
++		public void dispose() {
++			// not needed
++		}
++
++		public void inputChanged(Viewer viewer, Object oldInput, Object newInput) {
++			// not needed
++		}
++
++		public Object[] getElements(Object inputElement) {
++			Object[] elements = ElementUtils.requestToRemedyElementsCategories((Remedy) inputElement);
++			return elements;
++		}
++
++		public Object[] getChildren(Object parentElement) {
++			if (parentElement instanceof RemedyElementCategory) {
++				RemedyElementCategory category = (RemedyElementCategory) parentElement;
++				return category.getElements().toArray();
++			}
++			return null;
++		}
++
++		public Object getParent(Object element) {
++			return null;
++		}
++
++		public boolean hasChildren(Object element) {
++			if (element instanceof RemedyElementCategory) {
++				return true;
++			}
++			return false;
++		}
++	}
++
+ 	public RemediationGroup(WizardPage page) {
+ 		CONSTRAINTS = new HashMap<String, String[]>();
+ 		CONSTRAINTS.put(ProvUIMessages.RemediationPage_BeingInstalledSection, new String[] {ProvUIMessages.RemediationPage_BeingInstalledSection_AllowPartialInstall, ProvUIMessages.RemediationPage_BeingInstalledSection_AllowDifferentVersion});
+@@ -169,24 +206,132 @@ public class RemediationGroup {
+ 		insideFoundComposite.setLayoutData(new GridData(SWT.FILL, SWT.FILL, true, true));
+ 
+ 		treeViewer = new TreeViewer(insideFoundComposite, SWT.BORDER | SWT.MULTI | SWT.FULL_SELECTION);
++		ColumnViewerToolTipSupport.enableFor(treeViewer);
+ 		data = new GridData(GridData.FILL_BOTH);
+ 		Tree tree = treeViewer.getTree();
+ 		tree.setLayoutData(data);
+ 		tree.setHeaderVisible(true);
+-		IUColumnConfig[] columns = new IUColumnConfig[] {new IUColumnConfig(ProvUIMessages.ProvUI_NameColumnTitle, IUColumnConfig.COLUMN_NAME, ILayoutConstants.DEFAULT_PRIMARY_COLUMN_WIDTH), new IUColumnConfig(ProvUIMessages.ProvUI_VersionColumnTitle, IUColumnConfig.COLUMN_VERSION, ILayoutConstants.DEFAULT_SMALL_COLUMN_WIDTH), new IUColumnConfig(ProvUIMessages.ProvUI_IdColumnTitle, IUColumnConfig.COLUMN_ID, ILayoutConstants.DEFAULT_COLUMN_WIDTH)};
+-		for (int i = 0; i < columns.length; i++) {
+-			TreeColumn tc = new TreeColumn(treeViewer.getTree(), SWT.LEFT, i);
+-			tc.setResizable(true);
+-			tc.setText(columns[i].getColumnTitle());
+-			tc.setWidth(columns[i].getWidthInPixels(treeViewer.getTree()));
+-		}
+-		ProvElementContentProvider contentProvider = new ProvElementContentProvider();
+-		treeViewer.setContentProvider(contentProvider);
+-		IUDetailsLabelProvider labelProvider = new IUDetailsLabelProvider(null, columns, null);
+-		treeViewer.setLabelProvider(labelProvider); //	columnLayout.setColumnData(column.getColumn(), new ColumnWeightData(100, 100, true));
++		TreeViewerColumn nameColumn = new TreeViewerColumn(treeViewer, SWT.LEFT);
++		nameColumn.getColumn().setText(ProvUIMessages.ProvUI_NameColumnTitle);
++		nameColumn.getColumn().setWidth(400);
++		nameColumn.getColumn().setMoveable(true);
++		nameColumn.setLabelProvider(new ColumnLabelProvider() {
++			public String getText(Object element) {
++				if (element instanceof RemedyElementCategory)
++					return ((RemedyElementCategory) element).getName();
++				if (element instanceof RemedyIUDetail) {
++					RemedyIUDetail iu = (RemedyIUDetail) element;
++					String label = iu.getIu().getProperty(IInstallableUnit.PROP_NAME, null);
++					if (label == null)
++						label = iu.getIu().getId();
++					return label;
++				}
++				return super.getText(element);
++			}
+ 
+-		iuDetailsGroup = new IUDetailsGroup(resultErrorComposite, treeViewer, 500, true);
++			public Image getImage(Object element) {
++				if (element instanceof RemedyElementCategory) {
++					RemedyElementCategory category = (RemedyElementCategory) element;
++					if (category.getName().equals(ProvUIMessages.RemedyCategoryAdded))
++						return ProvUIImages.getImage(ProvUIImages.IMG_ADDED);
++					if (category.getName().equals(ProvUIMessages.RemedyCategoryChanged))
++						return ProvUIImages.getImage(ProvUIImages.IMG_CHANGED);
++					if (category.getName().equals(ProvUIMessages.RemedyCategoryNotAdded))
++						return ProvUIImages.getImage(ProvUIImages.IMG_NOTADDED);
++					if (category.getName().equals(ProvUIMessages.RemedyCategoryRemoved))
++						return ProvUIImages.getImage(ProvUIImages.IMG_REMOVED);
++				} else if (element instanceof RemedyIUDetail) {
++					RemedyIUDetail iuDetail = (RemedyIUDetail) element;
++					int status = compare(iuDetail);
++					if (compare(iuDetail.getBeingInstalledVersion(), iuDetail.getRequestedVersion()) < 0 && containerPage != null && containerPage.getWizard() instanceof UpdateWizard) {
++						Image img = ProvUIImages.getImage(ProvUIImages.IMG_UPGRADED_IU);
++						ImageDescriptor overlay = ProvUIActivator.getDefault().getImageRegistry().getDescriptor(ProvUIImages.IMG_INFO);
++						String decoratedImageId = ProvUIImages.IMG_UPGRADED_IU.concat(ProvUIImages.IMG_INFO);
++						if (ProvUIActivator.getDefault().getImageRegistry().get(decoratedImageId) == null) {
++							DecorationOverlayIcon decoratedImage = new DecorationOverlayIcon(img, overlay, IDecoration.BOTTOM_RIGHT);
++							ProvUIActivator.getDefault().getImageRegistry().put(decoratedImageId, decoratedImage);
++						}
++						Image decoratedImg = ProvUIActivator.getDefault().getImageRegistry().get(decoratedImageId);
++						return decoratedImg;
++					}
++
++					if (status < 0)
++						return ProvUIImages.getImage(ProvUIImages.IMG_DOWNGRADED_IU);
++					if (status > 0)
++						return ProvUIImages.getImage(ProvUIImages.IMG_UPGRADED_IU);
++					return ProvUIImages.getImage(ProvUIImages.IMG_IU);
++				}
++				return super.getImage(element);
++			}
++
++			public String getToolTipText(Object element) {
++				if (element instanceof RemedyIUDetail) {
++					RemedyIUDetail iuDetail = (RemedyIUDetail) element;
++					String toolTipText = ""; //$NON-NLS-1$
++					List<String> versions = new ArrayList<String>();
++					if (iuDetail.getInstalledVersion() != null)
++						versions.add(ProvUIMessages.RemedyElementInstalledVersion + iuDetail.getInstalledVersion().toString());
++					if (iuDetail.getRequestedVersion() != null)
++						versions.add(ProvUIMessages.RemedyElementRequestedVersion + iuDetail.getRequestedVersion().toString());
++					if (iuDetail.getBeingInstalledVersion() != null)
++						versions.add(ProvUIMessages.RemedyElementBeingInstalledVersion + iuDetail.getBeingInstalledVersion().toString());
++					for (Iterator<String> iterator = versions.iterator(); iterator.hasNext();) {
++						String version = iterator.next();
++						toolTipText += (toolTipText == "" ? "" : "\n") + version; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++					}
++					if (containerPage != null && containerPage.getWizard() instanceof UpdateWizard && compare(iuDetail.getBeingInstalledVersion(), iuDetail.getRequestedVersion()) < 0)
++						toolTipText = ProvUIMessages.RemedyElementNotHighestVersion + "\n\n" + toolTipText; //$NON-NLS-1$
++					return toolTipText;
++				}
++				return super.getToolTipText(element);
++			}
++
++			private int compare(Version versionA, Version versionB) {
++				if (versionA != null && versionB != null)
++					return versionA.compareTo(versionB);
++				return 0;
++			}
+ 
++			private int compare(RemedyIUDetail iuDetail) {
++				if (iuDetail.getStatus() == RemedyIUDetail.STATUS_ADDED && iuDetail.getRequestedVersion() != null && iuDetail.getBeingInstalledVersion() != null) {
++					return compare(iuDetail.getBeingInstalledVersion(), iuDetail.getRequestedVersion());
++				}
++				if (iuDetail.getStatus() == RemedyIUDetail.STATUS_CHANGED && iuDetail.getInstalledVersion() != null && iuDetail.getBeingInstalledVersion() != null) {
++					return compare(iuDetail.getBeingInstalledVersion(), iuDetail.getInstalledVersion());
++				}
++				return 0;
++			}
++		});
++		TreeViewerColumn versionColumn = new TreeViewerColumn(treeViewer, SWT.LEFT);
++		versionColumn.getColumn().setText(ProvUIMessages.ProvUI_VersionColumnTitle);
++		versionColumn.getColumn().setWidth(200);
++		versionColumn.setLabelProvider(new ColumnLabelProvider() {
++			public String getText(Object element) {
++				if (element instanceof RemedyIUDetail) {
++					RemedyIUDetail iu = (RemedyIUDetail) element;
++					if (iu.getBeingInstalledVersion() != null)
++						return iu.getBeingInstalledVersion().toString();
++				}
++				return ""; //$NON-NLS-1$
++			}
++		});
++		TreeViewerColumn idColumn = new TreeViewerColumn(treeViewer, SWT.LEFT);
++		idColumn.getColumn().setText(ProvUIMessages.ProvUI_IdColumnTitle);
++		idColumn.getColumn().setWidth(200);
++
++		idColumn.setLabelProvider(new ColumnLabelProvider() {
++			public String getText(Object element) {
++				if (element instanceof RemedyIUDetail) {
++					RemedyIUDetail iu = (RemedyIUDetail) element;
++					return iu.getIu().getId();
++				}
++				return ""; //$NON-NLS-1$
++			}
++		});
++
++		treeViewer.setContentProvider(new RemedyContentProvider());
++		treeViewer.setAutoExpandLevel(2);
++		iuDetailsGroup = new IUDetailsGroup(resultErrorComposite, treeViewer, 500, true);
+ 	}
+ 
+ 	public IUDetailsGroup getDetailsGroup() {
+@@ -254,13 +399,10 @@ public class RemediationGroup {
+ 			if (currentRemedy == null) {
+ 				switchRemediationLayout.topControl = resultNotFoundComposite;
+ 			} else {
+-				input = new IUElementListRoot();
+-				AvailableIUElement[] ius = ElementUtils.requestToElement(currentRemedy);
+-				if (ius.length == 0) {
++				if (currentRemedy.getIusDetails().size() == 0) {
+ 					switchRemediationLayout.topControl = resultNotFoundComposite;
+ 				} else {
+-					input.setChildren(ius);
+-					treeViewer.setInput(input);
++					treeViewer.setInput(currentRemedy);
+ 					switchRemediationLayout.topControl = resultFoundComposite;
+ 				}
+ 			}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ResolutionResultsWizardPage.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ResolutionResultsWizardPage.java
+index e0f719e..86777ed 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ResolutionResultsWizardPage.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ResolutionResultsWizardPage.java
+@@ -15,7 +15,7 @@ package org.eclipse.equinox.internal.p2.ui.dialogs;
+ 
+ import java.util.Collection;
+ import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.ui.ProvUIActivator;
++import org.eclipse.equinox.internal.p2.ui.*;
+ import org.eclipse.equinox.internal.p2.ui.model.*;
+ import org.eclipse.equinox.internal.p2.ui.viewers.*;
+ import org.eclipse.equinox.p2.engine.IProvisioningPlan;
+@@ -30,6 +30,7 @@ import org.eclipse.jface.operation.IRunnableWithProgress;
+ import org.eclipse.jface.viewers.*;
+ import org.eclipse.swt.SWT;
+ import org.eclipse.swt.custom.SashForm;
++import org.eclipse.swt.graphics.Image;
+ import org.eclipse.swt.layout.*;
+ import org.eclipse.swt.widgets.*;
+ import org.eclipse.ui.statushandlers.StatusManager;
+@@ -90,24 +91,68 @@ public abstract class ResolutionResultsWizardPage extends ResolutionStatusPage {
+ 		tree.setLayoutData(data);
+ 		tree.setHeaderVisible(true);
+ 		activateCopy(tree);
+-		IUColumnConfig[] columns = getColumnConfig();
+-		for (int i = 0; i < columns.length; i++) {
+-			TreeColumn tc = new TreeColumn(tree, SWT.LEFT, i);
+-			tc.setResizable(true);
+-			tc.setText(columns[i].getColumnTitle());
+-			tc.setWidth(columns[i].getWidthInPixels(tree));
+-		}
++		TreeViewerColumn nameColumn = new TreeViewerColumn(treeViewer, SWT.LEFT);
++		nameColumn.getColumn().setText(ProvUIMessages.ProvUI_NameColumnTitle);
++		nameColumn.getColumn().setWidth(400);
++		nameColumn.getColumn().setMoveable(true);
++		nameColumn.setLabelProvider(new ColumnLabelProvider() {
++			public String getText(Object element) {
++				IInstallableUnit iu = ProvUI.getAdapter(element, IInstallableUnit.class);
++				String label = iu.getProperty(IInstallableUnit.PROP_NAME, null);
++				if (label == null)
++					label = iu.getId();
++				return label;
++			}
++
++			public Image getImage(Object element) {
++				if (element instanceof ProvElement)
++					return ((ProvElement) element).getImage(element);
++				if (ProvUI.getAdapter(element, IInstallableUnit.class) != null)
++					return ProvUIImages.getImage(ProvUIImages.IMG_IU);
++				return null;
++			}
++
++			public String getToolTipText(Object element) {
++				if (element instanceof AvailableIUElement && ((AvailableIUElement) element).getImageOverlayId(null) == ProvUIImages.IMG_INFO)
++					return ProvUIMessages.RemedyElementNotHighestVersion;
++				return super.getToolTipText(element);
++			}
++		});
++		TreeViewerColumn versionColumn = new TreeViewerColumn(treeViewer, SWT.LEFT);
++		versionColumn.getColumn().setText(ProvUIMessages.ProvUI_VersionColumnTitle);
++		versionColumn.getColumn().setWidth(200);
++		versionColumn.setLabelProvider(new ColumnLabelProvider() {
++			public String getText(Object element) {
++				IInstallableUnit iu = ProvUI.getAdapter(element, IInstallableUnit.class);
++				if (element instanceof IIUElement) {
++					if (((IIUElement) element).shouldShowVersion())
++						return iu.getVersion().toString();
++					return ""; //$NON-NLS-1$
++				}
++				return iu.getVersion().toString();
++			}
++		});
++		TreeViewerColumn idColumn = new TreeViewerColumn(treeViewer, SWT.LEFT);
++		idColumn.getColumn().setText(ProvUIMessages.ProvUI_IdColumnTitle);
++		idColumn.getColumn().setWidth(200);
++
++		idColumn.setLabelProvider(new ColumnLabelProvider() {
++			public String getText(Object element) {
++				IInstallableUnit iu = ProvUI.getAdapter(element, IInstallableUnit.class);
++				return iu.getId();
++			}
++		});
+ 
+ 		// Filters and sorters before establishing content, so we don't refresh unnecessarily.
+ 		IUComparator comparator = new IUComparator(IUComparator.IU_NAME);
+ 		comparator.useColumnConfig(getColumnConfig());
+ 		treeViewer.setComparator(comparator);
+ 		treeViewer.setComparer(new ProvElementComparer());
+-
++		ColumnViewerToolTipSupport.enableFor(treeViewer);
+ 		contentProvider = new ProvElementContentProvider();
+ 		treeViewer.setContentProvider(contentProvider);
+-		labelProvider = new IUDetailsLabelProvider(null, getColumnConfig(), getShell());
+-		treeViewer.setLabelProvider(labelProvider);
++		//		labelProvider = new IUDetailsLabelProvider(null, getColumnConfig(), getShell());
++		//		treeViewer.setLabelProvider(labelProvider);
+ 
+ 		// Optional area to show the size
+ 		createSizingInfo(composite);
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
+index 209a799..5d55574 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
+@@ -118,7 +118,7 @@ public class UpdateWizard extends WizardWithLicenses {
+ 			return;
+ 		root = new IUElementListRoot();
+ 		if (operation instanceof RemediationOperation) {
+-			AvailableIUElement[] elements = ElementUtils.requestToElement(((RemediationOperation) operation).getCurrentRemedy());
++			AvailableIUElement[] elements = ElementUtils.requestToElement(((RemediationOperation) operation).getCurrentRemedy(), false);
+ 			root.setChildren(elements);
+ 			//planSelections = elements;
+ 		} else {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index 349a4ba..cbd1b3e 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -233,6 +233,14 @@ RemediationPage_BestSolutionBeingInstalledRelaxed=Keep my installation the same
+ RemediationPage_BestSolutionInstallationRelaxed=Update my installation to be compatible with the items being installed
+ RemediationPage_BestSolutionBuilt=Build my own solution:
+ RemediationPage_SolutionDetails=Solution Details
++RemedyCategoryAdded=Installed
++RemedyCategoryRemoved=Uninstalled
++RemedyCategoryChanged=Upgraded/Downgraded
++RemedyCategoryNotAdded=Not Installed
++RemedyElementInstalledVersion=Installed version: 
++RemedyElementRequestedVersion=Requested version: 
++RemedyElementBeingInstalledVersion=Version being installed: 
++RemedyElementNotHighestVersion=This is not the highest version
+ 
+ IUViewQueryContext_AllAreInstalledDescription=You can uncheck the 'Hide items that are already installed' check box to see all items.
+ Label_Profiles=All Software Profiles
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/AvailableIUElement.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/AvailableIUElement.java
+index 3d9b83b..cbb5aa7 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/AvailableIUElement.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/AvailableIUElement.java
+@@ -43,6 +43,8 @@ public class AvailableIUElement extends QueriedElement implements IIUElement {
+ 	boolean beingDowngraded = false;
+ 	boolean beingUpgraded = false;
+ 	boolean beingRemoved = false;
++	private String imageId;
++	private String imageOverlayId;
+ 
+ 	// Currently this variable is not settable due to the
+ 	// poor performance of sizing, but it is kept here for future improvement.
+@@ -67,6 +69,8 @@ public class AvailableIUElement extends QueriedElement implements IIUElement {
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.ui.model.ProvElement#getImageID(java.lang.Object)
+ 	 */
+ 	protected String getImageId(Object obj) {
++		if (imageId != null)
++			return imageId;
+ 		if (isUpdate)
+ 			return ProvUIImages.IMG_UPDATED_IU;
+ 		else if (isPatch)
+@@ -80,7 +84,9 @@ public class AvailableIUElement extends QueriedElement implements IIUElement {
+ 		return ProvUIImages.IMG_IU;
+ 	}
+ 
+-	protected String getImageOverlayId(Object obj) {
++	public String getImageOverlayId(Object obj) {
++		if (imageOverlayId != null)
++			return imageOverlayId;
+ 		if (beingRemoved)
+ 			return ProvUIImages.IMG_REMOVED_OVERLAY;
+ 		if (beingAdded)
+@@ -263,4 +269,12 @@ public class AvailableIUElement extends QueriedElement implements IIUElement {
+ 	public void setBeingRemoved(boolean beingRemoved) {
+ 		this.beingRemoved = beingRemoved;
+ 	}
++
++	public void setImageId(String imageId) {
++		this.imageId = imageId;
++	}
++
++	public void setImageOverlayId(String imageOverlayId) {
++		this.imageOverlayId = imageOverlayId;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ElementUtils.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ElementUtils.java
+index 1a663af..b07f491 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ElementUtils.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ElementUtils.java
+@@ -15,9 +15,10 @@ package org.eclipse.equinox.internal.p2.ui.model;
+ import java.net.URI;
+ import java.util.*;
+ import org.eclipse.core.runtime.URIUtil;
+-import org.eclipse.equinox.internal.p2.ui.ProvUI;
++import org.eclipse.equinox.internal.p2.ui.*;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.operations.Remedy;
++import org.eclipse.equinox.p2.operations.RemedyIUDetail;
+ import org.eclipse.equinox.p2.repository.IRepository;
+ import org.eclipse.equinox.p2.repository.IRepositoryManager;
+ import org.eclipse.equinox.p2.repository.artifact.IArtifactRepositoryManager;
+@@ -125,36 +126,51 @@ public class ElementUtils {
+ 		return false;
+ 	}
+ 
+-	public static AvailableIUElement[] requestToElement(Remedy remedy) {
++	public static AvailableIUElement[] requestToElement(Remedy remedy, boolean installMode) {
+ 		if (remedy == null)
+ 			return new AvailableIUElement[0];
+ 		ArrayList<AvailableIUElement> temp = new ArrayList<AvailableIUElement>();
+-
+-		ArrayList<String> updateIds = new ArrayList<String>();
+ 		IUElementListRoot root = new IUElementListRoot();
+-		for (IInstallableUnit addedIU : remedy.getRequest().getAdditions()) {
+-			AvailableIUElement element = new AvailableIUElement(root, addedIU, ProvisioningUI.getDefaultUI().getProfileId(), true);
+-			for (IInstallableUnit removedIU : remedy.getRequest().getRemovals()) {
+-				if (removedIU.getId().equals(addedIU.getId())) {
+-					int addedComparedToRemoved = addedIU.getVersion().compareTo(removedIU.getVersion());
+-					element.setBeingDowngraded(addedComparedToRemoved < 0);
+-					element.setBeingUpgraded(addedComparedToRemoved > 0);
+-					updateIds.add(addedIU.getId());
+-					break;
+-				}
+-			}
+-			if (!updateIds.contains(addedIU.getId())) {
+-				element.setBeingAdded(true);
+-			}
++		for (Iterator<RemedyIUDetail> iterator = remedy.getIusDetails().iterator(); iterator.hasNext();) {
++			RemedyIUDetail iuDetail = iterator.next();
++			if (iuDetail.getStatus() == RemedyIUDetail.STATUS_NOT_ADDED)
++				continue;
++			AvailableIUElement element = new AvailableIUElement(root, iuDetail.getIu(), ProvisioningUI.getDefaultUI().getProfileId(), true);
++			if (iuDetail.getBeingInstalledVersion() != null && iuDetail.getRequestedVersion() != null && iuDetail.getBeingInstalledVersion().compareTo(iuDetail.getRequestedVersion()) < 0 && !installMode)
++				element.setImageOverlayId(ProvUIImages.IMG_INFO);
++			else if (iuDetail.getStatus() == RemedyIUDetail.STATUS_REMOVED)
++				element.setImageId(ProvUIImages.IMG_REMOVED);
+ 			temp.add(element);
+ 		}
+-		for (IInstallableUnit removedIU : remedy.getRequest().getRemovals()) {
+-			if (!updateIds.contains(removedIU.getId())) {
+-				AvailableIUElement element = new AvailableIUElement(root, removedIU, ProvisioningUI.getDefaultUI().getProfileId(), false);
+-				element.setBeingRemoved(true);
+-				temp.add(element);
+-			}
+-		}
+ 		return temp.toArray(new AvailableIUElement[temp.size()]);
+ 	}
++
++	public static RemedyElementCategory[] requestToRemedyElementsCategories(Remedy remedy) {
++		List<RemedyElementCategory> categories = new ArrayList<RemedyElementCategory>();
++		RemedyElementCategory categoryAdded = new RemedyElementCategory(ProvUIMessages.RemedyCategoryAdded);
++		RemedyElementCategory cateogyRemoved = new RemedyElementCategory(ProvUIMessages.RemedyCategoryRemoved);
++		RemedyElementCategory categoryNotAdded = new RemedyElementCategory(ProvUIMessages.RemedyCategoryNotAdded);
++		RemedyElementCategory categoryChanged = new RemedyElementCategory(ProvUIMessages.RemedyCategoryChanged);
++		for (Iterator<RemedyIUDetail> iterator = remedy.getIusDetails().iterator(); iterator.hasNext();) {
++			RemedyIUDetail remedyIUVersions = iterator.next();
++			if (remedyIUVersions.getStatus() == RemedyIUDetail.STATUS_ADDED)
++				categoryAdded.add(remedyIUVersions);
++			else if (remedyIUVersions.getStatus() == RemedyIUDetail.STATUS_CHANGED)
++				categoryChanged.add(remedyIUVersions);
++			else if (remedyIUVersions.getStatus() == RemedyIUDetail.STATUS_REMOVED)
++				cateogyRemoved.add(remedyIUVersions);
++			else if (remedyIUVersions.getStatus() == RemedyIUDetail.STATUS_NOT_ADDED)
++				categoryNotAdded.add(remedyIUVersions);
++		}
++
++		if (cateogyRemoved.getElements().size() > 0)
++			categories.add(cateogyRemoved);
++		if (categoryChanged.getElements().size() > 0)
++			categories.add(categoryChanged);
++		if (categoryNotAdded.getElements().size() > 0)
++			categories.add(categoryNotAdded);
++		if (categoryAdded.getElements().size() > 0)
++			categories.add(categoryAdded);
++		return categories.toArray(new RemedyElementCategory[categories.size()]);
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RemedyElementCategory.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RemedyElementCategory.java
+new file mode 100644
+index 0000000..7a262cd
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RemedyElementCategory.java
+@@ -0,0 +1,39 @@
++/*******************************************************************************
++ * Copyright (c) 2013 Red Hat, Inc. and others
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ *  Contributors:
++ *     Red Hat, Inc. - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.ui.model;
++
++import java.util.ArrayList;
++import java.util.List;
++import org.eclipse.equinox.p2.operations.RemedyIUDetail;
++
++public class RemedyElementCategory {
++
++	private String name;
++	private List<RemedyIUDetail> elements;
++
++	public RemedyElementCategory(String name) {
++		this.name = name;
++		elements = new ArrayList<RemedyIUDetail>();
++	}
++
++	public List<RemedyIUDetail> getElements() {
++		return elements;
++	}
++
++	public String getName() {
++		return name;
++	}
++
++	public void add(RemedyIUDetail element) {
++		elements.add(element);
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/ProvisioningUI.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/ProvisioningUI.java
+index 38b45ef..e726038 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/ProvisioningUI.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/ProvisioningUI.java
+@@ -14,8 +14,7 @@ package org.eclipse.equinox.p2.ui;
+ 
+ import java.net.URI;
+ import java.util.Collection;
+-import org.eclipse.core.runtime.IProgressMonitor;
+-import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.core.runtime.jobs.Job;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.core.helpers.Tracing;
+@@ -275,7 +274,7 @@ public class ProvisioningUI {
+ 		WizardDialog dialog = new ProvisioningWizardDialog(ProvUI.getDefaultParentShell(), wizard);
+ 		dialog.create();
+ 		PlatformUI.getWorkbench().getHelpSystem().setHelp(dialog.getShell(), IProvHelpContextIds.UPDATE_WIZARD);
+-		if (wizard.getCurrentStatus().getSeverity() == IStatus.ERROR) {
++		if (wizard.getCurrentStatus().getSeverity() == IStatus.ERROR && remediationOperation != null && remediationOperation.getResolutionResult() != Status.OK_STATUS) {
+ 			wizard.deselectLockedIUs();
+ 		}
+ 		return dialog.open();

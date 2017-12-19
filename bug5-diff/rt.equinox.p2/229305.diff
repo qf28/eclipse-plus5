@@ -1,0 +1,383 @@
+commit 0e8fd985335e9482feb664c97a79de5760688c2e
+Author: Susan Franklin <sfranklin>
+Date:   Wed Apr 30 22:46:53 2008 +0000
+
+    Bug 229305 - [ui] Installing from a filtered selection does not work
+
+45	3	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ContainerCheckedTreeViewer.java
+0	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DeferredFetchFilteredTree.java
+1	11	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/InstallAction.java
+17	2	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProfileModificationAction.java
+3	7	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/RevertAction.java
+1	7	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/CategoryElement.java
+0	28	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/ElementUtils.java
+0	23	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/IUContainerElement.java
+1	14	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/MetadataRepositoryElement.java
+5	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ContainerCheckedTreeViewer.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ContainerCheckedTreeViewer.java
+index eb21c28..cb8eacb 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ContainerCheckedTreeViewer.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ContainerCheckedTreeViewer.java
+@@ -19,13 +19,31 @@ import org.eclipse.swt.widgets.*;
+  * CheckboxTreeViewer with special behaviour of the checked / gray state on 
+  * container (non-leaf) nodes:
+  * Copied from org.eclipse.ui.dialogs
+- * Altered so that checking a parent will expand it when we know it's a long
+- * running operation to get the children.  
++ * Altered to achieve the following:
++ * (1)checking a parent will also expand it when we know it's a long
++ * running operation that involves a placeholder.
++*  The modified method is doCheckStateChanged().
++*  
++ * (2)when preserving selection, we do not want the check state
++ * of the parents to influence the check state of the children.
++ * When children appear due to relaxed filtering,
++ * we never want to assume they should also be selected.  There are
++ * cases where this is not necessarily the right thing to do, but
++ * there are more cases where it is wrong.
++ * The added methods are preservingSelection(Runnable) and 
++ * updateParentsUsingChildren(TreeItem).
++ * Modified method is updateChildrenItems(TreeItem parent).
++
+  * 
+- * The modified method is doCheckStateChanged()
++ * (3) API added to update parent selection according to children.
++ * This is used after a filter refresh to ensure that parents are
++ * up to date.  Added method is
++ * updateParentSelectionsUsingChildren()
+  */
+ public class ContainerCheckedTreeViewer extends CheckboxTreeViewer {
+ 
++	private boolean rippleCheckMarks = true;
++
+ 	/**
+ 	 * Constructor for ContainerCheckedTreeViewer.
+ 	 * @see CheckboxTreeViewer#CheckboxTreeViewer(Composite)
+@@ -112,7 +130,13 @@ public class ContainerCheckedTreeViewer extends CheckboxTreeViewer {
+ 	/**
+ 	 * Updates the check state of all created children
+ 	 */
++	// MODIFIED to ignore parent state when in the middle of a 
++	// selection preserving refresh.  
+ 	private void updateChildrenItems(TreeItem parent) {
++		// We are in the middle of preserving selections, don't
++		// update any children according to parent
++		if (!rippleCheckMarks)
++			return;
+ 		Item[] children = getChildren(parent);
+ 		boolean state = parent.getChecked();
+ 		for (int i = 0; i < children.length; i++) {
+@@ -129,6 +153,10 @@ public class ContainerCheckedTreeViewer extends CheckboxTreeViewer {
+ 	 * Updates the check / gray state of all parent items
+ 	 */
+ 	private void updateParentItems(TreeItem item) {
++		// We are in the middle of preserving selections, don't
++		// update any parents according to children
++		if (!rippleCheckMarks)
++			return;
+ 		if (item != null) {
+ 			Item[] children = getChildren(item);
+ 			boolean containsChecked = false;
+@@ -212,4 +240,18 @@ public class ContainerCheckedTreeViewer extends CheckboxTreeViewer {
+ 		}
+ 	}
+ 
++	// The super implementation doesn't really work because the
++	// non-expanded items are not holding their real elements yet. 
++	// Yet the code that records the checked state uses the 
++	// elements to remember what checkmarks should be restored.
++	// The result is that non-expanded elements are not up to date
++	// and if anything in there should have been checked, it
++	// won't be.  The best we can do is at least turn off all the
++	// rippling checks that happen during this method since we are going
++	// to reset all the checkmarks anyway.
++	protected void preservingSelection(Runnable updateCode) {
++		rippleCheckMarks = false;
++		super.preservingSelection(updateCode);
++		rippleCheckMarks = true;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DeferredFetchFilteredTree.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DeferredFetchFilteredTree.java
+index 00e2dda..318b172 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DeferredFetchFilteredTree.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/DeferredFetchFilteredTree.java
+@@ -35,7 +35,6 @@ public class DeferredFetchFilteredTree extends FilteredTree {
+ 	ToolBar toolBar;
+ 	MenuManager menuManager;
+ 	ToolItem viewMenuButton;
+-	FilteredTree tree;
+ 	Display display;
+ 	PatternFilter patternFilter;
+ 	IViewMenuProvider viewMenuProvider;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/InstallAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/InstallAction.java
+index 8762a4a..6beaa73 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/InstallAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/InstallAction.java
+@@ -11,8 +11,6 @@
+ 
+ package org.eclipse.equinox.internal.provisional.p2.ui.actions;
+ 
+-import java.util.HashSet;
+-import java.util.Set;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+@@ -25,7 +23,6 @@ import org.eclipse.equinox.internal.provisional.p2.query.Collector;
+ import org.eclipse.equinox.internal.provisional.p2.ui.IProfileChooser;
+ import org.eclipse.equinox.internal.provisional.p2.ui.ProvUI;
+ import org.eclipse.equinox.internal.provisional.p2.ui.dialogs.InstallWizard;
+-import org.eclipse.equinox.internal.provisional.p2.ui.model.ElementUtils;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningUtil;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.Policies;
+ import org.eclipse.jface.viewers.ISelectionProvider;
+@@ -67,14 +64,7 @@ public class InstallAction extends ProfileModificationAction {
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.ui.actions.ProfileModificationAction#isEnabledFor(java.lang.Object[])
+ 	 */
+ 	protected boolean isEnabledFor(Object[] selectionArray) {
+-		if (selectionArray.length < 1)
+-			return false;
+-		Set children = new HashSet();
+-
+-		for (int i = 0; i < selectionArray.length; i++) {
+-			children.addAll(ElementUtils.getIUs(selectionArray[i]));
+-		}
+-		return !children.isEmpty();
++		return selectionArray.length > 0;
+ 	}
+ 
+ 	protected String getTaskName() {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProfileModificationAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProfileModificationAction.java
+index 948009a..dbc4581 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProfileModificationAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProfileModificationAction.java
+@@ -12,6 +12,8 @@
+ package org.eclipse.equinox.internal.provisional.p2.ui.actions;
+ 
+ import java.lang.reflect.InvocationTargetException;
++import java.util.ArrayList;
++import java.util.List;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+@@ -19,7 +21,6 @@ import org.eclipse.equinox.internal.provisional.p2.director.ProvisioningPlan;
+ import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.ui.*;
+-import org.eclipse.equinox.internal.provisional.p2.ui.model.ElementUtils;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningUtil;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.*;
+ import org.eclipse.jface.dialogs.ProgressMonitorDialog;
+@@ -106,8 +107,22 @@ public abstract class ProfileModificationAction extends ProvisioningAction {
+ 
+ 	protected abstract String getTaskName();
+ 
++	protected IInstallableUnit getIU(Object element) {
++		return (IInstallableUnit) ProvUI.getAdapter(element, IInstallableUnit.class);
++
++	}
++
+ 	protected IInstallableUnit[] getSelectedIUs() {
+-		return ElementUtils.getIUs(getStructuredSelection().toArray());
++		List elements = getStructuredSelection().toList();
++		List iusList = new ArrayList(elements.size());
++
++		for (int i = 0; i < elements.size(); i++) {
++			IInstallableUnit iu = getIU(elements.get(i));
++			if (iu != null && !ProvisioningUtil.isCategory(iu))
++				iusList.add(iu);
++		}
++
++		return (IInstallableUnit[]) iusList.toArray(new IInstallableUnit[iusList.size()]);
+ 	}
+ 
+ 	protected LicenseManager getLicenseManager() {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/RevertAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/RevertAction.java
+index 222273e..072e4cc 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/RevertAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/RevertAction.java
+@@ -11,14 +11,12 @@
+ 
+ package org.eclipse.equinox.internal.provisional.p2.ui.actions;
+ 
+-import java.util.Set;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProvisioningPlan;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.ui.*;
+-import org.eclipse.equinox.internal.provisional.p2.ui.model.ElementUtils;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.*;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.Policies;
+ import org.eclipse.jface.viewers.ISelectionProvider;
+@@ -51,11 +49,9 @@ public class RevertAction extends ProfileModificationAction {
+ 	 */
+ 	protected boolean isEnabledFor(Object[] selectionArray) {
+ 		if (selectionArray.length == 1) {
+-			Set ius = ElementUtils.getIUs(selectionArray[0]);
+-			if (ius.size() == 1) {
+-				Object element = ius.iterator().next();
+-				if (element instanceof IInstallableUnit)
+-					return Boolean.valueOf(((IInstallableUnit) element).getProperty(IInstallableUnit.PROP_TYPE_PROFILE)).booleanValue();
++			IInstallableUnit iu = getIU(selectionArray[0]);
++			if (iu != null) {
++				return Boolean.valueOf(iu.getProperty(IInstallableUnit.PROP_TYPE_PROFILE)).booleanValue();
+ 			}
+ 		}
+ 		return false;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/CategoryElement.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/CategoryElement.java
+index 845dfcc..7d267cd 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/CategoryElement.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/CategoryElement.java
+@@ -24,7 +24,7 @@ import org.eclipse.equinox.internal.provisional.p2.ui.policy.IQueryProvider;
+  * 
+  * @since 3.4
+  */
+-public class CategoryElement extends RemoteQueriedElement implements IUElement, IUContainerElement {
++public class CategoryElement extends RemoteQueriedElement implements IUElement {
+ 
+ 	private ArrayList ius = new ArrayList(1);
+ 
+@@ -98,10 +98,4 @@ public class CategoryElement extends RemoteQueriedElement implements IUElement,
+ 		return (RequiredCapability[]) capabilities.toArray(new RequiredCapability[capabilities.size()]);
+ 	}
+ 
+-	/* (non-Javadoc)
+-	 * @see org.eclipse.equinox.internal.provisional.p2.ui.model.IUContainerElement#getIUs()
+-	 */
+-	public IInstallableUnit[] getIUs() {
+-		return ElementUtils.getIUs(getChildren(this));
+-	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/ElementUtils.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/ElementUtils.java
+index 22cd23c..0d55bbe 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/ElementUtils.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/ElementUtils.java
+@@ -12,11 +12,9 @@
+ package org.eclipse.equinox.internal.provisional.p2.ui.model;
+ 
+ import java.net.URL;
+-import java.util.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.core.runtime.jobs.Job;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.ui.ProvUI;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningUtil;
+@@ -29,32 +27,6 @@ import org.eclipse.swt.widgets.Shell;
+  *
+  */
+ public class ElementUtils {
+-	public static IInstallableUnit[] getIUs(Object[] elements) {
+-		if (elements == null || elements.length == 0)
+-			return new IInstallableUnit[0];
+-		Set iuChildren = new HashSet(elements.length);
+-		for (int i = 0; i < elements.length; i++) {
+-			iuChildren.addAll(getIUs(elements[i]));
+-		}
+-		return (IInstallableUnit[]) iuChildren.toArray(new IInstallableUnit[iuChildren.size()]);
+-	}
+-
+-	public static Set getIUs(Object element) {
+-		Set ius = new HashSet();
+-		// Check first for a container.  Elements like categories are both
+-		// a container and an IU, and the container aspect is what we want
+-		// when we want to find out which IU's to manipulate.
+-		if (element instanceof IUContainerElement) {
+-			ius.addAll(Arrays.asList(((IUContainerElement) element).getIUs()));
+-		} else if (element instanceof IUElement) {
+-			ius.add(((IUElement) element).getIU());
+-		} else {
+-			IInstallableUnit iu = (IInstallableUnit) ProvUI.getAdapter(element, IInstallableUnit.class);
+-			if (iu != null)
+-				ius.add(iu);
+-		}
+-		return ius;
+-	}
+ 
+ 	public static void updateRepositoryUsingElements(final MetadataRepositoryElement[] elements, final Shell shell) {
+ 		Job job = new Job("Updating Repository Information") {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/IUContainerElement.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/IUContainerElement.java
+deleted file mode 100644
+index 9432d16..0000000
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/IUContainerElement.java
++++ /dev/null
+@@ -1,23 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.provisional.p2.ui.model;
+-
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+-
+-/**
+- * Interface for elements that contain IU's.
+- * 
+- * @since 3.4
+- */
+-public interface IUContainerElement {
+-
+-	public IInstallableUnit[] getIUs();
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/MetadataRepositoryElement.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/MetadataRepositoryElement.java
+index 6a78de1..ebc6e63 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/MetadataRepositoryElement.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/model/MetadataRepositoryElement.java
+@@ -16,7 +16,6 @@ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.p2.ui.model.RemoteQueriedElement;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.internal.provisional.p2.query.IQueryable;
+ import org.eclipse.equinox.internal.provisional.p2.ui.ProvUIImages;
+@@ -30,7 +29,7 @@ import org.eclipse.osgi.util.NLS;
+  * 
+  * @since 3.4
+  */
+-public class MetadataRepositoryElement extends RemoteQueriedElement implements IRepositoryElement, IUContainerElement {
++public class MetadataRepositoryElement extends RemoteQueriedElement implements IRepositoryElement {
+ 
+ 	URL url;
+ 	boolean isEnabled;
+@@ -141,18 +140,6 @@ public class MetadataRepositoryElement extends RemoteQueriedElement implements I
+ 		}
+ 	}
+ 
+-	/* 
+-	 * This method is used eagerly by actions to perform selection validation, so
+-	 * we do not answer the IU's unless we have already loaded the repository.
+-	 * (non-Javadoc)
+-	 * @see org.eclipse.equinox.internal.provisional.p2.ui.model.IUContainerElement#getIUs()
+-	 */
+-	public IInstallableUnit[] getIUs() {
+-		if (!hasQueryable())
+-			return new IInstallableUnit[0];
+-		return ElementUtils.getIUs(getChildren(this));
+-	}
+-
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.ui.model.RepositoryElement#isEnabled()
+ 	 */
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
+index f3c6cc6..9ca4214 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
+@@ -301,4 +301,9 @@ public class ProvisioningUtil {
+ 		if (artifactManager != null)
+ 			artifactManager.setEnabled(location, enabled);
+ 	}
++
++	public static boolean isCategory(IInstallableUnit iu) {
++		String isCategory = iu.getProperty(IInstallableUnit.PROP_TYPE_CATEGORY);
++		return isCategory != null && Boolean.valueOf(isCategory).booleanValue();
++	}
+ }

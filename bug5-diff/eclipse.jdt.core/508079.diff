@@ -1,0 +1,1255 @@
+commit bb0cd0abed1c56b4a47f5d7384903d654b1239ed
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Thu Dec 1 19:14:33 2016 -0800
+
+    Bug 508079 - Allow Database.malloc to large blocks
+    
+    Change-Id: I3f08b20c8006866bb84e36eca6a296f1db7b711a
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+19	18	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTest.java
+17	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTestUtil.java
+335	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/LargeBlockTest.java
+1	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/RunIndexTests.java
+1	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/RawGrowableArray.java
+496	59	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+26	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LargeBlock.java
+4	4	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LongString.java
+1	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/ShortString.java
+3	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTest.java
+index 9dd4557..3d770f9 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTest.java
+@@ -18,8 +18,6 @@ import java.util.Random;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.jdt.core.tests.nd.util.BaseTestCase;
+ import org.eclipse.jdt.internal.core.nd.Nd;
+-import org.eclipse.jdt.internal.core.nd.NdNode;
+-import org.eclipse.jdt.internal.core.nd.NdNodeTypeRegistry;
+ import org.eclipse.jdt.internal.core.nd.db.BTree;
+ import org.eclipse.jdt.internal.core.nd.db.ChunkCache;
+ import org.eclipse.jdt.internal.core.nd.db.Database;
+@@ -40,22 +38,18 @@ public class DatabaseTest extends BaseTestCase {
+ 	private static final long TEST_OFFSET = 0;
+ 	private Nd nd;
+ 	protected Database db;
+-	private static final int CURRENT_VERSION = 10;
+-
+ 	@Override
+ 	protected void setUp() throws Exception {
+ 		super.setUp();
+ 		String testName = getName();
+-		NdNodeTypeRegistry<NdNode> registry = new NdNodeTypeRegistry<>();
+-		this.nd = new Nd(DatabaseTestUtil.getTempDbName(testName), new ChunkCache(), registry,
+-				0, 100, CURRENT_VERSION);
++		this.nd = DatabaseTestUtil.createWithoutNodeRegistry(testName);
+ 		this.db = this.nd.getDB();
+ 		this.db.setExclusiveLock();
+ 
+ 		// Allocate all database chunks up to TEST_OFFSET.
+ 		int count = 0;
+ 		for (long offset = 0; offset < TEST_OFFSET;) {
+-			offset = this.db.malloc(Database.MAX_MALLOC_SIZE, Database.POOL_MISC);
++			offset = this.db.malloc(Database.MAX_SINGLE_BLOCK_MALLOC_SIZE, Database.POOL_MISC);
+ 			if (++count >= 1000) {
+ 				this.db.flush();
+ 				count = 0;
+@@ -70,27 +64,34 @@ public class DatabaseTest extends BaseTestCase {
+ 
+ 	@Override
+ 	protected void tearDown() throws Exception {
+-		this.db.close();
+-		if (!this.db.getLocation().delete()) {
+-			this.db.getLocation().deleteOnExit();
+-		}
+-		this.db= null;
++		DatabaseTestUtil.deleteDatabase(this.db);
++		this.db = null;
++	}
++
++	public void testBytesNeededForChunks() throws Exception {
++		int numChunks = 10;
++		long bytes = Database.getBytesThatFitInChunks(numChunks);
++		int measuredChunks = Database.getChunksNeededForBytes(bytes);
++		assertEquals(numChunks, measuredChunks);
+ 	}
+ 
+ 	public void testBlockSizeAndFirstBlock() throws Exception {
+-		assertEquals(CURRENT_VERSION, this.db.getVersion());
++		assertEquals(DatabaseTestUtil.CURRENT_VERSION, this.db.getVersion());
+ 
+ 		final int realsize = 42;
+-		final int deltas = (realsize + Database.BLOCK_HEADER_SIZE + Database.BLOCK_SIZE_DELTA - 1) / Database.BLOCK_SIZE_DELTA;
++		final int deltas = (realsize + Database.BLOCK_HEADER_SIZE + Database.BLOCK_SIZE_DELTA - 1)
++				/ Database.BLOCK_SIZE_DELTA;
+ 		final int blocksize = deltas * Database.BLOCK_SIZE_DELTA;
+-		final int freeDeltas= Database.CHUNK_SIZE / Database.BLOCK_SIZE_DELTA - deltas;
++		final int freeDeltas = Database.MAX_BLOCK_DELTAS - deltas;
+ 
+ 		long mem = this.db.malloc(realsize, Database.POOL_MISC);
+ 		assertEquals(-blocksize, this.db.getShort(mem - Database.BLOCK_HEADER_SIZE));
+ 		this.db.free(mem, Database.POOL_MISC);
+ 		assertEquals(blocksize, this.db.getShort(mem - Database.BLOCK_HEADER_SIZE));
+-		assertEquals(mem, this.db.getRecPtr((deltas - Database.MIN_BLOCK_DELTAS +1 ) * Database.INT_SIZE));
+-		assertEquals(mem + blocksize, this.db.getRecPtr((freeDeltas - Database.MIN_BLOCK_DELTAS + 1) * Database.INT_SIZE));
++		assertEquals(mem, this.db
++				.getRecPtr((deltas - Database.MIN_BLOCK_DELTAS) * Database.PTR_SIZE + Database.MALLOC_TABLE_OFFSET));
++		assertEquals(mem + blocksize, this.db.getRecPtr(
++				(freeDeltas - Database.MIN_BLOCK_DELTAS) * Database.PTR_SIZE + Database.MALLOC_TABLE_OFFSET));
+ 	}
+ 
+ 	public void testBug192437() throws Exception {
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTestUtil.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTestUtil.java
+index 30040db..d4bfd73 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTestUtil.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTestUtil.java
+@@ -19,6 +19,7 @@ import org.eclipse.jdt.internal.core.nd.Nd;
+ import org.eclipse.jdt.internal.core.nd.NdNode;
+ import org.eclipse.jdt.internal.core.nd.NdNodeTypeRegistry;
+ import org.eclipse.jdt.internal.core.nd.db.ChunkCache;
++import org.eclipse.jdt.internal.core.nd.db.Database;
+ 
+ /**
+  * 
+@@ -54,4 +55,20 @@ public class DatabaseTestUtil {
+ 	public static Nd createEmptyNd(String testName, NdNodeTypeRegistry<NdNode> registry) {
+ 		return new Nd(DatabaseTestUtil.getTempDbName(testName), new ChunkCache(), registry, 0, 0, 0);
+ 	}
++
++	static Nd createWithoutNodeRegistry(String testName) {
++		NdNodeTypeRegistry<NdNode> registry = new NdNodeTypeRegistry<>();
++		Nd tempNd = new Nd(getTempDbName(testName), new ChunkCache(), registry, 0, 100,
++				DatabaseTestUtil.CURRENT_VERSION);
++		return tempNd;
++	}
++
++	static final int CURRENT_VERSION = 10;
++
++	static void deleteDatabase(Database db) {
++		db.close();
++		if (!db.getLocation().delete()) {
++			db.getLocation().deleteOnExit();
++		}
++	}
+ }
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/LargeBlockTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/LargeBlockTest.java
+new file mode 100644
+index 0000000..674c709
+--- /dev/null
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/LargeBlockTest.java
+@@ -0,0 +1,335 @@
++/*******************************************************************************
++ * Copyright (c) 2005, 2016 QNX Software Systems and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     QNX Software Systems - initial API and implementation
++ *     Andrew Ferguson (Symbian)
++ *     Markus Schorn (Wind River Systems)
++ *******************************************************************************/
++package org.eclipse.jdt.core.tests.nd;
++
++import org.eclipse.jdt.core.tests.nd.util.BaseTestCase;
++import org.eclipse.jdt.internal.core.nd.Nd;
++import org.eclipse.jdt.internal.core.nd.db.Database;
++
++import junit.framework.Test;
++
++/**
++ * Tests for the {@link Database} class.
++ */
++public class LargeBlockTest extends BaseTestCase {
++	private Nd nd;
++	protected Database db;
++
++	@Override
++	protected void setUp() throws Exception {
++		super.setUp();
++		String testName = getName();
++		this.nd = DatabaseTestUtil.createWithoutNodeRegistry(testName);
++		this.db = this.nd.getDB();
++		this.db.setExclusiveLock();
++		this.db.flush();
++	}
++
++	public static Test suite() {
++		return BaseTestCase.suite(LargeBlockTest.class);
++	}
++
++	@Override
++	protected void tearDown() throws Exception {
++		DatabaseTestUtil.deleteDatabase(this.db);
++		this.db = null;
++	}
++
++	private long mallocChunks(int chunks) {
++		return malloc(Database.getBytesThatFitInChunks(chunks));
++	}
++
++	private long malloc(long bytes) {
++		return this.db.malloc(bytes, Database.POOL_MISC);
++	}
++
++	private void free(long address) {
++		this.db.free(address, Database.POOL_MISC);
++	}
++
++	/**
++	 * Allocate the maximum number of bytes that can fit in 3 chunks and verify
++	 * that it doesn't overflow.
++	 */
++	public void testAllocationThatFillsMultipleChunksDoesntOverflow() throws Exception {
++		int chunkCount = this.db.getChunkCount();
++
++		int numChunks = 5;
++		mallocChunks(numChunks);
++
++		assertEquals("The database should not allocate more (or less) memory than is needed", numChunks + chunkCount,
++				this.db.getChunkCount());
++	}
++
++	/**
++	 * Allocates a few blocks, frees them, then allocates more blocks. Verifies
++	 * that the database reuses the chunks from the first allocation when it
++	 * tries to allocate the larger block later.
++	 */
++	public void testLastChunkIsReused() throws Exception {
++		int chunkCount = this.db.getChunkCount();
++
++		int numChunks = 10;
++		long temporaryBlockAddress = mallocChunks(3);
++		free(temporaryBlockAddress);
++		mallocChunks(numChunks);
++
++		assertEquals("If the last chunk is free, it should be resized if necessary when a new chunk is requested",
++				numChunks + chunkCount, this.db.getChunkCount());
++	}
++
++	/**
++	 * Tests that if there is a single large free block available, that block
++	 * will be split and reused if necessary to satisfy a number of smaller
++	 * requests.
++	 * 
++	 * @throws Exception
++	 */
++	public void testLargeAllocationIsSplitAndReused() throws Exception {
++		long tempAddress = malloc(Database.getBytesThatFitInChunks(10));
++		// Use some space at the end of the database to prevent the allocator
++		// from using the end of the database, where stuff can be easily resized
++		mallocChunks(1);
++		free(tempAddress);
++
++		// Keep track of how much memory we are currently using, so we can
++		// ensure that any further allocations come from the freed block rather
++		// than the end of the database.
++		int chunkCount = this.db.getChunkCount();
++
++		long firstAllocation = mallocChunks(7);
++
++		assertEquals("The freed chunk should be reused (there should be 10 chunks available)", chunkCount,
++				this.db.getChunkCount());
++
++		long secondAllocation = mallocChunks(1);
++
++		assertEquals("The freed chunk should be reused (there should be 3 chunks available)", chunkCount,
++				this.db.getChunkCount());
++
++		long thirdAllocation = mallocChunks(2);
++
++		assertEquals("The freed chunk should be reused (there should be exactly 2 chunks available)", chunkCount,
++				this.db.getChunkCount());
++		assertTrue(
++				"Allocations should happen from the start of the database if it makes no difference to fragmentation",
++				secondAllocation > firstAllocation);
++		assertTrue("Free space should have been kept next to the largest block for as long as possible",
++				secondAllocation > thirdAllocation);
++
++		// Do another allocation when there are no free chunks
++		mallocChunks(1);
++
++		assertEquals("New chunks should be allocated when the database is out of free blocks", chunkCount + 1,
++				this.db.getChunkCount());
++	}
++
++	/**
++	 * Verifies that if a block is freed and the previous block is also free,
++	 * the two free blocks will be combined into a single larger block.
++	 */
++	public void testFreeBlockMergesWithPrevious() throws Exception {
++		long firstBlock = mallocChunks(1);
++		long secondBlock = mallocChunks(1);
++		mallocChunks(1);
++
++		free(firstBlock);
++		free(secondBlock);
++
++		int chunkCount = this.db.getChunkCount();
++
++		mallocChunks(2);
++		assertEquals("The merged block should have been used", chunkCount, this.db.getChunkCount());
++	}
++
++	/**
++	 * Verifies that if a block is freed and the next block is also free, the
++	 * two free blocks will be combined into a single larger block.
++	 */
++	public void testFreeBlockMergesWithNext() throws Exception {
++		long firstBlock = mallocChunks(1);
++		long secondBlock = mallocChunks(1);
++		mallocChunks(1);
++
++		free(secondBlock);
++		free(firstBlock);
++
++		int chunkCount = this.db.getChunkCount();
++
++		mallocChunks(2);
++		assertEquals("The merged block should have been used", chunkCount, this.db.getChunkCount());
++	}
++
++	/**
++	 * Verifies that if a block is freed and the blocks on both sides are also
++	 * free, the three free blocks will be combined into a single larger block.
++	 */
++	public void testFreeBlockMergesWithBothNextAndPrevious() throws Exception {
++		long firstBlock = mallocChunks(1);
++		long secondBlock = mallocChunks(1);
++		long thirdBlock = mallocChunks(1);
++		mallocChunks(1);
++
++		free(firstBlock);
++		free(thirdBlock);
++		free(secondBlock);
++
++		int chunkCount = this.db.getChunkCount();
++
++		mallocChunks(3);
++		assertEquals("The merged block should have been used", chunkCount, this.db.getChunkCount());
++	}
++
++	/**
++	 * Tests removal of a chunk from the free space trie when there are
++	 * duplicate free space nodes with the same size and the node being removed
++	 * isn't the one with the embedded trie node.
++	 */
++	public void testRemoveFreeSpaceNodeFromDuplicateList() throws Exception {
++		long chunk1 = mallocChunks(1);
++		mallocChunks(1);
++		long chunk3 = mallocChunks(1);
++		long chunk4 = mallocChunks(1);
++		mallocChunks(1);
++
++		int chunkCount = this.db.getChunkCount();
++
++		free(chunk1);
++		free(chunk3);
++		// At this point chunks 1 and 3 should be in the same linked list. Chunk
++		// 1 contains the embedded trie.
++
++		free(chunk4);
++		// Should merge with chunk3, causing it to be removed from the list
++
++		// Verify that we can allocate the merged chunk 3+4
++		mallocChunks(2);
++
++		assertEquals("Chunks 3 and 4 should have been merged", chunkCount, this.db.getChunkCount());
++	}
++
++	/**
++	 * Tests removal of a chunk from the free space trie when the node being
++	 * removed was part of the embedded trie and it has a non-empty list of
++	 * other nodes of the same size.
++	 */
++	public void testRemoveFreeSpaceNodeFromTrieWithDuplicates() throws Exception {
++		long chunk1 = mallocChunks(1);
++		mallocChunks(1);
++		long chunk3 = mallocChunks(1);
++		long chunk4 = mallocChunks(1);
++		mallocChunks(1);
++
++		int chunkCount = this.db.getChunkCount();
++
++		free(chunk3);
++		free(chunk1);
++		// At this point chunks 1 and 3 should be in the same linked list. Chunk
++		// 3 contains the embedded trie.
++
++		free(chunk4);
++		// Should merge with chunk3, causing it to be removed from the list
++
++		// Verify that we can allocate the merged chunk 3+4
++		mallocChunks(2);
++
++		assertEquals("Chunks 3 and 4 should have been merged", chunkCount, this.db.getChunkCount());
++	}
++
++	/**
++	 * Tests reusing a chunk from the free space trie when it contains
++	 * duplicates.
++	 */
++	public void testReuseDeallocatedChunksWithMultipleFreeSpaceNodesOfTheSameSize() throws Exception {
++		long chunk1 = mallocChunks(2);
++		mallocChunks(1);
++		long chunk3 = mallocChunks(2);
++		mallocChunks(1);
++		long chunk5 = mallocChunks(2);
++		mallocChunks(1);
++
++		int chunkCount = this.db.getChunkCount();
++
++		free(chunk1);
++		free(chunk3);
++		free(chunk5);
++
++		mallocChunks(2);
++
++		assertEquals("A chunk should have been reused", chunkCount, this.db.getChunkCount());
++	}
++
++	/**
++	 * Tests various corner cases in the trie map.
++	 */
++	public void testTriesOfVariousSize() throws Exception {
++		long chunk1 = mallocChunks(1);
++		mallocChunks(1);
++		long chunk2 = mallocChunks(2);
++		mallocChunks(1);
++		long chunk3 = mallocChunks(3);
++		mallocChunks(1);
++		long chunk4 = mallocChunks(5);
++		mallocChunks(1);
++		long chunk5 = mallocChunks(6);
++		mallocChunks(1);
++		long chunk6 = mallocChunks(6);
++		mallocChunks(1);
++		long chunk7 = mallocChunks(10);
++		mallocChunks(1);
++		long chunk8 = mallocChunks(20);
++		mallocChunks(1);
++
++		int chunkCount = this.db.getChunkCount();
++
++		free(chunk7);
++		free(chunk4);
++		free(chunk1);
++		free(chunk3);
++		free(chunk8);
++		free(chunk5);
++		free(chunk2);
++		free(chunk6);
++
++		mallocChunks(4);
++		mallocChunks(10);
++
++		assertEquals("A chunk should have been reused", chunkCount, this.db.getChunkCount());
++	}
++
++	/**
++	 * Tests that if there are multiple free blocks of different sizes and of
++	 * exactly one of the requested size, that one is always selected.
++	 */
++	public void testBestBlockIsAlwaysSelected() throws Exception {
++		int[] sizes = { 11, 2, 6, 1, 9, 10, 7, 8, 12, 20, 15, 3 };
++		long[] pointers = new long[sizes.length];
++
++		for (int idx = 0; idx < sizes.length; idx++) {
++			pointers[idx] = mallocChunks(sizes[idx]);
++			mallocChunks(1);
++		}
++
++		int chunkCount = this.db.getChunkCount();
++
++		for (int idx = 0; idx < pointers.length; idx++) {
++			free(pointers[idx]);
++		}
++
++		for (int idx = 0; idx < sizes.length; idx++) {
++			long nextPointer = mallocChunks(sizes[idx]);
++			assertEquals("Returned wrong pointer for malloc of " + sizes[idx] + " chunks", pointers[idx], nextPointer);
++			assertEquals("A chunk should have been reused", chunkCount, this.db.getChunkCount());
++		}
++	}
++}
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/RunIndexTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/RunIndexTests.java
+index a6c2bbc..740636b 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/RunIndexTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/RunIndexTests.java
+@@ -31,6 +31,7 @@ public static Class[] getAllTestClasses() {
+ 		FieldBackPointerTest.class,
+ 		IndexerTest.class,
+ 		InheritenceTests.class,
++		LargeBlockTest.class,
+ 		SearchKeyTests.class
+ 	};
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/RawGrowableArray.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/RawGrowableArray.java
+index df7ca4e..2bd371c 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/RawGrowableArray.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/RawGrowableArray.java
+@@ -126,7 +126,7 @@ public final class RawGrowableArray {
+ 
+ 			GROWABLE_BLOCK_HEADER_BYTES = type.size();
+ 
+-			MAX_GROWABLE_SIZE = (Database.MAX_MALLOC_SIZE - GROWABLE_BLOCK_HEADER_BYTES)
++			MAX_GROWABLE_SIZE = (Database.MAX_SINGLE_BLOCK_MALLOC_SIZE - GROWABLE_BLOCK_HEADER_BYTES)
+ 					/ Database.PTR_SIZE;
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+index c8067f4..8bb0ed0 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+@@ -46,8 +46,9 @@ import org.eclipse.osgi.util.NLS;
+  * INT_SIZE             | pointer to head of linked list of blocks of size MIN_BLOCK_DELTAS*BLOCK_SIZE_DELTA
+  * ..                   | ...
+  * INT_SIZE * (M + 1)   | pointer to head of linked list of blocks of size (M + MIN_BLOCK_DELTAS) * BLOCK_SIZE_DELTA
++ * FREE_BLOCK_OFFSET    | chunk number for the root of the large block free space trie
+  * WRITE_NUMBER_OFFSET  | long integer which is incremented on every write
+- * MALLOC_STATS_OFFSET  | memory usage statistics 
++ * MALLOC_STATS_OFFSET  | memory usage statistics  
+  * DATA_AREA            | The database singletons are stored here and use the remainder of chunk 0
+  *
+  * M = CHUNK_SIZE / BLOCK_SIZE_DELTA - MIN_BLOCK_DELTAS
+@@ -86,21 +87,26 @@ public class Database {
+ 	private static final int BLOCK_PREV_OFFSET = BLOCK_HEADER_SIZE;
+ 	private static final int BLOCK_NEXT_OFFSET = BLOCK_HEADER_SIZE + INT_SIZE;
+ 	private static final int FREE_BLOCK_HEADER_SIZE = BLOCK_NEXT_OFFSET + INT_SIZE;
+-	
+-	public static final int MIN_BLOCK_DELTAS = (FREE_BLOCK_HEADER_SIZE + BLOCK_SIZE_DELTA - 1) /
+-			BLOCK_SIZE_DELTA; // Must be enough multiples of BLOCK_SIZE_DELTA in order to fit the free block header
+-	public static final int MAX_BLOCK_DELTAS = CHUNK_SIZE / BLOCK_SIZE_DELTA;
+-	public static final int MAX_MALLOC_SIZE = MAX_BLOCK_DELTAS * BLOCK_SIZE_DELTA - BLOCK_HEADER_SIZE; 
+-	public static final int PTR_SIZE = 4;  // size of a pointer in the database in bytes
++
++	// Must be enough multiples of BLOCK_SIZE_DELTA in order to fit the free block header
++	public static final int MIN_BLOCK_DELTAS = (FREE_BLOCK_HEADER_SIZE + BLOCK_SIZE_DELTA - 1) / BLOCK_SIZE_DELTA;
++	public static final int MAX_BLOCK_DELTAS = (CHUNK_SIZE - LargeBlock.HEADER_SIZE - LargeBlock.FOOTER_SIZE)
++			/ BLOCK_SIZE_DELTA;
++	public static final int MAX_SINGLE_BLOCK_MALLOC_SIZE = MAX_BLOCK_DELTAS * BLOCK_SIZE_DELTA - BLOCK_HEADER_SIZE;
++	public static final int PTR_SIZE = 4; // size of a pointer in the database in bytes
+ 	public static final int STRING_SIZE = PTR_SIZE;
+ 	public static final int FLOAT_SIZE = INT_SIZE;
+ 	public static final int DOUBLE_SIZE = LONG_SIZE;
+ 	public static final long MAX_DB_SIZE= ((long) 1 << (Integer.SIZE + BLOCK_SIZE_DELTA_BITS));
+ 
++	public static final long MAX_MALLOC_SIZE = MAX_DB_SIZE - LargeBlock.HEADER_SIZE - LargeBlock.FOOTER_SIZE
++			- CHUNK_SIZE - BLOCK_HEADER_SIZE;
++
+ 	public static final int VERSION_OFFSET = 0;
+-	private static final int MALLOC_TABLE_OFFSET = VERSION_OFFSET + INT_SIZE;
+-	public static final int WRITE_NUMBER_OFFSET = MALLOC_TABLE_OFFSET
++	public static final int MALLOC_TABLE_OFFSET = VERSION_OFFSET + INT_SIZE;
++	public static final int FREE_BLOCK_OFFSET = MALLOC_TABLE_OFFSET
+ 			+ (CHUNK_SIZE / BLOCK_SIZE_DELTA - MIN_BLOCK_DELTAS + 1) * INT_SIZE;
++	public static final int WRITE_NUMBER_OFFSET = FREE_BLOCK_OFFSET + PTR_SIZE;
+ 	public static final int MALLOC_STATS_OFFSET = WRITE_NUMBER_OFFSET + LONG_SIZE;
+ 	public static final int DATA_AREA_OFFSET = MALLOC_STATS_OFFSET + MemoryStats.SIZE;
+ 
+@@ -171,8 +177,8 @@ public class Database {
+ 		this.memoryUsage = new MemoryStats(this.fHeaderChunk, MALLOC_STATS_OFFSET);
+ 	}
+ 
+-	private static int divideRoundingUp(int num, int den) {
+-		return (num + den - 1) / den;
++	private static int divideRoundingUp(long num, int den) {
++		return (int) ((num + den - 1) / den);
+ 	}
+ 
+ 	private void openFile() throws FileNotFoundException {
+@@ -380,7 +386,7 @@ public class Database {
+ 	 */
+ 	public void memcpy(long dest, long source, int numBytes) {
+ 		assert numBytes >= 0;
+-		assert numBytes <= MAX_MALLOC_SIZE;
++		assert numBytes <= MAX_SINGLE_BLOCK_MALLOC_SIZE;
+ 		// TODO: make use of lower-level System.arrayCopy
+ 		for (int count = 0; count < numBytes; count++) {
+ 			putByte(dest + count, getByte(source + count));
+@@ -390,58 +396,422 @@ public class Database {
+ 	/**
+ 	 * Allocate a block out of the database.
+ 	 */
+-	public long malloc(final int datasize, final short poolId) throws IndexException {
++	public long malloc(final long datasize, final short poolId) throws IndexException {
+ 		assert this.fExclusiveLock;
+ 		assert datasize >= 0;
+ 		assert datasize <= MAX_MALLOC_SIZE;
+ 
+-		int needDeltas= divideRoundingUp(datasize + BLOCK_HEADER_SIZE, BLOCK_SIZE_DELTA);
+-		if (needDeltas < MIN_BLOCK_DELTAS) {
+-			needDeltas= MIN_BLOCK_DELTAS;
++		long result;
++		int usedSize;
++		if (datasize >= MAX_SINGLE_BLOCK_MALLOC_SIZE) {
++			int newChunkNum = createLargeBlock(datasize);
++			usedSize = Math.abs(getBlockHeaderForChunkNum(newChunkNum)) * CHUNK_SIZE;
++			result = newChunkNum * CHUNK_SIZE + LargeBlock.HEADER_SIZE;
++			// Note that we identify large blocks by setting their block size to 0.
++			clearRange(result, usedSize - LargeBlock.HEADER_SIZE - LargeBlock.FOOTER_SIZE);
++			result = result + BLOCK_HEADER_SIZE;
++		} else {
++			long freeBlock = 0;
++			int needDeltas = divideRoundingUp(datasize + BLOCK_HEADER_SIZE, BLOCK_SIZE_DELTA);
++			if (needDeltas < MIN_BLOCK_DELTAS) {
++				needDeltas = MIN_BLOCK_DELTAS;
++			}
++
++			// Which block size.
++			int useDeltas;
++			for (useDeltas = needDeltas; useDeltas <= MAX_BLOCK_DELTAS; useDeltas++) {
++				freeBlock = getFirstBlock(useDeltas * BLOCK_SIZE_DELTA);
++				if (freeBlock != 0)
++					break;
++			}
++
++			// Get the block.
++			Chunk chunk;
++			if (freeBlock == 0) {
++				// Allocate a new chunk.
++				freeBlock = (long) (createLargeBlock(datasize)) * (long) CHUNK_SIZE + LargeBlock.HEADER_SIZE;
++				useDeltas = MAX_BLOCK_DELTAS;
++				chunk = getChunk(freeBlock);
++			} else {
++				chunk = getChunk(freeBlock);
++				removeBlock(chunk, useDeltas * BLOCK_SIZE_DELTA, freeBlock);
++			}
++
++			final int unusedDeltas = useDeltas - needDeltas;
++			if (unusedDeltas >= MIN_BLOCK_DELTAS) {
++				// Add in the unused part of our block.
++				addBlock(chunk, unusedDeltas * BLOCK_SIZE_DELTA, freeBlock + needDeltas * BLOCK_SIZE_DELTA);
++				useDeltas = needDeltas;
++			}
++
++			// Make our size negative to show in use.
++			usedSize = useDeltas * BLOCK_SIZE_DELTA;
++			chunk.putShort(freeBlock, (short) -usedSize);
++
++			// Clear out the block, lots of people are expecting this.
++			chunk.clear(freeBlock + BLOCK_HEADER_SIZE, usedSize - BLOCK_HEADER_SIZE);
++			result = freeBlock + BLOCK_HEADER_SIZE;
+ 		}
+ 
+-		// Which block size.
+-		long freeblock = 0;
+-		int useDeltas;
+-		for (useDeltas= needDeltas; useDeltas <= MAX_BLOCK_DELTAS; useDeltas++) {
+-			freeblock = getFirstBlock(useDeltas * BLOCK_SIZE_DELTA);
+-			if (freeblock != 0)
+-				break;
++		this.malloced += usedSize;
++		this.memoryUsage.recordMalloc(poolId, usedSize);
++		return result;
++	}
++
++	/**
++	 * Clears all the bytes in the given range by setting them to zero.
++	 * 
++	 * @param startAddress first address to clear
++	 * @param bytesToClear number of addresses to clear
++	 */
++	public void clearRange(long startAddress, int bytesToClear) {
++		if (bytesToClear == 0) {
++			return;
++		}
++		long endAddress = startAddress + bytesToClear;
++		assert endAddress <= this.fChunksUsed * CHUNK_SIZE;
++		int blockNumber = (int) (startAddress / CHUNK_SIZE);
++		int firstBlockBytesToClear = Math.min((int) (((blockNumber + 1) * CHUNK_SIZE) - startAddress), bytesToClear);
++
++		Chunk firstBlock = getChunk(startAddress);
++		firstBlock.clear(startAddress, firstBlockBytesToClear);
++		startAddress += firstBlockBytesToClear;
++		bytesToClear -= firstBlockBytesToClear;
++		while (bytesToClear > CHUNK_SIZE) {
++			Chunk nextBlock = getChunk(startAddress);
++			nextBlock.clear(startAddress, CHUNK_SIZE);
++			startAddress += CHUNK_SIZE;
++			bytesToClear -= CHUNK_SIZE;
+ 		}
+ 
+-		// Get the block.
+-		Chunk chunk;
+-		if (freeblock == 0) {
+-			// Allocate a new chunk.
+-			freeblock= createNewChunks(1);
+-			useDeltas = MAX_BLOCK_DELTAS;
+-			chunk = getChunk(freeblock);
++		if (bytesToClear > 0) {
++			Chunk nextBlock = getChunk(startAddress);
++			nextBlock.clear(startAddress, bytesToClear);
++		}
++	}
++
++	/**
++	 * Obtains a new block that can fit the given number of bytes (at minimum). Returns the
++	 * chunk number.
++	 * 
++	 * @param datasize minimum number of bytes needed
++	 * @return the chunk number
++	 */
++	private int createLargeBlock(long datasize) {
++		final int neededChunks = getChunksNeededForBytes(datasize);
++		int freeBlockChunkNum = getFreeBlockFromTrie(neededChunks);
++		final int numChunks;
++
++		if (freeBlockChunkNum == 0) {
++			final int lastChunkNum = this.fChunksUsed;
++
++			numChunks = neededChunks;
++
++			// Check if the last block in the database is free. If so, unlink and expand it.
++			int lastBlockSize = getBlockFooterForChunkBefore(lastChunkNum);
++			if (lastBlockSize > 0) {
++				int startChunkNum = getFirstChunkOfBlockBefore(lastChunkNum);
++
++				unlinkFreeBlock(startChunkNum);
++				// Allocate additional new chunks such that the new chunk is large enough to
++				// handle this allocation.
++				createNewChunks(neededChunks - lastBlockSize);
++				freeBlockChunkNum = startChunkNum;
++			} else {
++				freeBlockChunkNum = createNewChunks(numChunks);
++			}
+ 		} else {
+-			chunk = getChunk(freeblock);
+-			removeBlock(chunk, useDeltas * BLOCK_SIZE_DELTA, freeblock);
++			numChunks = getBlockHeaderForChunkNum(freeBlockChunkNum);
++
++			unlinkFreeBlock(freeBlockChunkNum);
+ 		}
+ 
+-		final int unusedDeltas = useDeltas - needDeltas;
+-		if (unusedDeltas >= MIN_BLOCK_DELTAS) {
+-			// Add in the unused part of our block.
+-			addBlock(chunk, unusedDeltas * BLOCK_SIZE_DELTA, freeblock + needDeltas * BLOCK_SIZE_DELTA);
+-			useDeltas= needDeltas;
++		final int resultChunkNum;
++		if (numChunks > neededChunks) {
++			// If the chunk we've selected is larger than necessary, split it. We have the
++			// choice of using either half of the block. In the interest of leaving more
++			// opportunities of merging large blocks, we leave the unused half of the block
++			// next to the larger adjacent block.
++			final long nextBlockChunkNum = freeBlockChunkNum + numChunks;
++
++			final int nextBlockSize = Math.abs(getBlockHeaderForChunkNum(nextBlockChunkNum));
++			final int prevBlockSize = Math.abs(getBlockFooterForChunkBefore(freeBlockChunkNum));
++
++			final int unusedChunks = numChunks - neededChunks;
++			if (nextBlockSize >= prevBlockSize) {
++				// Use the start of the block
++				resultChunkNum = freeBlockChunkNum;
++				// Return the last half of the block to the free block pool
++				linkFreeBlockToTrie(freeBlockChunkNum + neededChunks, unusedChunks);
++			} else {
++				// Use the end of the block
++				resultChunkNum = freeBlockChunkNum + neededChunks;
++				// Return the first half of the block to the free block pool
++				linkFreeBlockToTrie(freeBlockChunkNum, unusedChunks);
++			}
++		} else {
++			resultChunkNum = freeBlockChunkNum;
+ 		}
+ 
+-		// Make our size negative to show in use.
+-		final int usedSize= useDeltas * BLOCK_SIZE_DELTA;
+-		chunk.putShort(freeblock, (short) -usedSize);
++		// Fill in the header and footer
++		setBlockHeader(resultChunkNum, -neededChunks);
++		return resultChunkNum;
++	}
+ 
+-		// Clear out the block, lots of people are expecting this.
+-		chunk.clear(freeblock + BLOCK_HEADER_SIZE, usedSize - BLOCK_HEADER_SIZE);
++	/**
++	 * Unlinks a free block (which currently belongs to the free block trie) so that it may
++	 * be reused.
++	 * 
++	 * @param freeBlockChunkNum chunk number of the block to be unlinked
++	 */
++	private void unlinkFreeBlock(int freeBlockChunkNum) {
++		long freeBlockAddress = freeBlockChunkNum * CHUNK_SIZE;
++		int anotherBlockOfSameSize = 0;
++		int nextBlockChunkNum = getInt(freeBlockAddress + LargeBlock.NEXT_BLOCK_OFFSET);
++		int prevBlockChunkNum = getInt(freeBlockAddress + LargeBlock.PREV_BLOCK_OFFSET);
++		// Relink the linked list
++		if (nextBlockChunkNum != 0) {
++			anotherBlockOfSameSize = nextBlockChunkNum;
++			putInt(nextBlockChunkNum * CHUNK_SIZE + LargeBlock.PREV_BLOCK_OFFSET, prevBlockChunkNum);
++		}
++		if (prevBlockChunkNum != 0) {
++			anotherBlockOfSameSize = prevBlockChunkNum;
++			putInt(prevBlockChunkNum * CHUNK_SIZE + LargeBlock.NEXT_BLOCK_OFFSET, nextBlockChunkNum);
++		}
+ 
+-		this.malloced += usedSize;
+-		long result = freeblock + BLOCK_HEADER_SIZE;
+-		this.memoryUsage.recordMalloc(poolId, usedSize);
+-		return result;
++		long root = getInt(FREE_BLOCK_OFFSET);
++		if (root == freeBlockChunkNum) {
++			putInt(FREE_BLOCK_OFFSET, 0);
++		}
++
++		int freeBlockSize = getBlockHeaderForChunkNum(freeBlockChunkNum);
++		int parentChunkNum = getInt(freeBlockAddress + LargeBlock.PARENT_OFFSET);
++		if (parentChunkNum != 0) {
++			int currentSize = getBlockHeaderForChunkNum(parentChunkNum);
++			int difference = currentSize ^ freeBlockSize;
++			if (difference != 0) {
++				int firstDifference = LargeBlock.SIZE_OF_SIZE_FIELD * 8 - Integer.numberOfLeadingZeros(difference) - 1;
++				long locationOfChildPointer = parentChunkNum * CHUNK_SIZE + LargeBlock.CHILD_TABLE_OFFSET
++						+ (firstDifference * INT_SIZE);
++				putInt(locationOfChildPointer, 0);
++			}
++		}
++
++		if (anotherBlockOfSameSize != 0) {
++			insertChild(parentChunkNum, anotherBlockOfSameSize);
++		}
++
++		int currentParent = parentChunkNum;
++		for (int childIdx = 0; childIdx < LargeBlock.ENTRIES_IN_CHILD_TABLE; childIdx++) {
++			int nextChildChunkNum = getInt(freeBlockAddress + LargeBlock.CHILD_TABLE_OFFSET + (childIdx * INT_SIZE));
++			if (nextChildChunkNum != 0) {
++				insertChild(currentParent, nextChildChunkNum);
++				// Parent all subsequent children under the child that was most similar to the old parent
++				if (currentParent == parentChunkNum) {
++					currentParent = nextChildChunkNum;
++				}
++			}
++		}
++
++	}
++
++	/**
++	 * Returns the chunk number of a free block that contains at least the given number of chunks, or
++	 * 0 if there is no existing contiguous free block containing at least the given number of chunks.
++	 * 
++	 * @param numChunks minumum number of chunks desired
++	 * @return the chunk number of a free block containing at least the given number of chunks or 0
++	 * if there is no existing free block containing that many chunks.
++	 */
++	private int getFreeBlockFromTrie(int numChunks) {
++		int currentChunkNum = getInt(FREE_BLOCK_OFFSET);
++
++		int resultChunkNum = getSmallestChildNoSmallerThan(currentChunkNum, numChunks);
++		if (resultChunkNum == 0) {
++			return 0;
++		}
++
++		// Try not to return the trie node itself if there is a linked list entry available, since unlinking
++		// something from the linked list is faster than unlinking a trie node.
++		int nextResultChunkNum = getInt(resultChunkNum * CHUNK_SIZE + LargeBlock.NEXT_BLOCK_OFFSET);
++		if (nextResultChunkNum != 0) {
++			return nextResultChunkNum;
++		}
++		return resultChunkNum;
++	}
++
++	/**
++	 * Given the chunk number of a block somewhere in the free space trie, this returns the smallest
++	 * child in the subtree that is no smaller than the given number of chunks.
++	 * 
++	 * @param trieNodeChunkNum chunk number of a block in the free space trie
++	 * @param numChunks desired number of chunks
++	 * @return the chunk number of the first chunk in a contiguous free block containing at least the
++	 * given number of chunks
++	 */
++	private int getSmallestChildNoSmallerThan(int trieNodeChunkNum, int numChunks) {
++		if (trieNodeChunkNum == 0) {
++			return 0;
++		}
++		int currentSize = getBlockHeaderForChunkNum(trieNodeChunkNum);
++		assert (currentSize >= 0);
++		int difference = currentSize ^ numChunks;
++		if (difference == 0) {
++			return trieNodeChunkNum;
++		}
++
++		int bitMask = Integer.highestOneBit(difference);
++		int firstDifference = LargeBlock.SIZE_OF_SIZE_FIELD * 8 - Integer.numberOfLeadingZeros(bitMask) - 1;
++		boolean lookingForSmallerChild = (currentSize > numChunks);
++		for (int testPosition = firstDifference; testPosition < LargeBlock.ENTRIES_IN_CHILD_TABLE; testPosition++) {
++			if (((currentSize & bitMask) != 0) == lookingForSmallerChild) {
++				int nextChildChunkNum = getInt(
++						trieNodeChunkNum * CHUNK_SIZE + LargeBlock.CHILD_TABLE_OFFSET + (testPosition * PTR_SIZE));
++				int childResultChunkNum = getSmallestChildNoSmallerThan(nextChildChunkNum, numChunks);
++				if (childResultChunkNum != 0) {
++					return childResultChunkNum;
++				}
++			}
++			bitMask <<= 1;
++		}
++
++		if (lookingForSmallerChild) {
++			return trieNodeChunkNum;
++		} else {
++			return 0;
++		}
+ 	}
+ 
+-	private long createNewChunks(int numChunks) throws IndexException {
++	/**
++	 * Link the given unused block into the free block tries. The block does not need to have
++	 * its header filled in already.
++	 * 
++	 * @param freeBlockChunkNum chunk number of the start of the block
++	 * @param numChunks number of chunks in the block
++	 */
++	private void linkFreeBlockToTrie(int freeBlockChunkNum, int numChunks) {
++		setBlockHeader(freeBlockChunkNum, numChunks);
++		long freeBlockAddress = freeBlockChunkNum * CHUNK_SIZE;
++		Chunk chunk = getChunk(freeBlockAddress);
++		chunk.clear(freeBlockAddress + LargeBlock.HEADER_SIZE,
++				LargeBlock.UNALLOCATED_HEADER_SIZE - LargeBlock.HEADER_SIZE);
++
++		insertChild(getInt(FREE_BLOCK_OFFSET), freeBlockChunkNum);
++	}
++
++	/**
++	 * Adds the given child block to the given parent subtree of the free space trie. Any existing
++	 * subtree under the given child block will be retained.
++	 * 
++	 * @param parentChunkNum root of the existing tree, or 0 if the child is going to be the new root
++	 * @param newChildChunkNum the new child to insert
++	 */
++	private void insertChild(int parentChunkNum, int newChildChunkNum) {
++		if (parentChunkNum == 0) {
++			putInt(newChildChunkNum * CHUNK_SIZE + LargeBlock.PARENT_OFFSET, parentChunkNum);
++			putInt(FREE_BLOCK_OFFSET, newChildChunkNum);
++			return;
++		}
++		int numChunks = getBlockHeaderForChunkNum(newChildChunkNum);
++		for (;;) {
++			int currentSize = getBlockHeaderForChunkNum(parentChunkNum);
++			int difference = currentSize ^ numChunks;
++			if (difference == 0) {
++				// The newly added item is exactly the same size as this trie node
++				insertFreeBlockAfter(parentChunkNum, newChildChunkNum);
++				return;
++			}
++
++			int firstDifference = LargeBlock.SIZE_OF_SIZE_FIELD * 8 - Integer.numberOfLeadingZeros(difference) - 1;
++			long locationOfChildPointer = parentChunkNum * CHUNK_SIZE + LargeBlock.CHILD_TABLE_OFFSET
++					+ (firstDifference * INT_SIZE);
++			int childChunkNum = getInt(locationOfChildPointer);
++			if (childChunkNum == 0) {
++				putInt(locationOfChildPointer, newChildChunkNum);
++				putInt(newChildChunkNum * CHUNK_SIZE + LargeBlock.PARENT_OFFSET, parentChunkNum);
++				return;
++			}
++			parentChunkNum = childChunkNum;
++		}
++	}
++
++	/**
++	 * Adds the given block to the linked list of equally-sized free chunks in the free space trie.
++	 * Both chunks must be unused, must be the same size, and the previous chunk must already
++	 * be linked into the free space trie. The newly-added chunk must not have any children.
++	 * 
++	 * @param prevChunkNum chunk number of previous block in the existing list
++	 * @param newChunkNum new chunk to be added to the list
++	 */
++	private void insertFreeBlockAfter(int prevChunkNum, int newChunkNum) {
++		long prevChunkAddress = (long) prevChunkNum * CHUNK_SIZE;
++		int nextChunkNum = getInt(prevChunkAddress + LargeBlock.NEXT_BLOCK_OFFSET);
++		long nextChunkAddress = (long) nextChunkNum * CHUNK_SIZE;
++		long newLockAddress = (long) newChunkNum * CHUNK_SIZE;
++
++		putInt(prevChunkAddress + LargeBlock.NEXT_BLOCK_OFFSET, newChunkNum);
++		if (nextChunkNum != 0) {
++			putInt(nextChunkAddress + LargeBlock.PREV_BLOCK_OFFSET, newChunkNum);
++		}
++		putInt(newLockAddress + LargeBlock.PREV_BLOCK_OFFSET, prevChunkNum);
++		putInt(newLockAddress + LargeBlock.NEXT_BLOCK_OFFSET, nextChunkNum);
++	}
++
++	/**
++	 * Returns the chunk number of the chunk at the start of a block, given the
++	 * chunk number of the chunk at the start of the following block.
++	 * 
++	 * @param chunkNum the chunk number of the chunk immediately following the
++	 * chunk being queried
++	 * @return the chunk number of the chunk at the start of the previous block
++	 */
++	private int getFirstChunkOfBlockBefore(int chunkNum) {
++		int blockChunks = Math.abs(getBlockFooterForChunkBefore(chunkNum));
++		return chunkNum - blockChunks;
++	}
++
++	/**
++	 * Sets the block header and footer for the given range of chunks which make
++	 * up a contiguous block.
++	 * 
++	 * @param firstChunkNum chunk number of the first chunk in the block
++	 * @param headerContent the content of the header. Its magnitude is the number of
++	 * chunks in the block. It is positive if the chunk is free and negative if
++	 * the chunk is in use.
++	 */
++	private void setBlockHeader(int firstChunkNum, int headerContent) {
++		assert headerContent != 0;
++		assert firstChunkNum < this.fChunksUsed;
++		int numBlocks = Math.abs(headerContent);
++		long firstChunkAddress = firstChunkNum * CHUNK_SIZE;
++		putInt(firstChunkAddress, headerContent);
++		putInt(firstChunkAddress + (numBlocks * CHUNK_SIZE) - LargeBlock.FOOTER_SIZE, headerContent);
++	}
++
++	/**
++	 * Returns the size of the block (in number of chunks) starting at the given address. The return value is positive
++	 * if the block is free and negative if the block is allocated.
++	 */
++	private int getBlockHeaderForChunkNum(long firstChunkNum) {
++		if (firstChunkNum >= this.fChunksUsed) {
++			return 0;
++		}
++		return getInt(firstChunkNum * CHUNK_SIZE);
++	}
++
++	/**
++	 * Returns the size of the block (in number of chunks), given the (non-inclusive) address that the block ends at.
++	 * The return value is positive if the block is free and negative if the block is allocated.
++	 */
++	private int getBlockFooterForChunkBefore(int chunkNum) {
++		if (chunkNum < 2) {
++			// Don't report the database header as a normal chunk.
++			return 0;
++		}
++		return getInt(chunkNum * CHUNK_SIZE - LargeBlock.FOOTER_SIZE);
++	}
++
++	private int createNewChunks(int numChunks) throws IndexException {
+ 		assert this.fExclusiveLock;
+ 		synchronized (this.fCache) {
+ 			final int firstChunkIndex = this.fChunksUsed;
+@@ -477,7 +847,7 @@ public class Database {
+ 								bindings), null));
+ 			}
+ 
+-			return result;
++			return firstChunkIndex;
+ 		}
+ 	}
+ 
+@@ -525,26 +895,74 @@ public class Database {
+ 	/**
+ 	 * Free an allocated block.
+ 	 *
+-	 * @param address memory address to be freed
+-	 * @param poolId the same ID that was previously passed into malloc when allocating this memory address
++	 * @param address
++	 *            memory address to be freed
++	 * @param poolId
++	 *            the same ID that was previously passed into malloc when allocating this memory address
+ 	 */
+ 	public void free(long address, short poolId) throws IndexException {
+ 		assert this.fExclusiveLock;
+ 		if (address == 0) {
+ 			return;
+ 		}
+-		// TODO Look for opportunities to merge blocks
++		long blockSize;
+ 		long block = address - BLOCK_HEADER_SIZE;
+ 		Chunk chunk = getChunk(block);
+-		int blocksize = - chunk.getShort(block);
+-		if (blocksize < 0) {
+-			// Already freed.
+-			throw new IndexException(new Status(IStatus.ERROR, Package.PLUGIN_ID, 0,
+-					"Already freed record " + address, new Exception())); //$NON-NLS-1$
++		blockSize = -chunk.getShort(block);
++		// We use a block size of 0 to indicate a large block that fills a range of chunks
++		if (blockSize == 0) {
++			int offsetIntoChunk = (int) (address % CHUNK_SIZE);
++			assert offsetIntoChunk == LargeBlock.HEADER_SIZE + BLOCK_HEADER_SIZE;
++			// Deallocating a large block
++			// This was a large block. It uses a sequence of full chunks.
++			int chunkNum = (int) (address / CHUNK_SIZE);
++			int numChunks = -getBlockHeaderForChunkNum(chunkNum);
++			if (numChunks < 0) {
++				// Already freed.
++				throw new IndexException(new Status(IStatus.ERROR, Package.PLUGIN_ID, 0,
++						"Already freed large block " + address, new Exception())); //$NON-NLS-1$
++			}
++			blockSize = numChunks * CHUNK_SIZE;
++			freeLargeChunk(chunkNum, numChunks);
++		} else {
++			// Deallocating a normal block
++			// TODO Look for opportunities to merge small blocks
++			if (blockSize < 0) {
++				// Already freed.
++				throw new IndexException(new Status(IStatus.ERROR, Package.PLUGIN_ID, 0,
++						"Already freed record " + address, new Exception())); //$NON-NLS-1$
++			}
++			addBlock(chunk, (int) blockSize, block);
++		}
++
++		this.freed += blockSize;
++		this.memoryUsage.recordFree(poolId, blockSize);
++	}
++
++	private void freeLargeChunk(int chunkNum, int numChunks) {
++		assert chunkNum > 0;
++		assert numChunks > 0;
++		int prevBlockHeader = getBlockFooterForChunkBefore(chunkNum);
++		int nextBlockChunkNum = chunkNum + numChunks;
++		int nextBlockHeader = getBlockHeaderForChunkNum(nextBlockChunkNum);
++
++		// If the previous block is unused, merge with it
++		if (prevBlockHeader > 0) {
++			int prevBlockChunkNum = getFirstChunkOfBlockBefore(chunkNum);
++
++			unlinkFreeBlock(prevBlockChunkNum);
++			chunkNum = prevBlockChunkNum;
++			numChunks += prevBlockHeader;
+ 		}
+-		addBlock(chunk, blocksize, block);
+-		this.freed += blocksize;
+-		this.memoryUsage.recordFree(poolId, blocksize);
++
++		// If the next block is unused, merge with it
++		if (nextBlockHeader > 0) {
++			unlinkFreeBlock(nextBlockChunkNum);
++			numChunks += nextBlockHeader;
++		}
++
++		// Block merging is done. Now reinsert the merged block into the free space trie
++		linkFreeBlockToTrie(chunkNum, numChunks);
+ 	}
+ 
+ 	public void putByte(long offset, byte value) throws IndexException {
+@@ -912,6 +1330,10 @@ public class Database {
+ 		return this.fFile.length();
+ 	}
+ 
++	public int getChunkCount() {
++		return this.fChunksUsed;
++	}
++
+ 	/**
+ 	 * A Record Pointer is a pointer as returned by Database.malloc().
+ 	 * This is a pointer to a block + BLOCK_HEADER_SIZE.
+@@ -934,4 +1356,19 @@ public class Database {
+ 	public MemoryStats getMemoryStats() {
+ 		return this.memoryUsage;
+ 	}
++
++	/**
++	 * Returns the number of bytes that can fit in the payload of the given number of chunks.
++	 */
++	public static long getBytesThatFitInChunks(int numChunks) {
++		return CHUNK_SIZE * numChunks - LargeBlock.HEADER_SIZE - LargeBlock.FOOTER_SIZE - BLOCK_HEADER_SIZE;
++	}
++
++	/**
++	 * Returns the number of chunks needed to fit the given number of bytes of payload.
++	 */
++	public static int getChunksNeededForBytes(long datasize) {
++		return divideRoundingUp(datasize + BLOCK_HEADER_SIZE + LargeBlock.HEADER_SIZE + LargeBlock.FOOTER_SIZE,
++				CHUNK_SIZE);
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LargeBlock.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LargeBlock.java
+new file mode 100644
+index 0000000..26af53c
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LargeBlock.java
+@@ -0,0 +1,26 @@
++package org.eclipse.jdt.internal.core.nd.db;
++
++public class LargeBlock {
++	public static final int SIZE_OFFSET = 0;
++	public static final int SIZE_OF_SIZE_FIELD = Database.INT_SIZE;
++	/**
++	 * Size of the header for a large block. The header consists of a int which holds the number of chunks in the block.
++	 * It is negative for an allocated block and positive for an unallocated block. The header is located at the start
++	 * of the large block.
++	 */
++	public static final int HEADER_SIZE = Math.max(Database.INT_SIZE, Database.BLOCK_SIZE_DELTA);
++
++	public static final int ENTRIES_IN_CHILD_TABLE = SIZE_OF_SIZE_FIELD * 8;
++	public static final int CHILD_TABLE_OFFSET = HEADER_SIZE;
++	public static final int PARENT_OFFSET = CHILD_TABLE_OFFSET + (Database.INT_SIZE * ENTRIES_IN_CHILD_TABLE);
++	public static final int PREV_BLOCK_OFFSET = PARENT_OFFSET + Database.INT_SIZE;
++	public static final int NEXT_BLOCK_OFFSET = PREV_BLOCK_OFFSET + Database.INT_SIZE;
++
++	public static final int UNALLOCATED_HEADER_SIZE = NEXT_BLOCK_OFFSET + Database.INT_SIZE;
++
++	/**
++	 * The large block footer is located at the end of the last chunk in the large block. It is an exact copy of the
++	 * header.
++	 */
++	public static final int FOOTER_SIZE = HEADER_SIZE;
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LongString.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LongString.java
+index c78b7f9..eb0e48a 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LongString.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LongString.java
+@@ -29,13 +29,13 @@ public class LongString implements IString {
+ 	private static final int NEXT1 = 4;
+ 	private static final int CHARS1 = 8;
+ 
+-	private static final int NUM_CHARS1 = (Database.MAX_MALLOC_SIZE - CHARS1) / 2;
++	private static final int NUM_CHARS1 = (Database.MAX_SINGLE_BLOCK_MALLOC_SIZE - CHARS1) / 2;
+ 
+ 	// Additional fields of subsequent records.
+ 	private static final int NEXTN = 0;
+ 	private static final int CHARSN = 4;
+ 
+-	private static final int NUM_CHARSN = (Database.MAX_MALLOC_SIZE - CHARSN) / 2;
++	private static final int NUM_CHARSN = (Database.MAX_SINGLE_BLOCK_MALLOC_SIZE - CHARSN) / 2;
+ 
+ 	public LongString(Database db, long record) {
+ 		this.db = db;
+@@ -47,7 +47,7 @@ public class LongString implements IString {
+ 		final int numCharsn = useBytes ? NUM_CHARSN * 2 : NUM_CHARSN;
+ 
+ 		this.db = db;
+-		this.record = db.malloc(Database.MAX_MALLOC_SIZE, Database.POOL_STRING_LONG);
++		this.record = db.malloc(Database.MAX_SINGLE_BLOCK_MALLOC_SIZE, Database.POOL_STRING_LONG);
+ 
+ 		// Write the first record.
+ 		final int length = chars.length;
+@@ -64,7 +64,7 @@ public class LongString implements IString {
+ 		long lastNext = this.record + NEXT1;
+ 		int start = numChars1;
+ 		while (length - start > numCharsn) {
+-			long nextRecord = db.malloc(Database.MAX_MALLOC_SIZE, Database.POOL_STRING_LONG);
++			long nextRecord = db.malloc(Database.MAX_SINGLE_BLOCK_MALLOC_SIZE, Database.POOL_STRING_LONG);
+ 			db.putRecPtr(lastNext, nextRecord);
+ 			chunk= db.getChunk(nextRecord);
+ 			if (useBytes) {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/ShortString.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/ShortString.java
+index 09992a5..eb56c6c 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/ShortString.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/ShortString.java
+@@ -25,7 +25,7 @@ public class ShortString implements IString {
+ 	private static final int LENGTH = 0;
+ 	private static final int CHARS = 4;
+ 
+-	public static final int MAX_BYTE_LENGTH = Database.MAX_MALLOC_SIZE - CHARS;
++	public static final int MAX_BYTE_LENGTH = Database.MAX_SINGLE_BLOCK_MALLOC_SIZE - CHARS;
+ 
+ 	public ShortString(Database db, long offset) {
+ 		this.db = db;
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+index f0cbe1f..778d5da 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+@@ -34,9 +34,9 @@ import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+ 
+ public class JavaIndex {
+ 	// Version constants
+-	static final int CURRENT_VERSION = Nd.version(1, 37);
+-	static final int MAX_SUPPORTED_VERSION = Nd.version(1, 37);
+-	static final int MIN_SUPPORTED_VERSION = Nd.version(1, 37);
++	static final int CURRENT_VERSION = Nd.version(1, 38);
++	static final int MAX_SUPPORTED_VERSION = Nd.version(1, 38);
++	static final int MIN_SUPPORTED_VERSION = Nd.version(1, 38);
+ 
+ 	// Fields for the search header
+ 	public static final FieldSearchIndex<NdResourceFile> FILES;

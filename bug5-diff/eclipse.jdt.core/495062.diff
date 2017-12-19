@@ -1,0 +1,1838 @@
+commit 0a44f62a1f9b21f0e3abfd0c10f0f5be43cb1070
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Tue May 31 15:12:28 2016 -0400
+
+    Bug 495062 - JavaSearchNameEnvironment is slow for large classpaths
+    
+    Reimplement JavaSearchNameEnvironment backed by the new java index.
+    
+    Change-Id: I7507d7ffc7c7d2e8ecb1791ec0bdb56da7b481bd
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+143	12	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+2	2	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/BTree.java
+20	5	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/field/FieldSearchIndex.java
+8	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+1	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaNames.java
+136	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
+5	2	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/SourceIndexer.java
+207	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+15	5	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+6	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+index 15e63a9..8482312 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+@@ -16,6 +16,7 @@
+ package org.eclipse.jdt.internal.codeassist;
+ 
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.Locale;
+ import java.util.Map;
+ 
+@@ -39,41 +40,171 @@ import org.eclipse.jdt.core.compiler.CategorizedProblem;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.core.compiler.IProblem;
+ import org.eclipse.jdt.core.search.IJavaSearchConstants;
+-import org.eclipse.jdt.internal.codeassist.complete.*;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionNodeDetector;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionNodeFound;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnAnnotationOfType;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnArgumentName;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnBranchStatementLabel;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnClassLiteralAccess;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnExplicitConstructorCall;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnFieldName;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnFieldType;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnImportReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnJavadoc;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnJavadocAllocationExpression;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnJavadocFieldReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnJavadocMessageSend;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnJavadocParamNameReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnJavadocQualifiedTypeReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnJavadocSingleTypeReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnJavadocTag;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnJavadocTypeParamReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnKeyword;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnKeyword3;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnLocalName;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnMarkerAnnotationName;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnMemberAccess;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnMemberValueName;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnMessageSend;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnMessageSendName;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnMethodName;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnMethodReturnType;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnPackageReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnParameterizedQualifiedTypeReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnQualifiedAllocationExpression;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnQualifiedNameReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnQualifiedTypeReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnReferenceExpressionName;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnSingleNameReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnSingleTypeReference;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionOnStringLiteral;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionParser;
++import org.eclipse.jdt.internal.codeassist.complete.CompletionScanner;
++import org.eclipse.jdt.internal.codeassist.complete.InvalidCursorLocation;
+ import org.eclipse.jdt.internal.codeassist.impl.AssistParser;
+ import org.eclipse.jdt.internal.codeassist.impl.Engine;
+ import org.eclipse.jdt.internal.codeassist.impl.Keywords;
+ import org.eclipse.jdt.internal.compiler.CompilationResult;
+ import org.eclipse.jdt.internal.compiler.DefaultErrorHandlingPolicies;
+ import org.eclipse.jdt.internal.compiler.ExtraFlags;
+-import org.eclipse.jdt.internal.compiler.ast.*;
++import org.eclipse.jdt.internal.compiler.ast.ASTNode;
++import org.eclipse.jdt.internal.compiler.ast.AbstractMethodDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.AbstractVariableDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.AllocationExpression;
++import org.eclipse.jdt.internal.compiler.ast.Annotation;
++import org.eclipse.jdt.internal.compiler.ast.Argument;
++import org.eclipse.jdt.internal.compiler.ast.ArrayInitializer;
++import org.eclipse.jdt.internal.compiler.ast.ArrayReference;
++import org.eclipse.jdt.internal.compiler.ast.AssertStatement;
++import org.eclipse.jdt.internal.compiler.ast.Assignment;
++import org.eclipse.jdt.internal.compiler.ast.BinaryExpression;
++import org.eclipse.jdt.internal.compiler.ast.CaseStatement;
++import org.eclipse.jdt.internal.compiler.ast.CastExpression;
++import org.eclipse.jdt.internal.compiler.ast.CompilationUnitDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.ConditionalExpression;
++import org.eclipse.jdt.internal.compiler.ast.ConstructorDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.Expression;
++import org.eclipse.jdt.internal.compiler.ast.ExpressionContext;
++import org.eclipse.jdt.internal.compiler.ast.FieldDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.FieldReference;
++import org.eclipse.jdt.internal.compiler.ast.ForStatement;
++import org.eclipse.jdt.internal.compiler.ast.IfStatement;
++import org.eclipse.jdt.internal.compiler.ast.ImportReference;
++import org.eclipse.jdt.internal.compiler.ast.Initializer;
++import org.eclipse.jdt.internal.compiler.ast.InstanceOfExpression;
++import org.eclipse.jdt.internal.compiler.ast.Javadoc;
++import org.eclipse.jdt.internal.compiler.ast.JavadocImplicitTypeReference;
++import org.eclipse.jdt.internal.compiler.ast.JavadocQualifiedTypeReference;
++import org.eclipse.jdt.internal.compiler.ast.JavadocSingleTypeReference;
++import org.eclipse.jdt.internal.compiler.ast.LambdaExpression;
++import org.eclipse.jdt.internal.compiler.ast.LocalDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.MemberValuePair;
++import org.eclipse.jdt.internal.compiler.ast.MessageSend;
++import org.eclipse.jdt.internal.compiler.ast.MethodDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.NameReference;
++import org.eclipse.jdt.internal.compiler.ast.NormalAnnotation;
++import org.eclipse.jdt.internal.compiler.ast.OperatorExpression;
++import org.eclipse.jdt.internal.compiler.ast.OperatorIds;
++import org.eclipse.jdt.internal.compiler.ast.ParameterizedQualifiedTypeReference;
++import org.eclipse.jdt.internal.compiler.ast.ParameterizedSingleTypeReference;
++import org.eclipse.jdt.internal.compiler.ast.QualifiedNameReference;
++import org.eclipse.jdt.internal.compiler.ast.QualifiedTypeReference;
++import org.eclipse.jdt.internal.compiler.ast.ReferenceExpression;
++import org.eclipse.jdt.internal.compiler.ast.ReturnStatement;
++import org.eclipse.jdt.internal.compiler.ast.SingleNameReference;
++import org.eclipse.jdt.internal.compiler.ast.SingleTypeReference;
++import org.eclipse.jdt.internal.compiler.ast.SuperReference;
++import org.eclipse.jdt.internal.compiler.ast.SwitchStatement;
++import org.eclipse.jdt.internal.compiler.ast.ThisReference;
++import org.eclipse.jdt.internal.compiler.ast.TryStatement;
++import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.TypeParameter;
++import org.eclipse.jdt.internal.compiler.ast.TypeReference;
++import org.eclipse.jdt.internal.compiler.ast.UnaryExpression;
++import org.eclipse.jdt.internal.compiler.ast.UnionTypeReference;
++import org.eclipse.jdt.internal.compiler.ast.WhileStatement;
++import org.eclipse.jdt.internal.compiler.ast.Wildcard;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+-import org.eclipse.jdt.internal.compiler.env.*;
++import org.eclipse.jdt.internal.compiler.env.AccessRestriction;
++import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
++import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
++import org.eclipse.jdt.internal.compiler.env.ISourceType;
++import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.impl.ReferenceContext;
+-import org.eclipse.jdt.internal.compiler.lookup.*;
++import org.eclipse.jdt.internal.compiler.lookup.ArrayBinding;
++import org.eclipse.jdt.internal.compiler.lookup.BaseTypeBinding;
++import org.eclipse.jdt.internal.compiler.lookup.Binding;
++import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
++import org.eclipse.jdt.internal.compiler.lookup.ClassScope;
++import org.eclipse.jdt.internal.compiler.lookup.CompilationUnitScope;
++import org.eclipse.jdt.internal.compiler.lookup.ExtraCompilerModifiers;
++import org.eclipse.jdt.internal.compiler.lookup.FieldBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ImportBinding;
++import org.eclipse.jdt.internal.compiler.lookup.InferenceContext18;
++import org.eclipse.jdt.internal.compiler.lookup.InvocationSite;
++import org.eclipse.jdt.internal.compiler.lookup.LocalVariableBinding;
++import org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment;
++import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
++import org.eclipse.jdt.internal.compiler.lookup.MethodScope;
++import org.eclipse.jdt.internal.compiler.lookup.PackageBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ParameterizedMethodBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ParameterizedTypeBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ProblemMethodBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ProblemReasons;
++import org.eclipse.jdt.internal.compiler.lookup.ProblemReferenceBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
++import org.eclipse.jdt.internal.compiler.lookup.Scope;
++import org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding;
++import org.eclipse.jdt.internal.compiler.lookup.TagBits;
++import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
++import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
++import org.eclipse.jdt.internal.compiler.lookup.TypeIds;
++import org.eclipse.jdt.internal.compiler.lookup.TypeVariableBinding;
++import org.eclipse.jdt.internal.compiler.lookup.VariableBinding;
++import org.eclipse.jdt.internal.compiler.lookup.WildcardBinding;
++import org.eclipse.jdt.internal.compiler.parser.JavadocTagConstants;
+ import org.eclipse.jdt.internal.compiler.parser.ScannerHelper;
+ import org.eclipse.jdt.internal.compiler.parser.SourceTypeConverter;
+-import org.eclipse.jdt.internal.compiler.parser.JavadocTagConstants;
+ import org.eclipse.jdt.internal.compiler.parser.TerminalTokens;
+ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+ import org.eclipse.jdt.internal.compiler.problem.DefaultProblemFactory;
+ import org.eclipse.jdt.internal.compiler.problem.ProblemReporter;
+ import org.eclipse.jdt.internal.compiler.problem.ProblemSeverities;
+-import org.eclipse.jdt.internal.compiler.util.SimpleSetOfCharArray;
+-import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.compiler.util.HashtableOfObject;
+ import org.eclipse.jdt.internal.compiler.util.ObjectVector;
++import org.eclipse.jdt.internal.compiler.util.SimpleSetOfCharArray;
++import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.core.BasicCompilationUnit;
++import org.eclipse.jdt.internal.core.BinaryTypeConverter;
+ import org.eclipse.jdt.internal.core.INamingRequestor;
+ import org.eclipse.jdt.internal.core.InternalNamingConventions;
+ import org.eclipse.jdt.internal.core.JavaModelManager;
++import org.eclipse.jdt.internal.core.SearchableEnvironment;
+ import org.eclipse.jdt.internal.core.SourceMethod;
+ import org.eclipse.jdt.internal.core.SourceMethodElementInfo;
+ import org.eclipse.jdt.internal.core.SourceType;
+-import org.eclipse.jdt.internal.core.BinaryTypeConverter;
+-import org.eclipse.jdt.internal.core.SearchableEnvironment;
+ import org.eclipse.jdt.internal.core.SourceTypeElementInfo;
+-import org.eclipse.jdt.internal.core.search.matching.JavaSearchNameEnvironment;
++import org.eclipse.jdt.internal.core.search.matching.IndexBasedJavaSearchEnvironment;
+ import org.eclipse.jdt.internal.core.util.Messages;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+@@ -544,7 +675,7 @@ public final class CompletionEngine
+ 	CompletionRequestor requestor;
+ 	CompletionProblemFactory problemFactory;
+ 	ProblemReporter problemReporter;
+-	private JavaSearchNameEnvironment noCacheNameEnvironment;
++	private INameEnvironment noCacheNameEnvironment;
+ 	char[] source;
+ 	char[] completionToken;
+ 	char[] qualifiedCompletionToken;
+@@ -12056,7 +12187,7 @@ public final class CompletionEngine
+ 	private INameEnvironment getNoCacheNameEnvironment() {
+ 		if (this.noCacheNameEnvironment == null) {
+ 			JavaModelManager.getJavaModelManager().cacheZipFiles(this);
+-			this.noCacheNameEnvironment = new JavaSearchNameEnvironment(this.javaProject, this.owner == null ? null : JavaModelManager.getJavaModelManager().getWorkingCopies(this.owner, true/*add primary WCs*/));
++			this.noCacheNameEnvironment = IndexBasedJavaSearchEnvironment.create(Collections.singletonList(this.javaProject), this.owner == null ? null : JavaModelManager.getJavaModelManager().getWorkingCopies(this.owner, true/*add primary WCs*/));
+ 		}
+ 		return this.noCacheNameEnvironment;
+ 	}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/BTree.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/BTree.java
+index 1ed5b05..feec3ab 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/BTree.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/BTree.java
+@@ -598,8 +598,8 @@ public class BTree {
+ 	 *
+ 	 * @param visitor
+ 	 */
+-	public void accept(IBTreeVisitor visitor) throws IndexException {
+-		accept(this.db.getRecPtr(this.rootPointer), visitor);
++	public boolean accept(IBTreeVisitor visitor) throws IndexException {
++		return accept(this.db.getRecPtr(this.rootPointer), visitor);
+ 	}
+ 
+ 	private boolean accept(long node, IBTreeVisitor visitor) throws IndexException {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/field/FieldSearchIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/field/FieldSearchIndex.java
+index 5d3ad82..840ebc2 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/field/FieldSearchIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/field/FieldSearchIndex.java
+@@ -159,11 +159,10 @@ public class FieldSearchIndex<T extends NdNode> implements IField, IDestructable
+ 				}
+ 			}
+ 
+-			acceptResult(address);
+-			return true;
++			return acceptResult(address);
+ 		}
+ 
+-		protected abstract void acceptResult(long address);
++		protected abstract boolean acceptResult(long address);
+ 	}
+ 
+ 	private FieldSearchIndex(FieldSearchKey<?> searchKey) {
+@@ -233,12 +232,13 @@ public class FieldSearchIndex<T extends NdNode> implements IField, IDestructable
+ 		final long[] result = new long[1];
+ 		get(nd, address).accept(new SearchCriteriaToBtreeVisitorAdapter(searchCriteria, nd) {
+ 			@Override
+-			protected void acceptResult(long resultAddress) {
++			protected boolean acceptResult(long resultAddress) {
+ 				long rank = rankFunction.getRank(nd, resultAddress);
+ 				if (rank >= resultRank[0]) {
+ 					resultRank[0] = rank;
+ 					result[0] = resultAddress;
+ 				}
++				return true;
+ 			}
+ 		});
+ 
+@@ -248,13 +248,28 @@ public class FieldSearchIndex<T extends NdNode> implements IField, IDestructable
+ 		return (T)NdNode.load(nd, result[0]);
+ 	}
+ 
++	public interface Visitor<T> {
++		boolean visit(T toVisit);
++	}
++
++	public boolean visitAll(final Nd nd, long address, final SearchCriteria searchCriteria, final Visitor<T> visitor) {
++		return get(nd, address).accept(new SearchCriteriaToBtreeVisitorAdapter(searchCriteria, nd) {
++			@SuppressWarnings("unchecked")
++			@Override
++			protected boolean acceptResult(long resultAddress) {
++				return visitor.visit((T)NdNode.load(nd, resultAddress));
++			}
++		});
++	}
++
+ 	public List<T> findAll(final Nd nd, long address, final SearchCriteria searchCriteria) {
+ 		final List<T> result = new ArrayList<T>();
+ 		get(nd, address).accept(new SearchCriteriaToBtreeVisitorAdapter(searchCriteria, nd) {
+ 			@SuppressWarnings("unchecked")
+ 			@Override
+-			protected void acceptResult(long resultAddress) {
++			protected boolean acceptResult(long resultAddress) {
+ 				result.add((T)NdNode.load(nd, resultAddress));
++				return true;
+ 			}
+ 		});
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+index 5fd6a59..c4e74d9 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+@@ -10,6 +10,9 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.nd.java;
+ 
++import java.io.File;
++import java.util.List;
++
+ import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.IPath;
+@@ -28,9 +31,6 @@ import org.eclipse.jdt.internal.core.nd.field.FieldSearchIndex.SearchCriteria;
+ import org.eclipse.jdt.internal.core.nd.field.StructDef;
+ import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+ 
+-import java.io.File;
+-import java.util.List;
+-
+ /**
+  * @since 3.12
+  */
+@@ -129,6 +129,11 @@ public class JavaIndex {
+ 		return TYPES.findBest(this.nd, this.address, searchCriteria, this.anyResult);
+ 	}
+ 
++	public boolean visitFieldDescriptorsStartingWith(char[] fieldDescriptorPrefix, FieldSearchIndex.Visitor<NdTypeId> visitor) {
++		SearchCriteria searchCriteria = SearchCriteria.create(fieldDescriptorPrefix).prefix(true);
++		return TYPES.visitAll(this.nd, this.address, searchCriteria, visitor);
++	}
++
+ 	/**
+ 	 * Returns a type ID or creates a new one if it does not exist. The caller must
+ 	 * attach a reference to it after calling this method or it may leak.
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaNames.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaNames.java
+index 52ebadf..86311c9 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaNames.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaNames.java
+@@ -12,7 +12,7 @@ import org.eclipse.jdt.internal.core.util.CharArrayBuffer;
+  */
+ public class JavaNames {
+ 	private static final char[] CLASS_FILE_SUFFIX = ".class".toCharArray(); //$NON-NLS-1$
+-	private static final char[] FIELD_DESCRIPTOR_PREFIX = new char[] { 'L' };
++	public static final char[] FIELD_DESCRIPTOR_PREFIX = new char[] { 'L' };
+ 	private static final char[] FIELD_DESCRIPTOR_SUFFIX = new char[] { ';' };
+ 	private static final char[] METHOD_ID_SEPARATOR = new char[] { '#' };
+ 	private static final char[] JAR_FILE_ENTRY_SEPARATOR = IJavaSearchScope.JAR_FILE_ENTRY_SEPARATOR.toCharArray();
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
+new file mode 100644
+index 0000000..29f88e9
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
+@@ -0,0 +1,136 @@
++package org.eclipse.jdt.internal.core.nd.util;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import org.eclipse.core.runtime.IPath;
++
++/**
++ * Maps IPath keys onto values
++ */
++public class PathMap<T> {
++	private static class Node<T> {
++		int depth;
++		boolean exists;
++		T value;
++		Map<String, Node<T>> children;
++
++		Node(int depth) {
++			this.depth = depth;
++		}
++
++		String getSegment(IPath key) {
++			return key.segment(this.depth);
++		}
++
++		Node<T> createNode(IPath key) {
++			if (this.depth == key.segmentCount()) {
++				this.exists = true;
++				return this;
++			}
++
++			if (this.children == null) {
++				this.children = new HashMap<>();
++			}
++
++			String nextSegment = getSegment(key);
++			Node<T> next = createChild(nextSegment);
++			return next.createNode(key);
++		}
++
++		public Node<T> createChild(String nextSegment) {
++			Node<T> next = this.children.get(nextSegment);
++			if (next == null) {
++				next = new Node<>(this.depth + 1);
++				this.children.put(nextSegment, next);
++			}
++			return next;
++		}
++
++		public Node<T> getMostSpecificNode(IPath key) {
++			if (this.depth == key.segmentCount()) {
++				return this;
++			}
++			String nextSegment = getSegment(key);
++
++			Node<T> child = getChild(nextSegment);
++			if (child == null) {
++				return this;
++			}
++			Node<T> result = child.getMostSpecificNode(key);
++			if (result.exists) {
++				return result;
++			} else {
++				return this;
++			}
++		}
++
++		private Node<T> getChild(String nextSegment) {
++			return this.children.get(nextSegment);
++		}
++	}
++
++	private static class DeviceNode<T> extends Node<T> {
++		Node<T> noDevice = new Node<>(0);
++
++		DeviceNode() {
++			super(-1);
++		}
++
++		@Override
++		String getSegment(IPath key) {
++			return key.getDevice();
++		}
++
++		@Override
++		public Node<T> createChild(String nextSegment) {
++			if (nextSegment == null) {
++				return this.noDevice;
++			}
++			return super.createChild(nextSegment);
++		}
++	}
++
++	private Node<T> root = new DeviceNode<T>();
++
++	/**
++	 * Inserts the given key into the map.
++	 */
++	public T put(IPath key, T value) {
++		Node<T> node = this.root.createNode(key);
++		T result = node.value;
++		node.value = value;
++		return result;
++	}
++
++	/**
++	 * Returns the value associated with the given key
++	 */
++	public T get(IPath key) {
++		Node<T> node = this.root.getMostSpecificNode(key);
++		if (!node.exists || node.depth < key.segmentCount()) {
++			return null;
++		}
++		return node.value;
++	}
++
++	/**
++	 * Returns the value associated with the longest prefix of the given key
++	 * that can be found in the map.
++	 */
++	public T getMostSpecific(IPath key) {
++		Node<T> node = this.root.getMostSpecificNode(key);
++		if (!node.exists) {
++			return null;
++		}
++		return node.value;
++	}
++
++	/**
++	 * Returns true iff any key in this map is a prefix of the given path.
++	 */
++	public boolean containsPrefixOf(IPath path) {
++		Node<T> node = this.root.getMostSpecificNode(path);
++		return node.exists;
++	}
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/SourceIndexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/SourceIndexer.java
+index df77605..2392c94 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/SourceIndexer.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/SourceIndexer.java
+@@ -10,10 +10,13 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.search.indexing;
+ 
++import java.util.Collections;
++
+ import org.eclipse.core.resources.IProject;
+ import org.eclipse.core.resources.ResourcesPlugin;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.Path;
++import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IType;
+ import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+@@ -49,7 +52,7 @@ import org.eclipse.jdt.internal.core.JavaModelManager;
+ import org.eclipse.jdt.internal.core.JavaProject;
+ import org.eclipse.jdt.internal.core.SourceTypeElementInfo;
+ import org.eclipse.jdt.internal.core.jdom.CompilationUnit;
+-import org.eclipse.jdt.internal.core.search.matching.JavaSearchNameEnvironment;
++import org.eclipse.jdt.internal.core.search.matching.IndexBasedJavaSearchEnvironment;
+ import org.eclipse.jdt.internal.core.search.matching.MethodPattern;
+ import org.eclipse.jdt.internal.core.search.processing.JobManager;
+ 
+@@ -156,7 +159,7 @@ public class SourceIndexer extends AbstractIndexer implements ITypeRequestor, Su
+ 			this.cud = this.basicParser.parse(this.compilationUnit, new CompilationResult(this.compilationUnit, 0, 0, this.options.maxProblemsPerUnit));
+ 
+ 			// Use a non model name environment to avoid locks, monitors and such.
+-			INameEnvironment nameEnvironment = new JavaSearchNameEnvironment(javaProject, JavaModelManager.getJavaModelManager().getWorkingCopies(DefaultWorkingCopyOwner.PRIMARY, true/*add primary WCs*/));
++			INameEnvironment nameEnvironment = IndexBasedJavaSearchEnvironment.create(Collections.singletonList((IJavaProject)javaProject), JavaModelManager.getJavaModelManager().getWorkingCopies(DefaultWorkingCopyOwner.PRIMARY, true/*add primary WCs*/));
+ 			this.lookupEnvironment = new LookupEnvironment(this, this.options, problemReporter, nameEnvironment);
+ 			reduceParseTree(this.cud);
+ 			this.lookupEnvironment.buildTypeBindings(this.cud, null);
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+new file mode 100644
+index 0000000..ac8c2ea
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+@@ -0,0 +1,207 @@
++package org.eclipse.jdt.internal.core.search.matching;
++
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.jdt.core.ICompilationUnit;
++import org.eclipse.jdt.core.IJavaProject;
++import org.eclipse.jdt.core.IPackageFragmentRoot;
++import org.eclipse.jdt.core.JavaModelException;
++import org.eclipse.jdt.core.compiler.CharOperation;
++import org.eclipse.jdt.internal.compiler.env.AccessRestriction;
++import org.eclipse.jdt.internal.compiler.env.IBinaryType;
++import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
++import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
++import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
++import org.eclipse.jdt.internal.core.ClasspathEntry;
++import org.eclipse.jdt.internal.core.JavaProject;
++import org.eclipse.jdt.internal.core.nd.IReader;
++import org.eclipse.jdt.internal.core.nd.Nd;
++import org.eclipse.jdt.internal.core.nd.field.FieldSearchIndex;
++import org.eclipse.jdt.internal.core.nd.java.JavaIndex;
++import org.eclipse.jdt.internal.core.nd.java.JavaNames;
++import org.eclipse.jdt.internal.core.nd.java.NdResourceFile;
++import org.eclipse.jdt.internal.core.nd.java.NdType;
++import org.eclipse.jdt.internal.core.nd.java.NdTypeId;
++import org.eclipse.jdt.internal.core.nd.java.TypeRef;
++import org.eclipse.jdt.internal.core.nd.java.model.IndexBinaryType;
++import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
++import org.eclipse.jdt.internal.core.nd.util.PathMap;
++
++public class IndexBasedJavaSearchEnvironment implements INameEnvironment, SuffixConstants {
++
++	private Map<String, ICompilationUnit> workingCopies;
++	private PathMap<Integer> mapPathsToRoots = new PathMap<>();
++	private IPackageFragmentRoot[] roots;
++	private int sourceEntryPosition;
++
++	public IndexBasedJavaSearchEnvironment(List<IJavaProject> javaProject, org.eclipse.jdt.core.ICompilationUnit[] copies) {
++		this.workingCopies = JavaSearchNameEnvironment.getWorkingCopyMap(copies);
++
++		try {
++			List<IPackageFragmentRoot> localRoots = new ArrayList<>();
++			
++			for (IJavaProject next : javaProject) {
++				for (IPackageFragmentRoot nextRoot : next.getAllPackageFragmentRoots()) {
++					localRoots.add(nextRoot);
++				}
++			}
++
++			this.roots = localRoots.toArray(new IPackageFragmentRoot[0]);
++		} catch (JavaModelException e) {
++			this.roots = new IPackageFragmentRoot[0];
++			// project doesn't exist
++		}
++
++		// Build the map of paths onto root indices
++		int length = this.roots.length;
++		for (int i = 0; i < length; i++) {
++			IPath nextPath = JavaIndex.getLocationForElement(this.roots[i]);
++			this.mapPathsToRoots.put(nextPath, i);
++		}
++
++		// Locate the position of the first source entry
++		this.sourceEntryPosition = Integer.MAX_VALUE;
++		for (int i = 0; i < length; i++) {
++			IPackageFragmentRoot nextRoot = this.roots[i];
++			try {
++				if (nextRoot.getKind() == IPackageFragmentRoot.K_SOURCE) {
++					this.sourceEntryPosition = i;
++				}
++			} catch (JavaModelException e) {
++				// project doesn't exist
++			}
++		}
++	}
++
++	@Override
++	public NameEnvironmentAnswer findType(char[][] compoundTypeName) {
++		char[] binaryName = CharOperation.concatWith(compoundTypeName, '/');
++
++		int bestEntryPosition = Integer.MAX_VALUE;
++		NameEnvironmentAnswer result = null;
++		ICompilationUnit cu = this.workingCopies.get(new String(binaryName));
++		if (cu != null) {
++			result = new NameEnvironmentAnswer((org.eclipse.jdt.internal.compiler.env.ICompilationUnit)cu, null);
++			bestEntryPosition = this.sourceEntryPosition;
++		}
++
++		char[] fieldDescriptor = JavaNames.binaryNameToFieldDescriptor(binaryName);
++		JavaIndex index = JavaIndex.getIndex();
++		Nd nd = index.getNd();
++		try (IReader lock = nd.acquireReadLock()) {
++			NdTypeId typeId = index.findType(fieldDescriptor);
++
++			if (typeId != null) {
++				List<NdType> types = typeId.getTypes();
++				for (NdType next : types) {
++					NdResourceFile resource = next.getFile();
++
++					IPath path = resource.getPath();
++					Integer nextRoot = this.mapPathsToRoots.getMostSpecific(path);
++					if (nextRoot != null) {
++						IPackageFragmentRoot root = this.roots[nextRoot];
++
++						ClasspathEntry classpathEntry = (ClasspathEntry)root.getRawClasspathEntry();
++						AccessRestriction accessRestriction = classpathEntry.getAccessRuleSet().getViolatedRestriction(binaryName);
++						TypeRef typeRef = TypeRef.create(next);
++						IBinaryType binaryType = new IndexBinaryType(typeRef, resource.getLocation().getChars()); 
++						NameEnvironmentAnswer nextAnswer = new NameEnvironmentAnswer(binaryType, accessRestriction);
++
++						boolean useNewAnswer = isBetter(result, bestEntryPosition, nextAnswer, nextRoot);
++
++						if (useNewAnswer) {
++							bestEntryPosition = nextRoot;
++							result = nextAnswer;
++						}
++					}
++				}
++			}
++		} catch (JavaModelException e) {
++			// project doesn't exist
++		}
++
++		return result;
++	}
++
++	public boolean isBetter(NameEnvironmentAnswer currentBest, int currentBestClasspathPosition,
++			NameEnvironmentAnswer toTest, int toTestClasspathPosition) {
++		boolean useNewAnswer = false;
++
++		if (currentBest == null) {
++			useNewAnswer = true;
++		} else {
++			if (toTest.isBetter(currentBest)) {
++				useNewAnswer = true;
++			} else {
++				// If neither one is better, use the one with the earlier classpath position
++				if (!currentBest.isBetter(toTest)) {
++					useNewAnswer = (toTestClasspathPosition < currentBestClasspathPosition);
++				}
++			}
++		}
++		return useNewAnswer;
++	}
++
++	@Override
++	public NameEnvironmentAnswer findType(char[] typeName, char[][] packageName) {
++		char[][] newArray = new char[packageName.length + 1][];
++		for (int idx = 0; idx < packageName.length; idx++) {
++			newArray[idx] = packageName[idx];
++		}
++		newArray[packageName.length] = typeName;
++		return findType(newArray);
++	}
++
++	@Override
++	public boolean isPackage(char[][] parentPackageName, char[] packageName) {
++		char[] binaryPackageName = CharOperation.concatWith(parentPackageName, '/');
++		char[] fieldDescriptorPrefix = CharArrayUtils.concat(JavaNames.FIELD_DESCRIPTOR_PREFIX, binaryPackageName,
++				packageName, new char[] { '/' });
++
++		// Search all the types that are a subpackage of the given package name. Return if we find any one of them on
++		// the classpath of this project.
++		JavaIndex index = JavaIndex.getIndex();
++		Nd nd = index.getNd();
++		try (IReader lock = nd.acquireReadLock()) {
++			return !index.visitFieldDescriptorsStartingWith(fieldDescriptorPrefix,
++					new FieldSearchIndex.Visitor<NdTypeId>() {
++						@Override
++						public boolean visit(NdTypeId typeId) {
++							List<NdType> types = typeId.getTypes();
++							for (NdType next : types) {
++								NdResourceFile resource = next.getFile();
++
++								IPath path = resource.getPath();
++
++								if (IndexBasedJavaSearchEnvironment.this.mapPathsToRoots.containsPrefixOf(path)) {
++									return false;
++								}
++							}
++							return true;
++						}
++					});
++		}
++	}
++
++	@Override
++	public void cleanup() {
++	}
++
++	public static INameEnvironment create(List<IJavaProject> javaProjects, org.eclipse.jdt.core.ICompilationUnit[] copies) {
++		if (JavaIndex.isEnabled()) {
++			return new IndexBasedJavaSearchEnvironment(javaProjects, copies);
++		} else {
++			Iterator<IJavaProject> next = javaProjects.iterator();
++			JavaSearchNameEnvironment result = new JavaSearchNameEnvironment(next.next(), copies);
++
++			while (next.hasNext()) {
++				result.addProjectClassPath((JavaProject)next.next());
++			}
++			return result;
++		}
++	}
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+index 636863b..14df593 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+@@ -15,11 +15,15 @@ package org.eclipse.jdt.internal.core.search.matching;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.LinkedHashSet;
++import java.util.Map;
+ 
+ import org.eclipse.core.resources.IContainer;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.IPath;
+-import org.eclipse.jdt.core.*;
++import org.eclipse.jdt.core.IJavaProject;
++import org.eclipse.jdt.core.IPackageDeclaration;
++import org.eclipse.jdt.core.IPackageFragmentRoot;
++import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+@@ -45,13 +49,18 @@ public class JavaSearchNameEnvironment implements INameEnvironment, SuffixConsta
+ 	/*
+ 	 * A map from the fully qualified slash-separated name of the main type (String) to the working copy
+ 	 */
+-	HashMap workingCopies;
++	Map<String, org.eclipse.jdt.core.ICompilationUnit> workingCopies;
+ 
+ public JavaSearchNameEnvironment(IJavaProject javaProject, org.eclipse.jdt.core.ICompilationUnit[] copies) {
+ 	this.locationSet = computeClasspathLocations((JavaProject) javaProject);
++	this.workingCopies = getWorkingCopyMap(copies);
++}
++
++public static Map<String, org.eclipse.jdt.core.ICompilationUnit> getWorkingCopyMap(
++		org.eclipse.jdt.core.ICompilationUnit[] copies) {
++	int length = copies == null ? 0 : copies.length;
++	HashMap<String, org.eclipse.jdt.core.ICompilationUnit> result = new HashMap<>(length);
+ 	try {
+-		int length = copies == null ? 0 : copies.length;
+-		this.workingCopies = new HashMap(length);
+ 		if (copies != null) {
+ 			for (int i = 0; i < length; i++) {
+ 				org.eclipse.jdt.core.ICompilationUnit workingCopy = copies[i];
+@@ -60,12 +69,13 @@ public JavaSearchNameEnvironment(IJavaProject javaProject, org.eclipse.jdt.core.
+ 				String cuName = workingCopy.getElementName();
+ 				String mainTypeName = Util.getNameWithoutJavaLikeExtension(cuName);
+ 				String qualifiedMainTypeName = pkg.length() == 0 ? mainTypeName : pkg.replace('.', '/') + '/' + mainTypeName;
+-				this.workingCopies.put(qualifiedMainTypeName, workingCopy);
++				result.put(qualifiedMainTypeName, workingCopy);
+ 			}
+ 		}
+ 	} catch (JavaModelException e) {
+ 		// working copy doesn't exist: cannot happen
+ 	}
++	return result;
+ }
+ 
+ public void cleanup() {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+index 4d1b6ce..876dda4 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+@@ -1180,9 +1180,12 @@ public void initialize(JavaProject project, int possibleMatchSize) throws JavaMo
+ 
+ 	SearchableEnvironment searchableEnvironment = project.newSearchableNameEnvironment(this.workingCopies);
+ 
+-	this.nameEnvironment = new JavaSearchNameEnvironment(project, this.workingCopies);
+-	if (this.pattern.focus != null)  
+-		((JavaSearchNameEnvironment) this.nameEnvironment).addProjectClassPath((JavaProject) this.pattern.focus.getJavaProject());
++	List<IJavaProject> projects = new ArrayList<>();
++	projects.add(project);
++	if (this.pattern.focus != null) {
++		projects.add(this.pattern.focus.getJavaProject());
++	}
++	this.nameEnvironment = IndexBasedJavaSearchEnvironment.create(projects, this.workingCopies);
+ 
+ 	// create lookup environment
+ 	Map map = project.getOptions(true);
+commit 0071a6da1b4cdc0345b30e2885cb8a9cc9adf511
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Tue May 31 21:17:02 2016 -0400
+
+    Bug 495062 - JavaSearchNameEnvironment is slow for large classpaths
+    
+    Change-Id: I868728ee7f41f11b5adc6b3e3b9af58c15ac4cb8
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+26	11	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClassFileMatchLocator.java
+23	10	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+4	4	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+10	4	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/PossibleMatch.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClassFileMatchLocator.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClassFileMatchLocator.java
+index 1c86721..e8f17c4 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClassFileMatchLocator.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClassFileMatchLocator.java
+@@ -11,15 +11,30 @@
+ package org.eclipse.jdt.internal.core.search.matching;
+ 
+ import org.eclipse.core.runtime.CoreException;
+-import org.eclipse.jdt.core.*;
++import org.eclipse.jdt.core.IField;
++import org.eclipse.jdt.core.IMethod;
++import org.eclipse.jdt.core.Signature;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+-import org.eclipse.jdt.core.search.*;
++import org.eclipse.jdt.core.search.SearchMatch;
++import org.eclipse.jdt.core.search.SearchPattern;
++import org.eclipse.jdt.core.search.TypeReferenceMatch;
+ import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
+-import org.eclipse.jdt.internal.compiler.classfmt.FieldInfo;
+-import org.eclipse.jdt.internal.compiler.classfmt.MethodInfo;
+-import org.eclipse.jdt.internal.compiler.env.*;
+-import org.eclipse.jdt.internal.compiler.lookup.*;
+-import org.eclipse.jdt.internal.core.*;
++import org.eclipse.jdt.internal.compiler.env.IBinaryAnnotation;
++import org.eclipse.jdt.internal.compiler.env.IBinaryElementValuePair;
++import org.eclipse.jdt.internal.compiler.env.IBinaryField;
++import org.eclipse.jdt.internal.compiler.env.IBinaryMethod;
++import org.eclipse.jdt.internal.compiler.env.IBinaryType;
++import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding;
++import org.eclipse.jdt.internal.compiler.lookup.FieldBinding;
++import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
++import org.eclipse.jdt.internal.compiler.lookup.TagBits;
++import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
++import org.eclipse.jdt.internal.core.BinaryType;
++import org.eclipse.jdt.internal.core.ClassFile;
++import org.eclipse.jdt.internal.core.JavaElement;
++import org.eclipse.jdt.internal.core.ResolvedBinaryField;
++import org.eclipse.jdt.internal.core.ResolvedBinaryMethod;
++import org.eclipse.jdt.internal.core.ResolvedBinaryType;
+ import org.eclipse.jdt.internal.core.search.indexing.IIndexConstants;
+ 
+ public class ClassFileMatchLocator implements IIndexConstants {
+@@ -349,10 +364,10 @@ private void matchAnnotations(SearchPattern pattern, MatchLocator locator, Class
+ 	}
+ 
+ 	// Look for references in methods annotations
+-	MethodInfo[] methods = (MethodInfo[]) binaryType.getMethods();
++	IBinaryMethod[] methods = binaryType.getMethods();
+ 	if (methods != null) {
+ 		for (int i = 0, max = methods.length; i < max; i++) {
+-			MethodInfo method = methods[i];
++			IBinaryMethod method = methods[i];
+ 			if (checkAnnotations(typeReferencePattern, method.getAnnotations(), method.getTagBits())) {
+ 					binaryTypeBinding = locator.cacheBinaryType(classFileBinaryType, binaryType);
+ 					IMethod methodHandle = classFileBinaryType.getMethod(
+@@ -367,10 +382,10 @@ private void matchAnnotations(SearchPattern pattern, MatchLocator locator, Class
+ 	}
+ 
+ 	// Look for references in fields annotations
+-	FieldInfo[] fields = (FieldInfo[]) binaryType.getFields();
++	IBinaryField[] fields = binaryType.getFields();
+ 	if (fields != null) {
+ 		for (int i = 0, max = fields.length; i < max; i++) {
+-			FieldInfo field = fields[i];
++			IBinaryField field = fields[i];
+ 			if (checkAnnotations(typeReferencePattern, field.getAnnotations(), field.getTagBits())) {
+ 					IField fieldHandle = classFileBinaryType.getField(new String(field.getName()));
+ 					TypeReferenceMatch match = new TypeReferenceMatch(fieldHandle, SearchMatch.A_ACCURATE, -1, 0, false, locator.getParticipant(), locator.currentPossibleMatch.resource);
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+index ac8c2ea..1e60b15 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+@@ -192,16 +192,29 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 	}
+ 
+ 	public static INameEnvironment create(List<IJavaProject> javaProjects, org.eclipse.jdt.core.ICompilationUnit[] copies) {
+-		if (JavaIndex.isEnabled()) {
+-			return new IndexBasedJavaSearchEnvironment(javaProjects, copies);
+-		} else {
+-			Iterator<IJavaProject> next = javaProjects.iterator();
+-			JavaSearchNameEnvironment result = new JavaSearchNameEnvironment(next.next(), copies);
+-
+-			while (next.hasNext()) {
+-				result.addProjectClassPath((JavaProject)next.next());
++		long startTime = System.nanoTime();
++		try {
++			if (JavaIndex.isEnabled()) {
++				return new IndexBasedJavaSearchEnvironment(javaProjects, copies);
++			} else {
++				Iterator<IJavaProject> next = javaProjects.iterator();
++				JavaSearchNameEnvironment result = new JavaSearchNameEnvironment(next.next(), copies);
++	
++				while (next.hasNext()) {
++					result.addProjectClassPath((JavaProject)next.next());
++				}
++				return result;
+ 			}
+-			return result;
+-		}
++		} finally {
++	      long endTime = System.nanoTime();
++	
++	      long totalTimeMillis = (endTime - startTime) / 1000000;
++	
++	      System.out.println(
++	          "Time to open name environment: "
++	              + totalTimeMillis
++	              + "ms - indexEnabled="
++	              + JavaIndex.isEnabled());
++	    }
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+index 876dda4..1ed516c 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+@@ -239,11 +239,11 @@ private static HashMap workingCopiesThatCanSeeFocus(org.eclipse.jdt.core.ICompil
+ 	return result;
+ }
+ 
+-public static ClassFileReader classFileReader(IType type) {
++public static IBinaryType classFileReader(IType type) {
+ 	IClassFile classFile = type.getClassFile();
+ 	JavaModelManager manager = JavaModelManager.getJavaModelManager();
+ 	if (classFile.isOpen())
+-		return (ClassFileReader) manager.getInfo(type);
++		return (IBinaryType)manager.getInfo(type);
+ 
+ 	PackageFragment pkg = (PackageFragment) type.getPackageFragment();
+ 	IPackageFragmentRoot root = (IPackageFragmentRoot) pkg.getParent();
+@@ -475,7 +475,7 @@ protected IJavaElement createHandle(AbstractMethodDeclaration method, IJavaEleme
+ 	if (type.isBinary()) {
+ 		// don't cache the methods of the binary type
+ 		// fall thru if its a constructor with a synthetic argument... find it the slower way
+-		ClassFileReader reader = classFileReader(type);
++		IBinaryType reader = classFileReader(type);
+ 		if (reader != null) {
+ 			// build arguments names
+ 			boolean firstIsSynthetic = false;
+@@ -538,7 +538,7 @@ protected IJavaElement createHandle(AbstractMethodDeclaration method, IJavaEleme
+  * Create binary method handle
+  */
+ IMethod createBinaryMethodHandle(IType type, char[] methodSelector, char[][] argumentTypeNames) {
+-	ClassFileReader reader = MatchLocator.classFileReader(type);
++	IBinaryType reader = MatchLocator.classFileReader(type);
+ 	if (reader != null) {
+ 		IBinaryMethod[] methods = reader.getMethods();
+ 		if (methods != null) {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/PossibleMatch.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/PossibleMatch.java
+index 2a967c4..0488c26 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/PossibleMatch.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/PossibleMatch.java
+@@ -11,13 +11,19 @@
+ package org.eclipse.jdt.internal.core.search.matching;
+ 
+ import org.eclipse.core.resources.IResource;
+-import org.eclipse.jdt.core.*;
++import org.eclipse.jdt.core.IPackageFragment;
++import org.eclipse.jdt.core.IType;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.core.search.SearchDocument;
+ import org.eclipse.jdt.internal.compiler.ast.CompilationUnitDeclaration;
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
++import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+-import org.eclipse.jdt.internal.core.*;
++import org.eclipse.jdt.internal.core.BinaryType;
++import org.eclipse.jdt.internal.core.ClassFile;
++import org.eclipse.jdt.internal.core.CompilationUnit;
++import org.eclipse.jdt.internal.core.Openable;
++import org.eclipse.jdt.internal.core.PackageFragment;
++import org.eclipse.jdt.internal.core.SourceMapper;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+ public class PossibleMatch implements ICompilationUnit {
+@@ -135,7 +141,7 @@ private String getSourceFileName() {
+ 	this.sourceFileName = NO_SOURCE_FILE_NAME;
+ 	if (this.openable.getSourceMapper() != null) {
+ 		BinaryType type = (BinaryType) ((ClassFile) this.openable).getType();
+-		ClassFileReader reader = MatchLocator.classFileReader(type);
++		IBinaryType reader = MatchLocator.classFileReader(type);
+ 		if (reader != null) {
+ 			String fileName = type.sourceFileName(reader);
+ 			this.sourceFileName = fileName == null ? NO_SOURCE_FILE_NAME : fileName;
+commit 288390dbf9e344180661637b19a24ff7c4a7b6d0
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Wed Jun 1 22:41:50 2016 -0400
+
+    Bug 495062 - JavaSearchNameEnvironment is slow for large classpaths
+    
+    More bugfixes
+    
+    Change-Id: Idb6e2af33fe21f0e0bca89f7a4eb3f4b0422da93
+
+22	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
+76	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
+177	14	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
+index 64dc389..a7030a9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
+@@ -34,6 +34,28 @@ public class NameEnvironmentAnswer {
+ 		this.accessRestriction = accessRestriction;
+ 		this.externalAnnotationPath = externalAnnotationPath;
+ 	}
++	
++	@Override
++	public String toString() {
++		String baseString = ""; //$NON-NLS-1$
++		if (this.binaryType != null) {
++			baseString = "IBinaryType " + this.binaryType.toString(); //$NON-NLS-1$
++		}
++		if (this.compilationUnit != null) {
++			baseString = "ICompilationUnit " + this.compilationUnit.toString(); //$NON-NLS-1$
++		}
++		if (this.sourceTypes != null) {
++			baseString = this.sourceTypes.toString();
++		}
++		if (this.accessRestriction != null) {
++			baseString += " " + this.accessRestriction.toString(); //$NON-NLS-1$
++		}
++		if (this.externalAnnotationPath != null) {
++			baseString += " extPath=" + this.externalAnnotationPath.toString(); //$NON-NLS-1$
++		}
++		return baseString;
++	}
++	
+ 	/**
+ 	 * Returns the associated access restriction, or null if none.
+ 	 */
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
+index 29f88e9..99c4be2 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
+@@ -1,9 +1,13 @@
+ package org.eclipse.jdt.internal.core.nd.util;
+ 
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.Path;
++
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Map;
+-
+-import org.eclipse.core.runtime.IPath;
++import java.util.Map.Entry;
++import java.util.Set;
+ 
+ /**
+  * Maps IPath keys onto values
+@@ -65,9 +69,43 @@ public class PathMap<T> {
+ 			}
+ 		}
+ 
+-		private Node<T> getChild(String nextSegment) {
++		Node<T> getChild(String nextSegment) {
+ 			return this.children.get(nextSegment);
+ 		}
++
++	    public void addAllKeys(Set<IPath> result, IPath parent) {
++	    	if (this.exists) {
++	    		result.add(parent);
++	    	}
++
++	    	for (Entry<String, Node<T>> next : this.children.entrySet()) {
++	    		String key = next.getKey();
++	    		IPath nextPath = buildChildPath(parent, key);
++	    		next.getValue().addAllKeys(result, nextPath);
++	    	}
++	    }
++
++	    IPath buildChildPath(IPath parent, String key) {
++	      IPath nextPath = parent.append(key);
++	      return nextPath;
++	    }
++		
++	    public void toString(StringBuilder builder, IPath parentPath) {
++		    if (this.exists) {
++		    	builder.append("[");
++		    	builder.append(parentPath);
++		    	builder.append("] = ");
++		    	builder.append(this.value);
++		    	builder.append("\n");
++		    }
++		    if (this.children != null) { 
++		    	for (Entry<String, Node<T>> next : this.children.entrySet()) {
++		    		String key = next.getKey();
++		    		IPath nextPath = buildChildPath(parentPath, key);
++		    		next.getValue().toString(builder, nextPath);
++		    	}
++		    }
++		}
+ 	}
+ 
+ 	private static class DeviceNode<T> extends Node<T> {
+@@ -89,6 +127,26 @@ public class PathMap<T> {
+ 			}
+ 			return super.createChild(nextSegment);
+ 		}
++
++		Node<T> getChild(String nextSegment) {
++			if (nextSegment == null) {
++				return this.noDevice;
++			}
++			return super.getChild(nextSegment);
++		}
++
++		@Override
++		IPath buildChildPath(IPath parent, String key) {
++    		IPath nextPath = Path.EMPTY.append(parent);
++    		nextPath.setDevice(key);
++    		return nextPath;
++		}
++		
++		@Override
++		public void toString(StringBuilder builder, IPath parentPath) {
++			this.noDevice.toString(builder, parentPath);
++			super.toString(builder,parentPath);
++		}
+ 	}
+ 
+ 	private Node<T> root = new DeviceNode<T>();
+@@ -133,4 +191,19 @@ public class PathMap<T> {
+ 		Node<T> node = this.root.getMostSpecificNode(path);
+ 		return node.exists;
+ 	}
++
++	public Set<IPath> keySet() {
++		Set<IPath> result = new HashSet<>();
++
++		this.root.addAllKeys(result, Path.EMPTY);
++		return result;
++	}
++
++	@Override
++	public String toString() {
++		StringBuilder builder = new StringBuilder();
++		
++		this.root.toString(builder, Path.EMPTY);
++		return builder.toString();
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+index 1e60b15..15b60d8 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+@@ -1,10 +1,6 @@
+ package org.eclipse.jdt.internal.core.search.matching;
+ 
+-import java.util.ArrayList;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Map;
+-
++import org.eclipse.core.resources.IContainer;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.jdt.core.ICompilationUnit;
+ import org.eclipse.jdt.core.IJavaProject;
+@@ -12,12 +8,16 @@ import org.eclipse.jdt.core.IPackageFragmentRoot;
+ import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.env.AccessRestriction;
++import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.core.ClasspathEntry;
++import org.eclipse.jdt.internal.core.JavaModel;
+ import org.eclipse.jdt.internal.core.JavaProject;
++import org.eclipse.jdt.internal.core.PackageFragmentRoot;
++import org.eclipse.jdt.internal.core.builder.ClasspathLocation;
+ import org.eclipse.jdt.internal.core.nd.IReader;
+ import org.eclipse.jdt.internal.core.nd.Nd;
+ import org.eclipse.jdt.internal.core.nd.field.FieldSearchIndex;
+@@ -31,12 +31,18 @@ import org.eclipse.jdt.internal.core.nd.java.model.IndexBinaryType;
+ import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+ import org.eclipse.jdt.internal.core.nd.util.PathMap;
+ 
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++
+ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, SuffixConstants {
+ 
+ 	private Map<String, ICompilationUnit> workingCopies;
+ 	private PathMap<Integer> mapPathsToRoots = new PathMap<>();
+ 	private IPackageFragmentRoot[] roots;
+ 	private int sourceEntryPosition;
++	private List<ClasspathLocation> unindexedEntries = new ArrayList<>();
+ 
+ 	public IndexBasedJavaSearchEnvironment(List<IJavaProject> javaProject, org.eclipse.jdt.core.ICompilationUnit[] copies) {
+ 		this.workingCopies = JavaSearchNameEnvironment.getWorkingCopyMap(copies);
+@@ -44,8 +50,27 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 		try {
+ 			List<IPackageFragmentRoot> localRoots = new ArrayList<>();
+ 			
++			int idx = 0;
+ 			for (IJavaProject next : javaProject) {
+ 				for (IPackageFragmentRoot nextRoot : next.getAllPackageFragmentRoots()) {
++					IPath path = nextRoot.getPath();
++					if (!nextRoot.isArchive()) {
++						Object target = JavaModel.getTarget(path, true);
++						if (target != null) {
++							ClasspathLocation cp;
++							if (nextRoot.getKind() == IPackageFragmentRoot.K_SOURCE) {
++								PackageFragmentRoot root = (PackageFragmentRoot)nextRoot;
++								cp = new ClasspathSourceDirectory((IContainer)target, root.fullExclusionPatternChars(), root.fullInclusionPatternChars());
++								this.unindexedEntries.add(cp);
++//							} else {
++//								ClasspathEntry rawClasspathEntry = (ClasspathEntry) nextRoot.getRawClasspathEntry();
++//								cp = ClasspathLocation.forBinaryFolder((IContainer) target, false, rawClasspathEntry.getAccessRuleSet(),
++//																	ClasspathEntry.getExternalAnnotationPath(rawClasspathEntry, ((IJavaProject)nextRoot.getParent()).getProject(), true));
++							}
++						}
++					}
++
++					idx++;
+ 					localRoots.add(nextRoot);
+ 				}
+ 			}
+@@ -82,10 +107,8 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 		char[] binaryName = CharOperation.concatWith(compoundTypeName, '/');
+ 
+ 		int bestEntryPosition = Integer.MAX_VALUE;
+-		NameEnvironmentAnswer result = null;
+-		ICompilationUnit cu = this.workingCopies.get(new String(binaryName));
+-		if (cu != null) {
+-			result = new NameEnvironmentAnswer((org.eclipse.jdt.internal.compiler.env.ICompilationUnit)cu, null);
++		NameEnvironmentAnswer result = findClassInUnindexedLocations(new String(binaryName), compoundTypeName[compoundTypeName.length - 1]);
++		if (result != null) {
+ 			bestEntryPosition = this.sourceEntryPosition;
+ 		}
+ 
+@@ -106,7 +129,8 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 						IPackageFragmentRoot root = this.roots[nextRoot];
+ 
+ 						ClasspathEntry classpathEntry = (ClasspathEntry)root.getRawClasspathEntry();
+-						AccessRestriction accessRestriction = classpathEntry.getAccessRuleSet().getViolatedRestriction(binaryName);
++						AccessRuleSet ruleSet = classpathEntry.getAccessRuleSet();
++						AccessRestriction accessRestriction = ruleSet == null? null : ruleSet.getViolatedRestriction(binaryName);
+ 						TypeRef typeRef = TypeRef.create(next);
+ 						IBinaryType binaryType = new IndexBinaryType(typeRef, resource.getLocation().getChars()); 
+ 						NameEnvironmentAnswer nextAnswer = new NameEnvironmentAnswer(binaryType, accessRestriction);
+@@ -127,6 +151,71 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 		return result;
+ 	}
+ 
++	/**
++	 * Search unindexed locations on the classpath for the given class
++	 */
++	private NameEnvironmentAnswer findClassInUnindexedLocations(String qualifiedTypeName, char[] typeName) {
++		String
++			binaryFileName = null, qBinaryFileName = null,
++			sourceFileName = null, qSourceFileName = null,
++			qPackageName = null;
++		NameEnvironmentAnswer suggestedAnswer = null;
++		Iterator <ClasspathLocation> iter = this.unindexedEntries.iterator();
++		while (iter.hasNext()) {
++			ClasspathLocation location = iter.next();
++			NameEnvironmentAnswer answer;
++			if (location instanceof ClasspathSourceDirectory) {
++				if (sourceFileName == null) {
++					qSourceFileName = qualifiedTypeName; // doesn't include the file extension
++					sourceFileName = qSourceFileName;
++					qPackageName =  ""; //$NON-NLS-1$
++					if (qualifiedTypeName.length() > typeName.length) {
++						int typeNameStart = qSourceFileName.length() - typeName.length;
++						qPackageName =  qSourceFileName.substring(0, typeNameStart - 1);
++						sourceFileName = qSourceFileName.substring(typeNameStart);
++					}
++				}
++				org.eclipse.jdt.internal.compiler.env.ICompilationUnit workingCopy = (org.eclipse.jdt.internal.compiler.env.ICompilationUnit) this.workingCopies.get(qualifiedTypeName);
++				if (workingCopy != null) {
++					answer = new NameEnvironmentAnswer(workingCopy, null /*no access restriction*/);
++				} else {
++					answer = location.findClass(
++						sourceFileName, // doesn't include the file extension
++						qPackageName,
++						qSourceFileName);  // doesn't include the file extension
++				}
++			} else {
++				if (binaryFileName == null) {
++					qBinaryFileName = qualifiedTypeName + SUFFIX_STRING_class;
++					binaryFileName = qBinaryFileName;
++					qPackageName =  ""; //$NON-NLS-1$
++					if (qualifiedTypeName.length() > typeName.length) {
++						int typeNameStart = qBinaryFileName.length() - typeName.length - 6; // size of ".class"
++						qPackageName =  qBinaryFileName.substring(0, typeNameStart - 1);
++						binaryFileName = qBinaryFileName.substring(typeNameStart);
++					}
++				}
++				answer =
++					location.findClass(
++						binaryFileName,
++						qPackageName,
++						qBinaryFileName);
++			}
++			if (answer != null) {
++				if (!answer.ignoreIfBetter()) {
++					if (answer.isBetter(suggestedAnswer))
++						return answer;
++				} else if (answer.isBetter(suggestedAnswer))
++					// remember suggestion and keep looking
++					suggestedAnswer = answer;
++			}
++		}
++		if (suggestedAnswer != null)
++			// no better answer was found
++			return suggestedAnswer;
++		return null;
++	}
++
+ 	public boolean isBetter(NameEnvironmentAnswer currentBest, int currentBestClasspathPosition,
+ 			NameEnvironmentAnswer toTest, int toTestClasspathPosition) {
+ 		boolean useNewAnswer = false;
+@@ -159,8 +248,16 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 	@Override
+ 	public boolean isPackage(char[][] parentPackageName, char[] packageName) {
+ 		char[] binaryPackageName = CharOperation.concatWith(parentPackageName, '/');
+-		char[] fieldDescriptorPrefix = CharArrayUtils.concat(JavaNames.FIELD_DESCRIPTOR_PREFIX, binaryPackageName,
+-				packageName, new char[] { '/' });
++		final char[] fieldDescriptorPrefix;
++		
++		if (parentPackageName == null || parentPackageName.length == 0) {
++			fieldDescriptorPrefix = CharArrayUtils.concat(JavaNames.FIELD_DESCRIPTOR_PREFIX, binaryPackageName);
++		} else {
++			fieldDescriptorPrefix = CharArrayUtils.concat(JavaNames.FIELD_DESCRIPTOR_PREFIX, binaryPackageName,
++					new char[] { '/' }, packageName);
++		}
++		
++		String prefix = new String(fieldDescriptorPrefix);
+ 
+ 		// Search all the types that are a subpackage of the given package name. Return if we find any one of them on
+ 		// the classpath of this project.
+@@ -171,13 +268,24 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 					new FieldSearchIndex.Visitor<NdTypeId>() {
+ 						@Override
+ 						public boolean visit(NdTypeId typeId) {
++							// If this is an exact match for the field descriptor prefix we're looking for then
++							// this class can't be part of the package we're searching for (and, most likely, the
++							// "package" we're searching for is actually a class name - not a package).
++							if (typeId.getFieldDescriptor().length() <= fieldDescriptorPrefix.length + 1) {
++								return true;
++							}
+ 							List<NdType> types = typeId.getTypes();
+ 							for (NdType next : types) {
++								if (next.isMember() || next.isLocal() || next.isAnonymous()) {
++									continue;
++								}
+ 								NdResourceFile resource = next.getFile();
+ 
+ 								IPath path = resource.getPath();
+ 
+ 								if (IndexBasedJavaSearchEnvironment.this.mapPathsToRoots.containsPrefixOf(path)) {
++									// Terminate the search -- we've found a class belonging to the package
++									// we're searching for.
+ 									return false;
+ 								}
+ 							}
+@@ -191,11 +299,66 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 	public void cleanup() {
+ 	}
+ 
++	private static class TracingEnvironment implements INameEnvironment {
++		private INameEnvironment toWrap;
++		private String id;
++	    /**
++	     * @param toWrap
++	     */
++	    public TracingEnvironment(INameEnvironment toWrap) {
++	      super();
++	      this.toWrap = toWrap;
++	      id = "" + System.currentTimeMillis();
++	    }
++	
++	    String toPrintable(char[] toPrint) {
++	    	return new String(toPrint);
++	    }
++	    
++	    String toPrintable(char[][] compound) {
++	    	return toPrintable(CharOperation.concatWith(compound, '/')); //$NON-NLS-1$
++	    }
++	    
++	    @Override
++	    public NameEnvironmentAnswer findType(char[][] compoundTypeName) {
++	    	NameEnvironmentAnswer result = this.toWrap.findType(compoundTypeName);
++	    	
++	    	System.out.println("INameEnvironment.findType(" + toPrintable(compoundTypeName) + ") = " + result);
++	    	
++	    	return result;
++	    }
++	
++	    @Override
++	    public NameEnvironmentAnswer findType(char[] typeName, char[][] packageName) {
++	    	NameEnvironmentAnswer result = this.toWrap.findType(typeName, packageName);
++	    	
++	    	System.out.println("INameEnvironment.findType(" + toPrintable(typeName) + ", " + toPrintable(packageName) 
++	    		+ ") = " + result);
++
++	    	return result;
++	    }
++	
++	    @Override
++	    public boolean isPackage(char[][] parentPackageName, char[] packageName) {
++	    	boolean result = this.toWrap.isPackage(parentPackageName, packageName);
++	    	
++	    	System.out.println("INameEnvironment.isPackage(" + toPrintable(parentPackageName) + ", " 
++	    		+ toPrintable(packageName) + ") = " + result);
++
++		    return result;
++	    }
++	
++	    @Override
++	    public void cleanup() {
++	    	System.out.println("INameEnvironment.cleanup()");
++	    }	
++	}
++	
+ 	public static INameEnvironment create(List<IJavaProject> javaProjects, org.eclipse.jdt.core.ICompilationUnit[] copies) {
+ 		long startTime = System.nanoTime();
+ 		try {
+ 			if (JavaIndex.isEnabled()) {
+-				return new IndexBasedJavaSearchEnvironment(javaProjects, copies);
++				return new TracingEnvironment(new IndexBasedJavaSearchEnvironment(javaProjects, copies));
+ 			} else {
+ 				Iterator<IJavaProject> next = javaProjects.iterator();
+ 				JavaSearchNameEnvironment result = new JavaSearchNameEnvironment(next.next(), copies);
+@@ -203,7 +366,7 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 				while (next.hasNext()) {
+ 					result.addProjectClassPath((JavaProject)next.next());
+ 				}
+-				return result;
++				return new TracingEnvironment(result);
+ 			}
+ 		} finally {
+ 	      long endTime = System.nanoTime();
+commit bff1f9d1d8ddc00db2ed2012a6261c097f074211
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Thu Jun 2 22:15:28 2016 -0400
+
+    Bug 495062 - JavaSearchNameEnvironment is slow for large classpaths
+    
+    Change-Id: I3b93c8230990e80d6c62d4c9fc697a07ec6e20af
+
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
+16	83	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
+index a7030a9..03b8563 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/NameEnvironmentAnswer.java
+@@ -39,7 +39,9 @@ public class NameEnvironmentAnswer {
+ 	public String toString() {
+ 		String baseString = ""; //$NON-NLS-1$
+ 		if (this.binaryType != null) {
+-			baseString = "IBinaryType " + this.binaryType.toString(); //$NON-NLS-1$
++			char[] fileNameChars = this.binaryType.getFileName();
++			String fileName = fileNameChars == null ? "" : new String(fileNameChars); //$NON-NLS-1$
++			baseString = "IBinaryType " + fileName; //$NON-NLS-1$
+ 		}
+ 		if (this.compilationUnit != null) {
+ 			baseString = "ICompilationUnit " + this.compilationUnit.toString(); //$NON-NLS-1$
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+index 15b60d8..77f35ec 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+@@ -132,7 +132,8 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 						AccessRuleSet ruleSet = classpathEntry.getAccessRuleSet();
+ 						AccessRestriction accessRestriction = ruleSet == null? null : ruleSet.getViolatedRestriction(binaryName);
+ 						TypeRef typeRef = TypeRef.create(next);
+-						IBinaryType binaryType = new IndexBinaryType(typeRef, resource.getLocation().getChars()); 
++						String fileName = new String(binaryName) + ".class"; //$NON-NLS-1$
++						IBinaryType binaryType = new IndexBinaryType(typeRef, fileName.toCharArray()); 
+ 						NameEnvironmentAnswer nextAnswer = new NameEnvironmentAnswer(binaryType, accessRestriction);
+ 
+ 						boolean useNewAnswer = isBetter(result, bestEntryPosition, nextAnswer, nextRoot);
+@@ -251,13 +252,12 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 		final char[] fieldDescriptorPrefix;
+ 		
+ 		if (parentPackageName == null || parentPackageName.length == 0) {
+-			fieldDescriptorPrefix = CharArrayUtils.concat(JavaNames.FIELD_DESCRIPTOR_PREFIX, binaryPackageName);
++			fieldDescriptorPrefix = CharArrayUtils.concat(JavaNames.FIELD_DESCRIPTOR_PREFIX, packageName, 
++					new char[] { '/' });
+ 		} else {
+ 			fieldDescriptorPrefix = CharArrayUtils.concat(JavaNames.FIELD_DESCRIPTOR_PREFIX, binaryPackageName,
+-					new char[] { '/' }, packageName);
++					new char[] { '/' }, packageName, new char[] { '/' });
+ 		}
+-		
+-		String prefix = new String(fieldDescriptorPrefix);
+ 
+ 		// Search all the types that are a subpackage of the given package name. Return if we find any one of them on
+ 		// the classpath of this project.
+@@ -268,6 +268,7 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 					new FieldSearchIndex.Visitor<NdTypeId>() {
+ 						@Override
+ 						public boolean visit(NdTypeId typeId) {
++							//String fd = typeId.getFieldDescriptor().getString();
+ 							// If this is an exact match for the field descriptor prefix we're looking for then
+ 							// this class can't be part of the package we're searching for (and, most likely, the
+ 							// "package" we're searching for is actually a class name - not a package).
+@@ -298,86 +299,18 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 	@Override
+ 	public void cleanup() {
+ 	}
+-
+-	private static class TracingEnvironment implements INameEnvironment {
+-		private INameEnvironment toWrap;
+-		private String id;
+-	    /**
+-	     * @param toWrap
+-	     */
+-	    public TracingEnvironment(INameEnvironment toWrap) {
+-	      super();
+-	      this.toWrap = toWrap;
+-	      id = "" + System.currentTimeMillis();
+-	    }
+-	
+-	    String toPrintable(char[] toPrint) {
+-	    	return new String(toPrint);
+-	    }
+-	    
+-	    String toPrintable(char[][] compound) {
+-	    	return toPrintable(CharOperation.concatWith(compound, '/')); //$NON-NLS-1$
+-	    }
+-	    
+-	    @Override
+-	    public NameEnvironmentAnswer findType(char[][] compoundTypeName) {
+-	    	NameEnvironmentAnswer result = this.toWrap.findType(compoundTypeName);
+-	    	
+-	    	System.out.println("INameEnvironment.findType(" + toPrintable(compoundTypeName) + ") = " + result);
+-	    	
+-	    	return result;
+-	    }
+-	
+-	    @Override
+-	    public NameEnvironmentAnswer findType(char[] typeName, char[][] packageName) {
+-	    	NameEnvironmentAnswer result = this.toWrap.findType(typeName, packageName);
+-	    	
+-	    	System.out.println("INameEnvironment.findType(" + toPrintable(typeName) + ", " + toPrintable(packageName) 
+-	    		+ ") = " + result);
+-
+-	    	return result;
+-	    }
+-	
+-	    @Override
+-	    public boolean isPackage(char[][] parentPackageName, char[] packageName) {
+-	    	boolean result = this.toWrap.isPackage(parentPackageName, packageName);
+-	    	
+-	    	System.out.println("INameEnvironment.isPackage(" + toPrintable(parentPackageName) + ", " 
+-	    		+ toPrintable(packageName) + ") = " + result);
+-
+-		    return result;
+-	    }
+-	
+-	    @Override
+-	    public void cleanup() {
+-	    	System.out.println("INameEnvironment.cleanup()");
+-	    }	
+-	}
+ 	
+ 	public static INameEnvironment create(List<IJavaProject> javaProjects, org.eclipse.jdt.core.ICompilationUnit[] copies) {
+-		long startTime = System.nanoTime();
+-		try {
+-			if (JavaIndex.isEnabled()) {
+-				return new TracingEnvironment(new IndexBasedJavaSearchEnvironment(javaProjects, copies));
+-			} else {
+-				Iterator<IJavaProject> next = javaProjects.iterator();
+-				JavaSearchNameEnvironment result = new JavaSearchNameEnvironment(next.next(), copies);
+-	
+-				while (next.hasNext()) {
+-					result.addProjectClassPath((JavaProject)next.next());
+-				}
+-				return new TracingEnvironment(result);
++		if (JavaIndex.isEnabled()) {
++			return new IndexBasedJavaSearchEnvironment(javaProjects, copies);
++		} else {
++			Iterator<IJavaProject> next = javaProjects.iterator();
++			JavaSearchNameEnvironment result = new JavaSearchNameEnvironment(next.next(), copies);
++
++			while (next.hasNext()) {
++				result.addProjectClassPath((JavaProject)next.next());
+ 			}
+-		} finally {
+-	      long endTime = System.nanoTime();
+-	
+-	      long totalTimeMillis = (endTime - startTime) / 1000000;
+-	
+-	      System.out.println(
+-	          "Time to open name environment: "
+-	              + totalTimeMillis
+-	              + "ms - indexEnabled="
+-	              + JavaIndex.isEnabled());
+-	    }
++			return result;
++		}
+ 	}
+ }
+commit f722534baad1521340809313705a03702206f669
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Thu Jun 23 20:09:17 2016 -0700
+
+    Bug 495062 - JavaSearchNameEnvironment is slow for large classpaths
+    
+    Fix NPE in PathMap.addAllKeys
+    
+    Change-Id: I4f508d039520f16c6db11f89188a8c1eaf862f7b
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+10	4	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
+index 99c4be2..491db09 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/util/PathMap.java
+@@ -33,16 +33,15 @@ public class PathMap<T> {
+ 				return this;
+ 			}
+ 
+-			if (this.children == null) {
+-				this.children = new HashMap<>();
+-			}
+-
+ 			String nextSegment = getSegment(key);
+ 			Node<T> next = createChild(nextSegment);
+ 			return next.createNode(key);
+ 		}
+ 
+ 		public Node<T> createChild(String nextSegment) {
++			if (this.children == null) {
++				this.children = new HashMap<>();
++			}
+ 			Node<T> next = this.children.get(nextSegment);
+ 			if (next == null) {
+ 				next = new Node<>(this.depth + 1);
+@@ -70,6 +69,9 @@ public class PathMap<T> {
+ 		}
+ 
+ 		Node<T> getChild(String nextSegment) {
++			if (this.children == null) {
++				return null;
++			}
+ 			return this.children.get(nextSegment);
+ 		}
+ 
+@@ -78,6 +80,10 @@ public class PathMap<T> {
+ 	    		result.add(parent);
+ 	    	}
+ 
++	    	if (this.children == null) {
++	    		return;
++	    	}
++	
+ 	    	for (Entry<String, Node<T>> next : this.children.entrySet()) {
+ 	    		String key = next.getKey();
+ 	    		IPath nextPath = buildChildPath(parent, key);
+commit c9c759e453f1b2de03d6b449139917e124ee8962
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Thu Jun 23 20:29:27 2016 -0700
+
+    Bug 495062 - JavaSearchNameEnvironment is slow for large classpaths
+    
+    Address comments brought up during code review.
+    
+    Change-Id: Ic0c45547f282159d915e3264d1d6aef81d11c880
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+8	8	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+4	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+index 77f35ec..22200e6 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+@@ -49,8 +49,7 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 
+ 		try {
+ 			List<IPackageFragmentRoot> localRoots = new ArrayList<>();
+-			
+-			int idx = 0;
++
+ 			for (IJavaProject next : javaProject) {
+ 				for (IPackageFragmentRoot nextRoot : next.getAllPackageFragmentRoots()) {
+ 					IPath path = nextRoot.getPath();
+@@ -62,15 +61,10 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 								PackageFragmentRoot root = (PackageFragmentRoot)nextRoot;
+ 								cp = new ClasspathSourceDirectory((IContainer)target, root.fullExclusionPatternChars(), root.fullInclusionPatternChars());
+ 								this.unindexedEntries.add(cp);
+-//							} else {
+-//								ClasspathEntry rawClasspathEntry = (ClasspathEntry) nextRoot.getRawClasspathEntry();
+-//								cp = ClasspathLocation.forBinaryFolder((IContainer) target, false, rawClasspathEntry.getAccessRuleSet(),
+-//																	ClasspathEntry.getExternalAnnotationPath(rawClasspathEntry, ((IJavaProject)nextRoot.getParent()).getProject(), true));
+ 							}
+ 						}
+ 					}
+ 
+-					idx++;
+ 					localRoots.add(nextRoot);
+ 				}
+ 			}
+@@ -95,6 +89,7 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 			try {
+ 				if (nextRoot.getKind() == IPackageFragmentRoot.K_SOURCE) {
+ 					this.sourceEntryPosition = i;
++					break;
+ 				}
+ 			} catch (JavaModelException e) {
+ 				// project doesn't exist
+@@ -284,7 +279,7 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 
+ 								IPath path = resource.getPath();
+ 
+-								if (IndexBasedJavaSearchEnvironment.this.mapPathsToRoots.containsPrefixOf(path)) {
++								if (containsPrefixOf(path)) {
+ 									// Terminate the search -- we've found a class belonging to the package
+ 									// we're searching for.
+ 									return false;
+@@ -296,8 +291,13 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 		}
+ 	}
+ 
++	boolean containsPrefixOf(IPath path) {
++		return this.mapPathsToRoots.containsPrefixOf(path);
++	}
++
+ 	@Override
+ 	public void cleanup() {
++		// No explicit cleanup required for this class
+ 	}
+ 	
+ 	public static INameEnvironment create(List<IJavaProject> javaProjects, org.eclipse.jdt.core.ICompilationUnit[] copies) {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+index 1ed516c..95ce916 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+@@ -1183,7 +1183,10 @@ public void initialize(JavaProject project, int possibleMatchSize) throws JavaMo
+ 	List<IJavaProject> projects = new ArrayList<>();
+ 	projects.add(project);
+ 	if (this.pattern.focus != null) {
+-		projects.add(this.pattern.focus.getJavaProject());
++		IJavaProject focusProject = this.pattern.focus.getJavaProject();
++		if (focusProject != project) {
++			projects.add(focusProject);
++		}
+ 	}
+ 	this.nameEnvironment = IndexBasedJavaSearchEnvironment.create(projects, this.workingCopies);
+ 
+commit 2b79b7cd1b337fa470c04b4f23df88f38212c454
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Thu Jun 23 20:49:48 2016 -0700
+
+    Bug 495062 - JavaSearchNameEnvironment is slow for large classpaths
+    
+    Add a preference for disabling IndexBasedJavaSearchEnvironment,
+    independently of the rest of the new index code.
+    
+    Change-Id: I2d7ed6450dd69348d042fee4a79e958520ff74eb
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+8	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+index 22200e6..50811a9 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/IndexBasedJavaSearchEnvironment.java
+@@ -2,9 +2,11 @@ package org.eclipse.jdt.internal.core.search.matching;
+ 
+ import org.eclipse.core.resources.IContainer;
+ import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.Platform;
+ import org.eclipse.jdt.core.ICompilationUnit;
+ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IPackageFragmentRoot;
++import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.env.AccessRestriction;
+@@ -97,6 +99,11 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 		}
+ 	}
+ 
++	public static boolean isEnabled() {
++		return Platform.getPreferencesService().getBoolean(JavaCore.PLUGIN_ID, "useIndexBasedSearchEnvironment", false, //$NON-NLS-1$
++				null);
++	}
++
+ 	@Override
+ 	public NameEnvironmentAnswer findType(char[][] compoundTypeName) {
+ 		char[] binaryName = CharOperation.concatWith(compoundTypeName, '/');
+@@ -301,7 +308,7 @@ public class IndexBasedJavaSearchEnvironment implements INameEnvironment, Suffix
+ 	}
+ 	
+ 	public static INameEnvironment create(List<IJavaProject> javaProjects, org.eclipse.jdt.core.ICompilationUnit[] copies) {
+-		if (JavaIndex.isEnabled()) {
++		if (JavaIndex.isEnabled() && isEnabled()) {
+ 			return new IndexBasedJavaSearchEnvironment(javaProjects, copies);
+ 		} else {
+ 			Iterator<IJavaProject> next = javaProjects.iterator();

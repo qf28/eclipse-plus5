@@ -1,0 +1,954 @@
+commit a52e67267e1d7ce77c1b31adc66c1ca7f361bc47
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Fri Jul 21 12:10:07 2017 +0200
+
+    Bug 519674 - [9][compiler] Invalid compilation errors when trying to
+    compile a non-module java project
+    
+    Change-Id: I38ac8017965510b8688f27541778ea5c319a25a2
+
+39	3	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+4	1	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJrt.java
+79	88	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+72	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleAwareNameEnvironment.java
+3	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+6	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+4	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/UnresolvedReferenceBinding.java
+5	5	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/NameEnvironmentWithProgress.java
+39	32	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+1	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJMod.java
+4	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+2	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
+74	45	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+27	26	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 4f57fca..4935cb8 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -57,7 +57,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 	}
+ 
+ 	static {
+-//		 TESTS_NAMES = new String[] { "test_ReconcilerModuleLookup" };
++//		 TESTS_NAMES = new String[] { "testBug518282e" };
+ 	}
+ 	private static boolean isJRE9 = false;
+ 	private String sourceWorkspacePath = null;
+@@ -4076,7 +4076,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			IMarker[] markers = p3.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
+ 			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers", 
+-					"The import org cannot be resolved\n" +
++					"The package org.astro is not accessible\n" +
+ 					"World cannot be resolved to a type", markers);
+ 		} finally {
+ 			this.deleteProject("test");
+@@ -4143,7 +4143,10 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			IJavaProject p3 = setupModuleProject("test_automodules", src, new IClasspathEntry[] {dep, dep2});
+ 			getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
+ 			IMarker[] markers = p3.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
+-			assertMarkers("Unexpected markers", "org cannot be resolved to a type", markers);
++			assertMarkers("Unexpected markers",
++					"The project was not built since its build path is incomplete. Cannot find the class file for org.astro.World. Fix the build path then try building this project\n" + 
++					"The type org.astro.World cannot be resolved. It is indirectly referenced from required .class files",
++					markers);
+ 		} finally {
+ 			this.deleteProject("test");
+ 			this.deleteProject("test_automodules");
+@@ -4152,6 +4155,39 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			JavaCore.setOptions(javaCoreOptions);
+ 		}
+ 	}
++
++	public void testUnnamedModule_bug519674() throws CoreException {
++		if (!isJRE9) return;
++		try {
++			IJavaProject p1 = createJava9Project("Project1");
++			createFolder("/Project1/src/pack1");
++			createFile("/Project1/src/pack1/Class1.java",
++					"package pack1;\n" +
++					"public class Class1 {}\n");
++			
++			IJavaProject p2 = createJava9Project("Project2");
++			{
++				IClasspathEntry[] old = p2.getRawClasspath();
++				IClasspathEntry[] newPath = new IClasspathEntry[old.length + 1];
++				System.arraycopy(old, 0, newPath, 0, old.length);
++				newPath[old.length] = JavaCore.newProjectEntry(p1.getPath());
++				p2.setRawClasspath(newPath, null);
++			}
++			createFolder("/Project2/src/pack2");
++			createFile("/Project2/src/pack2/Class2.java",
++					"package pack2;\n" +
++					"import pack1.Class1;\n" +
++					"public class Class2 extends Class1 {}\n");
++			getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers", "", markers);
++		} finally {
++			this.deleteProject("Project1");
++			this.deleteProject("Project2");
++		}
++
++	}
++	
+ 	protected void assertNoErrors() throws CoreException {
+ 		for (IProject p : getWorkspace().getRoot().getProjects()) {
+ 			int maxSeverity = p.findMaxProblemSeverity(null, true, IResource.DEPTH_INFINITE);
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJrt.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJrt.java
+index 20d825e..1f59ed4 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJrt.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJrt.java
+@@ -336,7 +336,10 @@ public class ClasspathJrt extends ClasspathLocation implements IMultiModuleEntry
+ 	public int getMode() {
+ 		return BINARY;
+ 	}
+-
++	@Override
++	public boolean hasModule() {
++		return true;
++	}
+ 	public IModule getModule(char[] moduleName) {
+ 		Map<String, IModule> modules = ModulesCache.get(this.file.getPath());
+ 		if (modules != null) {
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+index 15cb3b3..4c51329 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+@@ -34,7 +34,6 @@ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
+-import org.eclipse.jdt.internal.compiler.env.IMultiModuleEntry;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.IModuleAwareNameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+@@ -61,6 +60,7 @@ public class FileSystem implements IModuleAwareNameEnvironment, SuffixConstants
+ 		NameEnvironmentAnswer findClass(char[] typeName, String qualifiedPackageName, String moduleName, String qualifiedBinaryFileName, boolean asBinaryOnly);
+ 		boolean isPackage(String qualifiedPackageName, /*@Nullable*/String moduleName);
+ 		char[][] getModulesDeclaringPackage(String qualifiedPackageName, /*@Nullable*/String moduleName);
++		default boolean hasModule() { return getModule() != null; }
+ 		/**
+ 		 * Return a list of the jar file names defined in the Class-Path section
+ 		 * of the jar file manifest if any, null else. Only ClasspathJar (and
+@@ -373,49 +373,54 @@ private NameEnvironmentAnswer internalFindClass(String qualifiedTypeName, char[]
+ 			? Util.EMPTY_STRING
+ 			: qualifiedBinaryFileName.substring(0, qualifiedTypeName.length() - typeName.length - 1);
+ 
+-	if (moduleName == ModuleBinding.ANY || moduleName == ModuleBinding.UNNAMED || this.moduleLocations == null) {
+-		String qp2 = File.separatorChar == '/' ? qualifiedPackageName : qualifiedPackageName.replace('/', File.separatorChar);
+-		NameEnvironmentAnswer suggestedAnswer = null;
+-		if (qualifiedPackageName == qp2) {
+-			for (int i = 0, length = this.classpaths.length; i < length; i++) {
+-				if (moduleName == ModuleBinding.UNNAMED && this.classpaths[i].getModule() != null) continue;
+-				NameEnvironmentAnswer answer = this.classpaths[i].findClass(typeName, qualifiedPackageName, null, qualifiedBinaryFileName, asBinaryOnly);
+-				if (answer != null) {
+-					if (!answer.ignoreIfBetter()) {
+-						if (answer.isBetter(suggestedAnswer))
+-							return answer;
+-					} else if (answer.isBetter(suggestedAnswer))
+-						// remember suggestion and keep looking
+-						suggestedAnswer = answer;
+-				}
+-			}
+-		} else {
+-			String qb2 = qualifiedBinaryFileName.replace('/', File.separatorChar);
+-			for (int i = 0, length = this.classpaths.length; i < length; i++) {
+-				Classpath p = this.classpaths[i];
+-				if (moduleName == ModuleBinding.UNNAMED && p.getModule() != null) continue;
+-				NameEnvironmentAnswer answer = (p instanceof ClasspathJar || p instanceof ClasspathJrt)
+-					? p.findClass(typeName, qualifiedPackageName, null, qualifiedBinaryFileName, asBinaryOnly)
+-					: p.findClass(typeName, qp2, null, qb2, asBinaryOnly);
+-				if (answer != null) {
+-					if (!answer.ignoreIfBetter()) {
+-						if (answer.isBetter(suggestedAnswer))
+-							return answer;
+-					} else if (answer.isBetter(suggestedAnswer))
+-						// remember suggestion and keep looking
+-						suggestedAnswer = answer;
+-				}
++	LookupStrategy strategy = LookupStrategy.get(moduleName);
++	if (strategy == LookupStrategy.Named) {
++		if (this.moduleLocations != null) {
++			// searching for a specific named module:
++			String moduleNameString = String.valueOf(moduleName);
++			Classpath classpath = this.moduleLocations.get(moduleNameString);
++			if (classpath != null) {
++				return classpath.findClass(typeName, qualifiedPackageName, moduleNameString, qualifiedBinaryFileName);
+ 			}
+ 		}
+-		return suggestedAnswer;
++		return null;
+ 	}
+-	// searching for a specific named module:
+-	String moduleNameString = String.valueOf(moduleName);
+-	Classpath classpath = this.moduleLocations.get(moduleNameString);
+-	if (classpath != null) {
+-		return classpath.findClass(typeName, qualifiedPackageName, moduleNameString, qualifiedBinaryFileName);
++	String qp2 = File.separatorChar == '/' ? qualifiedPackageName : qualifiedPackageName.replace('/', File.separatorChar);
++	NameEnvironmentAnswer suggestedAnswer = null;
++	if (qualifiedPackageName == qp2) {
++		for (int i = 0, length = this.classpaths.length; i < length; i++) {
++			if (!strategy.matches(this.classpaths[i], Classpath::hasModule))
++				continue;
++			NameEnvironmentAnswer answer = this.classpaths[i].findClass(typeName, qualifiedPackageName, null, qualifiedBinaryFileName, asBinaryOnly);
++			if (answer != null) {
++				if (!answer.ignoreIfBetter()) {
++					if (answer.isBetter(suggestedAnswer))
++						return answer;
++				} else if (answer.isBetter(suggestedAnswer))
++					// remember suggestion and keep looking
++					suggestedAnswer = answer;
++			}
++		}
++	} else {
++		String qb2 = qualifiedBinaryFileName.replace('/', File.separatorChar);
++		for (int i = 0, length = this.classpaths.length; i < length; i++) {
++			Classpath p = this.classpaths[i];
++			if (!strategy.matches(p, Classpath::hasModule))
++				continue;
++			NameEnvironmentAnswer answer = (p instanceof ClasspathJar || p instanceof ClasspathJrt)
++				? p.findClass(typeName, qualifiedPackageName, null, qualifiedBinaryFileName, asBinaryOnly)
++				: p.findClass(typeName, qp2, null, qb2, asBinaryOnly);
++			if (answer != null) {
++				if (!answer.ignoreIfBetter()) {
++					if (answer.isBetter(suggestedAnswer))
++						return answer;
++				} else if (answer.isBetter(suggestedAnswer))
++					// remember suggestion and keep looking
++					suggestedAnswer = answer;
++			}
++		}
+ 	}
+-	return null;
++	return suggestedAnswer;
+ }
+ 
+ public NameEnvironmentAnswer findType(char[][] compoundName, char[] moduleName) {
+@@ -477,65 +482,51 @@ public char[][][] findTypeNames(char[][] packageName, String[] moduleNames) {
+ }
+ 
+ public NameEnvironmentAnswer findType(char[] typeName, char[][] packageName, char[] moduleName) {
+-	if (typeName == null)
+-		return null;
+-	String qualifiedTypeName = new String(CharOperation.concatWith(packageName, typeName, '/'));
+-	NameEnvironmentAnswer answer = internalFindClass(qualifiedTypeName, typeName, false, moduleName);
+-	if (this.annotationsFromClasspath && answer != null && answer.getBinaryType() instanceof ClassFileReader) {
+-		for (int i = 0, length = this.classpaths.length; i < length; i++) {
+-			Classpath classpathEntry = this.classpaths[i];
+-			if (classpathEntry.hasAnnotationFileFor(qualifiedTypeName)) {
+-				@SuppressWarnings("resource")
+-				ZipFile zip = classpathEntry instanceof ClasspathJar ? ((ClasspathJar) classpathEntry).zipFile : null;
+-				try {
+-					if (zip == null) {
+-						zip = ExternalAnnotationDecorator.getAnnotationZipFile(classpathEntry.getPath(), null);
+-					}
+-					answer.setBinaryType(ExternalAnnotationDecorator.create(answer.getBinaryType(), classpathEntry.getPath(), 
+-							qualifiedTypeName, zip));
+-					break;
+-				} catch (IOException e) {
+-					// ignore broken entry, keep searching
+-				}
+-			}
+-		}
+-	}
+-	return answer;
+-	
++	if (typeName != null)
++		return findClass(
++			new String(CharOperation.concatWith(packageName, typeName, '/')),
++			typeName,
++			false,
++			moduleName);
++	return null;
+ }
+ 
+ public char[][] getModulesDeclaringPackage(char[][] parentPackageName, char[] packageName, char[] moduleName) {
+ 	String qualifiedPackageName = new String(CharOperation.concatWith(parentPackageName, packageName, '/'));
++	String moduleNameString = String.valueOf(moduleName);
+ 
+-	if (moduleName == ModuleBinding.ANY) {
+-		// search the entire environment and answer which modules declare that package:
+-		for (Classpath cp : this.classpaths) {
+-			char[][] declaringModules = cp.getModulesDeclaringPackage(qualifiedPackageName, null);
+-			if (declaringModules != null)
+-				return declaringModules;
+-			// TODO(SHMOD): support package split among different classpath locations?
++	LookupStrategy strategy = LookupStrategy.get(moduleName);
++	if (strategy == LookupStrategy.Named) {
++		if (this.moduleLocations != null) {
++			// specific search in a given module:
++			Classpath classpath = this.moduleLocations.get(moduleNameString);
++			if (classpath != null) {
++				if (classpath.isPackage(qualifiedPackageName, moduleNameString))
++					return new char[][] {moduleName};
++			}
+ 		}
++		return null;
+ 	}
+-	String moduleNameString = String.valueOf(moduleName);
+-	if (moduleName == ModuleBinding.UNNAMED) {
+-		// search all classpaths that have no module
+-		for (Classpath cp : this.classpaths) {
+-			if (cp.getModule() == null) {
+-				if (!(cp instanceof IMultiModuleEntry)) { // multiModuleEntries have a module by definition
+-					if (cp.isPackage(qualifiedPackageName, moduleNameString))
+-						return new char[][] {ModuleBinding.UNNAMED};
++	// search the entire environment and answer which modules declare that package:
++	char[][] allNames = null;
++	for (Classpath cp : this.classpaths) {
++		if (strategy.matches(cp, Classpath::hasModule)) {
++			if (strategy == LookupStrategy.Unnamed) {
++				// short-cut
++				if (cp.isPackage(qualifiedPackageName, moduleNameString))
++					return new char[][] { ModuleBinding.UNNAMED };
++			} else {
++				char[][] declaringModules = cp.getModulesDeclaringPackage(qualifiedPackageName, null);
++				if (declaringModules != null) {
++					if (allNames == null)
++						allNames = declaringModules;
++					else
++						allNames = CharOperation.arrayConcat(allNames, declaringModules);
+ 				}
+ 			}
+ 		}
+-	} else {
+-		// specific search in a given module:
+-		Classpath classpath = this.moduleLocations.get(moduleNameString);
+-		if (classpath != null) {
+-			if (classpath.isPackage(qualifiedPackageName, moduleNameString))
+-				return new char[][] {moduleName};
+-		}
+ 	}
+-	return null;
++	return allNames;
+ }
+ 
+ @Override
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleAwareNameEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleAwareNameEnvironment.java
+index 5ec64a3..4d21f85 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleAwareNameEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleAwareNameEnvironment.java
+@@ -14,6 +14,8 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.env;
+ 
++import java.util.function.Predicate;
++
+ import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+ 
+ /**
+@@ -22,6 +24,75 @@ import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+  *
+  */
+ public interface IModuleAwareNameEnvironment extends INameEnvironment {
++
++	/** Strategies for searching types & packages in classpath locations & modules. */
++	enum LookupStrategy {
++		/** Search a specific named module only. */
++		Named {
++			@Override
++			public <T> boolean matchesWithName(T elem, Predicate<T> isNamed, Predicate<T> nameMatcher) {
++				assert nameMatcher != null : "name match needs a nameMatcher"; //$NON-NLS-1$
++				return isNamed.test(elem) && nameMatcher.test(elem);
++			}
++		},
++		/** Search all named modules. */
++		AnyNamed {
++			@Override
++			public <T> boolean matchesWithName(T elem, Predicate<T> isNamed, Predicate<T> nameMatcher) {
++				return isNamed.test(elem);
++			}
++		},
++		/** Search all locations, module or otherwise. */
++		Any {
++			@Override
++			public <T> boolean matchesWithName(T elem, Predicate<T> isNamed, Predicate<T> nameMatcher) {
++				return true;
++			}
++		},
++		/** Search only the unnamed module. */
++		Unnamed {
++			@Override
++			public <T> boolean matchesWithName(T elem, Predicate<T> isNamed, Predicate<T> nameMatcher) {
++				return !isNamed.test(elem);
++			}
++		};
++		/**
++		 * Test whether the given element matches this lookup strategy.
++		 * @param elem location being tests
++		 * @param isNamed predicate to determine if 'elem' represents a named module
++		 * @param nameMatcher predicate to test if 'elem' matches the expected module name
++		 * @return true iff the given element matches this lookup strategy.
++		 */
++		public abstract <T> boolean matchesWithName(T elem, Predicate<T> isNamed, Predicate<T> nameMatcher);
++		/**
++		 * Test whether the given element matches this lookup strategy.
++		 * @param elem location being tests
++		 * @param isNamed predicate to determine if 'elem' represents a named module
++		 * @return true iff the given element matches this lookup strategy.
++		 */
++		public <T> boolean matches(T elem, Predicate<T> isNamed) {
++			return matchesWithName(elem, isNamed, t -> true);
++		}
++		
++		/** Get the lookup strategy corresponding to the given module name. */
++		public static LookupStrategy get(char[] moduleName) {
++			if (moduleName == ModuleBinding.ANY)
++				return Any;
++			if (moduleName == ModuleBinding.ANY_NAMED)
++				return AnyNamed;
++			if (moduleName == ModuleBinding.UNNAMED)
++				return Unnamed;
++			return Named;
++		}
++		/** If 'moduleName' is none of the special names (ANY, ANY_NAMED, UNNAMED) return the string converted name, else {@code null}. */
++		public static String getStringName(char[] moduleName) {
++			switch (get(moduleName)) {
++				case Named : return String.valueOf(moduleName);
++				default: return null;
++			}
++		}
++	}
++	
+ 	default NameEnvironmentAnswer findType(char[][] compoundTypeName) {
+ 		return findType(compoundTypeName, ModuleBinding.ANY);
+ 	}
+@@ -33,7 +104,7 @@ public interface IModuleAwareNameEnvironment extends INameEnvironment {
+ 	}
+ 
+ 	NameEnvironmentAnswer findType(char[][] compoundName, char[] moduleName);
+-	/** Answer a type identified by the given names. A {@code null} moduleName signals the unnamed module. */
++	/** Answer a type identified by the given names. moduleName may be one of the special names from ModuleBinding (ANY, ANY_NAMED, UNNAMED). */
+ 	NameEnvironmentAnswer findType(char[] typeName, char[][] packageName, char[] moduleName);
+ 	char[][] getModulesDeclaringPackage(char[][] parentPackageName, char[] name, char[] moduleName);
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+index 550dd51..d3288bb 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+@@ -203,7 +203,7 @@ public ModuleBinding getModule(char[] name) {
+ 		return this.UnNamedModule;
+ 	ModuleBinding moduleBinding = this.knownModules.get(name);
+ 	if (moduleBinding == null) {
+-		if (this.nameEnvironment instanceof IModuleAwareNameEnvironment) {
++		if (this.useModuleSystem) {
+ 			IModule mod = ((IModuleAwareNameEnvironment) this.nameEnvironment).getModule(name);
+ 			if (mod != null) {
+ 				moduleBinding = new BinaryModuleBinding(mod, this);
+@@ -284,7 +284,7 @@ ReferenceBinding askForType(PackageBinding packageBinding, char[] name, ModuleBi
+ 		packageBinding = this.defaultPackage;
+ 	}
+ 	NameEnvironmentAnswer[] answers = null;
+-	if (this.nameEnvironment instanceof IModuleAwareNameEnvironment) {
++	if (this.useModuleSystem) {
+ 		IModuleAwareNameEnvironment moduleEnv = (IModuleAwareNameEnvironment) this.nameEnvironment;
+ 		final PackageBinding pack = packageBinding;
+ 		// leverage module information from the (split?) package as to prefer NotAccessible over NotFound:
+@@ -363,7 +363,7 @@ private ReferenceBinding combine(ReferenceBinding one, ReferenceBinding two, Mod
+ private NameEnvironmentAnswer[] askForTypeFromModules(ModuleBinding clientModule, ModuleBinding[] otherModules,
+ 		Function<ModuleBinding,NameEnvironmentAnswer> oracle)
+ {
+-	if (clientModule != null && clientModule.nameForLookup() == ModuleBinding.ANY) {
++	if (clientModule != null && clientModule.nameForLookup().length == 0) {
+ 		NameEnvironmentAnswer answer = oracle.apply(clientModule);
+ 		if (answer != null)
+ 			answer.moduleBinding = this.root.getModuleFromAnswer(answer);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+index e50a3c9..0d7b206 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+@@ -52,6 +52,8 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	public static final char[] UNNAMED = "".toCharArray(); //$NON-NLS-1$
+ 	/** Module name for package/type lookup that doesn't care about modules. */
+ 	public static final char[] ANY = "".toCharArray(); //$NON-NLS-1$
++	/** Module name for package/type lookup that should look into all named modules. */
++	public static final char[] ANY_NAMED = "".toCharArray(); //$NON-NLS-1$
+ 
+ 	public static class UnNamedModule extends ModuleBinding {
+ 
+@@ -360,6 +362,8 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	public char[] nameForLookup() {
+ 		if (this.moduleName == UNNAMED)
+ 			return ANY;
++		else if (this.isAuto)
++			return ANY_NAMED;
+ 		else
+ 			return this.moduleName;
+ 	}
+@@ -377,7 +381,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 		PackageBinding resolved = getVisiblePackage(pkg.compoundName);
+ 		if (pkg.isEquivalentTo(resolved)) {
+ 			if (this.isAuto) { // all packages are exported by an automatic module
+-				return true;
++				return pkg.enclosingModule == this; // no transitive export
+ 			}
+ 			PackageBinding[] initializedExports = getExports();
+ 			for (int i = 0; i < initializedExports.length; i++) {
+@@ -549,7 +553,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 			return declared != LookupEnvironment.TheNotFoundPackage;
+ 		}
+ 		INameEnvironment nameEnvironment = this.environment.nameEnvironment;
+-		if (nameEnvironment instanceof IModuleAwareNameEnvironment) {
++		if (this.environment.useModuleSystem) {
+ 			IModuleAwareNameEnvironment moduleEnv = (IModuleAwareNameEnvironment)nameEnvironment;
+ 			return moduleEnv.getModulesDeclaringPackage(parentPackageName, name, this.moduleName) != null;
+ 		} else {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/UnresolvedReferenceBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/UnresolvedReferenceBinding.java
+index dbf8460..6b506e8 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/UnresolvedReferenceBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/UnresolvedReferenceBinding.java
+@@ -103,7 +103,10 @@ ReferenceBinding resolve(LookupEnvironment environment, boolean convertGenericTo
+ 		char[] typeName = this.compoundName[this.compoundName.length - 1];
+ 		targetType = this.fPackage.getType0(typeName);
+ 		if (targetType == this) { //$IDENTITY-COMPARISON$
+-			targetType = environment.askForType(this.compoundName, this.fPackage.enclosingModule);
++			if (this.fPackage instanceof SplitPackageBinding) // leverage SplitPackageBinding to avoid duplicate creation of BinaryTypeBinding
++				targetType = environment.askForType(this.fPackage, typeName, this.fPackage.enclosingModule);
++			else
++				targetType = environment.askForType(this.compoundName, this.fPackage.enclosingModule);
+ 		}
+ 		if ((targetType == null || targetType == this) && CharOperation.contains('.', typeName)) { //$IDENTITY-COMPARISON$
+ 			// bug 491354: this complements the NameLookup#seekTypes(..), which performs the same adaptation
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/NameEnvironmentWithProgress.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/NameEnvironmentWithProgress.java
+index c9e8fd2..2d3606f 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/NameEnvironmentWithProgress.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/NameEnvironmentWithProgress.java
+@@ -22,7 +22,6 @@ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.batch.ClasspathDirectory;
+ import org.eclipse.jdt.internal.compiler.batch.FileSystem;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+-import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+ import org.eclipse.jdt.internal.core.INameEnvironmentWithProgress;
+ import org.eclipse.jdt.internal.core.NameLookup;
+@@ -60,10 +59,11 @@ class NameEnvironmentWithProgress extends FileSystem implements INameEnvironment
+ 			for (int i = 0, length = this.classpaths.length; i < length; i++) {
+ 				if (!(this.classpaths[i] instanceof ClasspathDirectory)) continue;
+ 				ClasspathDirectory classpathDirectory = (ClasspathDirectory) this.classpaths[i];
+-				if (moduleName == ModuleBinding.UNNAMED) {
+-					if (classpathDirectory.getModule() != null) continue;
+-				} else if (moduleName != ModuleBinding.ANY) {
+-					if (!classpathDirectory.servesModule(moduleName)) continue;
++				LookupStrategy strategy = LookupStrategy.get(moduleName);
++				if (!strategy.matchesWithName(classpathDirectory,
++						loc -> loc.getModule() != null,
++						loc -> loc.servesModule(moduleName))) {
++					continue;
+ 				}
+ 				answer = classpathDirectory.findSecondaryInClass(typeName, qualifiedPackageName, qualifiedBinaryFileName);
+ 				if (answer != null) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+index ad52f8b..efd239b 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+@@ -331,7 +331,8 @@ public class SearchableEnvironment
+ 	public NameEnvironmentAnswer findType(char[][] compoundTypeName, char[] moduleName) {
+ 		if (compoundTypeName == null) return null;
+ 
+-		IJavaElement moduleLocation = (moduleName != ModuleBinding.ANY ? findModuleContext(moduleName) : null);
++		boolean isNamedStrategy = LookupStrategy.get(moduleName) == LookupStrategy.Named;
++		IJavaElement moduleLocation = isNamedStrategy ? findModuleContext(moduleName) : null;
+ 
+ 		int length = compoundTypeName.length;
+ 		if (length <= 1) {
+@@ -356,7 +357,8 @@ public class SearchableEnvironment
+ 	public NameEnvironmentAnswer findType(char[] name, char[][] packageName, char[] moduleName) {
+ 		if (name == null) return null;
+ 
+-		IJavaElement moduleLocation = (moduleName != ModuleBinding.ANY ? findModuleContext(moduleName) : null);
++		boolean isNamedStrategy = LookupStrategy.get(moduleName) == LookupStrategy.Named;
++		IJavaElement moduleLocation = isNamedStrategy ? findModuleContext(moduleName) : null;
+ 		return find(
+ 			new String(name),
+ 			packageName == null || packageName.length == 0 ? null : CharOperation.toString(packageName),
+@@ -765,39 +767,44 @@ public class SearchableEnvironment
+ 				pkgName[i] = new String(parentPackageName[i]);
+ 			pkgName[length] = new String(name);
+ 		}
+-		if (this.knownModuleLocations == null) {
+-			if ((this.owner != null && this.owner.isPackage(pkgName))
+-					|| this.nameLookup.isPackage(pkgName))
+-				return new char[][] { ModuleBinding.UNNAMED };
+-		} else if (moduleName == ModuleBinding.UNNAMED) {
+-			for (IPackageFragmentRoot packageRoot : this.nameLookup.packageFragmentRoots) {
+-				IModuleDescription moduleDescription = getModuleDescription(packageRoot);
+-				if (moduleDescription == null) {
+-					if (this.nameLookup.isPackage(pkgName, packageRoot)) // TODO(SHMOD): need to distinguish kinds?
+-						return new char[][] { moduleName };
+-				}
+-			}
+-			return null;
+-		} else if (moduleName == ModuleBinding.ANY) {
+-			char[][] names = CharOperation.NO_CHAR_CHAR;
+-			for (IPackageFragmentRoot packageRoot : this.nameLookup.packageFragmentRoots) {
+-				IModuleDescription moduleDescription = getModuleDescription(packageRoot);
+-				if (moduleDescription != null) {
+-					if (this.nameLookup.isPackage(pkgName, packageRoot)) // TODO(SHMOD): need to distinguish kinds?
+-						names = CharOperation.arrayConcat(names, moduleDescription.getElementName().toCharArray());
++		LookupStrategy strategy = LookupStrategy.get(moduleName);
++		switch (strategy) {
++			case Named:
++				if (this.knownModuleLocations != null) {
++					IJavaElement moduleContext = findModuleContext(moduleName);
++					if (moduleContext != null) {
++						// (this.owner != null && this.owner.isPackage(pkgName)) // TODO(SHMOD) see old isPackage
++						if (this.nameLookup.isPackage(pkgName, moduleContext)) {
++							return new char[][] { moduleName };
++						}
++					}
+ 				}
+-			}
+-			return names == CharOperation.NO_CHAR_CHAR ? null : names;
+-		} else {
+-			IJavaElement moduleContext = findModuleContext(moduleName);
+-			if (moduleContext != null) {
+-				// (this.owner != null && this.owner.isPackage(pkgName)) // TODO(SHMOD) see old isPackage
+-				if (this.nameLookup.isPackage(pkgName, moduleContext)) {
+-					return new char[][] { moduleName };
++				return null;
++			case Unnamed:
++			case Any:
++				// if in pre-9 mode we may still search the unnamed module 
++				if (this.knownModuleLocations == null) {
++					if ((this.owner != null && this.owner.isPackage(pkgName))
++							|| this.nameLookup.isPackage(pkgName))
++						return new char[][] { ModuleBinding.UNNAMED };
++					return null;
++				}
++				//$FALL-THROUGH$
++			case AnyNamed:
++				char[][] names = CharOperation.NO_CHAR_CHAR;
++				for (IPackageFragmentRoot packageRoot : this.nameLookup.packageFragmentRoots) {
++					if (strategy.matches(packageRoot, loc -> loc instanceof JrtPackageFragmentRoot || getModuleDescription(loc) != null)) {
++						if (this.nameLookup.isPackage(pkgName, packageRoot)) {
++							IModuleDescription moduleDescription = getModuleDescription(packageRoot);
++							char[] aName = moduleDescription != null ? moduleDescription.getElementName().toCharArray() : ModuleBinding.UNNAMED;
++							names = CharOperation.arrayConcat(names, aName);
++						}
++					}
+ 				}
+-			}
++				return names == CharOperation.NO_CHAR_CHAR ? null : names;
++			default:
++				throw new IllegalArgumentException("Unexpected LookupStrategy "+strategy); //$NON-NLS-1$
+ 		}
+-		return null;
+ 	}
+ 	private IModuleDescription getModuleDescription(IPackageFragmentRoot root) {
+ 		if (root instanceof JarPackageFragmentRoot)
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJMod.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJMod.java
+index 5f5e91a..72551b5 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJMod.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJMod.java
+@@ -105,6 +105,7 @@ public class ClasspathJMod extends ClasspathJar {
+ 								if (inputStream == null) throw new IOException("Invalid zip entry name : " + entry.getName()); //$NON-NLS-1$
+ 								stream = new BufferedInputStream(inputStream);
+ 								byte[] content = Util.getInputStreamAsByteArray(stream, (int) entry.getSize());
++								// FIXME(SHMOD): avoid this (platform dependent) temp file!!
+ 								DataOutputStream dos = new DataOutputStream(new FileOutputStream(new File("c:\\temp\\module-info.class"))); //$NON-NLS-1$
+ 								dos.write(content);
+ 								dos.close();
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+index d42a791..2d6c92e 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+@@ -243,6 +243,10 @@ public NameEnvironmentAnswer findClass(char[] typeName, String qualifiedPackageN
+ 	return findClass(fileName, qualifiedPackageName, moduleName, qualifiedBinaryFileName, asBinaryOnly);
+ }
+ @Override
++public boolean hasModule() {
++	return true;
++}
++@Override
+ public IModule getModule(char[] moduleName) {
+ 	Set<IModule> modules = ModulesCache.get(this.zipFilename);
+ 	if (modules != null) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
+index d267404..2bc1147 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
+@@ -30,12 +30,14 @@ public abstract class ClasspathLocation {
+ 
+ 	protected boolean isOnModulePath;
+ 	protected IModule module;
++	// In the following signatures, passing a null moduleName signals "don't care":
+ 	abstract public NameEnvironmentAnswer findClass(String typeName, String qualifiedPackageName, String moduleName, String qualifiedBinaryFileName);
+ 	abstract public NameEnvironmentAnswer findClass(String typeName, String qualifiedPackageName, String moduleName, String qualifiedBinaryFileName, boolean asBinaryOnly);
+ 	abstract public boolean isPackage(String qualifiedPackageName, String moduleName);
+ 	public char[][] getModulesDeclaringPackage(String qualifiedPackageName, String moduleName) {
+ 		return singletonModuleNameIf(isPackage(qualifiedPackageName, moduleName));
+ 	}
++	public boolean hasModule() { return getModule() != null; }
+ 
+ 	public NameEnvironmentAnswer findClass(char[] typeName, String qualifiedPackageName, String moduleName, String qualifiedBinaryFileName, boolean asBinaryOnly) {
+ 		String fileName = new String(typeName);
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+index fcb7465..b32c6a7 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+@@ -29,7 +29,6 @@ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.env.*;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.lookup.AutoModule;
+-import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.compiler.util.SimpleSet;
+@@ -347,7 +346,7 @@ private void createParentFolder(IContainer parent) throws CoreException {
+ 	}
+ }
+ 
+-private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeName, String moduleName) {
++private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeName, LookupStrategy strategy, String moduleName) {
+ 	if (this.notifier != null)
+ 		this.notifier.checkCancelWithinCompiler();
+ 
+@@ -399,6 +398,9 @@ private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeNam
+ 	}
+ 	NameEnvironmentAnswer suggestedAnswer = null;
+ 	for (ClasspathLocation classpathLocation : relevantLocations) {
++		if (!strategy.matches(classpathLocation, ClasspathLocation::hasModule)) {
++			continue;
++		}
+ 		NameEnvironmentAnswer answer = classpathLocation.findClass(binaryFileName, qPackageName, moduleName, qBinaryFileName, false);
+ 		if (answer != null) {
+ 			if (!answer.ignoreIfBetter()) {
+@@ -414,22 +416,22 @@ private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeNam
+ 
+ @Override
+ public NameEnvironmentAnswer findType(char[][] compoundName, char[] moduleName) {
+-	String stringModuleName = moduleName == ModuleBinding.ANY ? null : String.valueOf(moduleName);
+ 	if (compoundName != null)
+ 		return findClass(
+ 			String.valueOf(CharOperation.concatWith(compoundName, '/')),
+ 			compoundName[compoundName.length - 1], 
+-			stringModuleName);
++			LookupStrategy.get(moduleName),
++			LookupStrategy.getStringName(moduleName));
+ 	return null;
+ }
+ 
+ @Override
+ public NameEnvironmentAnswer findType(char[] typeName, char[][] packageName, char[] moduleName) {
+-	String stringModuleName = moduleName == ModuleBinding.ANY ? null : String.valueOf(moduleName);
+-		return findClass(
++	return findClass(
+ 			String.valueOf(CharOperation.concatWith(packageName, typeName, '/')),
+ 			typeName,
+-			stringModuleName);
++			LookupStrategy.get(moduleName),
++			LookupStrategy.getStringName(moduleName));
+ }
+ 
+ public boolean isPackage(String qualifiedPackageName) {
+@@ -438,50 +440,77 @@ public boolean isPackage(String qualifiedPackageName) {
+ @Override
+ public char[][] getModulesDeclaringPackage(char[][] parentPackageName, char[] name, char[] moduleName) {
+ 	String pkgName = new String(CharOperation.concatWith(parentPackageName, name, '/'));
+-	if (moduleName == ModuleBinding.UNNAMED || this.modulePathEntries == null) {
+-		char[][] names = CharOperation.NO_CHAR_CHAR;
+-		for (ClasspathLocation location : this.binaryLocations) {
+-			if (location.module == null && !(location instanceof ClasspathJrt)) {
+-				char[][] declaringModules = location.getModulesDeclaringPackage(pkgName, null);
+-				if (declaringModules != null)
+-					names = CharOperation.arrayConcat(names, declaringModules);
++	String modName = new String(moduleName);
++	LookupStrategy strategy = LookupStrategy.get(moduleName);
++	switch (strategy) {
++		// include unnamed (search all locations):
++		case Any:
++		case Unnamed:
++			char[][] names = CharOperation.NO_CHAR_CHAR;
++			for (ClasspathLocation location : this.binaryLocations) {
++				if (strategy.matches(location, ClasspathLocation::hasModule)) {
++					char[][] declaringModules = location.getModulesDeclaringPackage(pkgName, null);
++					if (declaringModules != null)
++						names = CharOperation.arrayConcat(names, declaringModules);
++				}
+ 			}
+-		}
+-		for (ClasspathLocation location : this.sourceLocations) {
+-			if (location.module == null) {
+-				char[][] declaringModules = location.getModulesDeclaringPackage(pkgName, null);
+-				if (declaringModules != null)
+-					names = CharOperation.arrayConcat(names, declaringModules);
++			for (ClasspathLocation location : this.sourceLocations) {
++				if (strategy.matches(location, ClasspathLocation::hasModule)) {
++					char[][] declaringModules = location.getModulesDeclaringPackage(pkgName, null);
++					if (declaringModules != null)
++						names = CharOperation.arrayConcat(names, declaringModules);
++				}
++			}
++			return names == CharOperation.NO_CHAR_CHAR ? null : names;
++
++		// only named (rely on modulePathEntries):
++		case AnyNamed:
++			modName = null;
++			//$FALL-THROUGH$
++		default:
++			if (this.modulePathEntries != null) {
++				names = CharOperation.NO_CHAR_CHAR;
++				for (IModulePathEntry modulePathEntry : this.modulePathEntries.values()) {
++					char[][] declaringModules = modulePathEntry.getModulesDeclaringPackage(pkgName, modName);
++					if (declaringModules != null)
++						names = CharOperation.arrayConcat(names, declaringModules);
++				}
++				return names == CharOperation.NO_CHAR_CHAR ? null : names;
+ 			}
+-		}
+-		return names == CharOperation.NO_CHAR_CHAR ? null : names;
+-	} else if (moduleName == ModuleBinding.ANY) {
+-		char[][] names = CharOperation.NO_CHAR_CHAR;
+-		for (IModulePathEntry modulePathEntry : this.modulePathEntries.values()) {
+-			char[][] declaringModules = modulePathEntry.getModulesDeclaringPackage(pkgName, null);
+-			if (declaringModules != null)
+-				names = CharOperation.arrayConcat(names, declaringModules);
+-		}
+-		return names == CharOperation.NO_CHAR_CHAR ? null : names;
+-	} else {
+-		String modName = new String(moduleName);
+-		IModulePathEntry modulePathEntry = this.modulePathEntries.get(modName);
+-		if (modulePathEntry != null) {
+-			return modulePathEntry.getModulesDeclaringPackage(pkgName, modName);
+-		}
+ 	}
+ 	return null;
+ }
+ private boolean isPackage(String qualifiedPackageName, char[] moduleName) {
+-	if (moduleName == ModuleBinding.ANY || this.modulePathEntries == null) {
+-		// NOTE: the output folders are added at the beginning of the binaryLocations
+-		for (int i = 0, l = this.binaryLocations.length; i < l; i++)
+-			if (this.binaryLocations[i].isPackage(qualifiedPackageName, null))
+-				return true;
+-		// TODO(SHMOD): also search sourceLocations?
+-	} else {
+-		String stringModuleName = String.valueOf(moduleName);
+-		IModulePathEntry modulePathEntry = this.modulePathEntries.get(stringModuleName);
++	String stringModuleName = null;
++
++	LookupStrategy strategy = LookupStrategy.get(moduleName);
++	Collection<IModulePathEntry> entries = null;
++	switch (strategy) {
++		case Any:
++		case Unnamed:
++			// NOTE: the output folders are added at the beginning of the binaryLocations
++			for (int i = 0, l = this.binaryLocations.length; i < l; i++) {
++				if (strategy.matches(this.binaryLocations[i], ClasspathLocation::hasModule))
++					if (this.binaryLocations[i].isPackage(qualifiedPackageName, null))
++						return true;
++			}
++			for (int i = 0, l = this.sourceLocations.length; i < l; i++) {
++				if (strategy.matches(this.sourceLocations[i], ClasspathLocation::hasModule))
++					if (this.sourceLocations[i].isPackage(qualifiedPackageName, null))
++						return true;
++			}
++			return false;
++		case AnyNamed:
++			entries = this.modulePathEntries.values();
++			break;
++		default:
++			stringModuleName = String.valueOf(moduleName);
++			IModulePathEntry entry = this.modulePathEntries.get(stringModuleName);
++			if (entry == null)
++				return false;
++			entries = Collections.singletonList(entry);
++	}
++	for (IModulePathEntry modulePathEntry : entries) {
+ 		if (modulePathEntry instanceof ModulePathEntry) {
+ 			for (ClasspathLocation classpathLocation : ((ModulePathEntry) modulePathEntry).getClasspathLocations()) {
+ 				if (classpathLocation.isPackage(qualifiedPackageName, stringModuleName))
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+index 3f224fd..9ef9045 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+@@ -187,7 +187,7 @@ private ClasspathLocation mapToClassPathLocation(JavaModelManager manager, Packa
+ 	return cp;
+ }
+ 
+-private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeName, /*@Nullable*/String moduleName) {
++private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeName, LookupStrategy strategy, /*@Nullable*/String moduleName) {
+ 	String
+ 		binaryFileName = null, qBinaryFileName = null,
+ 		sourceFileName = null, qSourceFileName = null,
+@@ -196,6 +196,8 @@ private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeNam
+ 	Iterator<ClasspathLocation> iter = getLocationsFor(moduleName);
+ 	while (iter.hasNext()) {
+ 		ClasspathLocation location = iter.next();
++		if (!strategy.matches(location, ClasspathLocation::hasModule))
++			continue;
+ 		NameEnvironmentAnswer answer;
+ 		if (location instanceof ClasspathSourceDirectory) {
+ 			if (sourceFileName == null) {
+@@ -266,7 +268,8 @@ public NameEnvironmentAnswer findType(char[] typeName, char[][] packageName, cha
+ 		return findClass(
+ 			new String(CharOperation.concatWith(packageName, typeName, '/')),
+ 			typeName,
+-			moduleName == ModuleBinding.ANY ? null : String.valueOf(moduleName));
++			LookupStrategy.get(moduleName),
++			LookupStrategy.getStringName(moduleName));
+ 	return null;
+ }
+ 
+@@ -276,39 +279,37 @@ public NameEnvironmentAnswer findType(char[][] compoundName, char[] moduleName)
+ 		return findClass(
+ 			new String(CharOperation.concatWith(compoundName, '/')),
+ 			compoundName[compoundName.length - 1],
+-			moduleName == ModuleBinding.ANY ? null : String.valueOf(moduleName));
++			LookupStrategy.get(moduleName),
++			LookupStrategy.getStringName(moduleName));
+ 	return null;
+ }
+ 
+ @Override
+ public char[][] getModulesDeclaringPackage(char[][] parentPackageName, char[] packageName, char[] moduleName) {
+ 	String qualifiedPackageName = String.valueOf(CharOperation.concatWith(parentPackageName, packageName, '/'));
+-	if (this.moduleLocations == null || moduleName == ModuleBinding.UNNAMED) {
+-		for (ClasspathLocation location : this.locationSet) {
+-			IModule module = location.getModule();
+-			if (module == null && location.isPackage(qualifiedPackageName, null))
+-				return new char[][] { moduleName };
+-		}
+-		return null;
+-		
+-	} else if (moduleName == ModuleBinding.ANY) {
+-		char[][] moduleNames = CharOperation.NO_CHAR_CHAR;
+-		for (ClasspathLocation location : this.locationSet) {
+-			IModule module = location.getModule();
+-			if (module != null && location.isPackage(qualifiedPackageName, null))
+-				moduleNames = CharOperation.arrayConcat(moduleNames, module.name()); // FIXME(SHMOD): handle multiple modules per location
++	LookupStrategy strategy = LookupStrategy.get(moduleName);
++	if (strategy == LookupStrategy.Named) {
++		if (this.moduleLocations != null) {
++			String moduleNameString = String.valueOf(moduleName);
++			ClasspathLocation location = this.moduleLocations.get(moduleNameString);
++			if (location != null) {
++				if (location.isPackage(qualifiedPackageName, moduleNameString))
++					return new char[][] { moduleName };
++			}
+ 		}
+-		return moduleNames == CharOperation.NO_CHAR_CHAR ? null : moduleNames;
+-	} else {
+-		String moduleNameString = String.valueOf(moduleName);
+-		ClasspathLocation location = this.moduleLocations.get(moduleNameString);
+-		if (location != null) {
+-			if (location.isPackage(qualifiedPackageName, moduleNameString))
+-				return new char[][] { moduleName };
+-			return null;
++		return null;		
++	}
++	char[][] moduleNames = CharOperation.NO_CHAR_CHAR;
++	for (ClasspathLocation location : this.locationSet) {
++		if (strategy.matches(location, ClasspathLocation::hasModule) ) {
++			if (location.isPackage(qualifiedPackageName, null)) {
++				IModule module = location.getModule();
++				char[] aName = module != null ? module.name() : ModuleBinding.UNNAMED;
++				moduleNames = CharOperation.arrayConcat(moduleNames, aName); // FIXME(SHMOD): handle multiple modules per location
++			}
+ 		}
+ 	}
+-	return null;
++	return moduleNames == CharOperation.NO_CHAR_CHAR ? null : moduleNames;
+ }
+ 
+ @Override

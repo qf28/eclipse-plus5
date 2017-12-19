@@ -1,0 +1,287 @@
+commit 692248becbfeeecaaa49a47735c06f5855e67509
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Thu Jan 5 23:38:52 2017 -0500
+
+    Bug 509994 - Optimize annotation data in the the NdMethod struct
+    
+    Change-Id: Iefa7bb748c8226cc617975e30a18dbf6f4532131
+
+4	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+3	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdAnnotationInMethod.java
+42	11	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethod.java
+69	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethodAnnotationData.java
+4	4	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdTypeAnnotationInMethod.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+index 9d8f411..0047297 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+@@ -34,9 +34,9 @@ import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+ 
+ public class JavaIndex {
+ 	// Version constants
+-	static final int CURRENT_VERSION = Nd.version(1, 41);
+-	static final int MAX_SUPPORTED_VERSION = Nd.version(1, 41);
+-	static final int MIN_SUPPORTED_VERSION = Nd.version(1, 41);
++	static final int CURRENT_VERSION = Nd.version(1, 42);
++	static final int MAX_SUPPORTED_VERSION = Nd.version(1, 42);
++	static final int MIN_SUPPORTED_VERSION = Nd.version(1, 42);
+ 
+ 	// Fields for the search header
+ 	public static final FieldSearchIndex<NdResourceFile> FILES;
+@@ -282,6 +282,7 @@ public class JavaIndex {
+ 		registry.register(0x00F0, NdConstantShort.type.getFactory());
+ 		registry.register(0x0100, NdConstantString.type.getFactory());
+ 		registry.register(0x0110, NdMethod.type.getFactory());
++		registry.register(0x0118, NdMethodAnnotationData.type.getFactory());
+ 		registry.register(0x0120, NdMethodException.type.getFactory());
+ 		registry.register(0x0130, NdMethodId.type.getFactory());
+ 		registry.register(0x0140, NdMethodParameter.type.getFactory());
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdAnnotationInMethod.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdAnnotationInMethod.java
+index e7e48eb..c1b524e 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdAnnotationInMethod.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdAnnotationInMethod.java
+@@ -15,14 +15,14 @@ import org.eclipse.jdt.internal.core.nd.field.FieldManyToOne;
+ import org.eclipse.jdt.internal.core.nd.field.StructDef;
+ 
+ public class NdAnnotationInMethod extends NdAnnotation {
+-	public static final FieldManyToOne<NdMethod> OWNER;
++	public static final FieldManyToOne<NdMethodAnnotationData> OWNER;
+ 
+ 	@SuppressWarnings("hiding")
+ 	public static final StructDef<NdAnnotationInMethod> type;
+ 
+ 	static {
+ 		type = StructDef.create(NdAnnotationInMethod.class, NdAnnotation.type);
+-		OWNER = FieldManyToOne.createOwner(type, NdMethod.ANNOTATIONS);
++		OWNER = FieldManyToOne.createOwner(type, NdMethodAnnotationData.ANNOTATIONS);
+ 		type.done();
+ 	}
+ 
+@@ -33,7 +33,7 @@ public class NdAnnotationInMethod extends NdAnnotation {
+ 	public NdAnnotationInMethod(Nd nd, NdMethod owner) {
+ 		super(nd);
+ 
+-		OWNER.put(getNd(), this.address, owner);
++		OWNER.put(getNd(), this.address, owner.createAnnotationData());
+ 	}
+ 
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethod.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethod.java
+index 77991be..537c357 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethod.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethod.java
+@@ -10,10 +10,10 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.nd.java;
+ 
++import java.util.Collections;
+ import java.util.List;
+ 
+ import org.eclipse.jdt.internal.core.nd.Nd;
+-import org.eclipse.jdt.internal.core.nd.field.FieldLong;
+ import org.eclipse.jdt.internal.core.nd.field.FieldManyToOne;
+ import org.eclipse.jdt.internal.core.nd.field.FieldOneToMany;
+ import org.eclipse.jdt.internal.core.nd.field.FieldOneToOne;
+@@ -31,9 +31,7 @@ public class NdMethod extends NdBinding {
+ 	public static final FieldOneToOne<NdConstant> DEFAULT_VALUE;
+ 	public static final FieldOneToMany<NdMethodException> EXCEPTIONS;
+ 	public static final FieldManyToOne<NdTypeSignature> RETURN_TYPE;
+-	public static final FieldLong TAG_BITS;
+-	public static final FieldOneToMany<NdAnnotationInMethod> ANNOTATIONS;
+-	public static final FieldOneToMany<NdTypeAnnotationInMethod> TYPE_ANNOTATIONS;
++	public static final FieldOneToOne<NdMethodAnnotationData> ANNOTATION_DATA;
+ 
+ 	@SuppressWarnings("hiding")
+ 	public static final StructDef<NdMethod> type;
+@@ -48,9 +46,7 @@ public class NdMethod extends NdBinding {
+ 		DEFAULT_VALUE = FieldOneToOne.create(type, NdConstant.class, NdConstant.PARENT_METHOD);
+ 		EXCEPTIONS = FieldOneToMany.create(type, NdMethodException.PARENT);
+ 		RETURN_TYPE = FieldManyToOne.create(type, NdTypeSignature.USED_AS_RETURN_TYPE);
+-		TAG_BITS = type.addLong();
+-		ANNOTATIONS = FieldOneToMany.create(type, NdAnnotationInMethod.OWNER);
+-		TYPE_ANNOTATIONS = FieldOneToMany.create(type, NdTypeAnnotationInMethod.OWNER);
++		ANNOTATION_DATA = FieldOneToOne.create(type, NdMethodAnnotationData.class, NdMethodAnnotationData.METHOD);
+ 		type.done();
+ 	}
+ 
+@@ -95,7 +91,11 @@ public class NdMethod extends NdBinding {
+ 	}
+ 
+ 	public List<NdAnnotationInMethod> getAnnotations() {
+-		return ANNOTATIONS.asList(getNd(), this.address);
++		NdMethodAnnotationData annotationData = getAnnotationData();
++		if (annotationData != null) {
++			return annotationData.getAnnotations();
++		}
++		return Collections.emptyList();
+ 	}
+ 
+ 	public void setDefaultValue(NdConstant value) {
+@@ -115,7 +115,11 @@ public class NdMethod extends NdBinding {
+ 	}
+ 
+ 	public List<NdTypeAnnotationInMethod> getTypeAnnotations() {
+-		return TYPE_ANNOTATIONS.asList(getNd(), this.address);
++		NdMethodAnnotationData annotationData = getAnnotationData();
++		if (annotationData != null) {
++			return annotationData.getTypeAnnotations();
++		}
++		return Collections.emptyList();
+ 	}
+ 
+ 	public List<NdMethodException> getExceptions() {
+@@ -144,11 +148,22 @@ public class NdMethod extends NdBinding {
+ 	}
+ 
+ 	public void setTagBits(long bits) {
+-		TAG_BITS.put(getNd(), this.address, bits);
++		if (bits != 0) {
++			createAnnotationData().setTagBits(bits);
++		} else {
++			NdMethodAnnotationData annotationData = getAnnotationData();
++			if (annotationData != null) {
++				annotationData.setTagBits(bits);
++			}
++		}
+ 	}
+ 
+ 	public long getTagBits() {
+-		return TAG_BITS.get(getNd(), this.address);
++		NdMethodAnnotationData annotations = getAnnotationData();
++		if (annotations == null) {
++			return 0;
++		}
++		return annotations.getTagBits();
+ 	}
+ 
+ 	public String toString() {
+@@ -189,4 +204,20 @@ public class NdMethod extends NdBinding {
+ 			}
+ 		}
+ 	}
++
++	/**
++	 * Creates the {@link NdMethodAnnotationData} struct for this method if it does not already exist. Returns
++	 * the existing or newly-created struct. 
++	 */
++	public NdMethodAnnotationData createAnnotationData() {
++		NdMethodAnnotationData result = getAnnotationData();
++		if (result == null) {
++			result = new NdMethodAnnotationData(this);
++		}
++		return result;
++	}
++
++	private NdMethodAnnotationData getAnnotationData() {
++		return ANNOTATION_DATA.get(getNd(), getAddress());
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethodAnnotationData.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethodAnnotationData.java
+new file mode 100644
+index 0000000..913eaad
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdMethodAnnotationData.java
+@@ -0,0 +1,69 @@
++/*******************************************************************************
++ * Copyright (c) 2017 Google, Inc and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *   Stefan Xenos (Google) - Initial implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core.nd.java;
++
++import java.util.List;
++
++import org.eclipse.jdt.internal.core.nd.Nd;
++import org.eclipse.jdt.internal.core.nd.NdNode;
++import org.eclipse.jdt.internal.core.nd.field.FieldLong;
++import org.eclipse.jdt.internal.core.nd.field.FieldOneToMany;
++import org.eclipse.jdt.internal.core.nd.field.FieldOneToOne;
++import org.eclipse.jdt.internal.core.nd.field.StructDef;
++
++/**
++ * Stores all annotation-related information for a single method. This is stored separately from the rest of the
++ * {@link NdMethod} structure in order to save space in the common case where a method has no annotations.
++ */
++public class NdMethodAnnotationData extends NdNode {
++	public static final FieldOneToOne<NdMethod> METHOD;
++	public static final FieldLong TAG_BITS;
++	public static final FieldOneToMany<NdAnnotationInMethod> ANNOTATIONS;
++	public static final FieldOneToMany<NdTypeAnnotationInMethod> TYPE_ANNOTATIONS;
++
++	@SuppressWarnings("hiding")
++	public static final StructDef<NdMethodAnnotationData> type;
++
++	static {
++		type = StructDef.create(NdMethodAnnotationData.class, NdNode.type);
++		METHOD = FieldOneToOne.createOwner(type, NdMethod.class, NdMethod.ANNOTATION_DATA);
++		TAG_BITS = type.addLong();
++		ANNOTATIONS = FieldOneToMany.create(type, NdAnnotationInMethod.OWNER);
++		TYPE_ANNOTATIONS = FieldOneToMany.create(type, NdTypeAnnotationInMethod.OWNER);
++		type.done();
++	}
++
++	public NdMethodAnnotationData(Nd nd, long address) {
++		super(nd, address);
++	}
++
++	public NdMethodAnnotationData(NdMethod method) {
++		super(method.getNd());
++
++		METHOD.put(getNd(), this.address, method);
++	}
++
++	public void setTagBits(long bits) {
++		TAG_BITS.put(getNd(), this.address, bits);
++	}
++
++	public long getTagBits() {
++		return TAG_BITS.get(getNd(), this.address);
++	}
++
++	public List<NdTypeAnnotationInMethod> getTypeAnnotations() {
++		return TYPE_ANNOTATIONS.asList(getNd(), this.address);
++	}
++
++	public List<NdAnnotationInMethod> getAnnotations() {
++		return ANNOTATIONS.asList(getNd(), this.address);
++	}
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdTypeAnnotationInMethod.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdTypeAnnotationInMethod.java
+index 894a1d5..06dcce3 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdTypeAnnotationInMethod.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdTypeAnnotationInMethod.java
+@@ -15,14 +15,14 @@ import org.eclipse.jdt.internal.core.nd.field.FieldManyToOne;
+ import org.eclipse.jdt.internal.core.nd.field.StructDef;
+ 
+ public class NdTypeAnnotationInMethod extends NdTypeAnnotation {
+-	public static final FieldManyToOne<NdMethod> OWNER;
++	public static final FieldManyToOne<NdMethodAnnotationData> OWNER;
+ 
+ 	@SuppressWarnings("hiding")
+ 	public static final StructDef<NdTypeAnnotationInMethod> type;
+ 
+ 	static {
+ 		type = StructDef.create(NdTypeAnnotationInMethod.class, NdTypeAnnotation.type);
+-		OWNER = FieldManyToOne.createOwner(type, NdMethod.TYPE_ANNOTATIONS);
++		OWNER = FieldManyToOne.createOwner(type, NdMethodAnnotationData.TYPE_ANNOTATIONS);
+ 		type.done();
+ 	}
+ 
+@@ -30,10 +30,10 @@ public class NdTypeAnnotationInMethod extends NdTypeAnnotation {
+ 		super(nd, address);
+ 	}
+ 
+-	public NdTypeAnnotationInMethod(Nd nd, NdMethod variable) {
++	public NdTypeAnnotationInMethod(Nd nd, NdMethod method) {
+ 		super(nd);
+ 
+-		OWNER.put(getNd(), this.address, variable);
++		OWNER.put(getNd(), this.address, method.createAnnotationData());
+ 	}
+ 
+ }

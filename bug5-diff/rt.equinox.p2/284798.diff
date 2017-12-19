@@ -1,0 +1,342 @@
+commit fb152d69c2aa9bac5710de9a2516ca0c8c02faac
+Author: Susan Franklin <sfranklin>
+Date:   Tue Sep 8 23:46:41 2009 +0000
+
+    Bug 284798 -  [ui] user management of profile snapshots
+
+2	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+23	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+1	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+12	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfileRegistry.java
+37	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
+5	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+5	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+2	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
+80	12	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RevertProfilePage.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+index 9468e23..77be0e2 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+@@ -48,6 +48,8 @@ class Messages extends NLS {
+ 	public static String SimpleProfileRegistry_Profile_not_locked_due_to_exception;
+ 	public static String SimpleProfileRegistry_Bad_profile_location;
+ 
++	public static String SimpleProfileRegistry_CannotRemoveCurrentSnapshot;
++
+ 	public static String thread_not_owner;
+ 	public static String profile_lock_not_reentrant;
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index 406d4c5..66049df 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -346,6 +346,29 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		broadcastChangeEvent(profileId, ProfileEvent.REMOVED);
+ 	}
+ 
++	public synchronized void removeProfile(String id, long timestamp) throws ProvisionException {
++		if (SELF.equals(id))
++			id = self;
++
++		if (profiles != null) {
++			IProfile profile = getProfile(id);
++			if (profile != null && profile.getTimestamp() == timestamp)
++				throw new ProvisionException(Messages.SimpleProfileRegistry_CannotRemoveCurrentSnapshot);
++		}
++
++		File profileDirectory = new File(store, escape(id) + PROFILE_EXT);
++		if (!profileDirectory.isDirectory())
++			return;
++
++		File profileFile = new File(profileDirectory, Long.toString(timestamp) + PROFILE_GZ_EXT);
++		if (!profileFile.exists()) {
++			profileFile = new File(profileDirectory, Long.toString(timestamp) + PROFILE_EXT);
++			if (!profileFile.exists())
++				return;
++		}
++		FileUtils.deleteAll(profileFile);
++	}
++
+ 	private void broadcastChangeEvent(String profileId, byte reason) {
+ 		((IProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), IProvisioningEventBus.class.getName())).publishEvent(new ProfileEvent(profileId, reason));
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+index a7514e8..a491c28 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+@@ -40,6 +40,7 @@ SimpleProfileRegistry_Profile_in_use=The profile is currently in use.
+ SimpleProfileRegistry_Profile_not_locked=The profile is not locked.
+ SimpleProfileRegistry_Profile_not_locked_due_to_exception=Profile not locked due to exception: {0}
+ SimpleProfileRegistry_Bad_profile_location=Bad profile location: {0}
++SimpleProfileRegistry_CannotRemoveCurrentSnapshot=Cannot remove the current profile timestamp
+ profile_does_not_exist=Profile to be updated does not exist: {0}.
+ profile_not_current=Profile {0} is not current.
+ profile_not_registered=Profile {0} not registered.
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfileRegistry.java
+index 364967e..a3cfdbc 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfileRegistry.java
+@@ -99,6 +99,18 @@ public interface IProfileRegistry {
+ 	public boolean containsProfile(String profileId);
+ 
+ 	/**
++	 * Remove the given profile snapshot from this profile registry. This method has no effect
++	 * if this registry does not contain a profile with the given id and timestamp.
++	 * The current profile cannot be removed using this method.
++	 * 
++	 * @param id the profile to remove
++	 * @param timestamp the timestamp of the profile to remove 
++	 * 
++	 * @throws ProvisionException if the profile with the specified id and timestamp is the current profile.
++	 */
++	void removeProfile(String id, long timestamp) throws ProvisionException;
++
++	/**
+ 	 * Remove the given profile from this profile registry.  This method has no effect
+ 	 * if this registry does not contain a profile with the given id.
+ 	 * 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
+index eeb0a60..2783002 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
+@@ -667,4 +667,41 @@ public class ProfileRegistryTest extends AbstractProvisioningTest {
+ 		});
+ 		assertEquals(1, filesFound.length);
+ 	}
++
++	public void testRemoveProfileTimestamps() throws ProvisionException {
++		assertNull(registry.getProfile(PROFILE_NAME));
++		Properties properties = new Properties();
++		properties.put("test", "test");
++		Profile profile = (Profile) registry.addProfile(PROFILE_NAME, properties);
++		assertTrue(profile.getProperties().containsKey("test"));
++		long[] timestamps = registry.listProfileTimestamps(PROFILE_NAME);
++		assertEquals(1, timestamps.length);
++
++		assertTrue(profile.getProperties().containsKey("test"));
++		profile.removeProperty("test");
++		assertNull(profile.getProperty("test"));
++		saveProfile(registry, profile);
++		timestamps = registry.listProfileTimestamps(PROFILE_NAME);
++		assertEquals(2, timestamps.length);
++
++		profile.setProperty("test2", "test2");
++		saveProfile(registry, profile);
++		timestamps = registry.listProfileTimestamps(PROFILE_NAME);
++
++		// We have three timestamps and should be able to remove two
++		// of them (but not the current)
++		assertEquals(3, timestamps.length);
++		int fail = 0;
++
++		for (int i = 0; i < timestamps.length; i++) {
++			try {
++				registry.removeProfile(PROFILE_NAME, timestamps[i]);
++			} catch (ProvisionException e) {
++				fail++;
++			}
++		}
++		timestamps = registry.listProfileTimestamps(PROFILE_NAME);
++		assertEquals(1, timestamps.length);
++		assertEquals(1, fail);
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+index 0b604ba..4ad793f 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+@@ -42,6 +42,11 @@ public class ProvUIMessages extends NLS {
+ 	public static String ColocatedRepositoryManipulator_GotoPrefs;
+ 	public static String ColocatedRepositoryManipulator_ManageSites;
+ 	public static String ColocatedRepositoryManipulator_RemoveSiteOperationLabel;
++	public static String RevertProfilePage_ConfirmDeleteMultipleConfigs;
++	public static String RevertProfilePage_ConfirmDeleteSingleConfig;
++	public static String RevertProfilePage_Delete;
++	public static String RevertProfilePage_DeleteMultipleConfigurationsTitle;
++	public static String RevertProfilePage_DeleteSingleConfigurationTitle;
+ 	public static String RevertProfilePage_NoProfile;
+ 	public static String RevertProfilePage_RevertLabel;
+ 	public static String RevertProfilePage_RevertTooltip;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index 95e15f9..a0e061f 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -154,6 +154,11 @@ ColocatedRepositoryManipulator_AddSiteOperationLabel=Add Site
+ ColocatedRepositoryManipulator_GotoPrefs=Go to the <a>Available Software Sites</a> preferences
+ ColocatedRepositoryManipulator_ManageSites=&Manage Sites...
+ ColocatedRepositoryManipulator_RemoveSiteOperationLabel=Remove Site
++RevertProfilePage_ConfirmDeleteMultipleConfigs=Deleting the selected configurations from the installation history will free up the disk space used to store the configurations.  However, you will no longer be able to revert your installation to these configurations.  Are you sure you want to delete the configurations?
++RevertProfilePage_ConfirmDeleteSingleConfig=Deleting the configuration from the installation history will free up the disk space used to store it.  However, you will no longer be able to revert your installation to this configuration.  Are you sure you want to delete it?
++RevertProfilePage_Delete=&Delete
++RevertProfilePage_DeleteMultipleConfigurationsTitle=Delete Configurations
++RevertProfilePage_DeleteSingleConfigurationTitle=Delete Configuration
+ RevertProfilePage_NoProfile=This installation has not been configured properly for accessing the installation history.  See the error log for details.
+ RevertProfilePage_RevertLabel=Re&vert
+ RevertProfilePage_RevertTooltip=Revert to the selected install configuration.
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
+index 0c17ddf..de66eb5 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
+@@ -47,7 +47,8 @@ public class ProfileSnapshots extends ProvElement {
+ 				// revert to.
+ 				if (i == 0) {
+ 					skipFirst = elements[0].getChildren(elements[0]).length == 0;
+-				} else if (i == timestamps.length - 1) {
++				}
++				if (i == timestamps.length - 1) {
+ 					elements[i].setIsCurrentProfile(true);
+ 				}
+ 			}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RevertProfilePage.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RevertProfilePage.java
+index 90726a7..40ec373 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RevertProfilePage.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/RevertProfilePage.java
+@@ -11,7 +11,10 @@
+ package org.eclipse.equinox.internal.provisional.p2.ui.dialogs;
+ 
+ import java.lang.reflect.InvocationTargetException;
++import java.util.Iterator;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
++import org.eclipse.equinox.internal.p2.ui.ProvUIActivator;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.p2.ui.dialogs.CopyUtils;
+ import org.eclipse.equinox.internal.p2.ui.dialogs.ICopyable;
+@@ -48,11 +51,12 @@ import org.eclipse.ui.statushandlers.StatusManager;
+ public class RevertProfilePage extends InstallationPage implements ICopyable {
+ 
+ 	private static final int REVERT_ID = IDialogConstants.CLIENT_ID;
++	private static final int DELETE_ID = IDialogConstants.CLIENT_ID + 1;
+ 	TableViewer configsViewer;
+ 	TreeViewer configContentsViewer;
+ 	IUDetailsLabelProvider labelProvider;
+ 	IAction revertAction;
+-	Button revertButton;
++	Button revertButton, deleteButton;
+ 	String profileId;
+ 	AbstractContributionFactory factory;
+ 	Text detailsArea;
+@@ -61,6 +65,8 @@ public class RevertProfilePage extends InstallationPage implements ICopyable {
+ 	public void createPageButtons(Composite parent) {
+ 		if (profileId == null)
+ 			return;
++		deleteButton = createButton(parent, DELETE_ID, ProvUIMessages.RevertProfilePage_Delete);
++		deleteButton.setEnabled(computeDeleteEnablement());
+ 		revertButton = createButton(parent, REVERT_ID, revertAction.getText());
+ 		revertButton.setEnabled(revertAction.isEnabled());
+ 	}
+@@ -109,7 +115,7 @@ public class RevertProfilePage extends InstallationPage implements ICopyable {
+ 
+ 		Label label = new Label(composite, SWT.NONE);
+ 		label.setText(ProvUIMessages.RevertDialog_ConfigsLabel);
+-		configsViewer = new TableViewer(composite, SWT.FULL_SELECTION | SWT.H_SCROLL | SWT.V_SCROLL | SWT.BORDER);
++		configsViewer = new TableViewer(composite, SWT.MULTI | SWT.H_SCROLL | SWT.V_SCROLL | SWT.BORDER);
+ 		configsViewer.setContentProvider(new RepositoryContentProvider());
+ 		configsViewer.setLabelProvider(new ProvElementLabelProvider());
+ 		configsViewer.setComparator(new ViewerComparator() {
+@@ -195,28 +201,63 @@ public class RevertProfilePage extends InstallationPage implements ICopyable {
+ 			case REVERT_ID :
+ 				revertAction.run();
+ 				break;
++			case DELETE_ID :
++				deleteSelectedSnapshots();
++				break;
+ 		}
+ 	}
+ 
+ 	void handleSelectionChanged(IStructuredSelection selection) {
+ 		if (!selection.isEmpty()) {
+-			final Object selected = selection.getFirstElement();
+-			if (selected instanceof RollbackProfileElement) {
+-				Object[] elements = configContentsViewer.getExpandedElements();
+-				configContentsViewer.getTree().setRedraw(false);
+-				configContentsViewer.setInput(selected);
+-				configContentsViewer.setExpandedElements(elements);
+-				configContentsViewer.getTree().setRedraw(true);
+-				revertAction.setEnabled(!((RollbackProfileElement) selected).isCurrentProfile());
+-				if (revertButton != null)
+-					revertButton.setEnabled(revertAction.isEnabled());
++			if (selection.size() == 1) {
++				final Object selected = selection.getFirstElement();
++				if (selected instanceof RollbackProfileElement) {
++					Object[] elements = configContentsViewer.getExpandedElements();
++					configContentsViewer.getTree().setRedraw(false);
++					configContentsViewer.setInput(selected);
++					configContentsViewer.setExpandedElements(elements);
++					configContentsViewer.getTree().setRedraw(true);
++					boolean isNotCurrentProfile = !((RollbackProfileElement) selected).isCurrentProfile();
++					revertAction.setEnabled(isNotCurrentProfile);
++					if (revertButton != null)
++						revertButton.setEnabled(isNotCurrentProfile);
++					if (deleteButton != null)
++						deleteButton.setEnabled(isNotCurrentProfile);
++					return;
++				}
++			} else {
++				// multiple selections, can't revert or look at details
++				revertAction.setEnabled(false);
++				if (revertButton != null) {
++					revertButton.setEnabled(false);
++				}
++				configContentsViewer.setInput(null);
++				deleteButton.setEnabled(computeDeleteEnablement());
+ 				return;
+ 			}
+ 		}
++		// Nothing is selected
+ 		configContentsViewer.setInput(null);
+ 		revertAction.setEnabled(false);
+ 		if (revertButton != null)
+ 			revertButton.setEnabled(false);
++		if (deleteButton != null)
++			deleteButton.setEnabled(computeDeleteEnablement());
++	}
++
++	boolean computeDeleteEnablement() {
++		// delete is permitted if none of the selected elements are the current profile
++		boolean okToDelete = true;
++		Iterator iter = ((IStructuredSelection) configsViewer.getSelection()).iterator();
++		while (iter.hasNext()) {
++			Object selected = iter.next();
++			// If it's not a recognized element or if it is the current profile, we can't delete.  Stop iterating.
++			if (!(selected instanceof RollbackProfileElement) || ((RollbackProfileElement) selected).isCurrentProfile()) {
++				okToDelete = false;
++				break;
++			}
++		}
++		return okToDelete;
+ 	}
+ 
+ 	private void setTreeColumns(Tree tree) {
+@@ -312,4 +353,31 @@ public class RevertProfilePage extends InstallationPage implements ICopyable {
+ 		clipboard.setContents(new Object[] {text}, new Transfer[] {TextTransfer.getInstance()});
+ 		clipboard.dispose();
+ 	}
++
++	void deleteSelectedSnapshots() {
++		IStructuredSelection selection = (IStructuredSelection) configsViewer.getSelection();
++		if (selection.isEmpty())
++			return;
++		String title = selection.size() == 1 ? ProvUIMessages.RevertProfilePage_DeleteSingleConfigurationTitle : ProvUIMessages.RevertProfilePage_DeleteMultipleConfigurationsTitle;
++		String confirmMessage = selection.size() == 1 ? ProvUIMessages.RevertProfilePage_ConfirmDeleteSingleConfig : ProvUIMessages.RevertProfilePage_ConfirmDeleteMultipleConfigs;
++		if (MessageDialog.openConfirm(configsViewer.getControl().getShell(), title, confirmMessage)) {
++			Iterator iter = selection.iterator();
++			while (iter.hasNext()) {
++				Object selected = iter.next();
++				// If it is a recognized element and it is not the current profile, then it can be deleted.
++				if (selected instanceof RollbackProfileElement && !((RollbackProfileElement) selected).isCurrentProfile()) {
++					RollbackProfileElement snapshot = (RollbackProfileElement) selected;
++					IProfileRegistry registry = (IProfileRegistry) ServiceHelper.getService(ProvUIActivator.getContext(), IProfileRegistry.class.getName());
++					if (registry != null) {
++						try {
++							registry.removeProfile(profileId, snapshot.getTimestamp());
++							configsViewer.refresh();
++						} catch (ProvisionException e) {
++							ProvUI.handleException(e, null, StatusManager.SHOW | StatusManager.LOG);
++						}
++					}
++				}
++			}
++		}
++	}
+ }

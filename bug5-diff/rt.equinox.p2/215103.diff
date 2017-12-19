@@ -1,0 +1,680 @@
+commit 51367f6af06d2a10b95519a072a0e7eea92860b8
+Author: John Arthorne <johna>
+Date:   Fri Apr 25 21:12:12 2008 +0000
+
+    Bug 215103 [prov] Signer trust check should be done for every installation
+
+10	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+4	1	bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
+121	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/CertificateChecker.java
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/DefaultPhaseSet.java
+5	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
+5	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
+62	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/CheckTrust.java
+1	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ActionFactory.java
+59	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/CheckTrustAction.java
+2	1	bundles/org.eclipse.equinox.p2.ui/META-INF/MANIFEST.MF
+2	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+2	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+56	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/CertificateLabelProvider.java
+46	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+121	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/TrustCertificateDialog.java
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+index ff1311d..6ec61c9 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+@@ -10,6 +10,8 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.provisional.p2.core;
+ 
++import java.security.cert.Certificate;
++
+ /**
+  * Callback API for prompting for user information from within lower level code.
+  */
+@@ -48,4 +50,12 @@ public interface IServiceUI {
+ 	 * @return The authentication result
+ 	 */
+ 	public AuthenticationInfo getUsernamePassword(String location);
++
++	/**
++	 * Displays a list of certificates to the user.
++	 *  
++	 * @param certificates - a list of certificates to display to the user
++	 * @return An array of certificates that have been accepted.
++	 */
++	public Certificate[] showCertificates(Certificate[][] certificates);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
+index 817f35b..ec32c9b 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
+@@ -39,8 +39,10 @@ Import-Package: javax.xml.parsers,
+  org.eclipse.equinox.internal.provisional.p2.query,
+  org.eclipse.equinox.internal.provisional.spi.p2.core.repository,
+  org.eclipse.equinox.internal.provisional.spi.p2.metadata.repository,
++ org.eclipse.jface.viewers,
+  org.eclipse.osgi.service.datalocation;version="1.0.0",
+  org.eclipse.osgi.service.resolver;version="1.1.0",
++ org.eclipse.osgi.signedcontent;version="1.0.0",
+  org.eclipse.osgi.util;version="1.0.0",
+  org.osgi.framework;version="1.3.0",
+  org.osgi.util.tracker;version="1.3.3",
+@@ -51,4 +53,5 @@ Eclipse-RegisterBuddy: org.eclipse.equinox.p2.metadata.repository
+ Bundle-RequiredExecutionEnvironment: J2SE-1.4,
+  CDC-1.1/Foundation-1.1
+ Require-Bundle: org.eclipse.equinox.common,
+- org.eclipse.equinox.registry
++ org.eclipse.equinox.registry,
++ org.eclipse.osgi
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/CertificateChecker.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/CertificateChecker.java
+new file mode 100644
+index 0000000..6286020
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/CertificateChecker.java
+@@ -0,0 +1,121 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.provisional.p2.engine;
++
++import java.io.File;
++import java.io.IOException;
++import java.security.GeneralSecurityException;
++import java.security.cert.Certificate;
++import java.util.ArrayList;
++import java.util.Iterator;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.Status;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
++import org.eclipse.equinox.internal.p2.engine.EngineActivator;
++import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
++import org.eclipse.osgi.service.security.TrustEngine;
++import org.eclipse.osgi.signedcontent.*;
++import org.osgi.util.tracker.ServiceTracker;
++
++public class CertificateChecker {
++	private ArrayList artifacts;
++	private ServiceTracker trustEngineTracker;
++
++	public CertificateChecker() {
++		artifacts = new ArrayList();
++		trustEngineTracker = new ServiceTracker(EngineActivator.getContext(), TrustEngine.class.getName(), null);
++		trustEngineTracker.open();
++	}
++
++	public IStatus start() {
++		return checkCertificates();
++	}
++
++	private IStatus checkCertificates() {
++		SignedContentFactory verifierFactory = (SignedContentFactory) ServiceHelper.getService(EngineActivator.getContext(), SignedContentFactory.class.getName());
++		IServiceUI serviceUI = (IServiceUI) ServiceHelper.getService(EngineActivator.getContext(), IServiceUI.class.getName());
++		SignedContent content = null;
++		SignerInfo[] signerInfo = null;
++		ArrayList untrusted = new ArrayList();
++		ArrayList untrustedChain = new ArrayList();
++		IStatus status = Status.OK_STATUS;
++		if (artifacts.size() == 0)
++			return status;
++		Iterator artifact = artifacts.iterator();
++		TrustEngine trustEngine = (TrustEngine) trustEngineTracker.getService();
++		while (artifact.hasNext()) {
++			try {
++				content = verifierFactory.getSignedContent((File) artifact.next());
++				if (!content.isSigned())
++					continue;
++				signerInfo = content.getSignerInfos();
++			} catch (GeneralSecurityException e) {
++				return new Status(IStatus.ERROR, EngineActivator.ID, Messages.CertificateChecker_SignedContentError, e);
++			} catch (IOException e) {
++				return new Status(IStatus.ERROR, EngineActivator.ID, Messages.CertificateChecker_SignedContentIOError, e);
++			}
++			for (int i = 0; i < signerInfo.length; i++) {
++				Certificate[] certificateChain = signerInfo[i].getCertificateChain();
++				try {
++					Certificate trustAnchor = trustEngine.findTrustAnchor(certificateChain);
++					if (trustAnchor == null) {
++						if (!untrusted.contains(certificateChain[0])) {
++							untrusted.add(certificateChain[0]);
++							untrustedChain.add(certificateChain);
++						}
++					}
++				} catch (IOException e) {
++					return new Status(IStatus.ERROR, EngineActivator.ID, Messages.CertificateChecker_KeystoreConnectionError, e);
++				}
++			}
++		}
++		if (untrusted.size() > 0) {
++			Certificate[][] certificates;
++			certificates = new Certificate[untrustedChain.size()][];
++			for (int i = 0; i < untrustedChain.size(); i++) {
++				certificates[i] = (Certificate[]) untrustedChain.get(i);
++			}
++			Certificate[] trustedCertificates = serviceUI.showCertificates(certificates);
++			if (trustedCertificates == null) {
++				return new Status(IStatus.ERROR, EngineActivator.ID, Messages.CertificateChecker_CertificateRejected);
++			}
++			for (int i = 0; i < trustedCertificates.length; i++) {
++				untrusted.remove(trustedCertificates[i]);
++			}
++			if (untrusted.size() > 0)
++				return new Status(IStatus.ERROR, EngineActivator.ID, Messages.CertificateChecker_CertificateRejected);
++			// add newly trusted certificates to trust engine
++			for (int i = 0; i < trustedCertificates.length; i++) {
++				try {
++					trustEngine.addTrustAnchor(trustedCertificates[i], trustedCertificates[i].toString());
++				} catch (IOException e) {
++					//just return an INFO so the user can proceed with the install
++					return new Status(IStatus.INFO, EngineActivator.ID, Messages.CertificateChecker_KeystoreConnectionError, e);
++				} catch (GeneralSecurityException e) {
++					return new Status(IStatus.INFO, EngineActivator.ID, Messages.CertificateChecker_CertificateError, e);
++				}
++			}
++		}
++
++		return status;
++	}
++
++	public void add(File toAdd) {
++		artifacts.add(toAdd);
++	}
++
++	public void add(Object[] toAdd) {
++		for (int i = 0; i < toAdd.length; i++) {
++			if (toAdd[i] instanceof File)
++				add((File) toAdd[i]);
++		}
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/DefaultPhaseSet.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/DefaultPhaseSet.java
+index 18bb62d..5cab49d 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/DefaultPhaseSet.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/DefaultPhaseSet.java
+@@ -15,7 +15,7 @@ import org.eclipse.equinox.internal.provisional.p2.engine.phases.*;
+ public class DefaultPhaseSet extends PhaseSet {
+ 
+ 	public DefaultPhaseSet() {
+-		super(new Phase[] {new Collect(100), new Unconfigure(10), new Uninstall(50), new Property(1), new Install(50), new Configure(10)});
++		super(new Phase[] {new Collect(100), new Unconfigure(10), new Uninstall(50), new Property(1), new CheckTrust(10), new Install(50), new Configure(10)});
+ 	}
+ 
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
+index 17f3d6d..604a143 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
+@@ -15,6 +15,11 @@ import org.eclipse.osgi.util.NLS;
+ //TODO Shouldn't have messages class in API package
+ public class Messages extends NLS {
+ 	private static final String BUNDLE_NAME = "org.eclipse.equinox.internal.provisional.p2.engine.messages"; //$NON-NLS-1$
++	public static String CertificateChecker_CertificateError;
++	public static String CertificateChecker_CertificateRejected;
++	public static String CertificateChecker_KeystoreConnectionError;
++	public static String CertificateChecker_SignedContentIOError;
++	public static String CertificateChecker_SignedContentError;
+ 	public static String action_or_iu_operand_null;
+ 	public static String not_current_phase;
+ 	public static String null_operands;
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
+index ee9ccc6..afc9a99 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
+@@ -23,3 +23,8 @@ phaseid_not_positive=Phase weight must be positive.
+ phaseid_not_set=Phase id must be set.
+ Engine_Operation_Canceled_By_User=Operation canceled by the user.
+ InstallableUnitEvent_type_not_install_or_uninstall=type must be either UNINSTALL(0) or INSTALL(1)
++CertificateChecker_CertificateError=An invalid certificate was found.
++CertificateChecker_CertificateRejected=One or more certificates rejected. Cannot proceed with installation.
++CertificateChecker_KeystoreConnectionError=Cannot connect to keystore.
++CertificateChecker_SignedContentError=Error with signed content.
++CertificateChecker_SignedContentIOError=Error reading signed content.
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/CheckTrust.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/CheckTrust.java
+new file mode 100644
+index 0000000..5ef06f2
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/CheckTrust.java
+@@ -0,0 +1,62 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.provisional.p2.engine.phases;
++
++import java.util.*;
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.equinox.internal.provisional.p2.engine.*;
++import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
++
++/**
++ * An install phase that checks if the certificates used to sign the artifacts
++ * being installed are from a trusted source.
++ */
++public class CheckTrust extends InstallableUnitPhase {
++
++	private static final String PHASE_ID = "checkTrust"; //$NON-NLS-1$
++
++	public CheckTrust(int weight) {
++		super(PHASE_ID, weight);
++	}
++
++	protected IStatus completePhase(IProgressMonitor monitor, IProfile profile, Map parameters) {
++		Collection artifactRequests = (Collection) parameters.get(PARM_ARTIFACT_REQUESTS);
++
++		// Instantiate a check trust manager
++		CertificateChecker certificateChecker = new CertificateChecker();
++		certificateChecker.add(artifactRequests.toArray());
++		IStatus status = certificateChecker.start();
++
++		return status;
++	}
++
++	protected ProvisioningAction[] getActions(InstallableUnitOperand currentOperand) {
++		ProvisioningAction action = getTouchpoint(currentOperand).getAction(phaseId);
++		if (action == null) {
++			return null;
++		}
++		return new ProvisioningAction[] {action};
++	}
++
++	protected IStatus initializeOperand(IProfile profile, InstallableUnitOperand operand, Map parameters, IProgressMonitor monitor) {
++		IInstallableUnit iu = operand.second();
++		parameters.put(PARM_IU, iu);
++
++		return super.initializeOperand(profile, operand, parameters, monitor);
++	}
++
++	protected IStatus initializePhase(IProgressMonitor monitor, IProfile profile, Map parameters) {
++		parameters.put(PARM_ARTIFACT_REQUESTS, new ArrayList());
++		return super.initializePhase(monitor, profile, parameters);
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ActionFactory.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ActionFactory.java
+index 102d4a4..44e9dec 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ActionFactory.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ActionFactory.java
+@@ -42,6 +42,7 @@ public class ActionFactory {
+ 		actions.put(RmdirAction.ID, RmdirAction.class);
+ 		actions.put(LinkAction.ID, LinkAction.class);
+ 		actions.put(ChmodAction.ID, ChmodAction.class);
++		actions.put(CheckTrustAction.ID, CheckTrustAction.class);
+ 	}
+ 
+ 	public static ProvisioningAction create(String actionId) {
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/CheckTrustAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/CheckTrustAction.java
+new file mode 100644
+index 0000000..c9659e8
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/CheckTrustAction.java
+@@ -0,0 +1,59 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
++
++import java.io.File;
++import java.util.Collection;
++import java.util.Map;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.Status;
++import org.eclipse.equinox.internal.p2.touchpoint.eclipse.EclipseTouchpoint;
++import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
++import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
++import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction;
++import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
++import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
++
++/**
++ * This action collects the set of bundle files on which the signature trust check
++ * should be performed. The actual trust checking is done by the CheckTrust phase.
++ */
++public class CheckTrustAction extends ProvisioningAction {
++
++	public static final String ID = "checkTrust"; //$NON-NLS-1$
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction#execute(java.util.Map)
++	 */
++	public IStatus execute(Map parameters) {
++		IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
++		if (iu == null)
++			return null;
++		Collection bundleFiles = (Collection) parameters.get(ActionConstants.PARM_ARTIFACT_REQUESTS);
++		IProfile profile = (IProfile) parameters.get(ActionConstants.PARM_PROFILE);
++		IArtifactKey[] artifacts = iu.getArtifacts();
++		if (artifacts == null)
++			return null;
++		for (int i = 0; i < artifacts.length; i++) {
++			File bundleFile = Util.getArtifactFile(artifacts[i], profile);
++			if (!bundleFiles.contains(bundleFile))
++				bundleFiles.add(bundleFile);
++		}
++		return null;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction#undo(java.util.Map)
++	 */
++	public IStatus undo(Map parameters) {
++		return Status.OK_STATUS;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.ui/META-INF/MANIFEST.MF
+index ee4b265..569c82d 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.ui/META-INF/MANIFEST.MF
+@@ -57,7 +57,8 @@ Export-Package: org.eclipse.equinox.internal.p2.ui;x-internal:=true,
+  org.eclipse.equinox.internal.provisional.p2.ui.viewers;x-friends:="org.eclipse.equinox.p2.ui.admin,org.eclipse.equinox.p2.ui.admin.rcp,org.eclipse.equinox.p2.ui.sdk"
+ Require-Bundle: org.eclipse.ui,
+  org.eclipse.core.runtime,
+- org.eclipse.equinox.simpleconfigurator
++ org.eclipse.equinox.simpleconfigurator,
++ org.eclipse.equinox.security.ui;bundle-version="[1.0.0,2.0.0)"
+ Eclipse-LazyStart: true
+ Bundle-RequiredExecutionEnvironment: J2SE-1.4,
+  CDC-1.1/Foundation-1.1
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+index 59756cc..2808d19 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+@@ -154,6 +154,8 @@ public class ProvUIMessages extends NLS {
+ 	public static String RevertDialog_Title;
+ 	public static String RevertProfileWizardPage_ErrorRetrievingHistory;
+ 
++	public static String TrustCertificateDialog_Details;
++	public static String TrustCertificateDialog_Title;
+ 	// Operations
+ 	public static String URLValidator_UnrecognizedURL;
+ 	public static String UpdateManagerCompatibility_ExportSitesTitle;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index 65fb7af..489bf2c 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -152,3 +152,5 @@ RevertDialog_RevertOperationLabel=Revert configuration
+ RevertDialog_Title=Revert Software Configuration
+ 
+ RevertProfileWizardPage_ErrorRetrievingHistory=Unexpected error while getting the history list.
++TrustCertificateDialog_Details=Details
++TrustCertificateDialog_Title=Do you trust these certificates?
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/CertificateLabelProvider.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/CertificateLabelProvider.java
+new file mode 100644
+index 0000000..94c5c0d
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/CertificateLabelProvider.java
+@@ -0,0 +1,56 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.provisional.p2.ui;
++
++import java.security.cert.Certificate;
++import java.security.cert.X509Certificate;
++import org.eclipse.equinox.internal.provisional.security.ui.X500PrincipalHelper;
++import org.eclipse.jface.viewers.*;
++import org.eclipse.swt.graphics.Image;
++
++/**
++ * A label provider that displays X509 certificates.
++ */
++public class CertificateLabelProvider implements ILabelProvider {
++
++	public Image getImage(Object element) {
++		return null;
++	}
++
++	public String getText(Object element) {
++		Certificate cert = null;
++		if (element instanceof TreeNode) {
++			cert = (Certificate) ((TreeNode) element).getValue();
++		}
++		if (cert != null) {
++			X500PrincipalHelper principalHelper = new X500PrincipalHelper(((X509Certificate) cert).getSubjectX500Principal());
++			return principalHelper.getCN() + "; " + principalHelper.getOU() + "; " + principalHelper.getO(); //$NON-NLS-1$ //$NON-NLS-2$
++		}
++		return ""; //$NON-NLS-1$
++	}
++
++	public void addListener(ILabelProviderListener listener) {
++		// do nothing
++	}
++
++	public void dispose() {
++		// do nothing
++	}
++
++	public boolean isLabelProperty(Object element, String property) {
++		return false;
++	}
++
++	public void removeListener(ILabelProviderListener listener) {
++		// do nothing
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+index 8444a83..2ed26ed 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+@@ -10,14 +10,20 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.provisional.p2.ui;
+ 
++import java.security.cert.Certificate;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
++import org.eclipse.equinox.internal.provisional.p2.ui.dialogs.TrustCertificateDialog;
+ import org.eclipse.equinox.internal.provisional.p2.ui.dialogs.UserValidationDialog;
++import org.eclipse.jface.viewers.*;
+ import org.eclipse.jface.window.Window;
+ import org.eclipse.osgi.util.NLS;
+ import org.eclipse.swt.widgets.Shell;
+ import org.eclipse.ui.PlatformUI;
+ 
++/**
++ * The default GUI-based implementation of {@link IServiceUI}.
++ */
+ public class ValidationDialogServiceUI implements IServiceUI {
+ 
+ 	/*
+@@ -43,4 +49,44 @@ public class ValidationDialogServiceUI implements IServiceUI {
+ 		});
+ 		return result[0];
+ 	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.provisional.p2.core.IServiceUI#showCertificates(java.lang.Object)
++	 */
++	public Certificate[] showCertificates(final Certificate[][] certificates) {
++		final Object[] result = new Object[1];
++		final TreeNode[] input = createTreeNodes(certificates);
++		PlatformUI.getWorkbench().getDisplay().syncExec(new Runnable() {
++			public void run() {
++				Shell shell = PlatformUI.getWorkbench().getActiveWorkbenchWindow().getShell();
++				ILabelProvider labelProvider = new CertificateLabelProvider();
++				TreeNodeContentProvider contentProvider = new TreeNodeContentProvider();
++				TrustCertificateDialog trustCertificateDialog = new TrustCertificateDialog(shell, input, labelProvider, contentProvider);
++				trustCertificateDialog.open();
++				Certificate[] values = new Certificate[trustCertificateDialog.getResult() == null ? 0 : trustCertificateDialog.getResult().length];
++				for (int i = 0; i < values.length; i++) {
++					values[i] = (Certificate) ((TreeNode) trustCertificateDialog.getResult()[i]).getValue();
++				}
++				result[0] = values;
++			}
++		});
++		return (Certificate[]) result[0];
++	}
++
++	private TreeNode[] createTreeNodes(Certificate[][] certificates) {
++		TreeNode[] children = new TreeNode[certificates.length];
++		for (int i = 0; i < certificates.length; i++) {
++			TreeNode head = new TreeNode(certificates[i][0]);
++			TreeNode parent = head;
++			children[i] = head;
++			for (int j = 0; j < certificates[i].length; j++) {
++				TreeNode node = new TreeNode(certificates[i][j]);
++				node.setParent(parent);
++				parent.setChildren(new TreeNode[] {node});
++				parent = node;
++			}
++		}
++		return children;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/TrustCertificateDialog.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/TrustCertificateDialog.java
+new file mode 100644
+index 0000000..fdc59f7
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/TrustCertificateDialog.java
+@@ -0,0 +1,121 @@
++package org.eclipse.equinox.internal.provisional.p2.ui.dialogs;
++
++import java.security.cert.X509Certificate;
++import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
++import org.eclipse.equinox.internal.provisional.p2.ui.CertificateLabelProvider;
++import org.eclipse.equinox.internal.provisional.security.ui.X509CertificateViewDialog;
++import org.eclipse.jface.viewers.*;
++import org.eclipse.swt.SWT;
++import org.eclipse.swt.events.SelectionEvent;
++import org.eclipse.swt.events.SelectionListener;
++import org.eclipse.swt.layout.GridData;
++import org.eclipse.swt.layout.GridLayout;
++import org.eclipse.swt.widgets.*;
++import org.eclipse.ui.dialogs.ListSelectionDialog;
++
++/**
++ * A dialog that displays a certificate chain and asks the user if they
++ * trust the certificate providers.
++ */
++public class TrustCertificateDialog extends ListSelectionDialog {
++
++	private TreeViewer certificateChainViewer;
++	private Button detailsButton;
++	protected TreeNode parentElement;
++	protected Object selectedCertificate;
++
++	public TrustCertificateDialog(Shell parentShell, Object input, ILabelProvider labelProvider, ITreeContentProvider contentProvider) {
++		super(parentShell, input, contentProvider, labelProvider, ProvUIMessages.TrustCertificateDialog_Title);
++		setShellStyle(SWT.DIALOG_TRIM | SWT.MODELESS | SWT.RESIZE | getDefaultOrientation());
++	}
++
++	private void createButtons(Composite composite) {
++		// Details button to view certificate chain
++		detailsButton = new Button(composite, SWT.NONE);
++		detailsButton.setText(ProvUIMessages.TrustCertificateDialog_Details);
++		detailsButton.addSelectionListener(new SelectionListener() {
++			public void widgetDefaultSelected(SelectionEvent e) {
++				if (selectedCertificate != null) {
++					X509Certificate cert = (X509Certificate) ((TreeNode) selectedCertificate).getValue();
++					X509CertificateViewDialog certificateDialog = new X509CertificateViewDialog(getShell(), cert);
++					certificateDialog.open();
++				}
++			}
++
++			public void widgetSelected(SelectionEvent e) {
++				widgetDefaultSelected(e);
++			}
++		});
++	}
++
++	protected Control createDialogArea(Composite parent) {
++		Composite composite = (Composite) super.createDialogArea(parent);
++		certificateChainViewer = new TreeViewer(composite, SWT.BORDER);
++		GridLayout layout = new GridLayout();
++		certificateChainViewer.getTree().setLayout(layout);
++		GridData data = new GridData(GridData.FILL_BOTH);
++		data.grabExcessHorizontalSpace = true;
++		certificateChainViewer.getTree().setLayoutData(data);
++		certificateChainViewer.setAutoExpandLevel(AbstractTreeViewer.ALL_LEVELS);
++		certificateChainViewer.setContentProvider(new TreeNodeContentProvider());
++		certificateChainViewer.setLabelProvider(new CertificateLabelProvider());
++		certificateChainViewer.addSelectionChangedListener(getChainSelectionListener());
++		Object input = getViewer().getInput();
++		if (input instanceof Object[]) {
++			ISelection selection = null;
++			Object[] nodes = (Object[]) input;
++			if (nodes.length > 0) {
++				selection = new StructuredSelection(nodes[0]);
++				certificateChainViewer.setInput(new TreeNode[] {(TreeNode) nodes[0]});
++				selectedCertificate = nodes[0];
++			}
++			getViewer().setSelection(selection);
++		}
++		getViewer().addDoubleClickListener(getDoubleClickListener());
++		getViewer().addSelectionChangedListener(getParentSelectionListener());
++		createButtons(composite);
++		return composite;
++	}
++
++	private ISelectionChangedListener getChainSelectionListener() {
++		return new ISelectionChangedListener() {
++			public void selectionChanged(SelectionChangedEvent event) {
++				ISelection selection = event.getSelection();
++				if (selection instanceof StructuredSelection) {
++					selectedCertificate = ((StructuredSelection) selection).getFirstElement();
++				}
++			}
++		};
++	}
++
++	public TreeViewer getCertificateChainViewer() {
++		return certificateChainViewer;
++	}
++
++	private IDoubleClickListener getDoubleClickListener() {
++		return new IDoubleClickListener() {
++			public void doubleClick(DoubleClickEvent event) {
++				StructuredSelection selection = (StructuredSelection) event.getSelection();
++				Object selectedElement = selection.getFirstElement();
++				if (selectedElement instanceof TreeNode) {
++					TreeNode treeNode = (TreeNode) selectedElement;
++					// create and open dialog for certificate chain
++					X509CertificateViewDialog certificateViewDialog = new X509CertificateViewDialog(getShell(), (X509Certificate) treeNode.getValue());
++					certificateViewDialog.open();
++				}
++			}
++		};
++	}
++
++	private ISelectionChangedListener getParentSelectionListener() {
++		return new ISelectionChangedListener() {
++			public void selectionChanged(SelectionChangedEvent event) {
++				ISelection selection = event.getSelection();
++				if (selection instanceof StructuredSelection) {
++					getCertificateChainViewer().setInput(new TreeNode[] {(TreeNode) ((StructuredSelection) selection).getFirstElement()});
++					getCertificateChainViewer().refresh();
++				}
++			}
++		};
++	}
++}

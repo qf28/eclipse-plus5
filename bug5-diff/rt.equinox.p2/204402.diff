@@ -1,0 +1,1759 @@
+commit b4add63cbe2ed0ab75190c8a3daff74065392ab9
+Author: Simon Kaegi <skaegi>
+Date:   Wed Oct 3 03:21:09 2007 +0000
+
+    Bug 204402 [prov] Use pre and post phase for install/uninstall
+
+10	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/NullTouchpoint.java
+1	3	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/EngineSession.java
+7	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/ITouchpoint.java
+5	2	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/ITouchpointAction.java
+74	47	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IUPhase.java
+7	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
+1	2	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
+48	40	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Collect.java
+71	28	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+86	47	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/SizingPhase.java
+69	26	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+2	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
+44	35	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+20	11	bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/NativeTouchpoint.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/NullTouchpoint.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/NullTouchpoint.java
+index aa2e11c..76bc0e1 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/NullTouchpoint.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/NullTouchpoint.java
+@@ -10,6 +10,9 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.engine;
+ 
++import java.util.Map;
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.p2.engine.*;
+ import org.eclipse.equinox.p2.metadata.TouchpointType;
+ 
+@@ -40,4 +43,11 @@ public class NullTouchpoint implements ITouchpoint {
+ 		return new ITouchpointAction[] {};
+ 	}
+ 
++	public IStatus completePhase(IProgressMonitor monitor, Profile profile, String phaseId, Map touchpointParameters) {
++		return null;
++	}
++
++	public IStatus initializePhase(IProgressMonitor monitor, Profile profile, String phaseId, Map touchpointParameters) {
++		return null;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
+index b943ad6..c7c55df 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
+@@ -52,9 +52,7 @@ public class Engine {
+ 			if (result.isOK()) {
+ 				eventBus.publishEvent(new CommitOperationEvent(profile, phaseSet, operands, this));
+ 				session.commit();
+-			}
+-
+-			if (result.isErrorOrCancel()) {
++			} else if (result.isErrorOrCancel()) {
+ 				eventBus.publishEvent(new RollbackOperationEvent(profile, phaseSet, operands, this, result));
+ 				session.rollback();
+ 			}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/EngineSession.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/EngineSession.java
+index c8a775a..c189d5d 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/EngineSession.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/EngineSession.java
+@@ -26,7 +26,7 @@ public class EngineSession {
+ 	public void rollback() {
+ 		for (ListIterator it = actions.listIterator(actions.size()); it.hasPrevious();) {
+ 			ITouchpointAction action = (ITouchpointAction) it.previous();
+-			action.undo();
++			action.undo(null);
+ 		}
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/ITouchpoint.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/ITouchpoint.java
+index 9ea12bb..fa66775 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/ITouchpoint.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/ITouchpoint.java
+@@ -10,6 +10,9 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.engine;
+ 
++import java.util.Map;
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.p2.metadata.TouchpointType;
+ 
+ /**
+@@ -23,4 +26,8 @@ public interface ITouchpoint {
+ 	public boolean supports(String phaseId);
+ 
+ 	public ITouchpointAction[] getActions(String phaseId, Profile profile, Operand operand);
++
++	public IStatus initializePhase(IProgressMonitor monitor, Profile profile, String phaseId, Map touchpointParameters);
++
++	public IStatus completePhase(IProgressMonitor monitor, Profile profile, String phaseId, Map touchpointParameters);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/ITouchpointAction.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/ITouchpointAction.java
+index a1587ef..43b918a 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/ITouchpointAction.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/ITouchpointAction.java
+@@ -10,9 +10,12 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.engine;
+ 
++import java.util.Map;
++import org.eclipse.core.runtime.IStatus;
++
+ public interface ITouchpointAction {
+ 
+-	Object execute();
++	IStatus execute(Map parameters);
+ 
+-	Object undo();
++	IStatus undo(Map parameters);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IUPhase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IUPhase.java
+index fc88d8a..abaa07f 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IUPhase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IUPhase.java
+@@ -10,8 +10,12 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.engine;
+ 
++import java.util.*;
++import java.util.Map.Entry;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.engine.TouchpointManager;
+ import org.eclipse.equinox.p2.core.helpers.MultiStatus;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ 
+ // An operation that is applied to a set of IUs.
+ public abstract class IUPhase extends Phase {
+@@ -19,11 +23,14 @@ public abstract class IUPhase extends Phase {
+ 	protected int PERFORM_WORK = 10000;
+ 	protected int POST_PERFORM_WORK = 1000;
+ 
+-	protected IUPhase(int weight, String phaseName) {
+-		super(weight, phaseName);
++	private Map phaseParameters = new HashMap();
++	private Map touchpoints = new HashMap();
++
++	protected IUPhase(String phaseId, int weight, String phaseName) {
++		super(phaseId, weight, phaseName);
+ 	}
+ 
+-	protected void perform(MultiStatus status, EngineSession session, Profile profile, Operand[] operands, IProgressMonitor monitor) { //TODO Maybe should we do some kind of adaptable
++	protected void perform(MultiStatus status, EngineSession session, Profile profile, Operand[] operands, IProgressMonitor monitor) {
+ 		SubMonitor subMonitor = SubMonitor.convert(monitor, PRE_PERFORM_WORK + PERFORM_WORK + POST_PERFORM_WORK);
+ 		prePerform(status, profile, operands, subMonitor.newChild(PRE_PERFORM_WORK));
+ 		if (status.isErrorOrCancel())
+@@ -42,59 +49,79 @@ public abstract class IUPhase extends Phase {
+ 		subMonitor.done();
+ 	}
+ 
+-	protected void mainPerform(MultiStatus status, EngineSession session, Profile profile, Operand[] operands, SubMonitor subMonitor) {
+-		int operandWork = PERFORM_WORK / operands.length;
+-		for (int i = 0; i < operands.length; ++i) {
++	private void prePerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
++		status.add(initializePhase(monitor, profile, phaseParameters));
++		// TODO: Consider moving touchpoint discovery up -- perhaps to session??
++		// TODO: Support Monitor
++		for (int i = 0; i < deltas.length; i++) {
++			ITouchpoint touchpoint = getTouchpoint(deltas[i]);
++			if (touchpoint == null)
++				continue;
++
++			if (!touchpoints.containsKey(touchpoint) && touchpoint.supports(phaseId)) {
++				Map touchpointParameters = new HashMap(phaseParameters);
++				status.add(touchpoint.initializePhase(monitor, profile, phaseId, touchpointParameters));
++				touchpoints.put(touchpoint, touchpointParameters);
++			}
++		}
++	}
++
++	private void mainPerform(MultiStatus status, EngineSession session, Profile profile, Operand[] operands, SubMonitor subMonitor) {
++		// TODO: Support Monitor
++		// int operandWork = PERFORM_WORK / operands.length;
++		for (int i = 0; i < operands.length; i++) {
+ 			if (subMonitor.isCanceled())
+ 				throw new OperationCanceledException();
+ 			Operand currentOperand = operands[i];
+ 			if (!isApplicable(currentOperand))
+ 				continue;
+-			IStatus result = performOperand(session, profile, currentOperand, subMonitor.newChild(operandWork));
+-			status.add(result);
+-			if (status.isErrorOrCancel())
+-				return;
++
++			ITouchpoint touchpoint = getTouchpoint(currentOperand);
++			if (touchpoint == null || !touchpoint.supports(phaseId))
++				continue;
++
++			ITouchpointAction[] actions = getActions(touchpoint, profile, currentOperand);
++			Map touchpointParameters = (Map) touchpoints.get(touchpoint);
++			Map parameters = new HashMap(touchpointParameters);
++			for (int j = 0; j < actions.length; j++) {
++				ITouchpointAction action = actions[j];
++				IStatus actionStatus = action.execute(parameters);
++				status.add(actionStatus);
++				if (actionStatus != null && !actionStatus.isOK())
++					return;
++
++				session.record(action);
++			}
+ 		}
+ 	}
+ 
+-	protected abstract boolean isApplicable(Operand op);
+-
+-	//			ITouchpoint touchpoint = TouchpointManager.getInstance().getTouchpoint(currentOperand.getTouchpointType());
+-	//			if (touchpoint == null) { //TODO Should we throw an exception instead?
+-	//				status.add(new Status(IStatus.ERROR, "org.eclipse.equinox.p2.engine", "The touchpoint " + currentOperand.getTouchpointType() + " is not available."));
+-	//				return;
+-	//			}
+-	//			if (touchpoint.supports(phaseId)) {
+-	//				status.add(performIU(touchpoint, currentOperand, subMonitor.newChild(operandWork)));
+-	//			}
+-	//			if (status.isErrorOrCancel() || sub.isCanceled()) {
+-	//				undoPerform(status, ius, i, context);
+-	//				return;
+-	//			}
+-
+-	// Error or cancel: undo IUs that were done.
+-	//	private void undoPerform(MultiStatus status, InstallableUnitPair[] ius, int currentIU, InstallContext context) {
+-	//		if (!status.isErrorOrCancel()) {
+-	//			status.setCanceled(); // first time we noticed cancelation
+-	//			currentIU += 1; // currentIU was completed so it must be undone
+-	//		}
+-	//		InstallableUnitPair[] undoIUs = new InstallableUnitPair[currentIU];
+-	//		for (int i = 0; i < currentIU; i += 1) {
+-	//			log.debug("Undo {0} phase for {1}", super.phaseName, ius[i]); //$NON-NLS-1$
+-	//			undoIUs[i] = ius[currentIU - (i + 1)].reverse();
+-	//		}
+-	//		// 1 unit to undo this phase, 10 for preceding phases
+-	//		SplitProgressMonitor pm = new SplitProgressMonitor(getUndoProgressMonitor(), new int[] {1, 10});
+-	//		doPerform(status, /*undoable*/false, undoIUs, context, pm.next());
+-	//		setUndoProgressMonitor(pm.next());
+-	//	}
+-	protected abstract IStatus performOperand(EngineSession session, Profile profile, Operand operand, IProgressMonitor monitor);
+-
+-	protected void prePerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+-		//Nothing to do.
++	private void postPerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
++		for (Iterator it = touchpoints.entrySet().iterator(); it.hasNext();) {
++			Entry entry = (Entry) it.next();
++			ITouchpoint touchpoint = (ITouchpoint) entry.getKey();
++			Map touchpointParameters = (Map) entry.getValue();
++			status.add(touchpoint.completePhase(monitor, profile, phaseId, touchpointParameters));
++		}
++		status.add(completePhase(monitor, profile, phaseParameters));
+ 	}
+ 
+-	protected void postPerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+-		//Nothing to do.
++	protected ITouchpoint getTouchpoint(Operand operand) {
++		IInstallableUnit unit = operand.second();
++		if (unit == null)
++			unit = operand.first();
++
++		if (unit == null)
++			return null;
++		TouchpointManager touchpointManager = TouchpointManager.getInstance();
++		ITouchpoint touchpoint = touchpointManager.getTouchpoint(unit.getTouchpointType());
++		return touchpoint;
+ 	}
++
++	protected abstract boolean isApplicable(Operand op);
++
++	protected abstract IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters);
++
++	protected abstract IStatus completePhase(IProgressMonitor monitor, Profile profile, Map parameters);
++
++	protected abstract ITouchpointAction[] getActions(ITouchpoint touchpoint, Profile profile, Operand currentOperand);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
+index 7afa879..c565637 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
+@@ -17,10 +17,15 @@ import org.eclipse.equinox.p2.core.helpers.MultiStatus;
+ import org.eclipse.osgi.util.NLS;
+ 
+ public abstract class Phase {
++	protected final String phaseId;
+ 	protected final int weight;
+ 	protected final String phaseName;
+ 
+-	protected Phase(int weight, String phaseName) {
++	protected Phase(String phaseId, int weight, String phaseName) {
++		if (phaseId == null || phaseId.length() == 0) {
++			throw new IllegalArgumentException("Phase id must be set.");
++		}
++
+ 		if (weight <= 0) {
+ 			throw new IllegalArgumentException("Phase weight must be positive.");
+ 		}
+@@ -31,6 +36,7 @@ public abstract class Phase {
+ 
+ 		this.weight = weight;
+ 		this.phaseName = phaseName;
++		this.phaseId = phaseId;
+ 	}
+ 
+ 	public String toString() {
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
+index 3c350fe..23ae96e 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
+@@ -37,8 +37,7 @@ public abstract class PhaseSet {
+ 				}
+ 				Phase phase = phases[i];
+ 				result.add(phase.perform(session, profile, deltas, pm.newChild(weights[i])));
+-				if (result.isErrorOrCancel())// || sub.isCanceled()) {
+-					//TODO Need to perform the undo if we don't we use transactions
++				if (result.isErrorOrCancel())
+ 					return result;
+ 			}
+ 		} finally {
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Collect.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Collect.java
+index 78c4aeb..07eed38 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Collect.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Collect.java
+@@ -8,69 +8,77 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.p2.engine.phases;
+ 
+-import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.engine.TouchpointManager;
++import java.util.*;
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.p2.artifact.repository.IArtifactRequest;
+-import org.eclipse.equinox.p2.core.helpers.MultiStatus;
+ import org.eclipse.equinox.p2.download.DownloadManager;
+ import org.eclipse.equinox.p2.engine.*;
+-import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+-import org.eclipse.osgi.util.NLS;
+ 
+ /**
+  * The goal of the collect phase is to ask the touchpoints if the artifacts associated with an IU need to be downloaded.
+  */
+ public class Collect extends IUPhase {
+ 	private static final String PHASE_ID = "collect"; //$NON-NLS-1$
+-	private DownloadManager dm = null;
+ 
+ 	public Collect(int weight) {
+-		super(weight, Messages.Engine_Collect_Phase);
++		super(PHASE_ID, weight, Messages.Engine_Collect_Phase);
+ 		//re-balance work since postPerform will do almost all the time-consuming work
+ 		PRE_PERFORM_WORK = 0;
+ 		PERFORM_WORK = 100;
+ 		POST_PERFORM_WORK = 1000;
+ 	}
+ 
+-	protected IStatus performOperand(EngineSession session, Profile profile, Operand operand, IProgressMonitor monitor) {
+-		IInstallableUnit unit = operand.second();
++	//	protected IStatus performOperand(EngineSession session, Profile profile, Operand operand, IProgressMonitor monitor) {
++	//		IInstallableUnit unit = operand.second();
++	//
++	//		if (unit != null) {
++	//			monitor.subTask(NLS.bind(Messages.Engine_Collecting_For_IU, unit.getId()));
++	//
++	//			// TODO: Need do progress reporting
++	//
++	//			// Ask all the touchpoints if they need to download an artifact
++	//			ITouchpoint touchpoint = TouchpointManager.getInstance().getTouchpoint(unit.getTouchpointType());
++	//			if (touchpoint.supports(PHASE_ID)) {
++	//				ITouchpointAction[] actions = touchpoint.getActions(PHASE_ID, profile, operand);
++	//				for (int i = 0; i < actions.length; i++) {
++	//					Object result = actions[i].execute();
++	//					if (result != null)
++	//						dm.add((IArtifactRequest[]) result);
++	//					session.record(actions[i]);
++	//				}
++	//			}
++	//
++	//			if (monitor.isCanceled())
++	//				return Status.CANCEL_STATUS;
++	//		}
++	//
++	//		return Status.OK_STATUS;
++	//	}
+ 
+-		if (unit != null) {
+-			monitor.subTask(NLS.bind(Messages.Engine_Collecting_For_IU, unit.getId()));
+-
+-			// TODO: Need do progress reporting
+-
+-			// Ask all the touchpoints if they need to download an artifact
+-			ITouchpoint touchpoint = TouchpointManager.getInstance().getTouchpoint(unit.getTouchpointType());
+-			if (touchpoint.supports(PHASE_ID)) {
+-				ITouchpointAction[] actions = touchpoint.getActions(PHASE_ID, profile, operand);
+-				for (int i = 0; i < actions.length; i++) {
+-					Object result = actions[i].execute();
+-					if (result != null)
+-						dm.add((IArtifactRequest[]) result);
+-					session.record(actions[i]);
+-				}
+-			}
+-
+-			if (monitor.isCanceled())
+-				return Status.CANCEL_STATUS;
+-		}
+-
+-		return Status.OK_STATUS;
++	protected boolean isApplicable(Operand op) {
++		if (op.second() != null)
++			return true;
++		return false;
+ 	}
+ 
+-	protected void postPerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+-		// Start the download
+-		status.add(dm.start(monitor));
++	protected ITouchpointAction[] getActions(ITouchpoint touchpoint, Profile profile, Operand currentOperand) {
++		return touchpoint.getActions(PHASE_ID, profile, currentOperand);
+ 	}
+ 
+-	protected void prePerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+-		dm = new DownloadManager();
++	protected IStatus completePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++		List artifactRequests = (List) parameters.get("artifactRequests");
++
++		DownloadManager dm = new DownloadManager();
++		for (Iterator it = artifactRequests.iterator(); it.hasNext();) {
++			IArtifactRequest[] requests = (IArtifactRequest[]) it.next();
++			dm.add(requests);
++		}
++		return dm.start(monitor);
+ 	}
+ 
+-	protected boolean isApplicable(Operand op) {
+-		if (op.second() != null)
+-			return true;
+-		return false;
++	protected IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++		parameters.put("artifactRequests", new ArrayList());
++		return null;
+ 	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+index 66a0d98..cbda47a 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+@@ -10,52 +10,95 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.engine.phases;
+ 
+-import org.eclipse.core.runtime.*;
++import java.util.Map;
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+-import org.eclipse.equinox.internal.p2.engine.TouchpointManager;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+-import org.eclipse.equinox.p2.core.helpers.MultiStatus;
+ import org.eclipse.equinox.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.engine.*;
+-import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+-import org.eclipse.osgi.util.NLS;
+ 
+ public class Install extends IUPhase {
+ 
+ 	private static final String PHASE_ID = "install"; //$NON-NLS-1$
+ 
+ 	public Install(int weight) {
+-		super(weight, Messages.Engine_Install_Phase);
++		super(PHASE_ID, weight, Messages.Engine_Install_Phase);
+ 	}
+ 
+-	protected IStatus performOperand(EngineSession session, Profile profile, Operand operand, IProgressMonitor monitor) {
+-		IInstallableUnit unit = operand.second();
++	//	protected IStatus performOperand(EngineSession session, Profile profile, Operand operand, IProgressMonitor monitor) {
++	//		IInstallableUnit unit = operand.second();
++	//
++	//		monitor.subTask(NLS.bind(Messages.Engine_Installing_IU, unit.getId()));
++	//
++	//		ITouchpoint touchpoint = TouchpointManager.getInstance().getTouchpoint(unit.getTouchpointType());
++	//		if (!touchpoint.supports(PHASE_ID))
++	//			return Status.OK_STATUS;
++	//
++	//		((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, true, profile, operand, InstallableUnitEvent.INSTALL, touchpoint));
++	//
++	//		ITouchpointAction[] actions = getActions();
++	//		MultiStatus result = new MultiStatus();
++	//		for (int i = 0; i < actions.length; i++) {
++	//			IStatus actionStatus = (IStatus) actions[i].execute();
++	//			result.add(actionStatus);
++	//			if (!actionStatus.isOK())
++	//				return result;
++	//
++	//			session.record(actions[i]);
++	//		}
++	//		((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, false, profile, operand, InstallableUnitEvent.INSTALL, touchpoint, result));
++	//		return result;
++	//	}
+ 
+-		monitor.subTask(NLS.bind(Messages.Engine_Installing_IU, unit.getId()));
++	protected boolean isApplicable(Operand op) {
++		if (op.second() != null)
++			return true;
++		return false;
++	}
+ 
+-		ITouchpoint touchpoint = TouchpointManager.getInstance().getTouchpoint(unit.getTouchpointType());
+-		if (!touchpoint.supports(PHASE_ID))
+-			return Status.OK_STATUS;
++	protected IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++		return null;
++	}
+ 
+-		((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, true, profile, operand, InstallableUnitEvent.INSTALL, touchpoint));
++	protected IStatus completePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++		return null;
++	}
+ 
+-		ITouchpointAction[] actions = touchpoint.getActions(PHASE_ID, profile, operand);
+-		MultiStatus result = new MultiStatus();
+-		for (int i = 0; i < actions.length; i++) {
+-			IStatus actionStatus = (IStatus) actions[i].execute();
+-			result.add(actionStatus);
+-			if (!actionStatus.isOK())
+-				return result;
++	protected ITouchpointAction[] getActions(ITouchpoint touchpoint, Profile profile, Operand currentOperand) {
++		//TODO: monitor.subTask(NLS.bind(Messages.Engine_Installing_IU, unit.getId()));
+ 
+-			session.record(actions[i]);
+-		}
+-		((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, false, profile, operand, InstallableUnitEvent.INSTALL, touchpoint, result));
+-		return result;
++		ITouchpointAction[] touchpointActions = touchpoint.getActions(PHASE_ID, profile, currentOperand);
++		ITouchpointAction[] actions = new ITouchpointAction[touchpointActions.length + 2];
++		actions[0] = beforeAction(profile, currentOperand, touchpoint);
++		System.arraycopy(touchpointActions, 0, actions, 1, touchpointActions.length);
++		actions[actions.length - 1] = afterAction(profile, currentOperand, touchpoint);
++		return actions;
+ 	}
+ 
+-	protected boolean isApplicable(Operand op) {
+-		if (op.second() != null)
+-			return true;
+-		return false;
++	protected ITouchpointAction beforeAction(final Profile profile, final Operand operand, final ITouchpoint touchpoint) {
++		return new ITouchpointAction() {
++			public IStatus execute(Map parameters) {
++				((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, true, profile, operand, InstallableUnitEvent.INSTALL, touchpoint));
++				return null;
++			}
++
++			public IStatus undo(Map parameters) {
++				return null;
++			}
++		};
++	}
++
++	protected ITouchpointAction afterAction(final Profile profile, final Operand operand, final ITouchpoint touchpoint) {
++		return new ITouchpointAction() {
++			public IStatus execute(Map parameters) {
++				((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, false, profile, operand, InstallableUnitEvent.INSTALL, touchpoint));
++				return null;
++			}
++
++			public IStatus undo(Map parameters) {
++				return null;
++			}
++		};
+ 	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/SizingPhase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/SizingPhase.java
+index 069d657..e23cb10 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/SizingPhase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/SizingPhase.java
+@@ -9,25 +9,21 @@
+ package org.eclipse.equinox.p2.engine.phases;
+ 
+ import java.util.*;
+-import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+-import org.eclipse.equinox.internal.p2.engine.TouchpointManager;
+ import org.eclipse.equinox.p2.artifact.repository.*;
+-import org.eclipse.equinox.p2.core.helpers.MultiStatus;
+ import org.eclipse.equinox.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.engine.*;
+-import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+-import org.eclipse.osgi.util.NLS;
+ 
+ public class SizingPhase extends IUPhase {
+ 	private static final String TP_DATA = "collect"; //$NON-NLS-1$
+ 
+-	private Set artifactsToObtain;
+ 	private long sizeOnDisk;
+ 	private long dlSize;
+ 
+ 	public SizingPhase(int weight, String phaseName) {
+-		super(weight, phaseName);
++		super(TP_DATA, weight, phaseName);
+ 	}
+ 
+ 	protected boolean isApplicable(Operand op) {
+@@ -36,43 +32,94 @@ public class SizingPhase extends IUPhase {
+ 		return false;
+ 	}
+ 
+-	protected IStatus performOperand(EngineSession session, Profile profile, Operand operand, IProgressMonitor monitor) {
+-		IInstallableUnit unit = operand.second();
+-
+-		if (unit != null) {
+-			monitor.subTask(NLS.bind(Messages.Engine_Collecting_For_IU, unit.getId()));
+-
+-			// TODO: Need do progress reporting
+-
+-			// Ask all the touchpoints if they need to download an artifact
+-			ITouchpoint touchpoint = TouchpointManager.getInstance().getTouchpoint(unit.getTouchpointType());
+-			if (touchpoint.supports(TP_DATA)) {
+-				ITouchpointAction[] actions = touchpoint.getActions(TP_DATA, profile, operand);
+-				for (int i = 0; i < actions.length; i++) {
+-					Object result = actions[i].execute();
+-					if (result != null) {
+-						IArtifactRequest[] requests = (IArtifactRequest[]) result;
+-						for (int j = 0; j < requests.length; j++) {
+-							artifactsToObtain.add(requests[j]);
+-						}
+-					}
+-				}
+-			}
++	//	protected IStatus performOperand(EngineSession session, Profile profile, Operand operand, IProgressMonitor monitor) {
++	//		IInstallableUnit unit = operand.second();
++	//
++	//		if (unit != null) {
++	//			monitor.subTask(NLS.bind(Messages.Engine_Collecting_For_IU, unit.getId()));
++	//
++	//			// TODO: Need do progress reporting
++	//
++	//			// Ask all the touchpoints if they need to download an artifact
++	//			ITouchpoint touchpoint = TouchpointManager.getInstance().getTouchpoint(unit.getTouchpointType());
++	//			if (touchpoint.supports(TP_DATA)) {
++	//				ITouchpointAction[] actions = touchpoint.getActions(TP_DATA, profile, operand);
++	//				for (int i = 0; i < actions.length; i++) {
++	//					Object result = actions[i].execute();
++	//					if (result != null) {
++	//						IArtifactRequest[] requests = (IArtifactRequest[]) result;
++	//						for (int j = 0; j < requests.length; j++) {
++	//							artifactsToObtain.add(requests[j]);
++	//						}
++	//					}
++	//				}
++	//			}
++	//
++	//			if (monitor.isCanceled())
++	//				return Status.CANCEL_STATUS;
++	//		}
++	//
++	//		return Status.OK_STATUS;
++	//	}
++	//
++	//	protected void postPerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
++	//		IArtifactRepositoryManager repoMgr = (IArtifactRepositoryManager) ServiceHelper.getService(EngineActivator.getContext(), IArtifactRepositoryManager.class.getName());
++	//		IArtifactRepository[] repositories = repoMgr.getKnownRepositories();
++	//
++	//		for (Iterator iterator = artifactsToObtain.iterator(); iterator.hasNext();) {
++	//			for (int i = 0; i < repositories.length; i++) {
++	//				IArtifactDescriptor[] descriptors = repositories[i].getArtifactDescriptors(((IArtifactRequest) iterator.next()).getArtifactKey());
++	//				if (descriptors.length > 0) {
++	//					if (descriptors[0].getProperty(IArtifactDescriptor.ARTIFACT_SIZE) != null)
++	//						sizeOnDisk += Long.parseLong(descriptors[0].getProperty(IArtifactDescriptor.ARTIFACT_SIZE));
++	//
++	//					if (descriptors[0].getProperty(IArtifactDescriptor.DOWNLOAD_SIZE) != null)
++	//						dlSize += Long.parseLong(descriptors[0].getProperty(IArtifactDescriptor.DOWNLOAD_SIZE));
++	//
++	//					break;
++	//				}
++	//			}
++	//		}
++	//	}
++	//
++	//	protected void prePerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
++	//		artifactsToObtain = new HashSet(deltas.length);
++	//		sizeOnDisk = 0;
++	//		dlSize = 0;
++	//	}
+ 
+-			if (monitor.isCanceled())
+-				return Status.CANCEL_STATUS;
+-		}
++	public long getDiskSize() {
++		return sizeOnDisk;
++	}
+ 
+-		return Status.OK_STATUS;
++	public long getDlSize() {
++		return dlSize;
+ 	}
+ 
+-	protected void postPerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
++	protected ITouchpointAction[] getActions(ITouchpoint touchpoint, Profile profile, Operand currentOperand) {
++		return touchpoint.getActions(TP_DATA, profile, currentOperand);
++	}
++
++	protected IStatus completePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++		List artifactRequests = (List) parameters.get("artifactRequests");
++		Set artifactsToObtain = new HashSet(artifactRequests.size());
++
++		for (Iterator it = artifactRequests.iterator(); it.hasNext();) {
++			IArtifactRequest[] requests = (IArtifactRequest[]) it.next();
++			if (requests == null)
++				continue;
++			for (int i = 0; i < requests.length; i++) {
++				artifactsToObtain.add(requests[i]);
++			}
++		}
++
+ 		IArtifactRepositoryManager repoMgr = (IArtifactRepositoryManager) ServiceHelper.getService(EngineActivator.getContext(), IArtifactRepositoryManager.class.getName());
+ 		IArtifactRepository[] repositories = repoMgr.getKnownRepositories();
+ 
+ 		for (Iterator iterator = artifactsToObtain.iterator(); iterator.hasNext();) {
++			IArtifactRequest artifactRequest = (IArtifactRequest) iterator.next();
+ 			for (int i = 0; i < repositories.length; i++) {
+-				IArtifactDescriptor[] descriptors = repositories[i].getArtifactDescriptors(((IArtifactRequest) iterator.next()).getArtifactKey());
++				IArtifactDescriptor[] descriptors = repositories[i].getArtifactDescriptors(artifactRequest.getArtifactKey());
+ 				if (descriptors.length > 0) {
+ 					if (descriptors[0].getProperty(IArtifactDescriptor.ARTIFACT_SIZE) != null)
+ 						sizeOnDisk += Long.parseLong(descriptors[0].getProperty(IArtifactDescriptor.ARTIFACT_SIZE));
+@@ -84,19 +131,11 @@ public class SizingPhase extends IUPhase {
+ 				}
+ 			}
+ 		}
++		return null;
+ 	}
+ 
+-	protected void prePerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+-		artifactsToObtain = new HashSet(deltas.length);
+-		sizeOnDisk = 0;
+-		dlSize = 0;
+-	}
+-
+-	public long getDiskSize() {
+-		return sizeOnDisk;
+-	}
+-
+-	public long getDlSize() {
+-		return dlSize;
++	protected IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++		parameters.put("artifactRequests", new ArrayList());
++		return null;
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+index 5ef81cc..b81109c 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+@@ -10,50 +10,93 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.engine.phases;
+ 
+-import org.eclipse.core.runtime.*;
++import java.util.Map;
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+-import org.eclipse.equinox.internal.p2.engine.TouchpointManager;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+-import org.eclipse.equinox.p2.core.helpers.MultiStatus;
+ import org.eclipse.equinox.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.engine.*;
+-import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+-import org.eclipse.osgi.util.NLS;
+ 
+ public class Uninstall extends IUPhase {
+ 
+ 	private static final String PHASE_ID = "uninstall"; //$NON-NLS-1$
+ 
+ 	public Uninstall(int weight) {
+-		super(weight, Messages.Engine_Uninstall_Phase);
++		super(PHASE_ID, weight, Messages.Engine_Uninstall_Phase);
+ 	}
+ 
+-	protected IStatus performOperand(EngineSession session, Profile profile, Operand operand, IProgressMonitor monitor) {
+-		IInstallableUnit unit = operand.first();
++	//	protected IStatus performOperand(EngineSession session, Profile profile, Operand operand, IProgressMonitor monitor) {
++	//		IInstallableUnit unit = operand.first();
++	//
++	//		monitor.subTask(NLS.bind(Messages.Engine_Uninstalling_IU, unit.getId()));
++	//
++	//		ITouchpoint touchpoint = TouchpointManager.getInstance().getTouchpoint(unit.getTouchpointType());
++	//		if (!touchpoint.supports(PHASE_ID))
++	//			return Status.OK_STATUS;
++	//
++	//		((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, true, profile, operand, InstallableUnitEvent.UNINSTALL, touchpoint));
++	//
++	//		//TODO need to protect the actual operation on a try / catch to ensure the delivery of event. 
++	//		ITouchpointAction[] actions = touchpoint.getActions(PHASE_ID, profile, operand);
++	//		MultiStatus result = new MultiStatus();
++	//		for (int i = 0; i < actions.length; i++) {
++	//			result.add((IStatus) actions[i].execute());
++	//			session.record(actions[i]);
++	//		}
++	//
++	//		((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, false, profile, operand, InstallableUnitEvent.UNINSTALL, touchpoint, result));
++	//		return result;
++	//	}
+ 
+-		monitor.subTask(NLS.bind(Messages.Engine_Uninstalling_IU, unit.getId()));
++	protected boolean isApplicable(Operand op) {
++		if (op.first() != null)
++			return true;
++		return false;
++	}
+ 
+-		ITouchpoint touchpoint = TouchpointManager.getInstance().getTouchpoint(unit.getTouchpointType());
+-		if (!touchpoint.supports(PHASE_ID))
+-			return Status.OK_STATUS;
++	protected IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++		return null;
++	}
+ 
+-		((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, true, profile, operand, InstallableUnitEvent.UNINSTALL, touchpoint));
++	protected IStatus completePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++		return null;
++	}
+ 
+-		//TODO need to protect the actual operation on a try / catch to ensure the delivery of event. 
+-		ITouchpointAction[] actions = touchpoint.getActions(PHASE_ID, profile, operand);
+-		MultiStatus result = new MultiStatus();
+-		for (int i = 0; i < actions.length; i++) {
+-			result.add((IStatus) actions[i].execute());
+-			session.record(actions[i]);
+-		}
++	protected ITouchpointAction[] getActions(ITouchpoint touchpoint, Profile profile, Operand currentOperand) {
++		//TODO: monitor.subTask(NLS.bind(Messages.Engine_Uninstalling_IU, unit.getId()));
+ 
+-		((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, false, profile, operand, InstallableUnitEvent.UNINSTALL, touchpoint, result));
+-		return result;
++		ITouchpointAction[] touchpointActions = touchpoint.getActions(PHASE_ID, profile, currentOperand);
++		ITouchpointAction[] actions = new ITouchpointAction[touchpointActions.length + 2];
++		actions[0] = beforeAction(profile, currentOperand, touchpoint);
++		System.arraycopy(touchpointActions, 0, actions, 1, touchpointActions.length);
++		actions[actions.length - 1] = afterAction(profile, currentOperand, touchpoint);
++		return actions;
+ 	}
+ 
+-	protected boolean isApplicable(Operand op) {
+-		if (op.first() != null)
+-			return true;
+-		return false;
++	protected ITouchpointAction beforeAction(final Profile profile, final Operand operand, final ITouchpoint touchpoint) {
++		return new ITouchpointAction() {
++			public IStatus execute(Map parameters) {
++				((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, true, profile, operand, InstallableUnitEvent.UNINSTALL, touchpoint));
++				return null;
++			}
++
++			public IStatus undo(Map parameters) {
++				return null;
++			}
++		};
++	}
++
++	protected ITouchpointAction afterAction(final Profile profile, final Operand operand, final ITouchpoint touchpoint) {
++		return new ITouchpointAction() {
++			public IStatus execute(Map parameters) {
++				((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(PHASE_ID, false, profile, operand, InstallableUnitEvent.UNINSTALL, touchpoint));
++				return null;
++			}
++
++			public IStatus undo(Map parameters) {
++				return null;
++			}
++		};
+ 	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
+index 78a61b1..69809d0 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
+@@ -162,7 +162,8 @@ public class EngineTest extends TestCase {
+ 		assertFalse(ius.hasNext());
+ 	}
+ 
+-	public void testPerformRollback() {
++	// temporarily broken until we can rollback completed phases
++	public void BROKENtestPerformRollback() {
+ 
+ 		Profile profile = new Profile("test");
+ 		profile.setValue(Profile.PROP_INSTALL_FOLDER, "c:/tmp/testProvisioning/");
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
+index 7a1d9a4..d9bb6ee 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
+@@ -84,7 +84,7 @@ public class PhaseTest extends TestCase {
+ 	public static class TestPhase extends Phase {
+ 
+ 		protected TestPhase(String phaseId, int weight, String phaseName) {
+-			super(weight, phaseName);
++			super(phaseId, weight, phaseName);
+ 		}
+ 
+ 		protected void perform(MultiStatus status, EngineSession session, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+index a5a3271..5d184a3 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+@@ -57,11 +57,14 @@ public class EclipseTouchpoint implements ITouchpoint {
+ 	public ITouchpointAction[] getActions(String phaseID, final Profile profile, final Operand operand) {
+ 		if (phaseID.equals("collect")) {
+ 			ITouchpointAction action = new ITouchpointAction() {
+-				public Object execute() {
+-					return collect(operand.second(), profile);
++				public IStatus execute(Map parameters) {
++					IArtifactRequest[] requests = collect(operand.second(), profile);
++					Collection artifactRequests = (Collection) parameters.get("artifactRequests");
++					artifactRequests.add(requests);
++					return null;
+ 				}
+ 
+-				public Object undo() {
++				public IStatus undo(Map parameters) {
+ 					return null;
+ 				}
+ 			};
+@@ -69,24 +72,24 @@ public class EclipseTouchpoint implements ITouchpoint {
+ 		}
+ 		if (phaseID.equals("install")) {
+ 			ITouchpointAction action = new ITouchpointAction() {
+-				public Object execute() {
+-					return configure(operand.second(), profile, true);
++				public IStatus execute(Map parameters) {
++					return configure(operand.second(), profile, true, parameters);
+ 				}
+ 
+-				public Object undo() {
+-					return configure(operand.second(), profile, false);
++				public IStatus undo(Map parameters) {
++					return configure(operand.second(), profile, false, parameters);
+ 				}
+ 			};
+ 			return new ITouchpointAction[] {action};
+ 		}
+ 		if (phaseID.equals("uninstall")) {
+ 			ITouchpointAction action = new ITouchpointAction() {
+-				public Object execute() {
+-					return configure(operand.first(), profile, false);
++				public IStatus execute(Map parameters) {
++					return configure(operand.first(), profile, false, parameters);
+ 				}
+ 
+-				public Object undo() {
+-					return configure(operand.first(), profile, true);
++				public IStatus undo(Map parameters) {
++					return configure(operand.first(), profile, true, parameters);
+ 				}
+ 			};
+ 			return new ITouchpointAction[] {action};
+@@ -208,7 +211,7 @@ public class EclipseTouchpoint implements ITouchpoint {
+ 		return false;
+ 	}
+ 
+-	private IStatus configure(IInstallableUnit unit, Profile profile, boolean isInstall) {
++	private IStatus configure(IInstallableUnit unit, Profile profile, boolean isInstall, Map parameters) {
+ 		if (unit.isFragment())
+ 			return Status.OK_STATUS;
+ 
+@@ -216,23 +219,14 @@ public class EclipseTouchpoint implements ITouchpoint {
+ 		Context cx = Context.enter();
+ 		Scriptable scope = cx.initStandardObjects();
+ 
+-		// Construct and wrap the manipulator for the configuration in the profile
+-		Manipulator manipulator = null;
+-		try {
+-			manipulator = getManipulator(profile);
+-		} catch (CoreException ce) {
+-			return ce.getStatus();
+-		}
+-		//TODO These values should be inserted by a configuration unit (bug 204124)
+-		manipulator.getConfigData().setFwDependentProp("eclipse.p2.profile", profile.getProfileId());
+-		manipulator.getConfigData().setFwDependentProp("eclipse.p2.data.area", computeRelativeAgentLocation(profile));
++		Manipulator manipulator = (Manipulator) parameters.get("manipulator");
++		// wrap the manipulator for the configuration in the profile
+ 		Object wrappedOut = Context.javaToJS(manipulator, scope);
+ 		ScriptableObject.putProperty(scope, "manipulator", wrappedOut);
+ 
+ 		// Get the touchpoint data from the installable unit
+ 		TouchpointData[] touchpointData = unit.getTouchpointData();
+ 
+-		boolean flag = false;
+ 		if (touchpointData.length > 0 && unit.getArtifacts() != null && unit.getArtifacts().length > 0) {
+ 			boolean zippedPlugin = isZipped(touchpointData);
+ 			boolean alreadyInCache = false;
+@@ -300,23 +294,11 @@ public class EclipseTouchpoint implements ITouchpoint {
+ 			logConfiguation(unit, instructions[i], isInstall);
+ 			try {
+ 				cx.evaluateString(scope, instructions[i], unit.getId(), 1, null);
+-				flag = true;
+ 				//TODO Need to get the result of the operations
+ 			} catch (RuntimeException ex) {
+ 				return new Status(IStatus.ERROR, Activator.ID, "Exception while executing " + instructions[i], ex);
+ 			}
+ 		}
+-
+-		if (flag) {
+-			try {
+-				manipulator.save(false);
+-				lastModifiedMap.put(getConfigurationFolder(profile), new Long(manipulator.getTimeStamp()));
+-			} catch (RuntimeException e) {
+-				return new Status(IStatus.ERROR, Activator.ID, 1, "Error saving manipulator", e);
+-			} catch (IOException e) {
+-				return new Status(IStatus.ERROR, Activator.ID, 1, "Error saving manipulator", e);
+-			}
+-		}
+ 		return Status.OK_STATUS;
+ 	}
+ 
+@@ -485,4 +467,31 @@ public class EclipseTouchpoint implements ITouchpoint {
+ 			iuCount++;
+ 		}
+ 	}
++
++	public IStatus completePhase(IProgressMonitor monitor, Profile profile, String phaseId, Map touchpointParameters) {
++		Manipulator manipulator = (Manipulator) touchpointParameters.get("manipulator");
++		try {
++			manipulator.save(false);
++			lastModifiedMap.put(getConfigurationFolder(profile), new Long(manipulator.getTimeStamp()));
++		} catch (RuntimeException e) {
++			return new Status(IStatus.ERROR, Activator.ID, 1, "Error saving manipulator", e);
++		} catch (IOException e) {
++			return new Status(IStatus.ERROR, Activator.ID, 1, "Error saving manipulator", e);
++		}
++		return null;
++	}
++
++	public IStatus initializePhase(IProgressMonitor monitor, Profile profile, String phaseId, Map touchpointParameters) {
++		Manipulator manipulator = null;
++		try {
++			manipulator = getManipulator(profile);
++		} catch (CoreException ce) {
++			return ce.getStatus();
++		}
++		//TODO These values should be inserted by a configuration unit (bug 204124)
++		manipulator.getConfigData().setFwDependentProp("eclipse.p2.profile", profile.getProfileId());
++		manipulator.getConfigData().setFwDependentProp("eclipse.p2.data.area", computeRelativeAgentLocation(profile));
++		touchpointParameters.put("manipulator", manipulator);
++		return null;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/NativeTouchpoint.java b/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/NativeTouchpoint.java
+index 32690e8..4a53dd8 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/NativeTouchpoint.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/NativeTouchpoint.java
+@@ -12,10 +12,8 @@ package org.eclipse.equinox.internal.p2.touchpoint.natives;
+ 
+ import java.io.File;
+ import java.net.URL;
+-import java.util.HashSet;
+-import java.util.Set;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Status;
++import java.util.*;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.p2.artifact.repository.*;
+ import org.eclipse.equinox.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.core.location.AgentLocation;
+@@ -42,11 +40,14 @@ public class NativeTouchpoint implements ITouchpoint {
+ 	public ITouchpointAction[] getActions(String phaseID, final Profile profile, final Operand operand) {
+ 		if (phaseID.equals("collect")) {
+ 			ITouchpointAction action = new ITouchpointAction() {
+-				public Object execute() {
+-					return collect(operand.second(), profile);
++				public IStatus execute(Map parameters) {
++					IArtifactRequest[] requests = collect(operand.second(), profile);
++					Collection artifactRequests = (Collection) parameters.get("artifactRequests");
++					artifactRequests.add(requests);
++					return null;
+ 				}
+ 
+-				public Object undo() {
++				public IStatus undo(Map parameters) {
+ 					return null;
+ 				}
+ 			};
+@@ -55,11 +56,11 @@ public class NativeTouchpoint implements ITouchpoint {
+ 
+ 		if (phaseID.equals("install")) {
+ 			ITouchpointAction action = new ITouchpointAction() {
+-				public Object execute() {
++				public IStatus execute(Map parameters) {
+ 					return doInstall(operand.second(), profile);
+ 				}
+ 
+-				public Object undo() {
++				public IStatus undo(Map parameters) {
+ 					return doUninstall(operand.second(), profile);
+ 				}
+ 			};
+@@ -67,11 +68,11 @@ public class NativeTouchpoint implements ITouchpoint {
+ 		}
+ 		if (phaseID.equals("uninstall")) {
+ 			ITouchpointAction action = new ITouchpointAction() {
+-				public Object execute() {
++				public IStatus execute(Map parameters) {
+ 					return doUninstall(operand.first(), profile);
+ 				}
+ 
+-				public Object undo() {
++				public IStatus undo(Map parameters) {
+ 					return doInstall(operand.first(), profile);
+ 				}
+ 			};
+@@ -175,4 +176,12 @@ public class NativeTouchpoint implements ITouchpoint {
+ 		return location.getArtifactRepositoryURL();
+ 	}
+ 
++	public IStatus completePhase(IProgressMonitor monitor, Profile profile, String phaseId, Map touchpointParameters) {
++		return null;
++	}
++
++	public IStatus initializePhase(IProgressMonitor monitor, Profile profile, String phaseId, Map touchpointParameters) {
++		return null;
++	}
++
+ }
+commit 718ea31cf79de065efed438542695ae7d745f2e8
+Author: Simon Kaegi <skaegi>
+Date:   Thu Oct 4 06:38:08 2007 +0000
+
+    Bug 204402 [prov] Use pre and post phase for install/uninstall - Engine rollback now works
+
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
+84	8	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/EngineSession.java
+0	127	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IUPhase.java
+139	6	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Collect.java
+1	10	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/SizingPhase.java
+1	10	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+1	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseSetTest.java
+18	3	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
+index c7c55df..1cb2215 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Engine.java
+@@ -47,7 +47,7 @@ public class Engine {
+ 		try {
+ 			eventBus.publishEvent(new BeginOperationEvent(profile, phaseSet, operands, this));
+ 
+-			EngineSession session = new EngineSession();
++			EngineSession session = new EngineSession(profile);
+ 			MultiStatus result = phaseSet.perform(session, profile, operands, monitor);
+ 			if (result.isOK()) {
+ 				eventBus.publishEvent(new CommitOperationEvent(profile, phaseSet, operands, this));
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/EngineSession.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/EngineSession.java
+index c189d5d..a0ab9a3 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/EngineSession.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/EngineSession.java
+@@ -11,23 +11,99 @@
+ package org.eclipse.equinox.p2.engine;
+ 
+ import java.util.*;
++import org.eclipse.core.runtime.NullProgressMonitor;
++import org.eclipse.equinox.p2.core.helpers.MultiStatus;
+ 
+ public class EngineSession {
+-	List actions = new ArrayList();
+ 
+-	public void record(ITouchpointAction action) {
+-		actions.add(action);
++	private static class ActionsRecord {
++		Operand operand;
++		List actions = new ArrayList();
++
++		ActionsRecord(Operand operand) {
++			this.operand = operand;
++		}
++	}
++
++	private List phaseActionRecordsPairs = new ArrayList();
++
++	private Phase currentPhase;
++	private List currentActionRecords;
++	private ActionsRecord currentRecord;
++
++	private Profile profile;
++
++	public EngineSession(Profile profile) {
++		this.profile = profile;
+ 	}
+ 
+ 	public void commit() {
+-		actions.clear();
++		phaseActionRecordsPairs.clear();
++	}
++
++	public MultiStatus rollback() {
++		MultiStatus result = new MultiStatus();
++		rollBackPhase(currentPhase, currentActionRecords);
++		currentPhase = null;
++		currentActionRecords = null;
++		currentRecord = null;
++
++		for (ListIterator it = phaseActionRecordsPairs.listIterator(phaseActionRecordsPairs.size()); it.hasPrevious();) {
++			Object[] pair = (Object[]) it.previous();
++			Phase phase = (Phase) pair[0];
++			List actionRecords = (List) pair[1];
++			rollBackPhase(phase, actionRecords);
++		}
++		phaseActionRecordsPairs.clear();
++		return result;
+ 	}
+ 
+-	public void rollback() {
+-		for (ListIterator it = actions.listIterator(actions.size()); it.hasPrevious();) {
+-			ITouchpointAction action = (ITouchpointAction) it.previous();
+-			action.undo(null);
++	private MultiStatus rollBackPhase(Phase phase, List actionRecords) {
++		MultiStatus result = new MultiStatus();
++
++		if (phase != currentPhase)
++			phase.prePerform(result, profile, new NullProgressMonitor());
++
++		for (ListIterator it = actionRecords.listIterator(actionRecords.size()); it.hasPrevious();) {
++			ActionsRecord record = (ActionsRecord) it.previous();
++			ITouchpointAction[] actions = (ITouchpointAction[]) record.actions.toArray(new ITouchpointAction[record.actions.size()]);
++			phase.undoActions(result, actions, record.operand);
+ 		}
++		phase.postPerform(result, profile, new NullProgressMonitor());
++		return result;
++	}
++
++	public void recordPhaseStart(Phase phase) {
++		if (phase == null)
++			throw new IllegalArgumentException("Phase must not be null.");
++
++		if (currentPhase != null)
++			throw new IllegalStateException("A phase is already started.");
++
++		currentPhase = phase;
++		currentActionRecords = new ArrayList();
++	}
++
++	public void recordPhaseEnd(Phase phase) {
++		if (currentPhase == null)
++			throw new IllegalStateException("There is no phase to end.");
++
++		if (currentPhase != phase)
++			throw new IllegalArgumentException("Current phase does not match argument.");
++
++		phaseActionRecordsPairs.add(new Object[] {currentPhase, currentActionRecords});
++		currentPhase = null;
++		currentActionRecords = null;
+ 	}
+ 
++	public void recordAction(ITouchpointAction action, Operand operand) {
++		if (action == null || operand == null)
++			throw new IllegalArgumentException("Action and Operand must not be null.");
++
++		if (currentRecord == null || operand != currentRecord.operand) {
++			currentRecord = new ActionsRecord(operand);
++			currentActionRecords.add(currentRecord);
++		}
++		currentRecord.actions.add(action);
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IUPhase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IUPhase.java
+deleted file mode 100644
+index abaa07f..0000000
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/IUPhase.java
++++ /dev/null
+@@ -1,127 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.p2.engine;
+-
+-import java.util.*;
+-import java.util.Map.Entry;
+-import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.engine.TouchpointManager;
+-import org.eclipse.equinox.p2.core.helpers.MultiStatus;
+-import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+-
+-// An operation that is applied to a set of IUs.
+-public abstract class IUPhase extends Phase {
+-	protected int PRE_PERFORM_WORK = 1000;
+-	protected int PERFORM_WORK = 10000;
+-	protected int POST_PERFORM_WORK = 1000;
+-
+-	private Map phaseParameters = new HashMap();
+-	private Map touchpoints = new HashMap();
+-
+-	protected IUPhase(String phaseId, int weight, String phaseName) {
+-		super(phaseId, weight, phaseName);
+-	}
+-
+-	protected void perform(MultiStatus status, EngineSession session, Profile profile, Operand[] operands, IProgressMonitor monitor) {
+-		SubMonitor subMonitor = SubMonitor.convert(monitor, PRE_PERFORM_WORK + PERFORM_WORK + POST_PERFORM_WORK);
+-		prePerform(status, profile, operands, subMonitor.newChild(PRE_PERFORM_WORK));
+-		if (status.isErrorOrCancel())
+-			return;
+-
+-		subMonitor.setWorkRemaining(PERFORM_WORK + POST_PERFORM_WORK);
+-		mainPerform(status, session, profile, operands, subMonitor.newChild(PERFORM_WORK));
+-		if (status.isErrorOrCancel())
+-			return;
+-
+-		subMonitor.setWorkRemaining(POST_PERFORM_WORK);
+-		postPerform(status, profile, operands, subMonitor.newChild(POST_PERFORM_WORK));
+-		if (status.isErrorOrCancel())
+-			return;
+-
+-		subMonitor.done();
+-	}
+-
+-	private void prePerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+-		status.add(initializePhase(monitor, profile, phaseParameters));
+-		// TODO: Consider moving touchpoint discovery up -- perhaps to session??
+-		// TODO: Support Monitor
+-		for (int i = 0; i < deltas.length; i++) {
+-			ITouchpoint touchpoint = getTouchpoint(deltas[i]);
+-			if (touchpoint == null)
+-				continue;
+-
+-			if (!touchpoints.containsKey(touchpoint) && touchpoint.supports(phaseId)) {
+-				Map touchpointParameters = new HashMap(phaseParameters);
+-				status.add(touchpoint.initializePhase(monitor, profile, phaseId, touchpointParameters));
+-				touchpoints.put(touchpoint, touchpointParameters);
+-			}
+-		}
+-	}
+-
+-	private void mainPerform(MultiStatus status, EngineSession session, Profile profile, Operand[] operands, SubMonitor subMonitor) {
+-		// TODO: Support Monitor
+-		// int operandWork = PERFORM_WORK / operands.length;
+-		for (int i = 0; i < operands.length; i++) {
+-			if (subMonitor.isCanceled())
+-				throw new OperationCanceledException();
+-			Operand currentOperand = operands[i];
+-			if (!isApplicable(currentOperand))
+-				continue;
+-
+-			ITouchpoint touchpoint = getTouchpoint(currentOperand);
+-			if (touchpoint == null || !touchpoint.supports(phaseId))
+-				continue;
+-
+-			ITouchpointAction[] actions = getActions(touchpoint, profile, currentOperand);
+-			Map touchpointParameters = (Map) touchpoints.get(touchpoint);
+-			Map parameters = new HashMap(touchpointParameters);
+-			for (int j = 0; j < actions.length; j++) {
+-				ITouchpointAction action = actions[j];
+-				IStatus actionStatus = action.execute(parameters);
+-				status.add(actionStatus);
+-				if (actionStatus != null && !actionStatus.isOK())
+-					return;
+-
+-				session.record(action);
+-			}
+-		}
+-	}
+-
+-	private void postPerform(MultiStatus status, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+-		for (Iterator it = touchpoints.entrySet().iterator(); it.hasNext();) {
+-			Entry entry = (Entry) it.next();
+-			ITouchpoint touchpoint = (ITouchpoint) entry.getKey();
+-			Map touchpointParameters = (Map) entry.getValue();
+-			status.add(touchpoint.completePhase(monitor, profile, phaseId, touchpointParameters));
+-		}
+-		status.add(completePhase(monitor, profile, phaseParameters));
+-	}
+-
+-	protected ITouchpoint getTouchpoint(Operand operand) {
+-		IInstallableUnit unit = operand.second();
+-		if (unit == null)
+-			unit = operand.first();
+-
+-		if (unit == null)
+-			return null;
+-		TouchpointManager touchpointManager = TouchpointManager.getInstance();
+-		ITouchpoint touchpoint = touchpointManager.getTouchpoint(unit.getTouchpointType());
+-		return touchpoint;
+-	}
+-
+-	protected abstract boolean isApplicable(Operand op);
+-
+-	protected abstract IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters);
+-
+-	protected abstract IStatus completePhase(IProgressMonitor monitor, Profile profile, Map parameters);
+-
+-	protected abstract ITouchpointAction[] getActions(ITouchpoint touchpoint, Profile profile, Operand currentOperand);
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
+index c565637..fd31e4c 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
+@@ -10,16 +10,24 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.engine;
+ 
+-import org.eclipse.core.runtime.IProgressMonitor;
+-import org.eclipse.core.runtime.IStatus;
++import java.util.*;
++import java.util.Map.Entry;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.engine.Messages;
++import org.eclipse.equinox.internal.p2.engine.TouchpointManager;
+ import org.eclipse.equinox.p2.core.helpers.MultiStatus;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.util.NLS;
+ 
+ public abstract class Phase {
+ 	protected final String phaseId;
+ 	protected final int weight;
+ 	protected final String phaseName;
++	protected int PRE_PERFORM_WORK = 1000;
++	protected int PERFORM_WORK = 10000;
++	protected int POST_PERFORM_WORK = 1000;
++	private Map phaseParameters;
++	private Map touchpointToTouchpointParameters;
+ 
+ 	protected Phase(String phaseId, int weight, String phaseName) {
+ 		if (phaseId == null || phaseId.length() == 0) {
+@@ -43,11 +51,9 @@ public abstract class Phase {
+ 		return "Phase: " + this.phaseName + " - " + this.weight; //$NON-NLS-1$ //$NON-NLS-2$
+ 	}
+ 
+-	protected MultiStatus perform(EngineSession session, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
++	public final MultiStatus perform(EngineSession session, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+ 		MultiStatus status = new MultiStatus();
+-		//			log.start(log.info(Messages2.Engine_Performing_Phase, this.phaseName));
+ 		perform(status, session, profile, deltas, monitor);
+-		//			log.stop();
+ 		if (status.matches(IStatus.CANCEL)) {
+ 			status.setMessage(Messages.Engine_Operation_Canceled_By_User);
+ 		} else if (status.matches(IStatus.ERROR)) {
+@@ -56,6 +62,133 @@ public abstract class Phase {
+ 		return status;
+ 	}
+ 
+-	protected abstract void perform(MultiStatus status, EngineSession session, Profile profile, Operand[] deltas, IProgressMonitor monitor);
++	void undoActions(MultiStatus status, ITouchpointAction[] actions, Operand operand) {
++		ITouchpoint touchpoint = getTouchpoint(operand);
++		Map touchpointParameters = (Map) touchpointToTouchpointParameters.get(touchpoint);
++		Map parameters = new HashMap(touchpointParameters);
++		parameters.put("operand", operand);
++		parameters = Collections.unmodifiableMap(parameters);
++		for (int j = 0; j < actions.length; j++) {
++			ITouchpointAction action = actions[j];
++			IStatus actionStatus = action.undo(parameters);
++			status.add(actionStatus);
++		}
++	}
++
++	void perform(MultiStatus status, EngineSession session, Profile profile, Operand[] operands, IProgressMonitor monitor) {
++		touchpointToTouchpointParameters = new HashMap();
++		for (int i = 0; i < operands.length; i++) {
++			ITouchpoint touchpoint = getTouchpoint(operands[i]);
++			if (touchpoint == null)
++				continue;
++
++			if (!touchpointToTouchpointParameters.containsKey(touchpoint) && touchpoint.supports(phaseId)) {
++				touchpointToTouchpointParameters.put(touchpoint, null);
++			}
++		}
++
++		SubMonitor subMonitor = SubMonitor.convert(monitor, PRE_PERFORM_WORK + PERFORM_WORK + POST_PERFORM_WORK);
++		prePerform(status, profile, subMonitor.newChild(PRE_PERFORM_WORK));
++		if (status.isErrorOrCancel())
++			return;
++		session.recordPhaseStart(this);
++
++		subMonitor.setWorkRemaining(PERFORM_WORK + POST_PERFORM_WORK);
++		mainPerform(status, session, profile, operands, subMonitor.newChild(PERFORM_WORK));
++		if (status.isErrorOrCancel())
++			return;
++
++		subMonitor.setWorkRemaining(POST_PERFORM_WORK);
++		postPerform(status, profile, subMonitor.newChild(POST_PERFORM_WORK));
++		if (status.isErrorOrCancel())
++			return;
++		session.recordPhaseEnd(this);
++
++		subMonitor.done();
++	}
++
++	void prePerform(MultiStatus status, Profile profile, IProgressMonitor monitor) {
++		phaseParameters = new HashMap();
++		phaseParameters.put("profile", profile);
++		phaseParameters.put("phaseId", phaseId);
++		status.add(initializePhase(monitor, profile, phaseParameters));
++
++		for (Iterator it = touchpointToTouchpointParameters.entrySet().iterator(); it.hasNext();) {
++			Entry entry = (Entry) it.next();
++			ITouchpoint touchpoint = (ITouchpoint) entry.getKey();
++			Map touchpointParameters = new HashMap(phaseParameters);
++			status.add(touchpoint.initializePhase(monitor, profile, phaseId, touchpointParameters));
++			entry.setValue(touchpointParameters);
++		}
++	}
++
++	private void mainPerform(MultiStatus status, EngineSession session, Profile profile, Operand[] operands, SubMonitor subMonitor) {
++		// TODO: Support Monitor
++		// int operandWork = PERFORM_WORK / operands.length;
++		for (int i = 0; i < operands.length; i++) {
++			if (subMonitor.isCanceled())
++				throw new OperationCanceledException();
++			Operand operand = operands[i];
++			if (!isApplicable(operand))
++				continue;
++
++			ITouchpoint touchpoint = getTouchpoint(operand);
++			if (touchpoint == null || !touchpoint.supports(phaseId))
++				continue;
++
++			Map touchpointParameters = (Map) touchpointToTouchpointParameters.get(touchpoint);
++			Map parameters = new HashMap(touchpointParameters);
++			parameters.put("operand", operand);
++			parameters = Collections.unmodifiableMap(parameters);
++			ITouchpointAction[] actions = getActions(touchpoint, profile, operand);
++			for (int j = 0; j < actions.length; j++) {
++				ITouchpointAction action = actions[j];
++				IStatus actionStatus = action.execute(parameters);
++				status.add(actionStatus);
++				if (actionStatus != null && !actionStatus.isOK())
++					return;
++
++				session.recordAction(action, operand);
++			}
++		}
++	}
++
++	void postPerform(MultiStatus status, Profile profile, IProgressMonitor monitor) {
++		for (Iterator it = touchpointToTouchpointParameters.entrySet().iterator(); it.hasNext();) {
++			Entry entry = (Entry) it.next();
++			ITouchpoint touchpoint = (ITouchpoint) entry.getKey();
++			Map touchpointParameters = (Map) entry.getValue();
++			status.add(touchpoint.completePhase(monitor, profile, phaseId, touchpointParameters));
++			entry.setValue(null);
++		}
++		status.add(completePhase(monitor, profile, phaseParameters));
++		phaseParameters = null;
++	}
++
++	private static ITouchpoint getTouchpoint(Operand operand) {
++		IInstallableUnit unit = operand.second();
++		if (unit == null)
++			unit = operand.first();
++
++		if (unit == null)
++			return null;
++		TouchpointManager touchpointManager = TouchpointManager.getInstance();
++		ITouchpoint touchpoint = touchpointManager.getTouchpoint(unit.getTouchpointType());
++		return touchpoint;
++	}
++
++	protected boolean isApplicable(Operand op) {
++		return true;
++	}
++
++	protected IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++		return Status.OK_STATUS;
++	}
++
++	protected IStatus completePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++		return Status.OK_STATUS;
++	}
++
++	protected abstract ITouchpointAction[] getActions(ITouchpoint touchpoint, Profile profile, Operand currentOperand);
+ 
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
+index 23ae96e..e5137fd 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
+@@ -24,7 +24,7 @@ public abstract class PhaseSet {
+ 		this.phases = phases;
+ 	}
+ 
+-	public MultiStatus perform(EngineSession session, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
++	public final MultiStatus perform(EngineSession session, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+ 		MultiStatus result = new MultiStatus();
+ 		int[] weights = getProgressWeights();
+ 		int totalWork = getTotalWork(weights);
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Collect.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Collect.java
+index 07eed38..7d2457c 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Collect.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Collect.java
+@@ -18,7 +18,7 @@ import org.eclipse.equinox.p2.engine.*;
+ /**
+  * The goal of the collect phase is to ask the touchpoints if the artifacts associated with an IU need to be downloaded.
+  */
+-public class Collect extends IUPhase {
++public class Collect extends Phase {
+ 	private static final String PHASE_ID = "collect"; //$NON-NLS-1$
+ 
+ 	public Collect(int weight) {
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+index cbda47a..f478391 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+@@ -11,14 +11,13 @@
+ package org.eclipse.equinox.p2.engine.phases;
+ 
+ import java.util.Map;
+-import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+ import org.eclipse.equinox.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.engine.*;
+ 
+-public class Install extends IUPhase {
++public class Install extends Phase {
+ 
+ 	private static final String PHASE_ID = "install"; //$NON-NLS-1$
+ 
+@@ -57,14 +56,6 @@ public class Install extends IUPhase {
+ 		return false;
+ 	}
+ 
+-	protected IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
+-		return null;
+-	}
+-
+-	protected IStatus completePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
+-		return null;
+-	}
+-
+ 	protected ITouchpointAction[] getActions(ITouchpoint touchpoint, Profile profile, Operand currentOperand) {
+ 		//TODO: monitor.subTask(NLS.bind(Messages.Engine_Installing_IU, unit.getId()));
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/SizingPhase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/SizingPhase.java
+index e23cb10..adaa352 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/SizingPhase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/SizingPhase.java
+@@ -16,7 +16,7 @@ import org.eclipse.equinox.p2.artifact.repository.*;
+ import org.eclipse.equinox.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.engine.*;
+ 
+-public class SizingPhase extends IUPhase {
++public class SizingPhase extends Phase {
+ 	private static final String TP_DATA = "collect"; //$NON-NLS-1$
+ 
+ 	private long sizeOnDisk;
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+index b81109c..677ec77 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+@@ -11,14 +11,13 @@
+ package org.eclipse.equinox.p2.engine.phases;
+ 
+ import java.util.Map;
+-import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+ import org.eclipse.equinox.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.engine.*;
+ 
+-public class Uninstall extends IUPhase {
++public class Uninstall extends Phase {
+ 
+ 	private static final String PHASE_ID = "uninstall"; //$NON-NLS-1$
+ 
+@@ -55,14 +54,6 @@ public class Uninstall extends IUPhase {
+ 		return false;
+ 	}
+ 
+-	protected IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
+-		return null;
+-	}
+-
+-	protected IStatus completePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
+-		return null;
+-	}
+-
+ 	protected ITouchpointAction[] getActions(ITouchpoint touchpoint, Profile profile, Operand currentOperand) {
+ 		//TODO: monitor.subTask(NLS.bind(Messages.Engine_Uninstalling_IU, unit.getId()));
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
+index 69809d0..78a61b1 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
+@@ -162,8 +162,7 @@ public class EngineTest extends TestCase {
+ 		assertFalse(ius.hasNext());
+ 	}
+ 
+-	// temporarily broken until we can rollback completed phases
+-	public void BROKENtestPerformRollback() {
++	public void testPerformRollback() {
+ 
+ 		Profile profile = new Profile("test");
+ 		profile.setValue(Profile.PROP_INSTALL_FOLDER, "c:/tmp/testProvisioning/");
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseSetTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseSetTest.java
+index ff793c3..cd7a9c3 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseSetTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseSetTest.java
+@@ -48,7 +48,7 @@ public class PhaseSetTest extends TestCase {
+ 		Operand op = new Operand(new ResolvedInstallableUnit(new InstallableUnit()), null);
+ 		Operand[] operands = new Operand[] {op};
+ 
+-		IStatus result = phaseSet.perform(new EngineSession(), profile, operands, new NullProgressMonitor());
++		IStatus result = phaseSet.perform(new EngineSession(profile), profile, operands, new NullProgressMonitor());
+ 		assertTrue(result.isOK());
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
+index d9bb6ee..d7107ba 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
+@@ -10,9 +10,10 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.engine;
+ 
++import java.util.Map;
+ import junit.framework.TestCase;
+ import org.eclipse.core.runtime.IProgressMonitor;
+-import org.eclipse.equinox.p2.core.helpers.MultiStatus;
++import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.p2.engine.*;
+ 
+ /**
+@@ -87,8 +88,22 @@ public class PhaseTest extends TestCase {
+ 			super(phaseId, weight, phaseName);
+ 		}
+ 
+-		protected void perform(MultiStatus status, EngineSession session, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+-			//empty
++		protected ITouchpointAction[] getActions(ITouchpoint touchpoint, Profile profile, Operand currentOperand) {
++			return null;
++		}
++
++		protected boolean isApplicable(Operand op) {
++			return false;
++		}
++
++		protected IStatus completePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++			// TODO Auto-generated method stub
++			return null;
++		}
++
++		protected IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
++			// TODO Auto-generated method stub
++			return null;
+ 		}
+ 	}
+ }

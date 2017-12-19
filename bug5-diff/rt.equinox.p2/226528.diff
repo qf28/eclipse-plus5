@@ -1,0 +1,760 @@
+commit 5446df3471c836dfad5c4f3faeea50bb18e1154a
+Author: John Arthorne <johna>
+Date:   Fri Apr 11 18:06:26 2008 +0000
+
+    Bug 226528 Excessive prompting for authenticated connections
+
+42	64	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
+32	4	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+2	0	bundles/org.eclipse.equinox.p2.directorywatcher/META-INF/MANIFEST.MF
+42	0	bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/internal/provisional/p2/directorywatcher/Activator.java
+30	1	bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/internal/provisional/p2/directorywatcher/RepositoryListener.java
+86	67	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/ECFMetadataTransport.java
+3	3	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+10	14	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UserValidationDialog.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
+index 39dc4e3..ce101e0 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ECFTransport.java
+@@ -11,7 +11,8 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.artifact.repository;
+ 
+-import java.io.*;
++import java.io.IOException;
++import java.io.OutputStream;
+ import java.net.ProtocolException;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.ecf.core.security.ConnectContextFactory;
+@@ -25,6 +26,7 @@ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IStateful;
+ import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI.AuthenticationInfo;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+ import org.eclipse.equinox.security.storage.*;
+ import org.eclipse.osgi.util.NLS;
+@@ -39,10 +41,9 @@ public class ECFTransport extends Transport {
+ 	 */
+ 	private static final int LOGIN_RETRIES = 3;
+ 
+-	protected String username;
+-	protected String password;
+-	private static final String ERROR_FILENOTFOUND = "FileNotFound"; //$NON-NLS-1$
+-	private static final String ERROR_401 = "401"; //$NON-NLS-1$
++	private static final ProtocolException ERROR_401 = new ProtocolException();
++
++	private static final String SERVER_REDIRECT = "Server redirected too many times"; //$NON-NLS-1$
+ 
+ 	/**
+ 	 * The singleton transport instance.
+@@ -93,14 +94,13 @@ public class ECFTransport extends Transport {
+ 
+ 	public IStatus download(String url, OutputStream destination, IProgressMonitor monitor) {
+ 		try {
+-			setLogin(url, false);
++			IConnectContext context = getConnectionContext(url, false);
+ 			for (int i = 0; i < LOGIN_RETRIES; i++) {
+ 				try {
+-					return performDownload(url, destination, monitor);
++					return performDownload(url, destination, context, monitor);
+ 				} catch (ProtocolException e) {
+-					if (ERROR_401.equals(e.getMessage())) {
+-						setLogin(url, true);
+-					}
++					if (e == ERROR_401)
++						context = getConnectionContext(url, true);
+ 				}
+ 			}
+ 		} catch (UserCancelledException e) {
+@@ -112,15 +112,15 @@ public class ECFTransport extends Transport {
+ 		return new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.io_failedRead, url), null);
+ 	}
+ 
+-	public IStatus performDownload(String toDownload, OutputStream target, IProgressMonitor monitor) throws ProtocolException {
++	public IStatus performDownload(String toDownload, OutputStream target, IConnectContext context, IProgressMonitor monitor) throws ProtocolException {
+ 		IRetrieveFileTransferFactory factory = (IRetrieveFileTransferFactory) retrievalFactoryTracker.getService();
+ 		if (factory == null)
+ 			return statusOn(target, new Status(IStatus.ERROR, Activator.ID, NLS.bind(Messages.io_failedRead, toDownload)));
+ 
+-		return transfer(factory.newInstance(), toDownload, target, monitor);
++		return transfer(factory.newInstance(), toDownload, target, context, monitor);
+ 	}
+ 
+-	private IStatus transfer(final IRetrieveFileTransferContainerAdapter retrievalContainer, final String toDownload, final OutputStream target, final IProgressMonitor monitor) throws ProtocolException {
++	private IStatus transfer(final IRetrieveFileTransferContainerAdapter retrievalContainer, final String toDownload, final OutputStream target, IConnectContext context, final IProgressMonitor monitor) throws ProtocolException {
+ 		final IStatus[] result = new IStatus[1];
+ 		final long startTime = System.currentTimeMillis();
+ 		IFileTransferListener listener = new IFileTransferListener() {
+@@ -158,21 +158,14 @@ public class ECFTransport extends Transport {
+ 		};
+ 
+ 		try {
+-			if (username != null && password != null) {
+-				IConnectContext connectContext = ConnectContextFactory.createUsernamePasswordConnectContext(username, password);
+-				retrievalContainer.setConnectContextForAuthentication(connectContext);
+-			} else {
+-				retrievalContainer.setConnectContextForAuthentication(null);
+-			}
++			retrievalContainer.setConnectContextForAuthentication(context);
+ 			retrievalContainer.sendRetrieveRequest(FileIDFactory.getDefault().createFileID(retrievalContainer.getRetrieveNamespace(), toDownload), listener, null);
+ 		} catch (IncomingFileTransferException e) {
+ 			IStatus status = e.getStatus();
+ 			Throwable exception = status.getException();
+-			if (exception instanceof FileNotFoundException) {
+-				throw new ProtocolException(ERROR_FILENOTFOUND);
+-			} else if (exception instanceof IOException) {
+-				//throw exception that login details are required
+-				throw new ProtocolException(ERROR_401);
++			if (exception instanceof IOException) {
++				if (exception.getMessage() != null && (exception.getMessage().indexOf("401") != -1 || exception.getMessage().indexOf(SERVER_REDIRECT) != -1)) //$NON-NLS-1$
++					throw ERROR_401;
+ 			}
+ 			return statusOn(target, status);
+ 		} catch (FileCreateException e) {
+@@ -194,71 +187,56 @@ public class ECFTransport extends Transport {
+ 	}
+ 
+ 	/**
+-	 * Sets the login details from the user for the specified URL. If the login
+-	 * details are not available, the user is prompted.
++	 * Returns the connection context for the given URL. This may prompt the
++	 * user for user name and password as required.
++	 * 
+ 	 * @param xmlLocation - the file location requiring login details
+ 	 * @param prompt - use <code>true</code> to prompt the user instead of
+ 	 * looking at the secure preference store for login, use <code>false</code>
+ 	 * to only try the secure preference store
+ 	 * @throws UserCancelledException when the user cancels the login prompt 
+ 	 * @throws ProvisionException if the password cannot be read or saved
++	 * @return The connection context
+ 	 */
+-	public void setLogin(String xmlLocation, boolean prompt) throws UserCancelledException, ProvisionException {
++	public IConnectContext getConnectionContext(String xmlLocation, boolean prompt) throws UserCancelledException, ProvisionException {
+ 		ISecurePreferences securePreferences = SecurePreferencesFactory.getDefault();
+ 		IPath hostLocation = new Path(xmlLocation).removeLastSegments(1);
+ 		int repositoryHash = hostLocation.hashCode();
+ 		ISecurePreferences metadataNode = securePreferences.node(IRepository.PREFERENCE_NODE + "/" + repositoryHash); //$NON-NLS-1$
+-		String[] loginDetails = new String[3];
+ 		if (!prompt) {
+ 			try {
+-				loginDetails[0] = metadataNode.get(IRepository.PROP_USERNAME, null);
+-				loginDetails[1] = metadataNode.get(IRepository.PROP_PASSWORD, null);
++				String username = metadataNode.get(IRepository.PROP_USERNAME, null);
++				String password = metadataNode.get(IRepository.PROP_PASSWORD, null);
++				//if we don't have stored connection data just return a null connection context
++				if (username == null || password == null)
++					return null;
++				return ConnectContextFactory.createUsernamePasswordConnectContext(username, password);
+ 			} catch (StorageException e) {
+ 				String msg = NLS.bind(Messages.repoMan_internalError, xmlLocation.toString());
+ 				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.INTERNAL_ERROR, msg, null));
+ 			}
+ 		}
+-		if ((loginDetails[0] == null || loginDetails[1] == null) && prompt) {
+-			ServiceTracker adminUITracker = new ServiceTracker(Activator.getContext(), IServiceUI.class.getName(), null);
+-			adminUITracker.open();
+-			IServiceUI adminUIService = (IServiceUI) adminUITracker.getService();
+-			if (adminUIService != null)
+-				loginDetails = adminUIService.getUsernamePassword(hostLocation.toString());
+-		}
+-		if (loginDetails == null) {
+-			setUsername(null);
+-			setPassword(null);
++		//need to prompt user for user name and password
++		ServiceTracker adminUITracker = new ServiceTracker(Activator.getContext(), IServiceUI.class.getName(), null);
++		adminUITracker.open();
++		IServiceUI adminUIService = (IServiceUI) adminUITracker.getService();
++		AuthenticationInfo loginDetails = null;
++		if (adminUIService != null)
++			loginDetails = adminUIService.getUsernamePassword(hostLocation.toString());
++		//null result means user canceled password dialog
++		if (loginDetails == null)
+ 			throw new UserCancelledException();
+-		}
+-		if (loginDetails[2] != null && Boolean.valueOf(loginDetails[2]).booleanValue()) {
++		//save user name and password if requested by user
++		if (loginDetails.saveResult()) {
+ 			try {
+-				metadataNode.put(IRepository.PROP_USERNAME, loginDetails[0], true);
+-				metadataNode.put(IRepository.PROP_PASSWORD, loginDetails[1], true);
++				metadataNode.put(IRepository.PROP_USERNAME, loginDetails.getUserName(), true);
++				metadataNode.put(IRepository.PROP_PASSWORD, loginDetails.getPassword(), true);
+ 			} catch (StorageException e1) {
+ 				String msg = NLS.bind(Messages.repoMan_internalError, xmlLocation.toString());
+ 				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.INTERNAL_ERROR, msg, null));
+ 			}
+ 		}
+-		setUsername(loginDetails[0]);
+-		setPassword(loginDetails[1]);
+-	}
+-
+-	/**
+-	 * Sets the username for login purposes on the next connection. Password
+-	 * must also be set.
+-	 * @param username - the username, may be <code>null</code>
+-	 */
+-	public void setUsername(String username) {
+-		this.username = username;
+-	}
+-
+-	/**
+-	 * Sets the password for login purposes on the next connection. Username
+-	 * must also be set.
+-	 * @param password - the password, may be <code>null</code>
+-	 */
+-	public void setPassword(String password) {
+-		this.password = password;
++		return ConnectContextFactory.createUsernamePasswordConnectContext(loginDetails.getUserName(), loginDetails.getPassword());
+ 	}
+ 
+ 	private static IStatus statusOn(OutputStream target, IStatus status) {
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+index b6c81e4..ff1311d 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+@@ -10,14 +10,42 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.provisional.p2.core;
+ 
++/**
++ * Callback API for prompting for user information from within lower level code.
++ */
+ public interface IServiceUI {
++	/**
++	 * Authentication information returned from an authentication prompt request.
++	 */
++	public static class AuthenticationInfo {
++		private final boolean save;
++		private final String userName;
++		private final String password;
++
++		public AuthenticationInfo(String userName, String password, boolean saveResult) {
++			this.userName = userName;
++			this.password = password;
++			this.save = saveResult;
++		}
++
++		public boolean saveResult() {
++			return save;
++		}
++
++		public String getUserName() {
++			return userName;
++		}
++
++		public String getPassword() {
++			return password;
++		}
++	}
+ 
+ 	/**
+-	 * Opens a UI prompt for a username and password.
++	 * Opens a UI prompt for authentication details
+ 	 * 
+ 	 * @param location - the location requiring login details, may be <code>null</code>.
+-	 * @return A two element array containing the username and password, in that orders.
+-	 * Returns <code>null</code> if the prompt was cancelled.
++	 * @return The authentication result
+ 	 */
+-	public String[] getUsernamePassword(String location);
++	public AuthenticationInfo getUsernamePassword(String location);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.directorywatcher/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.directorywatcher/META-INF/MANIFEST.MF
+index b105ba6..cdf57ee 100644
+--- a/bundles/org.eclipse.equinox.p2.directorywatcher/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.directorywatcher/META-INF/MANIFEST.MF
+@@ -9,6 +9,7 @@ Import-Package: org.eclipse.equinox.internal.p2.core.helpers,
+  org.eclipse.equinox.internal.p2.metadata.generator.features,
+  org.eclipse.equinox.internal.provisional.p2.artifact.repository,
+  org.eclipse.equinox.internal.provisional.p2.core,
++ org.eclipse.equinox.internal.provisional.p2.core.eventbus,
+  org.eclipse.equinox.internal.provisional.p2.core.repository,
+  org.eclipse.equinox.internal.provisional.p2.metadata,
+  org.eclipse.equinox.internal.provisional.p2.metadata.generator,
+@@ -25,3 +26,4 @@ Bundle-RequiredExecutionEnvironment: CDC-1.0/Foundation-1.0,
+  J2SE-1.3
+ Export-Package: org.eclipse.equinox.internal.provisional.p2.directorywatcher;x-friends:="org.eclipse.equinox.p2.reconciler.dropins"
+ Require-Bundle: org.eclipse.equinox.common;bundle-version="[3.3.0,4.0)"
++Bundle-Activator: org.eclipse.equinox.internal.provisional.p2.directorywatcher.Activator
+diff --git a/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/internal/provisional/p2/directorywatcher/Activator.java b/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/internal/provisional/p2/directorywatcher/Activator.java
+new file mode 100644
+index 0000000..b97dcd2
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/internal/provisional/p2/directorywatcher/Activator.java
+@@ -0,0 +1,42 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.provisional.p2.directorywatcher;
++
++import org.osgi.framework.BundleActivator;
++import org.osgi.framework.BundleContext;
++
++/**
++ * Bundle activator for directory watcher bundle.
++ */
++public class Activator implements BundleActivator {
++	public static final String ID = "org.eclipse.equinox.p2.directorywatcher"; //$NON-NLS-1$
++
++	private static BundleContext context;
++
++	public static BundleContext getContext() {
++		return context;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.osgi.framework.BundleActivator#start(org.osgi.framework.BundleContext)
++	 */
++	public void start(BundleContext aContext) throws Exception {
++		this.context = aContext;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.osgi.framework.BundleActivator#stop(org.osgi.framework.BundleContext)
++	 */
++	public void stop(BundleContext aContext) throws Exception {
++		this.context = null;
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/internal/provisional/p2/directorywatcher/RepositoryListener.java b/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/internal/provisional/p2/directorywatcher/RepositoryListener.java
+index 5ab7e76..c18433d 100644
+--- a/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/internal/provisional/p2/directorywatcher/RepositoryListener.java
++++ b/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/internal/provisional/p2/directorywatcher/RepositoryListener.java
+@@ -13,11 +13,16 @@ import java.io.File;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.Status;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.metadata.generator.features.FeatureParser;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.*;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.RepositoryEvent;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.generator.*;
+@@ -82,6 +87,29 @@ public class RepositoryListener extends DirectoryChangeListener {
+ 		bundleDescriptionFactory = initializeBundleDescriptionFactory(context);
+ 	}
+ 
++	/**
++	 * Broadcast events for any discovery sites associated with the feature
++	 * so the repository managers add them to their list of known repositories.
++	 */
++	private void broadcastDiscoverySites(Feature feature) {
++		URLEntry[] sites = feature.getDiscoverySites();
++		if (sites == null || sites.length == 0)
++			return;
++
++		IProvisioningEventBus bus = (IProvisioningEventBus) ServiceHelper.getService(Activator.getContext(), IProvisioningEventBus.SERVICE_NAME);
++		if (bus == null)
++			return;
++		for (int i = 0; i < sites.length; i++) {
++			try {
++				URL location = new URL(sites[i].getURL());
++				bus.publishEvent(new RepositoryEvent(location, IRepository.TYPE_METADATA, RepositoryEvent.DISCOVERED));
++				bus.publishEvent(new RepositoryEvent(location, IRepository.TYPE_ARTIFACT, RepositoryEvent.DISCOVERED));
++			} catch (MalformedURLException e) {
++				LogHelper.log(new Status(IStatus.WARNING, Activator.ID, "Feature has invalid discovery site: " + feature.getId(), e)); //$NON-NLS-1$
++			}
++		}
++	}
++
+ 	private BundleDescriptionFactory initializeBundleDescriptionFactory(BundleContext context) {
+ 
+ 		ServiceReference reference = context.getServiceReference(PlatformAdmin.class.getName());
+@@ -381,9 +409,10 @@ public class RepositoryListener extends DirectoryChangeListener {
+ 		if (feature == null)
+ 			return null;
+ 
++		broadcastDiscoverySites(feature);
++
+ 		IInstallableUnit featureIU = MetadataGeneratorHelper.createFeatureJarIU(feature, true, props);
+ 		IInstallableUnit groupIU = MetadataGeneratorHelper.createGroupIU(feature, featureIU, props);
+-
+ 		return new IInstallableUnit[] {featureIU, groupIU};
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/ECFMetadataTransport.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/ECFMetadataTransport.java
+index 6b315f7..945e125 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/ECFMetadataTransport.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/ECFMetadataTransport.java
+@@ -10,7 +10,8 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.metadata.repository;
+ 
+-import java.io.*;
++import java.io.IOException;
++import java.io.OutputStream;
+ import java.net.ProtocolException;
+ import java.net.URL;
+ import org.eclipse.core.runtime.*;
+@@ -25,18 +26,19 @@ import org.eclipse.ecf.filetransfer.service.IRetrieveFileTransferFactory;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI.AuthenticationInfo;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
+ import org.eclipse.equinox.security.storage.*;
+ import org.eclipse.osgi.util.NLS;
+ import org.osgi.util.tracker.ServiceTracker;
+ 
+ public class ECFMetadataTransport {
++	private static final String SERVER_REDIRECT = "Server redirected too many times"; //$NON-NLS-1$
+ 	/**
+ 	 * The number of password retry attempts allowed before failing.
+ 	 */
+ 	private static final int LOGIN_RETRIES = 3;
+-	private static final String ERROR_401 = "401"; //$NON-NLS-1$
+-	private static final String ERROR_FILE_NOT_FOUND = "FileNotFound"; //$NON-NLS-1$
++	private static final ProtocolException ERROR_401 = new ProtocolException();
+ 
+ 	/**
+ 	 * The singleton transport instance.
+@@ -44,8 +46,6 @@ public class ECFMetadataTransport {
+ 	private static ECFMetadataTransport instance;
+ 
+ 	private final ServiceTracker retrievalFactoryTracker;
+-	private String username;
+-	private String password;
+ 
+ 	public static synchronized ECFMetadataTransport getInstance() {
+ 		if (instance == null) {
+@@ -59,11 +59,31 @@ public class ECFMetadataTransport {
+ 		retrievalFactoryTracker.open();
+ 	}
+ 
+-	public IStatus download(String toDownload, OutputStream target, IProgressMonitor monitor) {
++	public IStatus download(String url, OutputStream destination, IProgressMonitor monitor) {
++		try {
++			IConnectContext context = getConnectionContext(url, false);
++			for (int i = 0; i < LOGIN_RETRIES; i++) {
++				try {
++					return performDownload(url, destination, context, monitor);
++				} catch (ProtocolException e) {
++					if (e == ERROR_401)
++						context = getConnectionContext(url, true);
++				}
++			}
++		} catch (UserCancelledException e) {
++			return Status.CANCEL_STATUS;
++		} catch (ProvisionException e) {
++			return e.getStatus();
++		}
++		//reached maximum number of retries without success
++		return new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.io_failedRead, url), null);
++	}
++
++	public IStatus performDownload(String toDownload, OutputStream target, IConnectContext context, IProgressMonitor monitor) throws ProtocolException {
+ 		IRetrieveFileTransferFactory factory = (IRetrieveFileTransferFactory) retrievalFactoryTracker.getService();
+ 		if (factory == null)
+ 			return new Status(IStatus.ERROR, Activator.ID, NLS.bind(Messages.io_failedRead, toDownload));
+-		return transfer(factory.newInstance(), toDownload, target, monitor);
++		return transfer(factory.newInstance(), toDownload, target, context, monitor);
+ 	}
+ 
+ 	/**
+@@ -73,32 +93,31 @@ public class ECFMetadataTransport {
+ 	 * @exception OperationCanceledException if the request was canceled.
+ 	 */
+ 	public long getLastModified(URL location) throws ProvisionException {
++		String locationString = location.toExternalForm();
+ 		try {
+-			setLogin(location, false);
++			IConnectContext context = getConnectionContext(locationString, false);
+ 			for (int i = 0; i < LOGIN_RETRIES; i++) {
+ 				try {
+-					return doGetLastModified(location.toExternalForm());
++					return doGetLastModified(locationString, context);
+ 				} catch (ProtocolException e) {
+-					if (ERROR_401.equals(e.getMessage())) {
+-						setLogin(location, true);
+-					}
+-					if (ERROR_FILE_NOT_FOUND.equals(e.getMessage())) {
+-						return 0;
+-					}
++					if (ERROR_401 == e)
++						context = getConnectionContext(locationString, true);
++				} catch (Exception e) {
++					e.getMessage();
+ 				}
+ 			}
+ 		} catch (UserCancelledException e) {
+ 			throw new OperationCanceledException();
+ 		}
+ 		//too many retries, so report as failure
+-		throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.io_failedRead, location), null));
++		throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.io_failedRead, locationString), null));
+ 	}
+ 
+ 	/**
+ 	 * Perform the ECF call to get the last modified time, failing if there is any
+ 	 * protocol failure such as an authentication failure.
+ 	 */
+-	private long doGetLastModified(String location) throws ProtocolException {
++	private long doGetLastModified(String location, IConnectContext context) throws ProtocolException {
+ 		IContainer container;
+ 		try {
+ 			container = ContainerFactory.getDefault().createContainer();
+@@ -109,7 +128,7 @@ public class ECFMetadataTransport {
+ 		if (adapter == null) {
+ 			return 0;
+ 		}
+-		IRemoteFile remoteFile = checkFile(adapter, location);
++		IRemoteFile remoteFile = checkFile(adapter, location, context);
+ 		if (remoteFile == null) {
+ 			return 0;
+ 		}
+@@ -117,55 +136,59 @@ public class ECFMetadataTransport {
+ 	}
+ 
+ 	/**
+-	 * Sets the login details from the user for the specified URL. If the login
+-	 * details are not available, the user is prompted.
+-	 * @param xmlLocation - the location requiring login details
++	 * Returns the connection context for the given URL. This may prompt the
++	 * user for user name and password as required.
++	 * 
++	 * @param xmlLocation - the file location requiring login details
+ 	 * @param prompt - use <code>true</code> to prompt the user instead of
+-	 * looking at the secure preference store for login details first 
+-	 * @throws UserCancelledException 
+-	 * @throws ProvisionException when the user cancels the login prompt
++	 * looking at the secure preference store for login, use <code>false</code>
++	 * to only try the secure preference store
++	 * @throws UserCancelledException when the user cancels the login prompt 
++	 * @throws ProvisionException if the password cannot be read or saved
++	 * @return The connection context
+ 	 */
+-	public void setLogin(URL xmlLocation, boolean prompt) throws UserCancelledException, ProvisionException {
++	public IConnectContext getConnectionContext(String xmlLocation, boolean prompt) throws UserCancelledException, ProvisionException {
+ 		ISecurePreferences securePreferences = SecurePreferencesFactory.getDefault();
+-		IPath hostLocation = new Path(xmlLocation.toExternalForm()).removeLastSegments(1);
++		IPath hostLocation = new Path(xmlLocation).removeLastSegments(1);
+ 		int repositoryHash = hostLocation.hashCode();
+ 		ISecurePreferences metadataNode = securePreferences.node(IRepository.PREFERENCE_NODE + "/" + repositoryHash); //$NON-NLS-1$
+-		String[] loginDetails = new String[3];
+ 		if (!prompt) {
+ 			try {
+-				loginDetails[0] = metadataNode.get(IRepository.PROP_USERNAME, null);
+-				loginDetails[1] = metadataNode.get(IRepository.PROP_PASSWORD, null);
++				String username = metadataNode.get(IRepository.PROP_USERNAME, null);
++				String password = metadataNode.get(IRepository.PROP_PASSWORD, null);
++				//if we don't have stored connection data just return a null connection context
++				if (username == null || password == null)
++					return null;
++				return ConnectContextFactory.createUsernamePasswordConnectContext(username, password);
+ 			} catch (StorageException e) {
+ 				String msg = NLS.bind(Messages.repoMan_internalError, xmlLocation.toString());
+ 				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.INTERNAL_ERROR, msg, null));
+ 			}
+ 		}
+-		if ((loginDetails[0] == null || loginDetails[1] == null) && prompt) {
+-			ServiceTracker adminUITracker = new ServiceTracker(Activator.getContext(), IServiceUI.class.getName(), null);
+-			adminUITracker.open();
+-			IServiceUI adminUIService = (IServiceUI) adminUITracker.getService();
+-			if (adminUIService != null)
+-				loginDetails = adminUIService.getUsernamePassword(hostLocation.toString());
+-		}
+-		if (loginDetails == null) {
+-			setUsername(null);
+-			setPassword(null);
++		//need to prompt user for user name and password
++		ServiceTracker adminUITracker = new ServiceTracker(Activator.getContext(), IServiceUI.class.getName(), null);
++		adminUITracker.open();
++		IServiceUI adminUIService = (IServiceUI) adminUITracker.getService();
++		AuthenticationInfo loginDetails = null;
++		if (adminUIService != null)
++			loginDetails = adminUIService.getUsernamePassword(hostLocation.toString());
++		//null result means user canceled password dialog
++		if (loginDetails == null)
+ 			throw new UserCancelledException();
+-		}
+-		if (loginDetails[2] != null && Boolean.valueOf(loginDetails[2]).booleanValue()) {
++		//save user name and password if requested by user
++		if (loginDetails.saveResult()) {
+ 			try {
+-				metadataNode.put(IRepository.PROP_USERNAME, loginDetails[0], true);
+-				metadataNode.put(IRepository.PROP_PASSWORD, loginDetails[1], true);
++				metadataNode.put(IRepository.PROP_USERNAME, loginDetails.getUserName(), true);
++				metadataNode.put(IRepository.PROP_PASSWORD, loginDetails.getPassword(), true);
+ 			} catch (StorageException e1) {
+ 				String msg = NLS.bind(Messages.repoMan_internalError, xmlLocation.toString());
+ 				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.INTERNAL_ERROR, msg, null));
+ 			}
+ 		}
+-		setUsername(loginDetails[0]);
+-		setPassword(loginDetails[1]);
++		return ConnectContextFactory.createUsernamePasswordConnectContext(loginDetails.getUserName(), loginDetails.getPassword());
+ 	}
+ 
+-	private IRemoteFile checkFile(final IRemoteFileSystemBrowserContainerAdapter retrievalContainer, final String location) throws ProtocolException {
++	private IRemoteFile checkFile(final IRemoteFileSystemBrowserContainerAdapter retrievalContainer, final String location, IConnectContext context) throws ProtocolException {
+ 		final Object[] result = new Object[2];
+ 		final Boolean[] done = new Boolean[1];
+ 		done[0] = new Boolean(false);
+@@ -199,12 +222,7 @@ public class ECFMetadataTransport {
+ 			}
+ 		};
+ 		try {
+-			if (username != null && password != null) {
+-				IConnectContext connectContext = ConnectContextFactory.createUsernamePasswordConnectContext(username, password);
+-				retrievalContainer.setConnectContextForAuthentication(connectContext);
+-			} else {
+-				retrievalContainer.setConnectContextForAuthentication(null);
+-			}
++			retrievalContainer.setConnectContextForAuthentication(context);
+ 			retrievalContainer.sendBrowseRequest(FileIDFactory.getDefault().createFileID(retrievalContainer.getBrowseNamespace(), location), listener);
+ 		} catch (RemoteFileSystemException e) {
+ 			return null;
+@@ -222,16 +240,17 @@ public class ECFMetadataTransport {
+ 				}
+ 			}
+ 		}
+-		if (result[0] == null && result[1] instanceof Exception) {
+-			if (result[1] instanceof FileNotFoundException)
+-				throw new ProtocolException(ERROR_FILE_NOT_FOUND);
+-			if (result[1] instanceof IOException)
+-				throw new ProtocolException(ERROR_401);
++		if (result[0] == null && result[1] instanceof IOException) {
++			IOException ioException = (IOException) result[1];
++			//throw a special exception for authentication failure so we know to prompt for username/password
++			String message = ioException.getMessage();
++			if (message != null && (message.indexOf("401") != -1 || message.indexOf(SERVER_REDIRECT) != -1)) //$NON-NLS-1$
++				throw ERROR_401;
+ 		}
+ 		return (IRemoteFile) result[0];
+ 	}
+ 
+-	private IStatus transfer(final IRetrieveFileTransferContainerAdapter retrievalContainer, final String toDownload, final OutputStream target, final IProgressMonitor monitor) {
++	private IStatus transfer(final IRetrieveFileTransferContainerAdapter retrievalContainer, final String toDownload, final OutputStream target, IConnectContext context, final IProgressMonitor monitor) throws ProtocolException {
+ 		final IStatus[] result = new IStatus[1];
+ 		IFileTransferListener listener = new IFileTransferListener() {
+ 
+@@ -268,9 +287,17 @@ public class ECFMetadataTransport {
+ 		};
+ 
+ 		try {
++			retrievalContainer.setConnectContextForAuthentication(context);
+ 			retrievalContainer.sendRetrieveRequest(FileIDFactory.getDefault().createFileID(retrievalContainer.getRetrieveNamespace(), toDownload), listener, null);
+ 		} catch (IncomingFileTransferException e) {
+-			return e.getStatus();
++			IStatus status = e.getStatus();
++			Throwable exception = status.getException();
++			if (exception instanceof IOException) {
++				String message = exception.getMessage();
++				if (message != null && (message.indexOf("401") != -1 || message.indexOf(SERVER_REDIRECT) != -1)) //$NON-NLS-1$
++					throw ERROR_401;
++			}
++			return status;
+ 		} catch (FileCreateException e) {
+ 			return e.getStatus();
+ 		}
+@@ -296,12 +323,4 @@ public class ECFMetadataTransport {
+ 			return new Status(IStatus.CANCEL, Activator.ID, e.getMessage(), e);
+ 		return new Status(IStatus.ERROR, Activator.ID, e.getMessage(), e);
+ 	}
+-
+-	public void setUsername(String username) {
+-		this.username = username;
+-	}
+-
+-	public void setPassword(String password) {
+-		this.password = password;
+-	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+index c0b1402..8444a83 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+@@ -24,9 +24,9 @@ public class ValidationDialogServiceUI implements IServiceUI {
+ 	 * (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.core.IServiceUI#getUsernamePassword(java.lang.String)
+ 	 */
+-	public String[] getUsernamePassword(final String location) {
++	public AuthenticationInfo getUsernamePassword(final String location) {
+ 
+-		final Object[] result = new Object[1];
++		final AuthenticationInfo[] result = new AuthenticationInfo[1];
+ 		PlatformUI.getWorkbench().getDisplay().syncExec(new Runnable() {
+ 
+ 			public void run() {
+@@ -41,6 +41,6 @@ public class ValidationDialogServiceUI implements IServiceUI {
+ 			}
+ 
+ 		});
+-		return result[0] instanceof String[] ? (String[]) result[0] : null;
++		return result[0];
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UserValidationDialog.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UserValidationDialog.java
+index e2ad864..6160ab1 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UserValidationDialog.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/dialogs/UserValidationDialog.java
+@@ -11,6 +11,7 @@
+ package org.eclipse.equinox.internal.provisional.p2.ui.dialogs;
+ 
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
++import org.eclipse.equinox.internal.provisional.p2.core.IServiceUI.AuthenticationInfo;
+ import org.eclipse.jface.dialogs.IDialogConstants;
+ import org.eclipse.jface.dialogs.MessageDialog;
+ import org.eclipse.swt.SWT;
+@@ -19,11 +20,14 @@ import org.eclipse.swt.layout.GridData;
+ import org.eclipse.swt.layout.GridLayout;
+ import org.eclipse.swt.widgets.*;
+ 
++/**
++ * A dialog to prompt the user for login information such as user name and password.
++ */
+ public class UserValidationDialog extends MessageDialog {
+ 
+ 	private Text username;
+ 	private Text password;
+-	private String[] result = null;
++	private AuthenticationInfo result = null;
+ 
+ 	private Button saveButton;
+ 
+@@ -72,24 +76,16 @@ public class UserValidationDialog extends MessageDialog {
+ 	}
+ 
+ 	protected void buttonPressed(int buttonId) {
+-		if (buttonId == getDefaultButtonIndex()) {
+-			String[] loginDetails = new String[3];
+-			loginDetails[0] = username.getText();
+-			loginDetails[1] = password.getText();
+-			loginDetails[2] = Boolean.toString(saveButton.getSelection());
+-			this.result = loginDetails;
+-		}
++		if (buttonId == getDefaultButtonIndex())
++			this.result = new AuthenticationInfo(username.getText(), password.getText(), saveButton.getSelection());
+ 		super.buttonPressed(buttonId);
+ 	}
+ 
+ 	/**
+-	 * Returns the username and password given by the user.
+-	 * @return A three element {@link String} array with the username, password, 
+-	 * and save state, in that order.
+-	 * Returns <code>null</code> if the dialog was canceled.
++	 * Returns the authentication information given by the user, or null if the user cancelled
++	 * @return the authentication information given by the user, or null if the user cancelled
+ 	 */
+-	public Object getResult() {
++	public AuthenticationInfo getResult() {
+ 		return result;
+ 	}
+-
+ }

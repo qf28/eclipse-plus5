@@ -1,0 +1,371 @@
+commit eca562f29be4293fc38f5e8349b687e010d35c7f
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Jul 23 10:27:29 2016 +0200
+
+    Bug 498362 - Compile error on Optional.map(byte[]::clone) (edit)
+    
+    Change-Id: I3960ba5fa61027ff78fb6fecc893f964270353bc
+
+16	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+14	20	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+2	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
+42	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
+0	19	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+index 844486c..d410696 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+@@ -6784,4 +6784,20 @@ public void testBug498113b() {
+ 			"}\n"
+ 		});
+ }
++public void testBug498362() {
++	runConformTest(
++		new String[] {
++			"X.java",
++			"import java.util.*;\n" +
++			"public class X {\n" +
++			"	static final byte[] EMPTY_BYTE_ARRAY = new byte[0];\n" +
++			"	private byte[] stream;\n" +
++			"	void test() {\n" +
++			"		this.stream = Optional.ofNullable(stream)\n" + 
++			"            .map(byte[]::clone)\n" + 
++			"            .orElse(EMPTY_BYTE_ARRAY);" +
++			"	}\n" +
++			"}\n"
++		});
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index 084eb6c..1e5da30 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -76,6 +76,7 @@ import org.eclipse.jdt.internal.compiler.flow.UnconditionalFlowInfo;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.impl.Constant;
+ import org.eclipse.jdt.internal.compiler.impl.ReferenceContext;
++import org.eclipse.jdt.internal.compiler.lookup.ArrayBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.Binding;
+ import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
+ import org.eclipse.jdt.internal.compiler.lookup.ExtraCompilerModifiers;
+@@ -405,7 +406,7 @@ public void computeConversion(Scope scope, TypeBinding runtimeTimeType, TypeBind
+ 	    		? compileTimeType  // unboxing: checkcast before conversion
+ 	    		: runtimeTimeType;
+ 	        this.valueCast = originalType.genericCast(targetType);
+-		} 	else if (this.binding == scope.environment().arrayClone
++		} 	else if (ArrayBinding.isArrayClone(this.actualReceiverType, this.binding)
+ 				&& runtimeTimeType.id != TypeIds.T_JavaLangObject
+ 				&& scope.compilerOptions().sourceLevel >= ClassFileConstants.JDK1_5) {
+ 					// from 1.5 source level on, array#clone() resolves to array type, but codegen to #clone()Object - thus require extra inserted cast
+@@ -857,25 +858,20 @@ public TypeBinding resolveType(BlockScope scope) {
+ 	if (isMethodUseDeprecated(this.binding, scope, true))
+ 		scope.problemReporter().deprecatedMethod(this.binding, this);
+ 
+-	// from 1.5 source level on, array#clone() returns the array type (but binding still shows Object)
+-	if (this.binding == scope.environment().arrayClone && compilerOptions.sourceLevel >= ClassFileConstants.JDK1_5) {
+-		this.resolvedType = this.actualReceiverType;
++	TypeBinding returnType;
++	if ((this.bits & ASTNode.Unchecked) != 0 && this.genericTypeArguments == null) {
++		// https://bugs.eclipse.org/bugs/show_bug.cgi?id=277643, align with javac on JLS 15.12.2.6
++		returnType = this.binding.returnType;
++		if (returnType != null) {
++			returnType = scope.environment().convertToRawType(returnType.erasure(), true);
++		}
+ 	} else {
+-		TypeBinding returnType;
+-		if ((this.bits & ASTNode.Unchecked) != 0 && this.genericTypeArguments == null) {
+-			// https://bugs.eclipse.org/bugs/show_bug.cgi?id=277643, align with javac on JLS 15.12.2.6
+-			returnType = this.binding.returnType;
+-			if (returnType != null) {
+-				returnType = scope.environment().convertToRawType(returnType.erasure(), true);
+-			}
+-		} else {
+-			returnType = this.binding.returnType;
+-			if (returnType != null) {
+-				returnType = returnType.capture(scope, this.sourceStart, this.sourceEnd);
+-			}
++		returnType = this.binding.returnType;
++		if (returnType != null) {
++			returnType = returnType.capture(scope, this.sourceStart, this.sourceEnd);
+ 		}
+-		this.resolvedType = returnType;
+ 	}
++	this.resolvedType = returnType;
+ 	if (this.receiver.isSuper() && compilerOptions.getSeverity(CompilerOptions.OverridingMethodWithoutSuperInvocation) != ProblemSeverities.Ignore) {
+ 		final ReferenceContext referenceContext = scope.methodScope().referenceContext;
+ 		if (referenceContext instanceof AbstractMethodDeclaration) {
+@@ -994,9 +990,7 @@ public boolean isCompatibleWith(TypeBinding targetType, final Scope scope) {
+ 		TypeBinding returnType;
+ 		if (method == null || !method.isValidBinding() || (returnType = method.returnType) == null || !returnType.isValidBinding())
+ 			return false;
+-		if (method == scope.environment().arrayClone)
+-			returnType = this.actualReceiverType;
+-		return returnType != null && returnType.capture(scope, this.sourceStart, this.sourceEnd).isCompatibleWith(targetType, scope);
++		return returnType.capture(scope, this.sourceStart, this.sourceEnd).isCompatibleWith(targetType, scope);
+ 	} finally {
+ 		this.expectedType = originalExpectedType;
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+index 130f3d7..331bd26 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+@@ -722,9 +722,8 @@ public class ReferenceExpression extends FunctionalExpression implements IPolyEx
+     		this.bits |= ASTNode.Unchecked;
+ 
+     	if (this.descriptor.returnType.id != TypeIds.T_void) {
+-    		// from 1.5 source level on, array#clone() returns the array type (but binding still shows Object)
+     		TypeBinding returnType = null;
+-    		if (this.binding == scope.environment().arrayClone || this.binding.isConstructor()) {
++    		if (this.binding.isConstructor()) {
+     			returnType = this.receiverType;
+     		} else {
+     			if ((this.bits & ASTNode.Unchecked) != 0 && this.resolvedTypeArguments == null) {
+@@ -786,7 +785,7 @@ public class ReferenceExpression extends FunctionalExpression implements IPolyEx
+ 	    			}
+ 	    		}
+ 	    		TypeBinding returnType = this.binding.returnType;
+-	    		if (this.binding.isConstructor() || this.binding == scope.environment().arrayClone) {
++	    		if (this.binding.isConstructor()) {
+ 	    			returnType = scope.environment().createAnnotatedType(this.receiverType, new AnnotationBinding[]{ scope.environment().getNonNullAnnotation() });
+ 	    		}
+ 	    		NullAnnotationMatching annotationStatus = NullAnnotationMatching.analyse(this.descriptor.returnType, returnType, FlowInfo.UNKNOWN);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
+index f21c3ba..ac79c0e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
+@@ -3388,8 +3388,8 @@ public static TypeBinding getConstantPoolDeclaringClass(Scope currentScope, Fiel
+ public static TypeBinding getConstantPoolDeclaringClass(Scope currentScope, MethodBinding codegenBinding, TypeBinding actualReceiverType, boolean isImplicitThisReceiver) {
+ 	TypeBinding constantPoolDeclaringClass = codegenBinding.declaringClass;
+ 	// Post 1.4.0 target, array clone() invocations are qualified with array type
+-	// This is handled in array type #clone method binding resolution (see Scope and UpdatedMethodBinding)
+-	if (codegenBinding == currentScope.environment().arrayClone) {
++	// This is handled in array type #clone method binding resolution (see ArrayBinding.getCloneMethod())
++	if (ArrayBinding.isArrayClone(actualReceiverType, codegenBinding)) {
+ 		CompilerOptions options = currentScope.compilerOptions();
+ 		if (options.sourceLevel > ClassFileConstants.JDK1_4 ) {
+ 			constantPoolDeclaringClass = actualReceiverType.erasure();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
+index 8a7b8e3..2602b5e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
+@@ -30,6 +30,7 @@ import java.util.List;
+ import java.util.Set;
+ 
+ import org.eclipse.jdt.core.compiler.CharOperation;
++import org.eclipse.jdt.internal.compiler.ClassFile;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.impl.Constant;
+@@ -49,6 +50,8 @@ public final class ArrayBinding extends TypeBinding {
+ 	// possible bits are TagBits.AnnotationNonNull and TagBits.AnnotationNullable
+ 	// (only ever set when CompilerOptions.isAnnotationBasedNullAnalysisEnabled == true):
+ 	public long[] nullTagBitsPerDimension;
++	
++	private MethodBinding clone;
+ 
+ public ArrayBinding(TypeBinding type, int dimensions, LookupEnvironment environment) {
+ 	this.tagBits |= TagBits.IsArrayType;
+@@ -485,4 +488,43 @@ public long updateTagBits() {
+ 		this.tagBits |= this.leafComponentType.updateTagBits(); 
+ 	return super.updateTagBits();
+ }
++
++/**
++ * The type of x.clone() is substituted from 'Object' into the type of the receiver array (non-null)
++ */
++public MethodBinding getCloneMethod(final MethodBinding originalMethod) {
++	if (this.clone != null)
++		return this.clone;
++	MethodBinding method = new MethodBinding() {
++		@Override
++		public char[] signature(ClassFile classFile) {
++			return originalMethod.signature(); // for codeGen we need to answer the signature of j.l.Object.clone()
++		}
++	};
++	method.modifiers = originalMethod.modifiers;
++	method.selector = originalMethod.selector;
++	method.declaringClass = originalMethod.declaringClass; // cannot set array binding as declaring class, will be tweaked in CodeStream.getConstantPoolDeclaringClass()
++	method.typeVariables = Binding.NO_TYPE_VARIABLES;
++	method.parameters = originalMethod.parameters;
++	method.thrownExceptions = Binding.NO_EXCEPTIONS;
++	method.tagBits = originalMethod.tagBits;
++	method.returnType = this.environment.globalOptions.sourceLevel >= ClassFileConstants.JDK1_5 ? this : originalMethod.returnType;
++	if (this.environment.globalOptions.isAnnotationBasedNullAnalysisEnabled) {
++		if (this.environment.usesNullTypeAnnotations())
++			method.returnType = this.environment.createAnnotatedType(method.returnType, new AnnotationBinding[] { this.environment.getNonNullAnnotation() });
++		else
++			method.tagBits |= TagBits.AnnotationNonNull;
++	}
++	if ((method.returnType.tagBits & TagBits.HasMissingType) != 0) {
++		method.tagBits |=  TagBits.HasMissingType;
++	}
++	return this.clone = method;
++}
++public static boolean isArrayClone(TypeBinding receiverType, MethodBinding binding) {
++	if (receiverType instanceof ArrayBinding) {
++		MethodBinding clone = ((ArrayBinding) receiverType).clone;
++		return clone != null && binding == clone;
++	}
++	return false;
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+index 9496c2f..44ae3f0 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+@@ -95,8 +95,6 @@ public class LookupEnvironment implements ProblemReasons, TypeConstants {
+ 	private CompilationUnitDeclaration[] units = new CompilationUnitDeclaration[4];
+ 	private MethodVerifier verifier;
+ 
+-	public MethodBinding arrayClone;
+-
+ 	private ArrayList missingTypes;
+ 	Set<SourceTypeBinding> typesBeingConnected;
+ 	public boolean isProcessingAnnotations = false;
+@@ -348,23 +346,6 @@ public void completeTypeBindings(CompilationUnitDeclaration[] parsedUnits, boole
+ 
+ 	this.unitBeingCompleted = null;
+ }
+-/**
+- * NB: for source >= 1.5 the return type is not correct: shows j.l.Object but should show T[].
+- * See references to {@link #arrayClone} for code that compensates for this mismatch.
+- */
+-public MethodBinding computeArrayClone(MethodBinding objectClone) {
+-	if (this.arrayClone == null) {
+-		this.arrayClone = new MethodBinding(
+-				(objectClone.modifiers & ~ClassFileConstants.AccProtected) | ClassFileConstants.AccPublic,
+-				TypeConstants.CLONE,
+-				objectClone.returnType,
+-				Binding.NO_PARAMETERS,
+-				Binding.NO_EXCEPTIONS, // no exception for array specific method
+-				(ReferenceBinding)objectClone.returnType);
+-	}
+-	return this.arrayClone;
+-	
+-}
+ public TypeBinding computeBoxingType(TypeBinding type) {
+ 	TypeBinding boxedType;
+ 	switch (type.id) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
+index 2ee8dc5..fbede14 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
+@@ -1081,7 +1081,7 @@ public final char[] signature() /* (ILjava/lang/Thread;)Ljava/lang/Object; */ {
+  *
+  * See https://bugs.eclipse.org/bugs/show_bug.cgi?id=171184
+  */
+-public final char[] signature(ClassFile classFile) {
++public char[] signature(ClassFile classFile) {
+ 	if (this.signature != null) {
+ 		if ((this.tagBits & TagBits.ContainsNestedTypeReferences) != 0) {
+ 			// we need to record inner classes references
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index c5d3f96..7c8dc05 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -1843,7 +1843,7 @@ public abstract class Scope {
+ 			    switch (selector[0]) {
+ 			        case 'c':
+ 			            if (CharOperation.equals(selector, TypeConstants.CLONE)) {
+-			            	return environment().computeArrayClone(methodBinding);
++			            	return receiverType.getCloneMethod(methodBinding);
+ 			            }
+ 			            break;
+ 			        case 'g':
+@@ -2271,7 +2271,7 @@ public abstract class Scope {
+ 		
+ 		if (receiverType.isArrayType()) {
+ 			if (CharOperation.equals(selector, TypeConstants.CLONE))
+-				return environment().computeArrayClone(exactMethod);
++				return ((ArrayBinding) receiverType).getCloneMethod(exactMethod);
+ 			if (CharOperation.equals(selector, TypeConstants.GETCLASS))
+ 				return environment().createGetClassMethod(receiverType, exactMethod, this);
+ 		}
+commit 6b76c1f636ac56a91d99f0f030b67798ffeabd5e
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Mon Jul 25 21:05:13 2016 +0200
+
+    Bug 498362 - Compile error on Optional.map(byte[]::clone) (edit)
+    
+    - fix for a regression
+    
+    Change-Id: Ic903a7214f773f0fd3e39a80bbcc064d7b4bab5b
+
+29	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+6	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+index d410696..d553532 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+@@ -6784,7 +6784,7 @@ public void testBug498113b() {
+ 			"}\n"
+ 		});
+ }
+-public void testBug498362() {
++public void testBug498362_comment0() {
+ 	runConformTest(
+ 		new String[] {
+ 			"X.java",
+@@ -6800,4 +6800,32 @@ public void testBug498362() {
+ 			"}\n"
+ 		});
+ }
++public void testBug498362_comment5() {
++	runConformTest(
++		new String[] {
++			"CloneVerifyError.java",
++			"public class CloneVerifyError {\n" + 
++			"    public interface PublicCloneable<T> extends Cloneable {\n" + 
++			"        public T clone();\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    public static <T> T[] clone0(T[] input) {\n" + 
++			"        return input == null ? null : input.clone();\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    public static <T extends PublicCloneable<T>> T clone0(T input) {\n" + 
++			"        if (input == null) {\n" + 
++			"            return null;\n" + 
++			"        } else {\n" + 
++			"            return input.clone();\n" + 
++			"        }\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    public static void main(String[] args) {\n" + 
++			"        Object[] array = null;\n" + 
++			"        clone0(array);\n" + 
++			"    }\n" + 
++			"}\n"
++		});
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index 1e5da30..c9dc409 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -401,16 +401,16 @@ public void computeConversion(Scope scope, TypeBinding runtimeTimeType, TypeBind
+ 		MethodBinding originalBinding = this.binding.original();
+ 		TypeBinding originalType = originalBinding.returnType;
+ 	    // extra cast needed if method return type is type variable
+-		if (originalType.leafComponentType().isTypeVariable()) {
++		if (ArrayBinding.isArrayClone(this.actualReceiverType, this.binding)
++				&& runtimeTimeType.id != TypeIds.T_JavaLangObject
++				&& scope.compilerOptions().sourceLevel >= ClassFileConstants.JDK1_5) {
++			// from 1.5 source level on, array#clone() resolves to array type, but codegen to #clone()Object - thus require extra inserted cast
++			this.valueCast = runtimeTimeType;
++		} else if (originalType.leafComponentType().isTypeVariable()) {
+ 	    	TypeBinding targetType = (!compileTimeType.isBaseType() && runtimeTimeType.isBaseType())
+ 	    		? compileTimeType  // unboxing: checkcast before conversion
+ 	    		: runtimeTimeType;
+ 	        this.valueCast = originalType.genericCast(targetType);
+-		} 	else if (ArrayBinding.isArrayClone(this.actualReceiverType, this.binding)
+-				&& runtimeTimeType.id != TypeIds.T_JavaLangObject
+-				&& scope.compilerOptions().sourceLevel >= ClassFileConstants.JDK1_5) {
+-					// from 1.5 source level on, array#clone() resolves to array type, but codegen to #clone()Object - thus require extra inserted cast
+-			this.valueCast = runtimeTimeType;
+ 		}
+         if (this.valueCast instanceof ReferenceBinding) {
+ 			ReferenceBinding referenceCast = (ReferenceBinding) this.valueCast;

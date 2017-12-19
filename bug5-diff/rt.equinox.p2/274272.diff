@@ -1,0 +1,1262 @@
+commit f19abed12ad5dbed3a6d97d0eb7fa71ba236d513
+Author: Pascal Rapicault <prapicau>
+Date:   Wed May 12 16:28:05 2010 +0000
+
+    Bug 274272 - [repository] Cache artifact repository index
+
+2	13	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepository.java
+79	62	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepositoryFactory.java
+6	16	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+75	62	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryFactory.java
+0	361	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CacheManager.java
+3	0	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepositoryFactory.java
+1	3	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
+2	9	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryComponent.java
+3	0	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+5	9	bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/tools/RecreateRepositoryApplication.java
+5	0	bundles/org.eclipse.equinox.p2.repository/.project
+1	0	bundles/org.eclipse.equinox.p2.repository/META-INF/MANIFEST.MF
+8	0	bundles/org.eclipse.equinox.p2.repository/OSGI-INF/cacheManager.xml
+5	14	bundles/org.eclipse.equinox.p2.repository/build.properties
+1	3	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManager.java
+27	0	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManagerComponent.java
+5	0	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Messages.java
+4	3	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/messages.properties
+2	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/JarURLArtifactRepositoryTest.java
+1	10	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/SimpleArtifactRepositoryTest.java
+1	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/planner/Bug306279f.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepository.java
+index 04167f7..928d34b 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepository.java
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Sonatype Inc - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.artifact.repository;
+ 
+@@ -130,19 +131,7 @@ public class CompositeArtifactRepository extends AbstractArtifactRepository impl
+ 	}
+ 
+ 	private static URI getActualLocation(URI base, String extension) {
+-		final String name = CONTENT_FILENAME + extension;
+-		String spec = base.toString();
+-		if (spec.endsWith(name))
+-			return base;
+-		if (spec.endsWith("/")) //$NON-NLS-1$
+-			spec += name;
+-		else
+-			spec += "/" + name; //$NON-NLS-1$
+-		try {
+-			return new URI(spec);
+-		} catch (URISyntaxException e) {
+-			return null;
+-		}
++		return URIUtil.append(base, CONTENT_FILENAME + extension);
+ 	}
+ 
+ 	private boolean isLocal() {
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepositoryFactory.java
+index a372168..180ed01 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepositoryFactory.java
+@@ -7,13 +7,10 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Sonatype Inc - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.artifact.repository;
+ 
+-import org.eclipse.equinox.p2.repository.artifact.spi.ArtifactRepositoryFactory;
+-
+-import org.eclipse.equinox.p2.core.ProvisionException;
+-
+ import java.io.*;
+ import java.net.URI;
+ import java.util.Map;
+@@ -23,83 +20,94 @@ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.Tracing;
+ import org.eclipse.equinox.internal.p2.persistence.CompositeRepositoryIO;
+ import org.eclipse.equinox.internal.p2.persistence.CompositeRepositoryState;
+-import org.eclipse.equinox.internal.p2.repository.RepositoryTransport;
+-import org.eclipse.equinox.internal.p2.repository.Transport;
++import org.eclipse.equinox.internal.p2.repository.CacheManager;
++import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.repository.IRepositoryManager;
+ import org.eclipse.equinox.p2.repository.artifact.IArtifactRepository;
+ import org.eclipse.equinox.p2.repository.artifact.IArtifactRepositoryManager;
++import org.eclipse.equinox.p2.repository.artifact.spi.ArtifactRepositoryFactory;
+ import org.eclipse.osgi.util.NLS;
+ 
+ public class CompositeArtifactRepositoryFactory extends ArtifactRepositoryFactory {
+ 
++	private static final String JAR_EXTENSION = ".jar"; //$NON-NLS-1$
++	private static final String XML_EXTENSION = ".xml"; //$NON-NLS-1$
++	private static final String PROTOCOL_FILE = "file"; //$NON-NLS-1$
++
+ 	private IArtifactRepositoryManager getManager() {
+ 		if (getAgent() != null)
+ 			return (IArtifactRepositoryManager) getAgent().getService(IArtifactRepositoryManager.SERVICE_NAME);
+ 		return null;
+ 	}
+ 
++	/**
++	 * Returns a file in the local file system that contains the contents of the
++	 * metadata repository at the given location.
++	 */
++	private File getLocalFile(URI location, IProgressMonitor monitor) throws IOException, ProvisionException {
++		File localFile = null;
++		URI jarLocation = CompositeArtifactRepository.getActualLocation(location, true);
++		URI xmlLocation = CompositeArtifactRepository.getActualLocation(location, false);
++		// If the repository is local, we can return the repository file directly
++		if (PROTOCOL_FILE.equals(xmlLocation.getScheme())) {
++			//look for a compressed local file
++			localFile = URIUtil.toFile(jarLocation);
++			if (localFile.exists())
++				return localFile;
++			//look for an uncompressed local file
++			localFile = URIUtil.toFile(xmlLocation);
++			if (localFile.exists())
++				return localFile;
++			String msg = NLS.bind(Messages.io_failedRead, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, msg, null));
++		}
++		//file is not local, create a cache of the repository metadata
++		CacheManager cache = (CacheManager) getAgent().getService(CacheManager.SERVICE_NAME);
++		if (cache == null)
++			throw new IllegalArgumentException("Cache manager service not available"); //$NON-NLS-1$
++		localFile = cache.createCache(location, CompositeArtifactRepository.CONTENT_FILENAME, monitor);
++		if (localFile == null) {
++			//there is no remote file in either form
++			String msg = NLS.bind(Messages.io_failedRead, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, msg, null));
++		}
++		return localFile;
++	}
++
+ 	public IArtifactRepository load(URI location, int flags, IProgressMonitor monitor) throws ProvisionException {
+-		final String PROTOCOL_FILE = "file"; //$NON-NLS-1$
+ 		long time = 0;
+ 		final String debugMsg = "Restoring artifact repository "; //$NON-NLS-1$
+ 		if (Tracing.DEBUG_METADATA_PARSING) {
+ 			Tracing.debug(debugMsg + location);
+ 			time = -System.currentTimeMillis();
+ 		}
+-		File localFile = null;
+-		boolean local = false;
++
++		SubMonitor sub = SubMonitor.convert(monitor, 400);
+ 		try {
+-			SubMonitor sub = SubMonitor.convert(monitor, 300);
+-			OutputStream artifacts = null;
+-			// try with compressed
+-			boolean compress = true;
+-			if (PROTOCOL_FILE.equals(location.getScheme())) {
+-				local = true;
+-				localFile = URIUtil.toFile(CompositeArtifactRepository.getActualLocation(location, true));
+-				if (!localFile.exists()) {
+-					localFile = URIUtil.toFile(CompositeArtifactRepository.getActualLocation(location, false));
+-					compress = false;
+-				}
+-			} else {
+-				//not local, return null if the caller wanted a modifiable repo
+-				if ((flags & IRepositoryManager.REPOSITORY_HINT_MODIFIABLE) > 0) {
+-					return null;
+-				}
++			//non local repos are not modifiable
++			if (!PROTOCOL_FILE.equals(location.getScheme()) && (flags & IRepositoryManager.REPOSITORY_HINT_MODIFIABLE) > 0)
++				return null;
+ 
+-				//download to local temp file
+-				localFile = File.createTempFile(CompositeArtifactRepository.CONTENT_FILENAME, CompositeArtifactRepository.XML_EXTENSION);
+-				try {
+-					artifacts = new BufferedOutputStream(new FileOutputStream(localFile));
+-					IStatus status = getTransport().download(CompositeArtifactRepository.getActualLocation(location, compress), artifacts, sub.newChild(100));
+-					if (!status.isOK()) {
+-						// retry uncompressed
+-						compress = false;
+-						status = getTransport().download(CompositeArtifactRepository.getActualLocation(location, compress), artifacts, sub.newChild(100));
+-						if (!status.isOK())
+-							throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, status.getMessage(), null));
+-					}
+-				} finally {
+-					if (artifacts != null)
+-						artifacts.close();
+-				}
+-			}
+-			InputStream descriptorStream = null;
++			File localFile = getLocalFile(location, sub.newChild(300));
++			InputStream inStream = new BufferedInputStream(new FileInputStream(localFile));
++			JarInputStream jarStream = null;
+ 			try {
+-				descriptorStream = new BufferedInputStream(new FileInputStream(localFile));
+-				if (compress) {
+-					URI actualLocation = CompositeArtifactRepository.getActualLocation(location, false);
+-					JarInputStream jInStream = new JarInputStream(descriptorStream);
+-					JarEntry jarEntry = jInStream.getNextJarEntry();
+-					String filename = URIUtil.lastSegment(actualLocation);
+-					while (jarEntry != null && filename != null && !(filename.equals(jarEntry.getName()))) {
+-						jarEntry = jInStream.getNextJarEntry();
+-					}
+-					if (jarEntry == null) {
+-						//there is a jar but the entry is missing or invalid, so treat this as an invalid repository
+-						throw new IOException(NLS.bind(Messages.io_invalidLocation, actualLocation.getPath()));
++				//if reading from a jar, obtain a stream on the entry with the actual contents
++				if (localFile.getAbsolutePath().endsWith(JAR_EXTENSION)) {
++					jarStream = new JarInputStream(inStream);
++					JarEntry jarEntry = jarStream.getNextJarEntry();
++					String entryName = CompositeArtifactRepository.CONTENT_FILENAME + XML_EXTENSION;
++					while (jarEntry != null && (!entryName.equals(jarEntry.getName()))) {
++						jarEntry = jarStream.getNextJarEntry();
+ 					}
+-					descriptorStream = jInStream;
++
++					//there is a jar but the entry is missing or invalid, so treat this as an invalid repository
++					if (jarEntry == null)
++						throw new IOException(NLS.bind(Messages.io_invalidLocation, location.getPath()));
+ 				}
++				//parse the repository descriptor file
++				sub.setWorkRemaining(100);
++				InputStream descriptorStream = jarStream != null ? jarStream : inStream;
+ 				CompositeRepositoryIO io = new CompositeRepositoryIO();
+ 				CompositeRepositoryState resultState = io.read(localFile.toURL(), descriptorStream, CompositeArtifactRepository.PI_REPOSITORY_TYPE, sub.newChild(100));
+ 				if (resultState.getLocation() == null)
+@@ -111,8 +119,8 @@ public class CompositeArtifactRepositoryFactory extends ArtifactRepositoryFactor
+ 				}
+ 				return result;
+ 			} finally {
+-				if (descriptorStream != null)
+-					descriptorStream.close();
++				safeClose(jarStream);
++				safeClose(inStream);
+ 			}
+ 		} catch (FileNotFoundException e) {
+ 			String msg = NLS.bind(Messages.io_failedRead, location);
+@@ -121,8 +129,8 @@ public class CompositeArtifactRepositoryFactory extends ArtifactRepositoryFactor
+ 			String msg = NLS.bind(Messages.io_failedRead, location);
+ 			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_READ, msg, e));
+ 		} finally {
+-			if (!local && localFile != null && !localFile.delete())
+-				localFile.deleteOnExit();
++			if (monitor != null)
++				monitor.done();
+ 		}
+ 	}
+ 
+@@ -130,7 +138,16 @@ public class CompositeArtifactRepositoryFactory extends ArtifactRepositoryFactor
+ 		return new CompositeArtifactRepository(getManager(), location, name, properties);
+ 	}
+ 
+-	private Transport getTransport() {
+-		return RepositoryTransport.getInstance();
++	/**
++	 * Closes a stream, ignoring any secondary exceptions
++	 */
++	private void safeClose(InputStream stream) {
++		if (stream == null)
++			return;
++		try {
++			stream.close();
++		} catch (IOException e) {
++			//ignore
++		}
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+index 1bb37ed..343ec0a 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+@@ -9,6 +9,7 @@
+  * 	IBM Corporation - initial API and implementation
+  * 	Genuitec, LLC - support for multi-threaded downloads
+  *  Cloudsmith Inc. - query indexes
++ *  Sonatype Inc - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.artifact.repository.simple;
+ 
+@@ -53,6 +54,8 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 
+ 	public static final boolean MD5_CHECK_ENABLED = !"false".equals(Activator.getContext().getProperty("eclipse.p2.MD5Check")); //$NON-NLS-1$//$NON-NLS-2$
+ 
++	public static final String CONTENT_FILENAME = "artifacts"; //$NON-NLS-1$
++
+ 	/** 
+ 	 * The key for a integer property controls the maximum number
+ 	 * of threads that should be used when optimizing downloads from a remote
+@@ -192,7 +195,6 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	private static final String ARTIFACT_FOLDER = "artifact.folder"; //$NON-NLS-1$
+ 	private static final String ARTIFACT_UUID = "artifact.uuid"; //$NON-NLS-1$
+ 	static final private String BLOBSTORE = ".blobstore/"; //$NON-NLS-1$
+-	static final private String CONTENT_FILENAME = "artifacts"; //$NON-NLS-1$
+ 	static final private String[][] PACKED_MAPPING_RULES = { {"(& (classifier=osgi.bundle) (format=packed))", "${repoUrl}/plugins/${id}_${version}.jar.pack.gz"}, //$NON-NLS-1$//$NON-NLS-2$
+ 			{"(& (classifier=osgi.bundle))", "${repoUrl}/plugins/${id}_${version}.jar"}, //$NON-NLS-1$//$NON-NLS-2$
+ 			{"(& (classifier=binary))", "${repoUrl}/binary/${id}_${version}"}, //$NON-NLS-1$ //$NON-NLS-2$
+@@ -239,24 +241,12 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		toDelete.delete();
+ 	}
+ 
+-	public static URI getActualLocation(URI base, boolean compress) throws IOException {
++	public static URI getActualLocation(URI base, boolean compress) {
+ 		return getActualLocation(base, compress ? JAR_EXTENSION : XML_EXTENSION);
+ 	}
+ 
+-	private static URI getActualLocation(URI base, String extension) throws IOException {
+-		final String name = CONTENT_FILENAME + extension;
+-		String spec = base.toString();
+-		if (spec.endsWith(name))
+-			return base;
+-		if (spec.endsWith("/")) //$NON-NLS-1$
+-			spec += name;
+-		else
+-			spec += "/" + name; //$NON-NLS-1$
+-		try {
+-			return new URI(spec);
+-		} catch (URISyntaxException e) {
+-			throw new IOException(NLS.bind(Messages.io_invalidLocation, spec));
+-		}
++	private static URI getActualLocation(URI base, String extension) {
++		return URIUtil.append(base, CONTENT_FILENAME + extension);
+ 	}
+ 
+ 	public static URI getBlobStoreLocation(URI base) {
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryFactory.java
+index d9cd59a..4ebeb06 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryFactory.java
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Sonatype Inc - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.artifact.repository.simple;
+ 
+@@ -19,8 +20,7 @@ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.artifact.repository.Activator;
+ import org.eclipse.equinox.internal.p2.artifact.repository.Messages;
+ import org.eclipse.equinox.internal.p2.core.helpers.Tracing;
+-import org.eclipse.equinox.internal.p2.repository.RepositoryTransport;
+-import org.eclipse.equinox.internal.p2.repository.Transport;
++import org.eclipse.equinox.internal.p2.repository.CacheManager;
+ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.repository.IRepositoryManager;
+ import org.eclipse.equinox.p2.repository.artifact.IArtifactRepository;
+@@ -28,86 +28,90 @@ import org.eclipse.equinox.p2.repository.artifact.spi.ArtifactRepositoryFactory;
+ import org.eclipse.osgi.util.NLS;
+ 
+ public class SimpleArtifactRepositoryFactory extends ArtifactRepositoryFactory {
++	private static final String PROTOCOL_FILE = "file"; //$NON-NLS-1$
++	private static final String JAR_EXTENSION = ".jar"; //$NON-NLS-1$
++	private static final String XML_EXTENSION = ".xml"; //$NON-NLS-1$
++
+ 	public SimpleArtifactRepositoryFactory() {
+ 		super();
+ 	}
+ 
++	/**
++	 * Returns a file in the local file system that contains the contents of the
++	 * metadata repository at the given location.
++	 */
++	private File getLocalFile(URI location, IProgressMonitor monitor) throws IOException, ProvisionException {
++		File localFile = null;
++		URI jarLocation = SimpleArtifactRepository.getActualLocation(location, true);
++		URI xmlLocation = SimpleArtifactRepository.getActualLocation(location, false);
++		// If the repository is local, we can return the repository file directly
++		if (PROTOCOL_FILE.equals(xmlLocation.getScheme())) {
++			//look for a compressed local file
++			localFile = URIUtil.toFile(jarLocation);
++			if (localFile.exists())
++				return localFile;
++			//look for an uncompressed local file
++			localFile = URIUtil.toFile(xmlLocation);
++			if (localFile.exists())
++				return localFile;
++			String msg = NLS.bind(Messages.io_failedRead, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, msg, null));
++		}
++		// file is not local, create a cache of the repository metadata
++		CacheManager cache = (CacheManager) getAgent().getService(CacheManager.SERVICE_NAME);
++		if (cache == null)
++			throw new IllegalArgumentException("Cache manager service not available"); //$NON-NLS-1$
++		localFile = cache.createCache(location, SimpleArtifactRepository.CONTENT_FILENAME, monitor);
++		if (localFile == null) {
++			// there is no remote file in either form - this should not really happen as
++			// createCache should bail out with exception if something is wrong. This is an internal
++			// error.
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, Messages.repoMan_internalError, null));
++		}
++		return localFile;
++	}
++
+ 	public IArtifactRepository load(URI location, int flags, IProgressMonitor monitor) throws ProvisionException {
+-		final String PROTOCOL_FILE = "file"; //$NON-NLS-1$
+ 		long time = 0;
+ 		final String debugMsg = "Restoring artifact repository "; //$NON-NLS-1$
+ 		if (Tracing.DEBUG_METADATA_PARSING) {
+ 			Tracing.debug(debugMsg + location);
+ 			time = -System.currentTimeMillis();
+ 		}
+-		File localFile = null;
+-		boolean local = false;
++		SubMonitor sub = SubMonitor.convert(monitor, 400);
+ 		try {
+-			SubMonitor sub = SubMonitor.convert(monitor, 300);
+-			OutputStream artifacts = null;
+-			// try with compressed
+-			boolean compress = true;
+-			if (PROTOCOL_FILE.equals(location.getScheme())) {
+-				local = true;
+-				localFile = URIUtil.toFile(SimpleArtifactRepository.getActualLocation(location, true));
+-				if (!localFile.exists()) {
+-					localFile = URIUtil.toFile(SimpleArtifactRepository.getActualLocation(location, false));
+-					compress = false;
+-				}
+-			} else {
+-				//not local, return null if the caller wanted a modifiable repo
+-				if ((flags & IRepositoryManager.REPOSITORY_HINT_MODIFIABLE) > 0) {
+-					return null;
+-				}
+-
+-				//download to local temp file
+-				localFile = File.createTempFile("artifacts", ".xml"); //$NON-NLS-1$ //$NON-NLS-2$
+-				try {
+-					artifacts = new BufferedOutputStream(new FileOutputStream(localFile));
+-					IStatus status = getTransport().download(SimpleArtifactRepository.getActualLocation(location, compress), artifacts, sub.newChild(100));
+-					if (!status.isOK()) {
+-						// not meaningful to continue on an authentication exception (user will likely just be prompted again)
+-						if (status.getCode() == ProvisionException.REPOSITORY_FAILED_AUTHENTICATION)
+-							throw new ProvisionException(status);
+-						// retry uncompressed
+-						compress = false;
+-						status = getTransport().download(SimpleArtifactRepository.getActualLocation(location, compress), artifacts, sub.newChild(100));
+-						if (!status.isOK())
+-							throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, status.getMessage(), null));
+-					}
+-				} finally {
+-					if (artifacts != null)
+-						artifacts.close();
+-				}
+-			}
+-			InputStream descriptorStream = null;
++			File localFile = getLocalFile(location, sub.newChild(300));
++			InputStream inStream = new BufferedInputStream(new FileInputStream(localFile));
++			JarInputStream jarStream = null;
+ 			try {
+-				descriptorStream = new BufferedInputStream(new FileInputStream(localFile));
+-				if (compress) {
+-					URI actualLocation = SimpleArtifactRepository.getActualLocation(location, false);
+-					JarInputStream jInStream = new JarInputStream(descriptorStream);
+-					JarEntry jarEntry = jInStream.getNextJarEntry();
+-					String filename = URIUtil.lastSegment(actualLocation);
+-					while (jarEntry != null && filename != null && !(filename.equals(jarEntry.getName()))) {
+-						jarEntry = jInStream.getNextJarEntry();
++				//if reading from a jar, obtain a stream on the entry with the actual contents
++				if (localFile.getAbsolutePath().endsWith(JAR_EXTENSION)) {
++					jarStream = new JarInputStream(inStream);
++					JarEntry jarEntry = jarStream.getNextJarEntry();
++					String entryName = SimpleArtifactRepository.CONTENT_FILENAME + XML_EXTENSION;
++					while (jarEntry != null && (!entryName.equals(jarEntry.getName()))) {
++						jarEntry = jarStream.getNextJarEntry();
+ 					}
+-					if (jarEntry == null) {
+-						//there is a jar but the entry is missing or invalid, so treat this as an invalid repository
+-						throw new IOException(NLS.bind(Messages.io_invalidLocation, actualLocation.getPath()));
+-					}
+-					descriptorStream = jInStream;
++					//if there is a jar but the entry is missing or invalid, treat this as an invalid repository
++					if (jarEntry == null)
++						throw new IOException(NLS.bind(Messages.io_invalidLocation, location));
+ 				}
++				//parse the repository descriptor file
++				sub.setWorkRemaining(100);
++				InputStream descriptorStream = jarStream != null ? jarStream : inStream;
+ 				SimpleArtifactRepositoryIO io = new SimpleArtifactRepositoryIO(getAgent());
+ 				SimpleArtifactRepository result = (SimpleArtifactRepository) io.read(localFile.toURL(), descriptorStream, sub.newChild(100));
+ 				result.initializeAfterLoad(location);
++				if (result != null && (flags & IRepositoryManager.REPOSITORY_HINT_MODIFIABLE) > 0 && !result.isModifiable())
++					return null;
+ 				if (Tracing.DEBUG_METADATA_PARSING) {
+ 					time += System.currentTimeMillis();
+ 					Tracing.debug(debugMsg + "time (ms): " + time); //$NON-NLS-1$ 
+ 				}
+ 				return result;
+ 			} finally {
+-				if (descriptorStream != null)
+-					descriptorStream.close();
++				safeClose(jarStream);
++				safeClose(inStream);
+ 			}
+ 		} catch (FileNotFoundException e) {
+ 			String msg = NLS.bind(Messages.io_failedRead, location);
+@@ -116,8 +120,8 @@ public class SimpleArtifactRepositoryFactory extends ArtifactRepositoryFactory {
+ 			String msg = NLS.bind(Messages.io_failedRead, location);
+ 			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_READ, msg, e));
+ 		} finally {
+-			if (!local && localFile != null && !localFile.delete())
+-				localFile.deleteOnExit();
++			if (monitor != null)
++				monitor.done();
+ 		}
+ 	}
+ 
+@@ -125,7 +129,16 @@ public class SimpleArtifactRepositoryFactory extends ArtifactRepositoryFactory {
+ 		return new SimpleArtifactRepository(getAgent(), name, location, properties);
+ 	}
+ 
+-	private Transport getTransport() {
+-		return RepositoryTransport.getInstance();
++	/**
++	 * Closes a stream, ignoring any secondary exceptions
++	 */
++	private void safeClose(InputStream stream) {
++		if (stream == null)
++			return;
++		try {
++			stream.close();
++		} catch (IOException e) {
++			//ignore
++		}
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CacheManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CacheManager.java
+deleted file mode 100644
+index 8bf33c3..0000000
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CacheManager.java
++++ /dev/null
+@@ -1,361 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2008, 2009 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *     Cloudsmith Inc - additional implementation
+- *     Sonatype Inc - additional implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.metadata.repository;
+-
+-import java.io.*;
+-import java.net.URI;
+-import java.util.EventObject;
+-import java.util.HashSet;
+-import org.eclipse.core.runtime.*;
+-import org.eclipse.ecf.filetransfer.UserCancelledException;
+-import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+-import org.eclipse.equinox.internal.p2.repository.*;
+-import org.eclipse.equinox.internal.p2.repository.Activator;
+-import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+-import org.eclipse.equinox.internal.provisional.p2.core.eventbus.SynchronousProvisioningListener;
+-import org.eclipse.equinox.internal.provisional.p2.repository.IStateful;
+-import org.eclipse.equinox.internal.provisional.p2.repository.RepositoryEvent;
+-import org.eclipse.equinox.p2.core.IAgentLocation;
+-import org.eclipse.equinox.p2.core.ProvisionException;
+-import org.eclipse.equinox.p2.repository.IRepository;
+-import org.eclipse.osgi.util.NLS;
+-
+-/**
+- * A class to manage metadata cache files. Creating the cache files will place
+- * the file in the AgentData location in a cache directory.
+- * 
+- * Using the bus listeners will allow the manager to listen for repository
+- * events. When a repository is removed, it will remove the cache file if one
+- * was created for the repository.
+- */
+-public class CacheManager {
+-	/**
+-	 * Service name for the internal cache manager service.
+-	 */
+-	public static final String SERVICE_NAME = CacheManager.class.getName();
+-
+-	private final IAgentLocation agentLocation;
+-
+-	/**
+-	 * IStateful implementation of BufferedOutputStream. Class is used to get the status from
+-	 * a download operation.
+-	 */
+-	private static class StatefulStream extends BufferedOutputStream implements IStateful {
+-		private IStatus status;
+-
+-		public StatefulStream(OutputStream stream) {
+-			super(stream);
+-		}
+-
+-		public IStatus getStatus() {
+-
+-			return status;
+-		}
+-
+-		public void setStatus(IStatus aStatus) {
+-			status = aStatus;
+-		}
+-
+-	}
+-
+-	public CacheManager(IAgentLocation agentLocation) {
+-		this.agentLocation = agentLocation;
+-	}
+-
+-	private static SynchronousProvisioningListener busListener;
+-	private static final String DOWNLOADING = "downloading"; //$NON-NLS-1$
+-	private static final String JAR_EXTENSION = ".jar"; //$NON-NLS-1$
+-	private static final String XML_EXTENSION = ".xml"; //$NON-NLS-1$
+-
+-	private final HashSet<String> knownPrefixes = new HashSet<String>(5);
+-
+-	/**
+-	 * Returns a hash of the repository location.
+-	 */
+-	private int computeHash(URI repositoryLocation) {
+-		return repositoryLocation.hashCode();
+-	}
+-
+-	/**
+-	 * Returns a local cache file with the contents of the given remote location,
+-	 * or <code>null</code> if a local cache could not be created.
+-	 * 
+-	 * @param repositoryLocation The remote location to be cached
+-	 * @param prefix The prefix to use when creating the cache file
+-	 * @param monitor a progress monitor
+-	 * @return A {@link File} object pointing to the cache file or <code>null</code>
+-	 * if the location is not a repository.
+-	 * @throws FileNotFoundException if neither jar nor xml index file exists at given location 
+-	 * @throws AuthenticationFailedException if jar not available and xml causes authentication fail
+-	 * @throws IOException on general IO errors
+-	 * @throws ProvisionException on any error (e.g. user cancellation, unknown host, malformed address, connection refused, etc.)
+-	 * @throws OperationCanceledException - if user canceled
+-	 */
+-	public File createCache(URI repositoryLocation, String prefix, IProgressMonitor monitor) throws IOException, ProvisionException {
+-
+-		SubMonitor submonitor = SubMonitor.convert(monitor, 1000);
+-		try {
+-			knownPrefixes.add(prefix);
+-			File cacheFile = getCache(repositoryLocation, prefix);
+-			URI jarLocation = URIUtil.append(repositoryLocation, prefix + JAR_EXTENSION);
+-			URI xmlLocation = URIUtil.append(repositoryLocation, prefix + XML_EXTENSION);
+-			int hashCode = computeHash(repositoryLocation);
+-
+-			// Knowing if cache is stale is complicated by the fact that a jar could have been 
+-			// produced after an xml index (and vice versa), and by the need to capture any
+-			// errors, as these needs to be reported to the user as something meaningful - instead of
+-			// just a general "can't read repository".
+-			// (Previous impl of stale checking ignored errors, and caused multiple round-trips)
+-			boolean stale = true;
+-			long lastModified = 0L;
+-			String name = null;
+-			String useExtension = JAR_EXTENSION;
+-			URI remoteFile = jarLocation;
+-
+-			if (cacheFile != null) {
+-				lastModified = cacheFile.lastModified();
+-				name = cacheFile.getName();
+-			}
+-			// get last modified on jar
+-			long lastModifiedRemote = 0L;
+-			// bug 269588 - server may return 0 when file exists, so extra flag is needed
+-			boolean useJar = true;
+-			try {
+-				lastModifiedRemote = getTransport().getLastModified(jarLocation, submonitor.newChild(1));
+-				if (lastModifiedRemote <= 0)
+-					LogHelper.log(new Status(IStatus.WARNING, Activator.ID, "Server returned lastModified <= 0 for " + jarLocation)); //$NON-NLS-1$
+-			} catch (AuthenticationFailedException e) {
+-				// it is not meaningful to continue - the credentials are for the server
+-				// do not pass the exception - it gives no additional meaningful user information
+-				throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.CacheManager_AuthenticationFaileFor_0, repositoryLocation), null));
+-			} catch (CoreException e) {
+-				useJar = false;
+-				// give up on a timeout - if we did not get a 404 on the jar, we will just prolong the pain
+-				// by (almost certainly) also timing out on the xml.
+-				if (e.getStatus() != null && e.getStatus().getException() != null) {
+-					Throwable ex = e.getStatus().getException();
+-					if (ex.getClass() == java.net.SocketTimeoutException.class)
+-						throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_READ, NLS.bind(Messages.CacheManager_FailedCommunicationWithRepo_0, repositoryLocation), ex));
+-				}
+-			} catch (OperationCanceledException e) {
+-				// must pass this on
+-				throw e;
+-			} catch (Exception e) {
+-				// not ideal, just skip the jar on error, and try the xml instead - report errors for
+-				// the xml.
+-				useJar = false;
+-			}
+-			if (submonitor.isCanceled())
+-				throw new OperationCanceledException();
+-
+-			if (useJar) {
+-				// There is a jar, and it should be used - cache is stale if it is xml based or
+-				// if older (irrespective of jar or xml).
+-				// Bug 269588 - also stale if remote reports 0
+-				stale = lastModifiedRemote > lastModified || (name != null && name.endsWith(XML_EXTENSION) || lastModifiedRemote <= 0);
+-			} else {
+-				// Also need to check remote XML file, and handle cancel, and errors
+-				// (Status is reported based on finding the XML file as giving up on certain errors
+-				// when checking for the jar may not be correct).
+-				try {
+-					lastModifiedRemote = getTransport().getLastModified(xmlLocation, submonitor.newChild(1));
+-					// if lastModifiedRemote is 0 - something is wrong in the communication stack, as 
+-					// a FileNotFound exception should have been thrown.
+-					// bug 269588 - server may return 0 when file exists - site is not correctly configured
+-					if (lastModifiedRemote <= 0)
+-						LogHelper.log(new Status(IStatus.WARNING, Activator.ID, "Server returned lastModified <= 0 for " + xmlLocation)); //$NON-NLS-1$
+-
+-				} catch (UserCancelledException e) {
+-					throw new OperationCanceledException();
+-				} catch (FileNotFoundException e) {
+-					throw new FileNotFoundException(NLS.bind(Messages.CacheManager_Neither_0_nor_1_found, jarLocation, xmlLocation));
+-				} catch (AuthenticationFailedException e) {
+-					// do not pass the exception, it provides no additional meaningful user information
+-					throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_AUTHENTICATION, NLS.bind(Messages.CacheManager_AuthenticationFaileFor_0, repositoryLocation), null));
+-				} catch (CoreException e) {
+-					IStatus status = e.getStatus();
+-					if (status == null)
+-						throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, NLS.bind(Messages.CacheManager_FailedCommunicationWithRepo_0, repositoryLocation), e));
+-					else if (status.getException() instanceof FileNotFoundException)
+-						throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, status.getMessage(), null));
+-					throw new ProvisionException(status);
+-
+-				}
+-				// There is an xml, and it should be used - cache is stale if it is jar based or
+-				// if older (irrespective of jar or xml).
+-				// bug 269588 - server may return 0 when file exists - assume it is stale
+-				stale = lastModifiedRemote > lastModified || (name != null && name.endsWith(JAR_EXTENSION) || lastModifiedRemote <= 0);
+-				useExtension = XML_EXTENSION;
+-				remoteFile = xmlLocation;
+-			}
+-
+-			if (!stale)
+-				return cacheFile;
+-
+-			// The cache is stale or missing, so we need to update it from the remote location
+-			cacheFile = new File(getCacheDirectory(), prefix + hashCode + useExtension);
+-			updateCache(cacheFile, remoteFile, lastModifiedRemote, submonitor);
+-			return cacheFile;
+-		} finally {
+-			submonitor.done();
+-		}
+-	}
+-
+-	/**
+-	 * Deletes the local cache file(s) for the given repository
+-	 * @param repositoryLocation
+-	 */
+-	void deleteCache(URI repositoryLocation) {
+-		for (String prefix : knownPrefixes) {
+-			File[] cacheFiles = getCacheFiles(repositoryLocation, prefix);
+-			for (int i = 0; i < cacheFiles.length; i++) {
+-				// delete the cache file if it exists
+-				safeDelete(cacheFiles[i]);
+-				// delete a resumable download if it exists
+-				safeDelete(new File(new File(cacheFiles[i].getParentFile(), DOWNLOADING), cacheFiles[i].getName()));
+-			}
+-		}
+-	}
+-
+-	/**
+-	 * Determines the local file path of the repository's cache file.
+-	 * @param repositoryLocation The location to compute the cache for
+-	 * @param prefix The prefix to use for this location
+-	 * @return A {@link File} pointing to the cache file or <code>null</code> if
+-	 * the cache file does not exist.
+-	 */
+-	private File getCache(URI repositoryLocation, String prefix) {
+-		File[] files = getCacheFiles(repositoryLocation, prefix);
+-		if (files[0].exists())
+-			return files[0];
+-		return files[1].exists() ? files[1] : null;
+-	}
+-
+-	/**
+-	 * Returns the file corresponding to the data area to be used by the cache manager.
+-	 */
+-	private File getCacheDirectory() {
+-		return URIUtil.toFile(agentLocation.getDataArea(Activator.ID + "/cache/")); //$NON-NLS-1$
+-	}
+-
+-	/**
+-	 * Determines the local file paths of the repository's potential cache files.
+-	 * @param repositoryLocation The location to compute the cache for
+-	 * @param prefix The prefix to use for this location
+-	 * @return A {@link File} array with the cache files for JAR and XML extensions.
+-	 */
+-	private File[] getCacheFiles(URI repositoryLocation, String prefix) {
+-		File[] files = new File[2];
+-		File dataAreaFile = getCacheDirectory();
+-		int hashCode = computeHash(repositoryLocation);
+-		files[0] = new File(dataAreaFile, prefix + hashCode + JAR_EXTENSION);
+-		files[1] = new File(dataAreaFile, prefix + hashCode + XML_EXTENSION);
+-		return files;
+-	}
+-
+-	private RepositoryTransport getTransport() {
+-		return RepositoryTransport.getInstance();
+-	}
+-
+-	/**
+-	 * Adds a {@link SynchronousProvisioningListener} to the event bus for
+-	 * deleting cache files when the corresponding repository is deleted.
+-	 */
+-	private void registerRepoEventListener(IProvisioningEventBus eventBus) {
+-		if (busListener == null) {
+-			busListener = new SynchronousProvisioningListener() {
+-				public void notify(EventObject o) {
+-					if (o instanceof RepositoryEvent) {
+-						RepositoryEvent event = (RepositoryEvent) o;
+-						if (RepositoryEvent.REMOVED == event.getKind() && IRepository.TYPE_METADATA == event.getRepositoryType()) {
+-							deleteCache(event.getRepositoryLocation());
+-						}
+-					}
+-				}
+-			};
+-		}
+-		// the bus could have disappeared and is now back again - so do this every time
+-		eventBus.addListener(busListener);
+-	}
+-
+-	private boolean safeDelete(File file) {
+-		if (file.exists()) {
+-			if (!file.delete()) {
+-				file.deleteOnExit();
+-				return true;
+-			}
+-		}
+-		return false;
+-	}
+-
+-	public void setEventBus(IProvisioningEventBus newBus) {
+-		registerRepoEventListener(newBus);
+-	}
+-
+-	public void unsetEventBus(IProvisioningEventBus oldBus) {
+-		unregisterRepoEventListener(oldBus);
+-	}
+-
+-	/**
+-	 * Removes the {@link SynchronousProvisioningListener} that cleans up the
+-	 * cache file from the event bus.
+-	 */
+-	private void unregisterRepoEventListener(IProvisioningEventBus bus) {
+-		if (bus != null && busListener != null)
+-			bus.removeListener(busListener);
+-	}
+-
+-	private void updateCache(File cacheFile, URI remoteFile, long lastModifiedRemote, SubMonitor submonitor) throws FileNotFoundException, IOException, ProvisionException {
+-		cacheFile.getParentFile().mkdirs();
+-		File downloadDir = new File(cacheFile.getParentFile(), DOWNLOADING);
+-		if (!downloadDir.exists())
+-			downloadDir.mkdir();
+-		File tempFile = new File(downloadDir, cacheFile.getName());
+-		// Ensure that the file from a previous download attempt is removed 
+-		if (tempFile.exists())
+-			safeDelete(tempFile);
+-
+-		tempFile.createNewFile();
+-
+-		StatefulStream stream = null;
+-		try {
+-			stream = new StatefulStream(new FileOutputStream(tempFile));
+-		} catch (Exception e) {
+-			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, e.getMessage(), e));
+-		}
+-		IStatus result = null;
+-		try {
+-			submonitor.setWorkRemaining(1000);
+-			result = getTransport().download(remoteFile, stream, submonitor.newChild(1000));
+-		} catch (OperationCanceledException e) {
+-			// need to pick up the status - a new operation canceled exception is thrown at the end
+-			// as status will be CANCEL.
+-			result = stream.getStatus();
+-		} finally {
+-			stream.close();
+-			// If there was any problem fetching the file, delete the temp file
+-			if (result == null || !result.isOK())
+-				safeDelete(tempFile);
+-		}
+-		if (result.isOK()) {
+-			if (cacheFile.exists())
+-				safeDelete(cacheFile);
+-			if (tempFile.renameTo(cacheFile))
+-				return;
+-		}
+-
+-		if (result.getSeverity() == IStatus.CANCEL || submonitor.isCanceled())
+-			throw new OperationCanceledException();
+-		throw new ProvisionException(result);
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepositoryFactory.java
+index bcfa455..0c5d3c3 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepositoryFactory.java
+@@ -7,9 +7,12 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Sonatype Inc - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.metadata.repository;
+ 
++import org.eclipse.equinox.internal.p2.repository.CacheManager;
++
+ import java.io.*;
+ import java.net.URI;
+ import java.util.Map;
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
+index d243483..c764e06 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
+@@ -5,6 +5,7 @@
+  * available at http://www.eclipse.org/legal/epl-v10.html
+  *
+  * Contributors: IBM Corporation - initial API and implementation
++ * Sonatype Inc - ongoing development
+  ******************************************************************************/
+ package org.eclipse.equinox.internal.p2.metadata.repository;
+ 
+@@ -22,9 +23,6 @@ public class Messages extends NLS {
+ 		// Do not instantiate
+ 	}
+ 
+-	public static String CacheManager_AuthenticationFaileFor_0;
+-	public static String CacheManager_FailedCommunicationWithRepo_0;
+-	public static String CacheManager_Neither_0_nor_1_found;
+ 	public static String io_failedRead;
+ 	public static String io_failedWrite;
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryComponent.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryComponent.java
+index b89db69..7cb5c05 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryComponent.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryComponent.java
+@@ -7,11 +7,10 @@
+  * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Sonatype Inc - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.metadata.repository;
+ 
+-import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+-import org.eclipse.equinox.p2.core.IAgentLocation;
+ import org.eclipse.equinox.p2.core.IProvisioningAgent;
+ import org.eclipse.equinox.p2.core.spi.IAgentServiceFactory;
+ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepositoryManager;
+@@ -22,12 +21,6 @@ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepositoryManager;
+ public class MetadataRepositoryComponent implements IAgentServiceFactory {
+ 
+ 	public Object createService(IProvisioningAgent agent) {
+-		MetadataRepositoryManager manager = new MetadataRepositoryManager(agent);
+-		final IProvisioningEventBus eventBus = (IProvisioningEventBus) agent.getService(IProvisioningEventBus.SERVICE_NAME);
+-		CacheManager cache = new CacheManager((IAgentLocation) agent.getService(IAgentLocation.SERVICE_NAME));
+-		cache.setEventBus(eventBus);
+-		agent.registerService(CacheManager.SERVICE_NAME, cache);
+-		return manager;
++		return new MetadataRepositoryManager(agent);
+ 	}
+-
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+index ee5c3e2..4f98f6e 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+@@ -7,9 +7,12 @@
+  * 
+  *  Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Sonatype Inc - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.metadata.repository;
+ 
++import org.eclipse.equinox.internal.p2.repository.CacheManager;
++
+ import java.io.*;
+ import java.net.URI;
+ import java.util.Map;
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/tools/RecreateRepositoryApplication.java b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/tools/RecreateRepositoryApplication.java
+index adaa79a..bd2a2b8 100644
+--- a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/tools/RecreateRepositoryApplication.java
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/tools/RecreateRepositoryApplication.java
+@@ -7,12 +7,12 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Sonatype Inc - ongoing development
+  *******************************************************************************/
+ 
+ package org.eclipse.equinox.p2.internal.repository.tools;
+ 
+ import java.io.File;
+-import java.io.IOException;
+ import java.net.URI;
+ import java.util.*;
+ import org.eclipse.core.runtime.*;
+@@ -84,14 +84,10 @@ public class RecreateRepositoryApplication extends AbstractApplication {
+ 		manager.removeRepository(repository.getLocation());
+ 
+ 		boolean compressed = Boolean.valueOf(repoProperties.get(IRepository.PROP_COMPRESSED)).booleanValue();
+-		try {
+-			URI realLocation = SimpleArtifactRepository.getActualLocation(repository.getLocation(), compressed);
+-			File realFile = URIUtil.toFile(realLocation);
+-			if (!realFile.exists() || !realFile.delete())
+-				throw new ProvisionException(NLS.bind(Messages.exception_unableToRemoveRepo, realFile.toString()));
+-		} catch (IOException e) {
+-			throw new ProvisionException(NLS.bind(Messages.exception_unableToRemoveRepo, repository.getLocation().toString()));
+-		}
++		URI realLocation = SimpleArtifactRepository.getActualLocation(repository.getLocation(), compressed);
++		File realFile = URIUtil.toFile(realLocation);
++		if (!realFile.exists() || !realFile.delete())
++			throw new ProvisionException(NLS.bind(Messages.exception_unableToRemoveRepo, realFile.toString()));
+ 	}
+ 
+ 	private void recreateRepository(IProgressMonitor monitor) throws ProvisionException {
+diff --git a/bundles/org.eclipse.equinox.p2.repository/.project b/bundles/org.eclipse.equinox.p2.repository/.project
+index 120c042..ee1e670 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/.project
++++ b/bundles/org.eclipse.equinox.p2.repository/.project
+@@ -25,6 +25,11 @@
+ 			<arguments>
+ 			</arguments>
+ 		</buildCommand>
++		<buildCommand>
++			<name>org.eclipse.pde.ds.core.builder</name>
++			<arguments>
++			</arguments>
++		</buildCommand>
+ 	</buildSpec>
+ 	<natures>
+ 		<nature>org.eclipse.pde.PluginNature</nature>
+diff --git a/bundles/org.eclipse.equinox.p2.repository/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.repository/META-INF/MANIFEST.MF
+index 8c9fb23..63428ef 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.repository/META-INF/MANIFEST.MF
+@@ -55,3 +55,4 @@ Import-Package: javax.xml.parsers,
+  org.osgi.util.tracker;version="1.3.0",
+  org.xml.sax,
+  org.xml.sax.helpers
++Service-Component: OSGI-INF/cacheManager.xml
+diff --git a/bundles/org.eclipse.equinox.p2.repository/OSGI-INF/cacheManager.xml b/bundles/org.eclipse.equinox.p2.repository/OSGI-INF/cacheManager.xml
+new file mode 100644
+index 0000000..d04c8df
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.repository/OSGI-INF/cacheManager.xml
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<scr:component xmlns:scr="http://www.osgi.org/xmlns/scr/v1.1.0" name="org.eclipse.equinox.p2.repository">
++   <implementation class="org.eclipse.equinox.internal.p2.repository.CacheManagerComponent"/>
++   <service>
++      <provide interface="org.eclipse.equinox.p2.core.spi.IAgentServiceFactory"/>
++   </service>
++   <property name="p2.agent.servicename" type="String" value="org.eclipse.equinox.internal.p2.repository.CacheManager"/>
++</scr:component>
+diff --git a/bundles/org.eclipse.equinox.p2.repository/build.properties b/bundles/org.eclipse.equinox.p2.repository/build.properties
+index 7ac06b4..82222b8 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/build.properties
++++ b/bundles/org.eclipse.equinox.p2.repository/build.properties
+@@ -1,19 +1,10 @@
+-###############################################################################
+-#  Copyright (c) 2005, 2009 IBM Corporation and others.
+-#  All rights reserved. This program and the accompanying materials
+-#  are made available under the terms of the Eclipse Public License v1.0
+-#  which accompanies this distribution, and is available at
+-#  http://www.eclipse.org/legal/epl-v10.html
+-# 
+-#  Contributors:
+-#      IBM Corporation - initial API and implementation
+-###############################################################################
+-source.. = src/
+ output.. = bin/
+ bin.includes = META-INF/,\
+                .,\
+                about.html,\
+-               plugin.properties
++               plugin.properties,\
++               OSGI-INF/cacheManager.xml
+ src.includes = about.html
+-javacTarget=jsr14
+-javacSource=1.5
++javacSource = 1.5
++javacTarget = jsr14
++source.. = src/
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManager.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManager.java
+index 8bf33c3..e2fe061 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManager.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManager.java
+@@ -10,7 +10,7 @@
+  *     Cloudsmith Inc - additional implementation
+  *     Sonatype Inc - additional implementation
+  *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.metadata.repository;
++package org.eclipse.equinox.internal.p2.repository;
+ 
+ import java.io.*;
+ import java.net.URI;
+@@ -19,8 +19,6 @@ import java.util.HashSet;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.ecf.filetransfer.UserCancelledException;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+-import org.eclipse.equinox.internal.p2.repository.*;
+-import org.eclipse.equinox.internal.p2.repository.Activator;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.SynchronousProvisioningListener;
+ import org.eclipse.equinox.internal.provisional.p2.repository.IStateful;
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManagerComponent.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManagerComponent.java
+new file mode 100644
+index 0000000..26d5851
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/CacheManagerComponent.java
+@@ -0,0 +1,27 @@
++/*******************************************************************************
++ *  Copyright (c) 2010 Sonatype, Inc and others.
++ *  All rights reserved. This program and the accompanying materials
++ *  are made available under the terms of the Eclipse Public License v1.0
++ *  which accompanies this distribution, and is available at
++ *  http://www.eclipse.org/legal/epl-v10.html
++ * 
++ *  Contributors:
++ *     Sonatype, Inc. - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.repository;
++
++import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
++import org.eclipse.equinox.p2.core.IAgentLocation;
++import org.eclipse.equinox.p2.core.IProvisioningAgent;
++import org.eclipse.equinox.p2.core.spi.IAgentServiceFactory;
++
++public class CacheManagerComponent implements IAgentServiceFactory {
++
++	public Object createService(IProvisioningAgent agent) {
++		final IProvisioningEventBus eventBus = (IProvisioningEventBus) agent.getService(IProvisioningEventBus.SERVICE_NAME);
++		CacheManager cache = new CacheManager((IAgentLocation) agent.getService(IAgentLocation.SERVICE_NAME));
++		cache.setEventBus(eventBus);
++		return cache;
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Messages.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Messages.java
+index 2ed09a9..daf6642 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Messages.java
+@@ -8,6 +8,7 @@
+  *  Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Cloudsmith Inc - additional messages
++ *     Sonatype Inc - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.repository;
+ 
+@@ -16,6 +17,10 @@ import org.eclipse.osgi.util.NLS;
+ public class Messages extends NLS {
+ 	private static final String BUNDLE_NAME = "org.eclipse.equinox.internal.p2.repository.messages"; //$NON-NLS-1$
+ 
++	public static String CacheManager_AuthenticationFaileFor_0;
++	public static String CacheManager_FailedCommunicationWithRepo_0;
++	public static String CacheManager_Neither_0_nor_1_found;
++
+ 	public static String artifact_not_found;
+ 	public static String io_failedRead;
+ 	public static String ecf_configuration_error;
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/messages.properties b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/messages.properties
+index 15728fe..510885b 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/messages.properties
+@@ -8,6 +8,7 @@
+ #  Contributors:
+ #     IBM Corporation - initial API and implementation
+ #     Cloudsmith Inc - additional messages
++#     Sonatype Inc - ongoing implementation
+ ###############################################################################
+ artifact_not_found=Artifact not found: {0}.
+ 
+@@ -18,9 +19,9 @@ ecf_configuration_error=Transport initialization error.
+ repoMan_internalError=Internal error.
+ repo_loading = Loading the repository {0}
+ 
+-
+-
+-
++CacheManager_Neither_0_nor_1_found=Neither {0} nor {1} found.
++CacheManager_AuthenticationFaileFor_0=Authentication failed for {0}.
++CacheManager_FailedCommunicationWithRepo_0=Communication with repository at {0} failed.
+ 
+ exception_malformedRepoURI = The repository location ({0}) must be a URI.
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/JarURLArtifactRepositoryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/JarURLArtifactRepositoryTest.java
+index d20aef2..105ad2e 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/JarURLArtifactRepositoryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/JarURLArtifactRepositoryTest.java
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Sonatype Inc - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.artifact.repository;
+ 
+@@ -47,7 +48,7 @@ public class JarURLArtifactRepositoryTest extends TestCase {
+ 		URL engineJar = TestActivator.getContext().getBundle().getEntry("/testData/enginerepo.jar");
+ 		URI jarRepoLocation = null;
+ 		try {
+-			jarRepoLocation = URIUtil.toURI(new URL("jar:" + engineJar.toString() + "!/testData/enginerepo/artifacts.xml"));
++			jarRepoLocation = URIUtil.toURI(new URL("jar:" + engineJar.toString() + "!/testData/enginerepo/"));
+ 		} catch (URISyntaxException e) {
+ 			fail(e.getMessage());
+ 		} catch (MalformedURLException e) {
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/SimpleArtifactRepositoryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/SimpleArtifactRepositoryTest.java
+index 369665e..8324b7a 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/SimpleArtifactRepositoryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/SimpleArtifactRepositoryTest.java
+@@ -9,6 +9,7 @@
+  *		compeople AG (Stefan Liebig) - initial API and implementation
+  *		Code 9 - ongoing development
+  *		IBM - ongoing development
++ *		Sonatype Inc - ongoing development
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.artifact.repository;
+ 
+@@ -62,11 +63,6 @@ public class SimpleArtifactRepositoryTest extends AbstractProvisioningTest {
+ 		assertEquals(new URI(base + "artifacts.xml"), SimpleArtifactRepository.getActualLocation(base, false));
+ 	}
+ 
+-	public void testGetActualLocation3() throws Exception {
+-		URI base = new URI("http://localhost/artifactRepository/artifacts.xml");
+-		assertEquals(base, SimpleArtifactRepository.getActualLocation(base, false));
+-	}
+-
+ 	public void testGetActualLocationCompressed1() throws Exception {
+ 		URI base = new URI("http://localhost/artifactRepository");
+ 		assertEquals(new URI(base + "/artifacts.jar"), SimpleArtifactRepository.getActualLocation(base, true));
+@@ -77,11 +73,6 @@ public class SimpleArtifactRepositoryTest extends AbstractProvisioningTest {
+ 		assertEquals(new URI(base + "artifacts.jar"), SimpleArtifactRepository.getActualLocation(base, true));
+ 	}
+ 
+-	public void testGetActualLocationCompressed3() throws Exception {
+-		URI base = new URI("http://localhost/artifactRepository/artifacts.jar");
+-		assertEquals(base, SimpleArtifactRepository.getActualLocation(base, true));
+-	}
+-
+ 	public void testCompressedRepository() throws ProvisionException {
+ 		IArtifactRepositoryManager artifactRepositoryManager = getArtifactRepositoryManager();
+ 		String tempDir = System.getProperty("java.io.tmpdir");
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/planner/Bug306279f.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/planner/Bug306279f.java
+index d0bc612..0ed6924 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/planner/Bug306279f.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/planner/Bug306279f.java
+@@ -1,6 +1,5 @@
+ package org.eclipse.equinox.p2.tests.planner;
+ 
+-import java.net.URISyntaxException;
+ import org.eclipse.core.runtime.NullProgressMonitor;
+ import org.eclipse.equinox.p2.core.*;
+ import org.eclipse.equinox.p2.engine.*;
+@@ -11,7 +10,7 @@ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepositoryManager;
+ import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+ 
+ public class Bug306279f extends AbstractProvisioningTest {
+-	public void testInstallBabel() throws ProvisionException, URISyntaxException {
++	public void testInstallBabel() throws ProvisionException {
+ 		IProvisioningAgentProvider provider = getAgentProvider();
+ 		IProvisioningAgent agent = provider.createAgent(getTestData("bug306279f data", "testData/bug306279f/p2").toURI());
+ 		IMetadataRepositoryManager repoMgr = (IMetadataRepositoryManager) agent.getService(IMetadataRepositoryManager.SERVICE_NAME);

@@ -1,0 +1,2568 @@
+commit adb182a60ce6052b63a6e8f73944260ea9d9d534
+Author: Susan Franklin <sfranklin>
+Date:   Thu Nov 8 22:03:18 2007 +0000
+
+    Bug 207978 - [prov] [repo] Addition of remote repository has no progress, is terribly slow
+
+5	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/RepositoryOperation.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/RepositoryOperation.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/RepositoryOperation.java
+index c4e460c..816b7f6 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/RepositoryOperation.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/RepositoryOperation.java
+@@ -42,4 +42,9 @@ abstract class RepositoryOperation extends UndoableProvisioningOperation {
+ 	public Object[] getAffectedObjects() {
+ 		return urls;
+ 	}
++
++	public boolean runInBackground() {
++		return true;
++	}
++
+ }
+commit 212e4429f31f78e7435db2668cfbf65f81d060ec
+Author: John Arthorne <johna>
+Date:   Fri Nov 30 17:12:21 2007 +0000
+
+    Bug 207978 [prov] [repo] manager.loadRepository(...) has no progress, is terribly slow
+
+1	3	bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+7	3	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+10	1	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/DirectorTest.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/JarURLRepositoryTest.java
+2	5	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+diff --git a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+index 96790d7..40b47ed 100644
+--- a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
++++ b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+@@ -60,9 +60,7 @@ public class ProvisioningHelper {
+ 		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(Activator.getContext(), IMetadataRepositoryManager.class.getName());
+ 		if (manager == null)
+ 			throw new IllegalStateException("No metadata repository manager found");
+-		IMetadataRepository repo = manager.getRepository(location);
+-		if (repo != null)
+-			manager.removeRepository(repo);
++		manager.removeRepository(location);
+ 	}
+ 
+ 	public static IArtifactRepository addArtifactRepository(URL location) {
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+index 7ef678b..914f49e 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+@@ -201,15 +201,19 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		LogHelper.log(new Status(IStatus.ERROR, Activator.PI_METADATA_REPOSITORY, message, t));
+ 	}
+ 
+-	public void removeRepository(IMetadataRepository toRemove) {
+-		repositories.remove(toRemove);
++	public boolean removeRepository(URL toRemove) {
++		IMetadataRepository repository = getRepository(toRemove);
++		if (repository == null)
++			return false;
++		repositories.remove(repository);
+ 		// remove the repository from the preference store
+ 		try {
+-			getPreferences().node(getKey(toRemove)).removeNode();
++			getPreferences().node(getKey(repository)).removeNode();
+ 			saveRepositoryList();
+ 		} catch (BackingStoreException e) {
+ 			log("Error saving preferences", e); //$NON-NLS-1$
+ 		}
++		return true;
+ 	}
+ 
+ 	public void restoreRepositories() {
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+index 3f9873d..690b3fe 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+@@ -41,5 +41,14 @@ public interface IMetadataRepositoryManager {
+ 
+ 	public IMetadataRepository getRepository(URL repo); //TODO Should this throw an exception
+ 
+-	public void removeRepository(IMetadataRepository toRemove);
++	/**
++	 * Removes the metadata repository at the given location from the list of
++	 * metadata repositories tracked by the repository manager.  The underlying
++	 * repository is not deleted.
++	 * 
++	 * @param location The location of the repository to remove
++	 * @return <code>true</code> if a repository was removed, and 
++	 * <code>false</code> otherwise.
++	 */
++	public boolean removeRepository(URL location);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
+index 44656cc..98b926f 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
+@@ -612,7 +612,7 @@ public class AbstractProvisioningTest extends TestCase {
+ 		if (!metadataRepos.isEmpty()) {
+ 			for (Iterator it = metadataRepos.iterator(); it.hasNext();) {
+ 				IMetadataRepository repo = (IMetadataRepository) it.next();
+-				repoMan.removeRepository(repo);
++				repoMan.removeRepository(repo.getLocation());
+ 			}
+ 			metadataRepos.clear();
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/DirectorTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/DirectorTest.java
+index e2de98b..570afb3 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/DirectorTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/DirectorTest.java
+@@ -135,7 +135,7 @@ public class DirectorTest extends TestCase {
+ 	private void ensureFragmentAssociationIsNotPersisted(IMetadataRepositoryManager mgr) {
+ 		//Test for https://bugs.eclipse.org/bugs/show_bug.cgi?id=177661
+ 		AgentLocation location = (AgentLocation) ServiceHelper.getService(TestActivator.getContext(), AgentLocation.class.getName());
+-		mgr.removeRepository(mgr.getRepository(location.getMetadataRepositoryURL()));
++		mgr.removeRepository(location.getMetadataRepositoryURL());
+ 		IMetadataRepository repo = null;
+ 		repo = mgr.loadRepository(location.getMetadataRepositoryURL(), null);
+ 		Iterator it = repo.query(new InstallableUnitQuery("org.eclipse.equinox.simpleconfigurator", VersionRange.emptyRange), new Collector(), null).iterator();
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/JarURLRepositoryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/JarURLRepositoryTest.java
+index 36dd975..0920200 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/JarURLRepositoryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/JarURLRepositoryTest.java
+@@ -77,6 +77,6 @@ public class JarURLRepositoryTest extends TestCase {
+ 		}
+ 		IMetadataRepository repo = manager.loadRepository(jarRepoURL, null);
+ 		assertTrue(repo.getInstallableUnits(null).length > 0);
+-		manager.removeRepository(repo);
++		manager.removeRepository(jarRepoURL);
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+index fd61e56..d992d47 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+@@ -69,11 +69,8 @@ public class ProvisioningUtil {
+ 		if (manager == null) {
+ 			throw new ProvisionException(ProvUIMessages.ProvisioningUtil_NoRepositoryManager);
+ 		}
+-		IMetadataRepository repo = manager.getRepository(location);
+-		if (repo != null)
+-			manager.removeRepository(repo);
+-		EventObject event = new EventObject(IProvisioningListener.REPO_REMOVED);
+-		ProvUIActivator.getDefault().notifyListeners(event);
++		if (manager.removeRepository(location))
++			ProvUIActivator.getDefault().notifyListeners(new EventObject(IProvisioningListener.REPO_REMOVED));
+ 
+ 	}
+ 
+commit ce0e9800a270e764029c81b526ae3f1b9151fbf3
+Author: John Arthorne <johna>
+Date:   Fri Nov 30 21:19:07 2007 +0000
+
+    Bug 207978 [prov] [repo] manager.loadRepository(...) has no progress, is terribly slow
+
+1	1	bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+1	1	bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
+144	134	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+15	8	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+index 40b47ed..54a8a61 100644
+--- a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
++++ b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+@@ -53,7 +53,7 @@ public class ProvisioningHelper {
+ 		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(Activator.getContext(), IMetadataRepositoryManager.class.getName());
+ 		if (manager == null)
+ 			throw new IllegalStateException("No metadata repository manager found");
+-		return manager.getRepository(location);
++		return manager.loadRepository(location, null);
+ 	}
+ 
+ 	public static void removeMetadataRepository(URL location) {
+diff --git a/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java b/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
+index a5e877a..9a4d311 100644
+--- a/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
++++ b/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
+@@ -105,7 +105,7 @@ public class RepositoryListener extends DirectoryChangeListener {
+ 
+ 		IMetadataRepository repository = null;
+ 		try {
+-			repository = manager.getRepository(stateDirURL);
++			repository = manager.loadRepository(stateDirURL, null);
+ 			if (repository == null)
+ 				repository = manager.createRepository(stateDirURL, "metadata listener " + repositoryName, "org.eclipse.equinox.p2.metadata.repository.simpleRepository");
+ 		} finally {
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+index 914f49e..2bd214f 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+@@ -26,13 +26,13 @@ import org.osgi.service.prefs.Preferences;
+ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 	private static final String FACTORY = "factory"; //$NON-NLS-1$
+ 
+-	private static final String NODE_REPOSITORIES = "repositories"; //$NON-NLS-1$
+ 	private static final String KEY_DESCRIPTION = "description"; //$NON-NLS-1$
+ 	private static final String KEY_NAME = "name"; //$NON-NLS-1$
+ 	private static final String KEY_PROVIDER = "provider"; //$NON-NLS-1$
+ 	private static final String KEY_TYPE = "type"; //$NON-NLS-1$
+ 	private static final String KEY_URL = "url"; //$NON-NLS-1$
+ 	private static final String KEY_VERSION = "version"; //$NON-NLS-1$
++	private static final String NODE_REPOSITORIES = "repositories"; //$NON-NLS-1$
+ 
+ 	private List repositories = Collections.synchronizedList(new ArrayList());
+ 
+@@ -46,60 +46,67 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		remember(repository);
+ 	}
+ 
+-	/*
+-	 * Restore the list of repositories from the preference store.
+-	 */
+-	private void restoreFromPreferences() {
+-		// restore the list of repositories from the preference store
+-		Preferences node = getPreferences();
+-		String[] children;
++	private Object createExecutableExtension(IExtension extension, String element) throws CoreException {
++		IConfigurationElement[] elements = extension.getConfigurationElements();
++		for (int i = 0; i < elements.length; i++) {
++			if (elements[i].getName().equals(element))
++				return elements[i].createExecutableExtension("class");
++		}
++		throw new CoreException(new Status(IStatus.ERROR, Activator.ID, "Malformed extension"));
++	}
++
++	// TODO This method really should not be here.  There could be lots of different kinds of
++	// repositories and many different ways to create them.
++	// for now discriminate by the type of URL but this is bogus.
++	public IMetadataRepository createRepository(URL location, String name, String type) {
++		IMetadataRepository result = loadRepository(location, (IProgressMonitor) null);
++		if (result != null)
++			return result;
++		IExtension extension = RegistryFactory.getRegistry().getExtension(Activator.REPO_PROVIDER_XPT, type);
++		if (extension == null)
++			return null;
+ 		try {
+-			children = node.childrenNames();
+-		} catch (BackingStoreException e) {
+-			log("Error restoring repositories from preferences", e); //$NON-NLS-1$
+-			return;
++			IMetadataRepositoryFactory factory = (IMetadataRepositoryFactory) createExecutableExtension(extension, FACTORY);
++			if (factory == null)
++				return null;
++			result = factory.create(location, name, type);
++			if (result != null)
++				addRepository(result);
++			return result;
++		} catch (CoreException e) {
++			return null;
+ 		}
+-		for (int i = 0; i < children.length; i++) {
+-			Preferences child = node.node(children[i]);
+-			String url = child.get(KEY_URL, null);
+-			if (url == null)
+-				continue;
+-			try {
+-				IMetadataRepository repository = loadRepository(new URL(url), (IProgressMonitor) null);
+-				// If we could not restore the repo then remove it from the preferences.
+-				if (repository == null)
+-					child.removeNode();
+-			} catch (MalformedURLException e) {
+-				log("Error while restoring repository: " + url, e); //$NON-NLS-1$
+-			} catch (BackingStoreException e) {
+-				log("Error while restoring repository: " + url, e); //$NON-NLS-1$
++	}
++
++	private IExtension[] findMatchingRepositoryExtensions(String suffix) {
++		IConfigurationElement[] elt = RegistryFactory.getRegistry().getConfigurationElementsFor(Activator.REPO_PROVIDER_XPT);
++		int count = 0;
++		for (int i = 0; i < elt.length; i++) {
++			if (elt[i].getName().equals("filter")) {
++				if (!elt[i].getAttribute("suffix").equals(suffix)) {
++					elt[i] = null;
++				} else {
++					count++;
++				}
++			} else {
++				elt[i] = null;
+ 			}
+ 		}
++		IExtension[] results = new IExtension[count];
++		for (int i = 0; i < elt.length; i++) {
++			if (elt[i] != null)
++				results[--count] = elt[i].getDeclaringExtension();
++		}
++		return results;
+ 	}
+ 
+-	/*
+-	 * Save the list of repositories in the preference store.
+-	 */
+-	private void remember(IMetadataRepository repository) {
+-		Preferences node = getPreferences().node(getKey(repository));
+-		String value = repository.getLocation().toExternalForm();
+-		node.put(KEY_URL, value);
+-		value = repository.getDescription();
+-		if (value != null)
+-			node.put(KEY_DESCRIPTION, value);
+-		value = repository.getName();
+-		if (value != null)
+-			node.put(KEY_NAME, value);
+-		value = repository.getProvider();
+-		if (value != null)
+-			node.put(KEY_PROVIDER, value);
+-		value = repository.getType();
+-		if (value != null)
+-			node.put(KEY_TYPE, value);
+-		value = repository.getVersion();
+-		if (value != null)
+-			node.put(KEY_VERSION, value);
+-		saveRepositoryList();
++	private String[] getAllSuffixes() {
++		IConfigurationElement[] elements = RegistryFactory.getRegistry().getConfigurationElementsFor(Activator.REPO_PROVIDER_XPT);
++		ArrayList result = new ArrayList(elements.length);
++		for (int i = 0; i < elements.length; i++)
++			if (elements[i].getName().equals("filter"))
++				result.add(elements[i].getAttribute("suffix"));
++		return (String[]) result.toArray(new String[result.size()]);
+ 	}
+ 
+ 	/*
+@@ -110,6 +117,38 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		return repository.getLocation().toExternalForm().replace('/', '_');
+ 	}
+ 
++	public IMetadataRepository[] getKnownRepositories() {
++		return (IMetadataRepository[]) repositories.toArray(new IMetadataRepository[repositories.size()]);
++	}
++
++	public URL[] getKnownRepositories2() {
++		URL[] result = new URL[repositories.size()];
++		int i = 0;
++		for (Iterator it = repositories.iterator(); it.hasNext(); i++) {
++			IMetadataRepository repository = (IMetadataRepository) it.next();
++			result[i] = repository.getLocation();
++		}
++		return result;
++	}
++
++	/*
++	 * Return the preference node which is the root for where we store the repository information.
++	 */
++	private Preferences getPreferences() {
++		return new ConfigurationScope().getNode(Activator.PI_METADATA_REPOSITORY).node(NODE_REPOSITORIES);
++	}
++
++	public IMetadataRepository getRepository(URL location) {
++		if (repositories == null)
++			restoreRepositories();
++		for (Iterator iterator = repositories.iterator(); iterator.hasNext();) {
++			IMetadataRepository match = (IMetadataRepository) iterator.next();
++			if (Utils.sameURL(match.getLocation(), location))
++				return match;
++		}
++		return null;
++	}
++
+ 	public IMetadataRepository loadRepository(URL location, IProgressMonitor progress) {
+ 		// TODO do some thing with the monitor
+ 		IMetadataRepository result = getRepository(location);
+@@ -131,38 +170,6 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		return null;
+ 	}
+ 
+-	private String[] getAllSuffixes() {
+-		IConfigurationElement[] elements = RegistryFactory.getRegistry().getConfigurationElementsFor(Activator.REPO_PROVIDER_XPT);
+-		ArrayList result = new ArrayList(elements.length);
+-		for (int i = 0; i < elements.length; i++)
+-			if (elements[i].getName().equals("filter"))
+-				result.add(elements[i].getAttribute("suffix"));
+-		return (String[]) result.toArray(new String[result.size()]);
+-	}
+-
+-	// TODO This method really should not be here.  There could be lots of different kinds of
+-	// repositories and many different ways to create them.
+-	// for now discriminate by the type of URL but this is bogus.
+-	public IMetadataRepository createRepository(URL location, String name, String type) {
+-		IMetadataRepository result = loadRepository(location, (IProgressMonitor) null);
+-		if (result != null)
+-			return result;
+-		IExtension extension = RegistryFactory.getRegistry().getExtension(Activator.REPO_PROVIDER_XPT, type);
+-		if (extension == null)
+-			return null;
+-		try {
+-			IMetadataRepositoryFactory factory = (IMetadataRepositoryFactory) createExecutableExtension(extension, FACTORY);
+-			if (factory == null)
+-				return null;
+-			result = factory.create(location, name, type);
+-			if (result != null)
+-				addRepository(result);
+-			return result;
+-		} catch (CoreException e) {
+-			return null;
+-		}
+-	}
+-
+ 	/**
+ 	 * Try to load a pre-existing repo at the given location
+ 	 */
+@@ -182,25 +189,35 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		return null;
+ 	}
+ 
+-	public IMetadataRepository[] getKnownRepositories() {
+-		return (IMetadataRepository[]) repositories.toArray(new IMetadataRepository[repositories.size()]);
+-	}
+-
+-	public IMetadataRepository getRepository(URL location) {
+-		if (repositories == null)
+-			restoreRepositories();
+-		for (Iterator iterator = repositories.iterator(); iterator.hasNext();) {
+-			IMetadataRepository match = (IMetadataRepository) iterator.next();
+-			if (Utils.sameURL(match.getLocation(), location))
+-				return match;
+-		}
+-		return null;
+-	}
+-
+ 	protected void log(String message, Throwable t) {
+ 		LogHelper.log(new Status(IStatus.ERROR, Activator.PI_METADATA_REPOSITORY, message, t));
+ 	}
+ 
++	/*
++	 * Save the list of repositories in the preference store.
++	 */
++	private void remember(IMetadataRepository repository) {
++		Preferences node = getPreferences().node(getKey(repository));
++		String value = repository.getLocation().toExternalForm();
++		node.put(KEY_URL, value);
++		value = repository.getDescription();
++		if (value != null)
++			node.put(KEY_DESCRIPTION, value);
++		value = repository.getName();
++		if (value != null)
++			node.put(KEY_NAME, value);
++		value = repository.getProvider();
++		if (value != null)
++			node.put(KEY_PROVIDER, value);
++		value = repository.getType();
++		if (value != null)
++			node.put(KEY_TYPE, value);
++		value = repository.getVersion();
++		if (value != null)
++			node.put(KEY_VERSION, value);
++		saveRepositoryList();
++	}
++
+ 	public boolean removeRepository(URL toRemove) {
+ 		IMetadataRepository repository = getRepository(toRemove);
+ 		if (repository == null)
+@@ -216,6 +233,37 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		return true;
+ 	}
+ 
++	/*
++	 * Restore the list of repositories from the preference store.
++	 */
++	private void restoreFromPreferences() {
++		// restore the list of repositories from the preference store
++		Preferences node = getPreferences();
++		String[] children;
++		try {
++			children = node.childrenNames();
++		} catch (BackingStoreException e) {
++			log("Error restoring repositories from preferences", e); //$NON-NLS-1$
++			return;
++		}
++		for (int i = 0; i < children.length; i++) {
++			Preferences child = node.node(children[i]);
++			String url = child.get(KEY_URL, null);
++			if (url == null)
++				continue;
++			try {
++				IMetadataRepository repository = loadRepository(new URL(url), (IProgressMonitor) null);
++				// If we could not restore the repo then remove it from the preferences.
++				if (repository == null)
++					child.removeNode();
++			} catch (MalformedURLException e) {
++				log("Error while restoring repository: " + url, e); //$NON-NLS-1$
++			} catch (BackingStoreException e) {
++				log("Error while restoring repository: " + url, e); //$NON-NLS-1$
++			}
++		}
++	}
++
+ 	public void restoreRepositories() {
+ 		//TODO we may want to have proxies on repo instead of the real repo object to limit what is activated.
+ 		URL path = null;
+@@ -250,13 +298,6 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 	}
+ 
+ 	/*
+-	 * Return the preference node which is the root for where we store the repository information.
+-	 */
+-	private Preferences getPreferences() {
+-		return new ConfigurationScope().getNode(Activator.PI_METADATA_REPOSITORY).node(NODE_REPOSITORIES);
+-	}
+-
+-	/*
+ 	 * Save the repository list in the file-system
+ 	 */
+ 	private void saveRepositoryList() {
+@@ -266,35 +307,4 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 			log("Error while saving repositories in preferences", e);
+ 		}
+ 	}
+-
+-	private Object createExecutableExtension(IExtension extension, String element) throws CoreException {
+-		IConfigurationElement[] elements = extension.getConfigurationElements();
+-		for (int i = 0; i < elements.length; i++) {
+-			if (elements[i].getName().equals(element))
+-				return elements[i].createExecutableExtension("class");
+-		}
+-		throw new CoreException(new Status(IStatus.ERROR, Activator.ID, "Malformed extension"));
+-	}
+-
+-	private IExtension[] findMatchingRepositoryExtensions(String suffix) {
+-		IConfigurationElement[] elt = RegistryFactory.getRegistry().getConfigurationElementsFor(Activator.REPO_PROVIDER_XPT);
+-		int count = 0;
+-		for (int i = 0; i < elt.length; i++) {
+-			if (elt[i].getName().equals("filter")) {
+-				if (!elt[i].getAttribute("suffix").equals(suffix)) {
+-					elt[i] = null;
+-				} else {
+-					count++;
+-				}
+-			} else {
+-				elt[i] = null;
+-			}
+-		}
+-		IExtension[] results = new IExtension[count];
+-		for (int i = 0; i < elt.length; i++) {
+-			if (elt[i] != null)
+-				results[--count] = elt[i].getDeclaringExtension();
+-		}
+-		return results;
+-	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+index 690b3fe..9ca473f 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+@@ -21,13 +21,6 @@ public interface IMetadataRepositoryManager {
+ 	public void addRepository(IMetadataRepository repository);
+ 
+ 	/**
+-	 * Adds a repository corresponding to the given URL.
+-	 * @param url The URL of the repository to add
+-	 * @param progress TODO
+-	 */
+-	public IMetadataRepository loadRepository(URL url, IProgressMonitor progress);
+-
+-	/**
+ 	 * Creates and returns a metadata repository of the given type at the given location.
+ 	 * If a repository already exists at that location <code>null</code> is returned.
+ 	 * @param location the location for the new repository
+@@ -39,7 +32,21 @@ public interface IMetadataRepositoryManager {
+ 
+ 	public IMetadataRepository[] getKnownRepositories();
+ 
+-	public IMetadataRepository getRepository(URL repo); //TODO Should this throw an exception
++	/**
++	 * Returns the locations of the repositories managed by this repository manager.
++	 * 
++	 * @return the locations of the repositories managed by this repository manager.
++	 */
++	public URL[] getKnownRepositories2();
++
++	/**
++	 * Adds a repository corresponding to the given URL.
++	 * 
++	 * @param url The URL of the repository to add
++	 * @param monitor a progress monitor, or <code>null</code> if progress
++	 *    reporting is not desired
++	 */
++	public IMetadataRepository loadRepository(URL url, IProgressMonitor monitor);
+ 
+ 	/**
+ 	 * Removes the metadata repository at the given location from the list of
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
+index 8d748c7..000d256 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
+@@ -39,7 +39,7 @@ public class RollbackTest extends AbstractProvisioningTest {
+ 		printProfile(profile);
+ 		IMetadataRepositoryManager repoMan = (IMetadataRepositoryManager) ServiceHelper.getService(TestActivator.getContext(), IMetadataRepositoryManager.class.getName());
+ 		IMetadataRepository repo = null;
+-		repo = repoMan.getRepository(getRollbackRepository());
++		repo = repoMan.loadRepository(getRollbackRepository(), null);
+ 		IInstallableUnit[] ius = repo.getInstallableUnits(null);
+ 		for (int i = 0; i < ius.length; i++)
+ 			System.out.println(ius[i]);
+commit b0320bc80555b6827f37793699edb586f07fd478
+Author: John Arthorne <johna>
+Date:   Tue Dec 4 18:56:56 2007 +0000
+
+    Bug 207978 [prov] [repo] manager.loadRepository(...) has no progress, is terribly slow
+
+1	1	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+2	2	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/spi/p2/artifact/repository/AbstractArtifactRepository.java
+10	16	bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvCommandProvider.java
+9	13	bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+46	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/URLUtil.java
+0	56	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Utils.java
+5	7	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+7	10	bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
+145	98	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+4	5	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+3	11	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/DirectorTest.java
+12	29	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/End2EndTest.java
+7	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+7	7	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/query/QueryableMetadataRepositoryManager.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+index 4ae7af5..1e23638 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+@@ -154,7 +154,7 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 			restoreRepositories();
+ 		for (Iterator iterator = repositories.iterator(); iterator.hasNext();) {
+ 			IArtifactRepository match = (IArtifactRepository) iterator.next();
+-			if (Utils.sameURL(match.getLocation(), location))
++			if (URLUtil.sameURL(match.getLocation(), location))
+ 				return match;
+ 		}
+ 		return null;
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/spi/p2/artifact/repository/AbstractArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/spi/p2/artifact/repository/AbstractArtifactRepository.java
+index 003b6ce..10bab37 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/spi/p2/artifact/repository/AbstractArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/spi/p2/artifact/repository/AbstractArtifactRepository.java
+@@ -14,7 +14,7 @@ import java.io.OutputStream;
+ import java.net.URL;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.equinox.internal.p2.core.helpers.Utils;
++import org.eclipse.equinox.internal.p2.core.helpers.URLUtil;
+ import org.eclipse.equinox.p2.artifact.repository.*;
+ import org.eclipse.equinox.p2.metadata.IArtifactKey;
+ import org.eclipse.equinox.spi.p2.core.repository.AbstractRepository;
+@@ -70,7 +70,7 @@ public abstract class AbstractArtifactRepository extends AbstractRepository impl
+ 		if (!(o instanceof AbstractArtifactRepository)) {
+ 			return false;
+ 		}
+-		if (Utils.sameURL(getLocation(), ((AbstractArtifactRepository) o).getLocation()))
++		if (URLUtil.sameURL(getLocation(), ((AbstractArtifactRepository) o).getLocation()))
+ 			return true;
+ 		return false;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvCommandProvider.java b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvCommandProvider.java
+index fedcd6e..5d28d64 100644
+--- a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvCommandProvider.java
++++ b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvCommandProvider.java
+@@ -14,6 +14,7 @@ import java.net.URL;
+ import java.util.*;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.NullProgressMonitor;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.artifact.repository.*;
+ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.engine.IProfileRegistry;
+@@ -21,7 +22,7 @@ import org.eclipse.equinox.p2.engine.Profile;
+ import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.metadata.query.CapabilityQuery;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+-import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
++import org.eclipse.equinox.p2.metadata.repository.IMetadataRepositoryManager;
+ import org.eclipse.equinox.p2.query.*;
+ import org.eclipse.osgi.framework.console.CommandInterpreter;
+ import org.eclipse.osgi.framework.console.CommandProvider;
+@@ -159,11 +160,9 @@ public class ProvCommandProvider implements CommandProvider {
+ 		String id = processArgument(interpreter.nextArgument());
+ 		String version = processArgument(interpreter.nextArgument());
+ 		if (urlString == null) {
+-			IMetadataRepository[] repositories = ProvisioningHelper.getMetadataRepositories();
+-			if (repositories == null)
+-				return;
++			URL[] repositories = ProvisioningHelper.getMetadataRepositories();
+ 			for (int i = 0; i < repositories.length; i++)
+-				interpreter.println(repositories[i].getLocation());
++				interpreter.println(repositories[i]);
+ 			return;
+ 		}
+ 		URL repoURL = toURL(interpreter, urlString);
+@@ -182,27 +181,22 @@ public class ProvCommandProvider implements CommandProvider {
+ 	 */
+ 	public void _provlg(CommandInterpreter interpreter) {
+ 		String urlString = processArgument(interpreter.nextArgument());
+-		IMetadataRepository[] repositories;
++		IQueryable queryable = null;
+ 		if (urlString == null) {
+-			repositories = ProvisioningHelper.getMetadataRepositories();
+-			if (repositories == null)
++			queryable = (IQueryable) ServiceHelper.getService(Activator.getContext(), IMetadataRepositoryManager.class.getName());
++			if (queryable == null)
+ 				return;
+ 		} else {
+ 			URL repoURL = toURL(interpreter, urlString);
+ 			if (repoURL == null)
+ 				return;
+-			IMetadataRepository repo = null;
+-			repo = ProvisioningHelper.getMetadataRepository(repoURL);
+-			if (repo == null)
++			queryable = ProvisioningHelper.getMetadataRepository(repoURL);
++			if (queryable == null)
+ 				return;
+-			repositories = new IMetadataRepository[] {repo};
+ 		}
+ 		RequiredCapability requirement = new RequiredCapability(IInstallableUnit.NAMESPACE_IU_KIND, "group", null, null, false, false); //$NON-NLS-1$
+ 		Query query = new CapabilityQuery(requirement);
+-		Collector result = new Collector();
+-		for (int i = 0; i < repositories.length; i++)
+-			repositories[i].query(query, result, null);
+-		IInstallableUnit[] units = sort(result);
++		IInstallableUnit[] units = sort(queryable.query(query, new Collector(), null));
+ 		for (int i = 0; i < units.length; i++)
+ 			println(interpreter, units[i]);
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+index 54a8a61..398261f 100644
+--- a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
++++ b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+@@ -27,8 +27,7 @@ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepositoryManager;
+-import org.eclipse.equinox.p2.query.Collector;
+-import org.eclipse.equinox.p2.query.Query;
++import org.eclipse.equinox.p2.query.*;
+ import org.eclipse.osgi.service.environment.EnvironmentInfo;
+ import org.osgi.framework.Version;
+ 
+@@ -153,24 +152,21 @@ public class ProvisioningHelper {
+ 	 * @return The IUs that match the query
+ 	 */
+ 	public static Collector getInstallableUnits(URL location, Query query, IProgressMonitor monitor) {
+-		IMetadataRepository[] repositories = null;
+-		Collector collector = new Collector();
++		IQueryable queryable = null;
+ 		if (location == null) {
+-			repositories = getMetadataRepositories();
+-			for (int i = 0; i < repositories.length; i++)
+-				repositories[i].query(query, collector, monitor);
++			queryable = (IQueryable) ServiceHelper.getService(Activator.getContext(), IMetadataRepositoryManager.class.getName());
+ 		} else {
+-			getMetadataRepository(location).query(query, collector, null);
++			queryable = getMetadataRepository(location);
+ 		}
+-		return collector;
++		return queryable.query(query, new Collector(), null);
+ 	}
+ 
+-	public static IMetadataRepository[] getMetadataRepositories() {
++	public static URL[] getMetadataRepositories() {
+ 		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(Activator.getContext(), IMetadataRepositoryManager.class.getName());
+ 		if (manager == null)
+ 			// TODO log here
+ 			return null;
+-		IMetadataRepository[] repos = manager.getKnownRepositories();
++		URL[] repos = manager.getKnownRepositories();
+ 		if (repos.length > 0)
+ 			return repos;
+ 		return null;
+@@ -187,9 +183,9 @@ public class ProvisioningHelper {
+ 			StringBuffer error = new StringBuffer();
+ 			error.append("Installable unit not found: " + unitId + ' ' + version + '\n');
+ 			error.append("Repositories searched:\n");
+-			IMetadataRepository[] repos = getMetadataRepositories();
++			URL[] repos = getMetadataRepositories();
+ 			for (int i = 0; i < repos.length; i++)
+-				error.append(repos[i].getLocation() + "\n");
++				error.append(repos[i] + "\n");
+ 			throw new ProvisionException(error.toString());
+ 		}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/URLUtil.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/URLUtil.java
+new file mode 100644
+index 0000000..5c7adb7
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/URLUtil.java
+@@ -0,0 +1,46 @@
++/*******************************************************************************
++ * Copyright (c) 2007 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.core.helpers;
++
++import java.io.File;
++import java.net.URL;
++
++/**
++ * A utility class for manipulating URLs.
++ */
++public class URLUtil {
++	/*
++	 * Compares two URL for equality.
++	 * Return false if one of them is null
++	 */
++	public static boolean sameURL(URL url1, URL url2) {
++		if (url1 == url2)
++			return true;
++		if (url1 == null || url2 == null)
++			return false;
++		if (url1.equals(url2))
++			return true;
++
++		// check if we have two local file references that are case variants
++		File file1 = toFile(url1);
++		return file1 == null ? false : file1.equals(toFile(url2));
++	}
++
++	/**
++	 * Returns the URL as a local file, or <code>null</code> if the given
++	 * URL does not represent a local file.
++	 * @param url The url to return the file file
++	 * @return The local file corresponding to the given url, or <code>null</code>
++	 */
++	public static File toFile(URL url) {
++		return "file".equalsIgnoreCase(url.getProtocol()) ? new File(url.getFile()) : null; //$NON-NLS-1$
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Utils.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Utils.java
+deleted file mode 100644
+index 99d588f..0000000
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/helpers/Utils.java
++++ /dev/null
+@@ -1,56 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.core.helpers;
+-
+-import java.io.File;
+-import java.net.URL;
+-
+-public class Utils {
+-	/*
+-	 * Compares two URL for equality
+-	 * Return false if one of them is null
+-	 */
+-	public static boolean sameURL(URL url1, URL url2) {
+-
+-		if (url1 == null || url2 == null)
+-			return false;
+-		if (url1 == url2)
+-			return true;
+-		if (url1.equals(url2))
+-			return true;
+-
+-		// check if URL are file: URL as we may
+-		// have 2 URL pointing to the same featureReference
+-		// but with different representation
+-		// (i.e. file:/C;/ and file:C:/)
+-		if (!"file".equalsIgnoreCase(url1.getProtocol())) //$NON-NLS-1$
+-			return false;
+-		if (!"file".equalsIgnoreCase(url2.getProtocol())) //$NON-NLS-1$
+-			return false;
+-
+-		File file1 = getFileFor(url1);//new File(url1.getFile());
+-		File file2 = getFileFor(url2);
+-
+-		if (file1 == null)
+-			return false;
+-
+-		return (file1.equals(file2));
+-	}
+-
+-	/*
+-	 * Method getFileFor.
+-	 * @param url1
+-	 * @return File
+-	 */
+-	private static File getFileFor(URL url1) {
+-		return new File(url1.getFile());
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index 16c1c70..decc5cd 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -18,8 +18,8 @@ import org.eclipse.equinox.p2.engine.Operand;
+ import org.eclipse.equinox.p2.engine.Profile;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+-import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepositoryManager;
++import org.eclipse.equinox.p2.query.Collector;
+ import org.eclipse.equinox.p2.query.Query;
+ import org.eclipse.osgi.service.resolver.VersionRange;
+ import org.eclipse.osgi.util.NLS;
+@@ -202,18 +202,16 @@ public class SimplePlanner implements IPlanner {
+ 	}
+ 
+ 	protected IInstallableUnit[] gatherAvailableInstallableUnits(IInstallableUnit[] additionalSource) {
+-		IMetadataRepositoryManager repoMgr = (IMetadataRepositoryManager) ServiceHelper.getService(DirectorActivator.context, IMetadataRepositoryManager.class.getName());
+-		IMetadataRepository[] repos = repoMgr.getKnownRepositories();
+ 		List results = new ArrayList();
+ 		if (additionalSource != null) {
+ 			for (int i = 0; i < additionalSource.length; i++) {
+ 				results.add(additionalSource[i]);
+ 			}
+ 		}
+-
+-		for (int i = 0; i < repos.length; i++) {
+-			results.addAll(Arrays.asList(repos[i].getInstallableUnits(null)));
+-		}
++		IMetadataRepositoryManager repoMgr = (IMetadataRepositoryManager) ServiceHelper.getService(DirectorActivator.context, IMetadataRepositoryManager.class.getName());
++		Iterator matches = repoMgr.query(new InstallableUnitQuery(null, VersionRange.emptyRange), new Collector(), null).iterator();
++		while (matches.hasNext())
++			results.add(matches.next());
+ 		return (IInstallableUnit[]) results.toArray(new IInstallableUnit[results.size()]);
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
+index 10cc68c..e99dfe8 100644
+--- a/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
++++ b/bundles/org.eclipse.equinox.p2.installer/src/org/eclipse/equinox/internal/p2/installer/InstallUpdateProductOperation.java
+@@ -23,9 +23,9 @@ import org.eclipse.equinox.p2.engine.IProfileRegistry;
+ import org.eclipse.equinox.p2.engine.Profile;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+-import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepositoryManager;
+-import org.eclipse.equinox.p2.query.*;
++import org.eclipse.equinox.p2.query.Collector;
++import org.eclipse.equinox.p2.query.Query;
+ import org.eclipse.osgi.service.environment.EnvironmentInfo;
+ import org.eclipse.osgi.service.resolver.VersionRange;
+ import org.eclipse.osgi.util.NLS;
+@@ -140,14 +140,11 @@ public class InstallUpdateProductOperation implements IInstallOperation {
+ 		VersionRange range = VersionRange.emptyRange;
+ 		if (version != null && !version.equals(Version.emptyVersion))
+ 			range = new VersionRange(version, true, version, true);
+-		IMetadataRepository[] repos = metadataRepoMan.getKnownRepositories();
+-		for (int i = 0; i < repos.length; i++) {
+-			Query query = new InstallableUnitQuery(id, range);
+-			Collector collector = new Collector();
+-			Iterator result = repos[i].query(query, collector, null).iterator();
+-			if (result.hasNext())
+-				return (IInstallableUnit) result.next();
+-		}
++		Query query = new InstallableUnitQuery(id, range);
++		Collector collector = new Collector();
++		Iterator matches = metadataRepoMan.query(query, collector, null).iterator();
++		if (matches.hasNext())
++			return (IInstallableUnit) matches.next();
+ 		throw fail("Installable unit not found: " + id);
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+index 2bd214f..0da56c9 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+@@ -14,16 +14,24 @@ import java.util.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.core.runtime.preferences.ConfigurationScope;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+-import org.eclipse.equinox.internal.p2.core.helpers.Utils;
+-import org.eclipse.equinox.p2.core.repository.RepositoryCreationException;
++import org.eclipse.equinox.internal.p2.core.helpers.URLUtil;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepositoryManager;
++import org.eclipse.equinox.p2.query.Collector;
++import org.eclipse.equinox.p2.query.Query;
+ import org.eclipse.equinox.spi.p2.metadata.repository.IMetadataRepositoryFactory;
+ import org.eclipse.osgi.util.NLS;
+ import org.osgi.service.prefs.BackingStoreException;
+ import org.osgi.service.prefs.Preferences;
+ 
+ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
++	static class RepositoryInfo {
++		String description;
++		String name;
++		IMetadataRepository repository;
++		URL url;
++	}
++
+ 	private static final String FACTORY = "factory"; //$NON-NLS-1$
+ 
+ 	private static final String KEY_DESCRIPTION = "description"; //$NON-NLS-1$
+@@ -34,25 +42,48 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 	private static final String KEY_VERSION = "version"; //$NON-NLS-1$
+ 	private static final String NODE_REPOSITORIES = "repositories"; //$NON-NLS-1$
+ 
+-	private List repositories = Collections.synchronizedList(new ArrayList());
++	private Map repositories = null;
++	//lock object to be held when referring repositories field
++	private final Object repositoryLock = new Object();
+ 
+ 	public MetadataRepositoryManager() {
+-		restoreRepositories();
++		//initialize repositories lazily
+ 	}
+ 
+ 	public void addRepository(IMetadataRepository repository) {
+-		repositories.add(repository);
++		RepositoryInfo info = new RepositoryInfo();
++		info.repository = repository;
++		info.name = repository.getName();
++		info.description = repository.getDescription();
++		info.url = repository.getLocation();
++		synchronized (repositoryLock) {
++			if (repositories == null)
++				restoreRepositories();
++			repositories.put(getKey(repository), info);
++		}
+ 		// save the given repository in the preferences.
+ 		remember(repository);
+ 	}
+ 
+-	private Object createExecutableExtension(IExtension extension, String element) throws CoreException {
++	/**
++	 * Returns the executable extension, or <code>null</code> if there
++	 * was no corresponding extension, or an error occurred loading it
++	 */
++	private Object createExecutableExtension(IExtension extension, String element) {
+ 		IConfigurationElement[] elements = extension.getConfigurationElements();
++		CoreException failure = null;
+ 		for (int i = 0; i < elements.length; i++) {
+-			if (elements[i].getName().equals(element))
+-				return elements[i].createExecutableExtension("class");
++			if (elements[i].getName().equals(element)) {
++				try {
++					return elements[i].createExecutableExtension("class"); //$NON-NLS-1$
++				} catch (CoreException e) {
++					log("Error loading repository extension: " + extension.getUniqueIdentifier(), failure); //$NON-NLS-1$
++					return null;
++				}
++			}
+ 		}
+-		throw new CoreException(new Status(IStatus.ERROR, Activator.ID, "Malformed extension"));
++		log("Malformed repository extension: " + extension.getUniqueIdentifier(), null); //$NON-NLS-1$
++		return null;
+ 	}
+ 
+ 	// TODO This method really should not be here.  There could be lots of different kinds of
+@@ -65,25 +96,21 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		IExtension extension = RegistryFactory.getRegistry().getExtension(Activator.REPO_PROVIDER_XPT, type);
+ 		if (extension == null)
+ 			return null;
+-		try {
+-			IMetadataRepositoryFactory factory = (IMetadataRepositoryFactory) createExecutableExtension(extension, FACTORY);
+-			if (factory == null)
+-				return null;
+-			result = factory.create(location, name, type);
+-			if (result != null)
+-				addRepository(result);
+-			return result;
+-		} catch (CoreException e) {
++		IMetadataRepositoryFactory factory = (IMetadataRepositoryFactory) createExecutableExtension(extension, FACTORY);
++		if (factory == null)
+ 			return null;
+-		}
++		result = factory.create(location, name, type);
++		if (result != null)
++			addRepository(result);
++		return result;
+ 	}
+ 
+ 	private IExtension[] findMatchingRepositoryExtensions(String suffix) {
+ 		IConfigurationElement[] elt = RegistryFactory.getRegistry().getConfigurationElementsFor(Activator.REPO_PROVIDER_XPT);
+ 		int count = 0;
+ 		for (int i = 0; i < elt.length; i++) {
+-			if (elt[i].getName().equals("filter")) {
+-				if (!elt[i].getAttribute("suffix").equals(suffix)) {
++			if (elt[i].getName().equals("filter")) { //$NON-NLS-1$
++				if (!elt[i].getAttribute("suffix").equals(suffix)) { //$NON-NLS-1$
+ 					elt[i] = null;
+ 				} else {
+ 					count++;
+@@ -104,31 +131,39 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		IConfigurationElement[] elements = RegistryFactory.getRegistry().getConfigurationElementsFor(Activator.REPO_PROVIDER_XPT);
+ 		ArrayList result = new ArrayList(elements.length);
+ 		for (int i = 0; i < elements.length; i++)
+-			if (elements[i].getName().equals("filter"))
+-				result.add(elements[i].getAttribute("suffix"));
++			if (elements[i].getName().equals("filter")) //$NON-NLS-1$
++				result.add(elements[i].getAttribute("suffix")); //$NON-NLS-1$
+ 		return (String[]) result.toArray(new String[result.size()]);
+ 	}
+ 
+ 	/*
+-	 * Return a string key suitable based on the given repository which
++	 * Return a string key based on the given repository which
+ 	 * is suitable for use as a preference node name.
+ 	 */
+ 	private String getKey(IMetadataRepository repository) {
+-		return repository.getLocation().toExternalForm().replace('/', '_');
++		return getKey(repository.getLocation());
+ 	}
+ 
+-	public IMetadataRepository[] getKnownRepositories() {
+-		return (IMetadataRepository[]) repositories.toArray(new IMetadataRepository[repositories.size()]);
++	/*
++	 * Return a string key based on the given repository location which
++	 * is suitable for use as a preference node name.
++	 */
++	private String getKey(URL location) {
++		return location.toExternalForm().replace('/', '_');
+ 	}
+ 
+-	public URL[] getKnownRepositories2() {
+-		URL[] result = new URL[repositories.size()];
+-		int i = 0;
+-		for (Iterator it = repositories.iterator(); it.hasNext(); i++) {
+-			IMetadataRepository repository = (IMetadataRepository) it.next();
+-			result[i] = repository.getLocation();
++	public URL[] getKnownRepositories() {
++		synchronized (repositoryLock) {
++			if (repositories == null)
++				restoreRepositories();
++			URL[] result = new URL[repositories.size()];
++			int i = 0;
++			for (Iterator it = repositories.values().iterator(); it.hasNext(); i++) {
++				RepositoryInfo info = (RepositoryInfo) it.next();
++				result[i] = info.url;
++			}
++			return result;
+ 		}
+-		return result;
+ 	}
+ 
+ 	/*
+@@ -139,18 +174,19 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 	}
+ 
+ 	public IMetadataRepository getRepository(URL location) {
+-		if (repositories == null)
+-			restoreRepositories();
+-		for (Iterator iterator = repositories.iterator(); iterator.hasNext();) {
+-			IMetadataRepository match = (IMetadataRepository) iterator.next();
+-			if (Utils.sameURL(match.getLocation(), location))
+-				return match;
++		synchronized (repositoryLock) {
++			if (repositories == null)
++				restoreRepositories();
++			for (Iterator it = repositories.values().iterator(); it.hasNext();) {
++				RepositoryInfo info = (RepositoryInfo) it.next();
++				if (URLUtil.sameURL(info.url, location))
++					return info.repository;
++			}
++			return null;
+ 		}
+-		return null;
+ 	}
+ 
+ 	public IMetadataRepository loadRepository(URL location, IProgressMonitor progress) {
+-		// TODO do some thing with the monitor
+ 		IMetadataRepository result = getRepository(location);
+ 		if (result != null)
+ 			return result;
+@@ -178,14 +214,11 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 	private IMetadataRepository loadRepository(URL location, String suffix) {
+ 		IExtension[] providers = findMatchingRepositoryExtensions(suffix);
+ 		// Loop over the candidates and return the first one that successfully loads
+-		for (int i = 0; i < providers.length; i++)
+-			try {
+-				IMetadataRepositoryFactory factory = (IMetadataRepositoryFactory) createExecutableExtension(providers[i], FACTORY);
+-				if (factory != null)
+-					return factory.load(location);
+-			} catch (CoreException e) {
+-				log("Error loading repository extension: " + providers[i].getUniqueIdentifier(), e); //$NON-NLS-1$
+-			}
++		for (int i = 0; i < providers.length; i++) {
++			IMetadataRepositoryFactory factory = (IMetadataRepositoryFactory) createExecutableExtension(providers[i], FACTORY);
++			if (factory != null)
++				return factory.load(location);
++		}
+ 		return null;
+ 	}
+ 
+@@ -193,6 +226,21 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		LogHelper.log(new Status(IStatus.ERROR, Activator.PI_METADATA_REPOSITORY, message, t));
+ 	}
+ 
++	/* (non-Javadoc)
++	 * @see org.eclipse.equinox.p2.query.IQueryable#query(org.eclipse.equinox.p2.query.Query, org.eclipse.equinox.p2.query.Collector, org.eclipse.core.runtime.IProgressMonitor)
++	 */
++	public Collector query(Query query, Collector collector, IProgressMonitor monitor) {
++		URL[] locations = getKnownRepositories();
++		SubMonitor sub = SubMonitor.convert(monitor, locations.length * 10);
++		for (int i = 0; i < locations.length; i++) {
++			IMetadataRepository repository = loadRepository(locations[i], sub.newChild(9));
++			if (repository != null)
++				repository.query(query, collector, sub.newChild(1));
++		}
++		sub.done();
++		return collector;
++	}
++
+ 	/*
+ 	 * Save the list of repositories in the preference store.
+ 	 */
+@@ -215,25 +263,28 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		value = repository.getVersion();
+ 		if (value != null)
+ 			node.put(KEY_VERSION, value);
+-		saveRepositoryList();
++		saveToPreferences();
+ 	}
+ 
+ 	public boolean removeRepository(URL toRemove) {
+-		IMetadataRepository repository = getRepository(toRemove);
+-		if (repository == null)
+-			return false;
+-		repositories.remove(repository);
++		final String repoKey = getKey(toRemove);
++		synchronized (repositoryLock) {
++			if (repositories == null)
++				restoreRepositories();
++			if (repositories.remove(repoKey) == null)
++				return false;
++		}
+ 		// remove the repository from the preference store
+ 		try {
+-			getPreferences().node(getKey(repository)).removeNode();
+-			saveRepositoryList();
++			getPreferences().node(repoKey).removeNode();
++			saveToPreferences();
+ 		} catch (BackingStoreException e) {
+ 			log("Error saving preferences", e); //$NON-NLS-1$
+ 		}
+ 		return true;
+ 	}
+ 
+-	/*
++	/**
+ 	 * Restore the list of repositories from the preference store.
+ 	 */
+ 	private void restoreFromPreferences() {
+@@ -248,63 +299,59 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		}
+ 		for (int i = 0; i < children.length; i++) {
+ 			Preferences child = node.node(children[i]);
+-			String url = child.get(KEY_URL, null);
+-			if (url == null)
++			String locationString = child.get(KEY_URL, null);
++			if (locationString == null)
+ 				continue;
+ 			try {
+-				IMetadataRepository repository = loadRepository(new URL(url), (IProgressMonitor) null);
+-				// If we could not restore the repo then remove it from the preferences.
+-				if (repository == null)
+-					child.removeNode();
++				RepositoryInfo info = new RepositoryInfo();
++				info.url = new URL(locationString);
++				info.name = child.get(KEY_NAME, null);
++				info.description = child.get(KEY_DESCRIPTION, null);
+ 			} catch (MalformedURLException e) {
+-				log("Error while restoring repository: " + url, e); //$NON-NLS-1$
+-			} catch (BackingStoreException e) {
+-				log("Error while restoring repository: " + url, e); //$NON-NLS-1$
++				log("Error while restoring repository: " + locationString, e); //$NON-NLS-1$
+ 			}
+ 		}
+ 	}
+ 
+-	public void restoreRepositories() {
+-		//TODO we may want to have proxies on repo instead of the real repo object to limit what is activated.
+-		URL path = null;
+-		//		try {
+-		//			AgentLocation location = (AgentLocation) ServiceHelper.getService(Activator.getContext(), AgentLocation.class.getName());
+-		//			if (location == null)
+-		//				// TODO should do something here since we are failing to restore.
+-		//				return;
+-		//			path = location.getMetadataRepositoryURL();
+-		//			repositories.add(new MetadataCache(path));
+-		//		} catch (RepositoryCreationException e) {
+-		//			log("Error while restoring repository " + path, e);
+-		//		}
+-		try {
+-			String locationString = Activator.getContext().getProperty("eclipse.p2.metadataRepository");
+-			if (locationString != null) {
+-				StringTokenizer tokenizer = new StringTokenizer(locationString, ",");
+-				while (tokenizer.hasMoreTokens()) {
+-					try {
+-						path = new URL(tokenizer.nextToken());
+-						loadRepository(path, (IProgressMonitor) null);
+-					} catch (MalformedURLException e) {
+-						throw new RepositoryCreationException(e);
+-					}
+-				}
++	/**
++	 * Restores metadata repositories specified as system properties.
++	 */
++	private void restoreFromSystemProperty() {
++		String locationString = Activator.getContext().getProperty("eclipse.p2.metadataRepository"); //$NON-NLS-1$
++		if (locationString == null)
++			return;
++		StringTokenizer tokenizer = new StringTokenizer(locationString, ","); //$NON-NLS-1$
++		while (tokenizer.hasMoreTokens()) {
++			String pathString = tokenizer.nextToken();
++			try {
++				RepositoryInfo info = new RepositoryInfo();
++				info.url = new URL(pathString);
++				repositories.put(getKey(info.url), info);
++			} catch (MalformedURLException e) {
++				log("Error while restoring repository " + pathString, e); //$NON-NLS-1$
+ 			}
+-		} catch (RepositoryCreationException e) {
+-			log("Error while restoring repository " + path, e);
+ 		}
+-		// load the list which is stored in the preferences
+-		restoreFromPreferences();
++	}
++
++	/**
++	 * Restores the repository list.
++	 */
++	protected void restoreRepositories() {
++		synchronized (repositoryLock) {
++			repositories = new HashMap();
++			restoreFromSystemProperty();
++			restoreFromPreferences();
++		}
+ 	}
+ 
+ 	/*
+ 	 * Save the repository list in the file-system
+ 	 */
+-	private void saveRepositoryList() {
++	private void saveToPreferences() {
+ 		try {
+ 			getPreferences().flush();
+ 		} catch (BackingStoreException e) {
+-			log("Error while saving repositories in preferences", e);
++			log("Error while saving repositories in preferences", e); //$NON-NLS-1$
+ 		}
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+index 9ca473f..e56f08a 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+@@ -12,8 +12,9 @@ package org.eclipse.equinox.p2.metadata.repository;
+ 
+ import java.net.URL;
+ import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.equinox.p2.query.IQueryable;
+ 
+-public interface IMetadataRepositoryManager {
++public interface IMetadataRepositoryManager extends IQueryable {
+ 	/**
+ 	 * Adds a new metadata repository to the set of known repositories.
+ 	 * @param repository
+@@ -24,20 +25,18 @@ public interface IMetadataRepositoryManager {
+ 	 * Creates and returns a metadata repository of the given type at the given location.
+ 	 * If a repository already exists at that location <code>null</code> is returned.
+ 	 * @param location the location for the new repository
+-	 * @param name the name of the new repo
++	 * @param name the name of the new repository
+ 	 * @param type the kind of repository to create
+ 	 * @return the discovered or created repository
+ 	 */
+ 	public IMetadataRepository createRepository(URL location, String name, String type);
+ 
+-	public IMetadataRepository[] getKnownRepositories();
+-
+ 	/**
+ 	 * Returns the locations of the repositories managed by this repository manager.
+ 	 * 
+ 	 * @return the locations of the repositories managed by this repository manager.
+ 	 */
+-	public URL[] getKnownRepositories2();
++	public URL[] getKnownRepositories();
+ 
+ 	/**
+ 	 * Adds a repository corresponding to the given URL.
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/DirectorTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/DirectorTest.java
+index 570afb3..78f585c 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/DirectorTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/DirectorTest.java
+@@ -10,7 +10,7 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.full;
+ 
+-import java.util.*;
++import java.util.Iterator;
+ import junit.framework.TestCase;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+@@ -51,16 +51,8 @@ public class DirectorTest extends TestCase {
+ 			throw new RuntimeException("Repository manager could not be loaded");
+ 		}
+ 
+-		IMetadataRepository[] repos = mgr.getKnownRepositories();
+-		Collection allJobs = new ArrayList();
+ 		String autoInstall = System.getProperty("eclipse.p2.autoInstall");
+-		for (int i = 0; i < repos.length; i++) {
+-			IInstallableUnit[] ius = repos[i].getInstallableUnits(null);
+-			for (int j = 0; j < ius.length; j++) {
+-				if (ius[j].getId().equals(autoInstall))
+-					allJobs.add(ius[j]);
+-			}
+-		}
++		Collector allJobs = mgr.query(new InstallableUnitQuery(autoInstall, VersionRange.emptyRange), new Collector(), null);
+ 
+ 		String installFolder = System.getProperty(Profile.PROP_INSTALL_FOLDER);
+ 		ServiceReference profileRegSr = TestActivator.context.getServiceReference(IProfileRegistry.class.getName());
+@@ -97,7 +89,7 @@ public class DirectorTest extends TestCase {
+ 
+ 		IInstallableUnit[] allRoots = new IInstallableUnit[1];
+ 		IStatus operationStatus = null;
+-		if (allJobs.size() != 0) {
++		if (!allJobs.isEmpty()) {
+ 			allRoots[0] = (IInstallableUnit) allJobs.iterator().next();
+ 			if (!doUninstall) {
+ 				operationStatus = director.install(allRoots, p, new NullProgressMonitor());
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/End2EndTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/End2EndTest.java
+index a3efede..f2058c7 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/End2EndTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/End2EndTest.java
+@@ -8,7 +8,7 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.p2.tests.full;
+ 
+-import java.util.*;
++import java.util.Iterator;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.NullProgressMonitor;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+@@ -18,7 +18,6 @@ import org.eclipse.equinox.p2.engine.IProfileRegistry;
+ import org.eclipse.equinox.p2.engine.Profile;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+-import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepositoryManager;
+ import org.eclipse.equinox.p2.query.Collector;
+ import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+@@ -30,23 +29,20 @@ import org.osgi.framework.Version;
+ 
+ public class End2EndTest extends AbstractProvisioningTest {
+ 
+-	private IMetadataRepository[] repos;
++	private IMetadataRepositoryManager repoManager;
+ 	private IDirector director;
+ 	private IPlanner planner;
+ 
+ 	protected void setUp() throws Exception {
+ 		ServiceReference sr = TestActivator.context.getServiceReference(IDirector.class.getName());
+-		if (sr == null) {
++		if (sr == null)
+ 			throw new RuntimeException("Director service not available");
+-		}
+ 		director = createDirector();
+ 		planner = createPlanner();
+ 		ServiceReference sr2 = TestActivator.context.getServiceReference(IMetadataRepositoryManager.class.getName());
+-		IMetadataRepositoryManager mgr = (IMetadataRepositoryManager) TestActivator.context.getService(sr2);
+-		if (mgr == null) {
++		repoManager = (IMetadataRepositoryManager) TestActivator.context.getService(sr2);
++		if (repoManager == null)
+ 			throw new RuntimeException("Repository manager could not be loaded");
+-		}
+-		repos = mgr.getKnownRepositories();
+ 	}
+ 
+ 	protected Profile createProfile(String profileId) {
+@@ -125,33 +121,20 @@ public class End2EndTest extends AbstractProvisioningTest {
+ 	}
+ 
+ 	public IInstallableUnit[] getIUs(String id) {
+-		Collection result = new ArrayList();
+-		for (int i = 0; i < repos.length; i++) {
+-			Iterator it = repos[i].query(new InstallableUnitQuery(id, VersionRange.emptyRange), new Collector(), null).iterator();
+-			while (it.hasNext()) {
+-				result.add(it.next());
+-			}
+-		}
+-		return (IInstallableUnit[]) result.toArray(new IInstallableUnit[result.size()]);
++		return (IInstallableUnit[]) repoManager.query(new InstallableUnitQuery(id, VersionRange.emptyRange), new Collector(), null).toArray(IInstallableUnit.class);
+ 	}
+ 
+ 	public IInstallableUnit getIU(String id) {
+-		for (int i = 0; i < repos.length; i++) {
+-			Iterator it = repos[i].query(new InstallableUnitQuery(id, VersionRange.emptyRange), new Collector(), null).iterator();
+-			if (it.hasNext()) {
+-				return (IInstallableUnit) it.next();
+-			}
+-		}
++		Iterator it = repoManager.query(new InstallableUnitQuery(id, VersionRange.emptyRange), new Collector(), null).iterator();
++		if (it.hasNext())
++			return (IInstallableUnit) it.next();
+ 		return null;
+ 	}
+ 
+ 	public IInstallableUnit getIU(String id, Version v) {
+-		for (int i = 0; i < repos.length; i++) {
+-			Iterator it = repos[i].query(new InstallableUnitQuery(id, v), new Collector(), null).iterator();
+-			while (it.hasNext()) {
+-				return (IInstallableUnit) it.next();
+-			}
+-		}
++		Iterator it = repoManager.query(new InstallableUnitQuery(id, v), new Collector(), null).iterator();
++		if (it.hasNext())
++			return (IInstallableUnit) it.next();
+ 		return null;
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+index 936aaa8..9995f11 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+@@ -183,7 +183,13 @@ public class ProvisioningUtil {
+ 		if (manager == null) {
+ 			throw new ProvisionException(ProvUIMessages.ProvisioningUtil_NoRepositoryManager);
+ 		}
+-		return manager.getKnownRepositories();
++		URL[] locations = manager.getKnownRepositories();
++		//TODO Shouldn't be eagerly loading all repositories here
++		IMetadataRepository[] repositories = new IMetadataRepository[locations.length];
++		for (int i = 0; i < repositories.length; i++) {
++			repositories[i] = manager.loadRepository(locations[i], null);
++		}
++		return repositories;
+ 	}
+ 
+ 	/*
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/query/QueryableMetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/query/QueryableMetadataRepositoryManager.java
+index 7a2da71..30d5f62 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/query/QueryableMetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/query/QueryableMetadataRepositoryManager.java
+@@ -10,6 +10,7 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.ui.query;
+ 
++import java.net.URL;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+@@ -32,16 +33,15 @@ public class QueryableMetadataRepositoryManager implements IQueryable {
+ 			ProvUI.reportStatus(new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, ProvUIMessages.ProvisioningUtil_NoRepositoryManager));
+ 			return result;
+ 		}
+-		IMetadataRepository[] repos = manager.getKnownRepositories();
+-		if (monitor == null)
+-			monitor = new NullProgressMonitor();
+-		monitor.beginTask(ProvUIMessages.QueryableMetadataRepositoryManager_RepositoryQueryProgress, repos.length);
++		URL[] repos = manager.getKnownRepositories();
++		SubMonitor sub = SubMonitor.convert(monitor, ProvUIMessages.QueryableMetadataRepositoryManager_RepositoryQueryProgress, repos.length * 2);
+ 		for (int i = 0; i < repos.length; i++) {
++			IMetadataRepository repository = manager.loadRepository(repos[i], sub.newChild(1));
+ 			if (query.isMatch(repos[i]))
+-				result.accept(new MetadataRepositoryElement(repos[i]));
+-			monitor.worked(1);
++				result.accept(new MetadataRepositoryElement(repository));
++			sub.worked(1);
+ 		}
+-		monitor.done();
++		sub.done();
+ 		return result;
+ 	}
+ }
+commit d8a4990a49ef57449a1e7db66a7bc3cd339e0416
+Author: John Arthorne <johna>
+Date:   Fri Jan 4 19:39:48 2008 +0000
+
+    Bug 207978 - support for lazy loading and flushing artifact repositories
+
+8	4	bundles/org.eclipse.equinox.p2.artifact.processors/src/org/eclipse/equinox/internal/p2/artifact/processors/AbstractDeltaProcessorStep.java
+129	74	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+5	4	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+50	46	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/p2/artifact/repository/IArtifactRepositoryManager.java
+2	2	bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvCommandProvider.java
+6	16	bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+40	40	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/spi/p2/core/repository/AbstractRepository.java
+2	2	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+2	0	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+5	5	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/p2/director/IDirector.java
+1	1	bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
+7	3	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Sizing.java
+4	3	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
+5	1	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+6	1	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+3	5	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/FoldersRepositoryTest.java
+8	6	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+3	22	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+6	4	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/query/QueryableArtifactRepositoryManager.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.processors/src/org/eclipse/equinox/internal/p2/artifact/processors/AbstractDeltaProcessorStep.java b/bundles/org.eclipse.equinox.p2.artifact.processors/src/org/eclipse/equinox/internal/p2/artifact/processors/AbstractDeltaProcessorStep.java
+index 8f00876..7963cb4 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.processors/src/org/eclipse/equinox/internal/p2/artifact/processors/AbstractDeltaProcessorStep.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.processors/src/org/eclipse/equinox/internal/p2/artifact/processors/AbstractDeltaProcessorStep.java
+@@ -11,6 +11,7 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.artifact.processors;
+ 
++import java.net.URL;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.Status;
+ import org.eclipse.equinox.internal.p2.artifact.optimizers.AbstractDeltaStep;
+@@ -45,11 +46,14 @@ public abstract class AbstractDeltaProcessorStep extends AbstractDeltaStep {
+ 			return;
+ 		}
+ 
+-		IArtifactRepository[] repositories = repoMgr.getKnownRepositories();
++		URL[] repositories = repoMgr.getKnownRepositories();
+ 		for (int i = 0; i < repositories.length; i++) {
+-			if ("file".equals(repositories[i].getLocation().getProtocol()) && repositories[i].contains(key)) {
+-				repository = repositories[i];
+-				return;
++			if ("file".equals(repositories[i].getProtocol())) {//$NON-NLS-1$
++				IArtifactRepository currentRepo = repoMgr.loadRepository(repositories[i], null);
++				if (currentRepo != null && currentRepo.contains(key)) {
++					repository = currentRepo;
++					return;
++				}
+ 			}
+ 		}
+ 		status = new Status(IStatus.ERROR, Activator.ID, "No repository available containing key " + key);
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+index 72c1751..eabb883 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+@@ -9,6 +9,7 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.internal.p2.artifact.repository;
+ 
++import java.lang.ref.SoftReference;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+@@ -25,8 +26,15 @@ import org.osgi.service.prefs.Preferences;
+ 
+ // TODO Need to react to repository going away 
+ // TODO the current assumption that the "location" is the dir/root limits us to 
+-// having just one repo in a given URL..  
++// having just one repository in a given URL..  
+ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
++	static class RepositoryInfo {
++		String description;
++		URL location;
++		String name;
++		SoftReference repository;
++	}
++
+ 	private static final String ATTR_FILTER = "filter"; //$NON-NLS-1$
+ 	private static final String ATTR_SUFFIX = "suffix"; //$NON-NLS-1$
+ 	private static final String EL_FACTORY = "factory"; //$NON-NLS-1$
+@@ -39,18 +47,46 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 	private static final String KEY_VERSION = "version"; //$NON-NLS-1$
+ 	private static final String NODE_REPOSITORIES = "repositories"; //$NON-NLS-1$
+ 
+-	private List repositories = Collections.synchronizedList(new ArrayList());
++	/**
++	 * Map of String->RepositoryInfo, where String is the repository key
++	 * obtained vai getKey(URL).
++	 */
++	private Map repositories = null;
++	//lock object to be held when referring to the repositories field
++	private final Object repositoryLock = new Object();
+ 
+ 	public ArtifactRepositoryManager() {
+-		restoreRepositories();
++		//initialize repositories lazily
+ 	}
+ 
+ 	public void addRepository(IArtifactRepository repository) {
+-		repositories.add(repository);
++		RepositoryInfo info = new RepositoryInfo();
++		info.repository = new SoftReference(repository);
++		info.name = repository.getName();
++		info.description = repository.getDescription();
++		info.location = repository.getLocation();
++		synchronized (repositoryLock) {
++			if (repositories == null)
++				restoreRepositories();
++			repositories.put(getKey(repository), info);
++		}
+ 		// save the given repository in the preferences.
+ 		remember(repository);
+ 	}
+ 
++	public void addRepository(URL location) {
++		Assert.isNotNull(location);
++		RepositoryInfo info = new RepositoryInfo();
++		info.location = location;
++		synchronized (repositoryLock) {
++			if (repositories == null)
++				restoreRepositories();
++			repositories.put(getKey(location), info);
++		}
++		// save the given repository in the preferences.
++		remember(info);
++	}
++
+ 	public IArtifactRequest createDownloadRequest(IArtifactKey key, IPath destination) {
+ 		return new FileDownloadRequest(key, destination);
+ 	}
+@@ -115,10 +151,6 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 		return results;
+ 	}
+ 
+-	private void forget(IArtifactRepository toRemove) throws BackingStoreException {
+-		getPreferences().node(getKey(toRemove)).removeNode();
+-	}
+-
+ 	private String[] getAllSuffixes() {
+ 		IConfigurationElement[] elements = RegistryFactory.getRegistry().getConfigurationElementsFor(Activator.REPO_PROVIDER_XPT);
+ 		ArrayList result = new ArrayList(elements.length);
+@@ -133,13 +165,29 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 	 * as the name of a preference node.
+ 	 */
+ 	private String getKey(IArtifactRepository repository) {
+-		return repository.getLocation().toExternalForm().replace('/', '_');
++		return getKey(repository.getLocation());
+ 	}
+ 
+-	public IArtifactRepository[] getKnownRepositories() {
+-		if (repositories == null)
+-			restoreRepositories();
+-		return (IArtifactRepository[]) repositories.toArray(new IArtifactRepository[repositories.size()]);
++	/*
++	 * Return a string key based on the given repository location which
++	 * is suitable for use as a preference node name.
++	 */
++	private String getKey(URL location) {
++		return location.toExternalForm().replace('/', '_');
++	}
++
++	public URL[] getKnownRepositories() {
++		synchronized (repositoryLock) {
++			if (repositories == null)
++				restoreRepositories();
++			URL[] result = new URL[repositories.size()];
++			int i = 0;
++			for (Iterator it = repositories.values().iterator(); it.hasNext(); i++) {
++				RepositoryInfo info = (RepositoryInfo) it.next();
++				result[i] = info.location;
++			}
++			return result;
++		}
+ 	}
+ 
+ 	/*
+@@ -150,14 +198,19 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 	}
+ 
+ 	public IArtifactRepository getRepository(URL location) {
+-		if (repositories == null)
+-			restoreRepositories();
+-		for (Iterator iterator = repositories.iterator(); iterator.hasNext();) {
+-			IArtifactRepository match = (IArtifactRepository) iterator.next();
+-			if (URLUtil.sameURL(match.getLocation(), location))
+-				return match;
++		synchronized (repositoryLock) {
++			if (repositories == null)
++				restoreRepositories();
++			for (Iterator it = repositories.values().iterator(); it.hasNext();) {
++				RepositoryInfo info = (RepositoryInfo) it.next();
++				if (URLUtil.sameURL(info.location, location)) {
++					if (info.repository == null)
++						return null;
++					return (IArtifactRepository) info.repository.get();
++				}
++			}
++			return null;
+ 		}
+-		return null;
+ 	}
+ 
+ 	public IArtifactRepository loadRepository(URL location, IProgressMonitor monitor) {
+@@ -216,21 +269,49 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 			node.put(KEY_VERSION, value);
+ 		value = repository.getLocation().toExternalForm();
+ 		node.put(KEY_URL, value);
+-		saveRepositoryList();
++		saveToPreferences();
+ 	}
+ 
+-	public void removeRepository(IArtifactRepository toRemove) {
+-		if (toRemove == null)
+-			return;
++	/*
++	 * Save the list of repositories in the preference store.
++	 */
++	private void remember(RepositoryInfo info) {
++		Preferences node = getPreferences().node(getKey(info.location));
++		node.put(KEY_URL, info.location.toExternalForm());
++		if (info.description != null)
++			node.put(KEY_DESCRIPTION, info.description);
++		if (info.name != null)
++			node.put(KEY_NAME, info.name);
++		saveToPreferences();
++	}
+ 
+-		repositories.remove(toRemove);
+-		// remove the repository from the preferences
++	public boolean removeRepository(URL toRemove) {
++		Assert.isNotNull(toRemove);
++		final String repoKey = getKey(toRemove);
++		synchronized (repositoryLock) {
++			if (repositories == null)
++				restoreRepositories();
++			if (repositories.remove(repoKey) == null)
++				return false;
++		}
++		// remove the repository from the preference store
+ 		try {
+-			forget(toRemove);
+-			saveRepositoryList();
++			getPreferences().node(repoKey).removeNode();
++			saveToPreferences();
+ 		} catch (BackingStoreException e) {
+ 			log("Error saving preferences", e); //$NON-NLS-1$
+ 		}
++		return true;
++	}
++
++	private void restoreDownloadCache() {
++		// TODO while recreating, we may want to have proxies on repo instead of the real repo object to limit what is activated.
++		AgentLocation location = (AgentLocation) ServiceHelper.getService(Activator.getContext(), AgentLocation.class.getName());
++		if (location == null)
++			// TODO should do something here since we are failing to restore.
++			return;
++		SimpleArtifactRepository cache = (SimpleArtifactRepository) createRepository(location.getArtifactRepositoryURL(), "download cache", "org.eclipse.equinox.p2.artifact.repository.simpleRepository"); //$NON-NLS-1$ //$NON-NLS-2$
++		cache.tagAsImplementation();
+ 	}
+ 
+ 	/*
+@@ -248,37 +329,25 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 		}
+ 		for (int i = 0; i < children.length; i++) {
+ 			Preferences child = node.node(children[i]);
+-			String url = child.get(KEY_URL, null);
+-			if (url == null)
++			String locationString = child.get(KEY_URL, null);
++			if (locationString == null)
+ 				continue;
+ 			String type = child.get(KEY_TYPE, null);
+ 			try {
+-				IArtifactRepository repository = restoreRepository(new URL(url), type);
+-				// If we could not restore the repo then remove it from the preferences.
+-				if (repository == null)
+-					child.removeNode();
+-				else
+-					repositories.add(repository);
++				RepositoryInfo info = new RepositoryInfo();
++				info.location = new URL(locationString);
++				info.name = child.get(KEY_NAME, null);
++				info.description = child.get(KEY_DESCRIPTION, null);
++				repositories.put(getKey(info.location), info);
+ 			} catch (MalformedURLException e) {
+-				log("Error while restoring repository: " + url, e); //$NON-NLS-1$
+-			} catch (BackingStoreException e) {
+-				log("Error restoring repositories from preferences", e); //$NON-NLS-1$
++				log("Error while restoring repository: " + locationString, e); //$NON-NLS-1$
+ 			}
+ 		}
+ 		// now that we have loaded everything, remember them
+-		saveRepositoryList();
++		saveToPreferences();
+ 	}
+ 
+-	private void restoreRepositories() {
+-		repositories = new ArrayList();
+-		// TODO while recreating, we may want to have proxies on repo instead of the real repo object to limit what is activated.
+-		AgentLocation location = (AgentLocation) ServiceHelper.getService(Activator.getContext(), AgentLocation.class.getName());
+-		if (location == null)
+-			// TODO should do something here since we are failing to restore.
+-			return;
+-		SimpleArtifactRepository cache = (SimpleArtifactRepository) createRepository(location.getArtifactRepositoryURL(), "download cache", "org.eclipse.equinox.p2.artifact.repository.simpleRepository"); //$NON-NLS-1$ //$NON-NLS-2$
+-		cache.tagAsImplementation();
+-
++	private void restoreFromSystemProperty() {
+ 		String locationString = Activator.getContext().getProperty("eclipse.p2.artifactRepository"); //$NON-NLS-1$
+ 		if (locationString != null) {
+ 			StringTokenizer tokenizer = new StringTokenizer(locationString, ","); //$NON-NLS-1$
+@@ -290,38 +359,24 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 				}
+ 			}
+ 		}
+-		// restore the persisted list of repositories
+-		restoreFromPreferences();
+ 	}
+ 
+-	private IArtifactRepository restoreRepository(URL location, String type) {
+-		if (getRepository(location) != null) {
+-			//already restored
+-			return null;
+-		}
+-
+-		IExtension extension = RegistryFactory.getRegistry().getExtension(Activator.REPO_PROVIDER_XPT, type);
+-		if (extension == null) {
+-			// TODO: remove next milestone or otherwise the next time we need a metadata format change 
+-			// this is to allow us to get away with missing or bad types in older artifact repos
+-			return loadRepository(location, "artifacts.xml"); //$NON-NLS-1$
+-		}
+-
+-		IArtifactRepositoryFactory factory = null;
+-		try {
+-			factory = (IArtifactRepositoryFactory) createExecutableExtension(extension, EL_FACTORY);
+-		} catch (CoreException e) {
+-			log("Failed to restore artifact repository extension: " + location, e); //$NON-NLS-1$
++	/**
++	 * Restores the repository list.
++	 */
++	protected void restoreRepositories() {
++		synchronized (repositoryLock) {
++			repositories = new HashMap();
++			restoreDownloadCache();
++			restoreFromSystemProperty();
++			restoreFromPreferences();
+ 		}
+-		if (factory == null)
+-			return null;
+-		return factory.load(location);
+ 	}
+ 
+ 	/*
+ 	 * Save the list of repositories to the file-system.
+ 	 */
+-	private void saveRepositoryList() {
++	private void saveToPreferences() {
+ 		try {
+ 			getPreferences().flush();
+ 		} catch (BackingStoreException e) {
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+index 428f4b5..a327fba 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+@@ -530,9 +530,10 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		return mappingRules;
+ 	}
+ 
+-	public String setProperty(String key, String value) {
+-		String oldValue = super.setProperty(key, value);
+-		save();
++	public String setProperty(String key, String newValue) {
++		String oldValue = super.setProperty(key, newValue);
++		if (oldValue != newValue && (oldValue == null || !oldValue.equals(newValue)))
++			save();
+ 		return oldValue;
+ 	}
+ 
+@@ -541,7 +542,7 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 	}
+ 
+ 	public void tagAsImplementation() {
+-		properties.put(IRepository.IMPLEMENTATION_ONLY_KEY, Boolean.TRUE.toString());
++		setProperty(IRepository.IMPLEMENTATION_ONLY_KEY, Boolean.TRUE.toString());
+ 	}
+ 
+ 	/**
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/p2/artifact/repository/IArtifactRepositoryManager.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/p2/artifact/repository/IArtifactRepositoryManager.java
+index 4572790..3dea3ba 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/p2/artifact/repository/IArtifactRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/p2/artifact/repository/IArtifactRepositoryManager.java
+@@ -20,52 +20,12 @@ public interface IArtifactRepositoryManager {
+ 	public static final IArtifactRequest[] NO_ARTIFACT_REQUEST = new IArtifactRequest[0];
+ 
+ 	/**
+-	 * Return the list of artifact repositories known by this manager.
+-	 * @return the list of known repositories
++	 * Adds a repository to the list of artifact repositories tracked by the repository
++	 * manager.
++	 * 
++	 * @param location The location of the artifact repository to add
+ 	 */
+-	public IArtifactRepository[] getKnownRepositories();
+-
+-	/**
+-	 * Loads the repository at the given location.  The location is expected to contain 
+-	 * data that describes a valid artifact repository of a known type.  If this manager
+-	 * already knows a repository at the given location then that repository is returned.
+-	 * @param location the location in which to look for a repository description
+-	 * @monitor 
+-	 * @return a repository object for the given location or <code>null</code> if a repository
+-	 * could not be found or loaded.
+-	 */
+-	public IArtifactRepository loadRepository(URL location, IProgressMonitor monitor);
+-
+-	/**
+-	 * Add the given repository to the set of repositories managed by this manager.
+-	 * @param repository the repository to add
+-	 */
+-	public void addRepository(IArtifactRepository repository);
+-
+-	/**
+-	 * Return the artifact repository at the given location if known by this manager.  
+-	 * Otherwise return <code>null</code>
+-	 * @param location the location of the repository to return
+-	 * @return the found repository
+-	 */
+-	public IArtifactRepository getRepository(URL location);
+-
+-	/**
+-	 * Remove the given repository from this manager.  Do nothing if the repository
+-	 * is not currently managed.
+-	 * @param toRemove the repository to remove
+-	 */
+-	public void removeRepository(IArtifactRepository toRemove);
+-
+-	/**
+-	 * Creates and returns an artifact repository of the given type at the given location.
+-	 * If a repository already exists at that location <code>null</code> is returned.
+-	 * @param location the location for the new repository
+-	 * @param name the name of the new repo
+-	 * @param type the kind of repository to create
+-	 * @return the discovered or created repository
+-	 */
+-	public IArtifactRepository createRepository(URL location, String name, String type);
++	public void addRepository(URL location);
+ 
+ 	/**
+ 	 * Return a new request to download the given artifact and store it at the given destination.
+@@ -93,4 +53,48 @@ public interface IArtifactRepositoryManager {
+ 	 */
+ 	public IArtifactRequest createMirrorRequest(IArtifactKey key, IArtifactRepository destination, Properties destinationDescriptorProperties, Properties destinationRepositoryProperties);
+ 
+-}
++	/**
++	 * Creates and returns an artifact repository of the given type at the given location.
++	 * If a repository already exists at that location <code>null</code> is returned.
++	 * @param location the location for the new repository
++	 * @param name the name of the new repository
++	 * @param type the kind of repository to create
++	 * @return the discovered or created repository
++	 */
++	public IArtifactRepository createRepository(URL location, String name, String type);
++
++	/**
++	 * Returns the artifact repository locations known to the repository manager.
++	 * <p>
++	 * Note that the repository manager does not guarantee that a valid repository
++	 * exists at any of the returned locations at any particular moment in time.
++	 * A subsequent attempt to load a repository at any of the given locations may
++	 * or may not succeed.
++	 * 
++	 * @return the locations of the repositories managed by this repository manager.
++	 */
++	public URL[] getKnownRepositories();
++
++	/**
++	 * Loads the repository at the given location.  The location is expected to contain 
++	 * data that describes a valid artifact repository of a known type.  If this manager
++	 * already knows a repository at the given location then that repository is returned.
++	 * 
++	 * @param location the location in which to look for a repository description
++	 * @param monitor a progress monitor, or <code>null</code> if progress
++	 *    reporting is not desired
++	 * @return a repository object for the given location or <code>null</code> if a repository
++	 * could not be found or loaded.
++	 */
++	public IArtifactRepository loadRepository(URL location, IProgressMonitor monitor);
++
++	/**
++	 * Remove the given repository from this manager.  Do nothing if the repository
++	 * is not currently managed.
++	 * 
++	 * @param location the location of the repository to remove
++	 * @return <code>true</code> if a repository was removed, and 
++	 * <code>false</code> otherwise.
++	 */
++	public boolean removeRepository(URL location);
++}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvCommandProvider.java b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvCommandProvider.java
+index 9b6f726..3185c2c 100644
+--- a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvCommandProvider.java
++++ b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvCommandProvider.java
+@@ -210,11 +210,11 @@ public class ProvCommandProvider implements CommandProvider {
+ 	public void _provlar(CommandInterpreter interpreter) {
+ 		String urlString = processArgument(interpreter.nextArgument());
+ 		if (urlString == null) {
+-			IArtifactRepository[] repositories = ProvisioningHelper.getArtifactRepositories();
++			URL[] repositories = ProvisioningHelper.getArtifactRepositories();
+ 			if (repositories == null)
+ 				return;
+ 			for (int i = 0; i < repositories.length; i++)
+-				interpreter.println(repositories[i].getLocation());
++				interpreter.println(repositories[i]);
+ 			return;
+ 		}
+ 		URL repoURL = toURL(interpreter, urlString);
+diff --git a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+index ae36843..1dc19c7 100644
+--- a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
++++ b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+@@ -81,14 +81,7 @@ public class ProvisioningHelper {
+ 		if (manager == null)
+ 			// TODO log here
+ 			return;
+-		IArtifactRepository[] repos = manager.getKnownRepositories();
+-		for (int i = 0; i < repos.length; i++) {
+-			IArtifactRepository repo = repos[i];
+-			if (repo.getLocation().equals(location)) {
+-				manager.removeRepository(repo);
+-				return;
+-			}
+-		}
++		manager.removeRepository(location);
+ 	}
+ 
+ 	public static Profile addProfile(String profileId, Properties properties) {
+@@ -234,24 +227,21 @@ public class ProvisioningHelper {
+ 		}
+ 	}
+ 
+-	public static IArtifactRepository[] getArtifactRepositories() {
++	public static URL[] getArtifactRepositories() {
+ 		IArtifactRepositoryManager manager = (IArtifactRepositoryManager) ServiceHelper.getService(Activator.getContext(), IArtifactRepositoryManager.class.getName());
+ 		if (manager == null)
+ 			// TODO log here
+ 			return null;
+-		IArtifactRepository[] repos = manager.getKnownRepositories();
++		URL[] repos = manager.getKnownRepositories();
+ 		if (repos.length > 0)
+ 			return repos;
+ 		return null;
+ 	}
+ 
+ 	public static IArtifactRepository getArtifactRepository(URL repoURL) {
+-		IArtifactRepository[] repositories = getArtifactRepositories();
+-		if (repositories == null)
++		IArtifactRepositoryManager manager = (IArtifactRepositoryManager) ServiceHelper.getService(Activator.getContext(), IArtifactRepositoryManager.class.getName());
++		if (manager == null)
+ 			return null;
+-		for (int i = 0; i < repositories.length; i++)
+-			if (repoURL.equals(repositories[i].getLocation()))
+-				return repositories[i];
+-		return null;
++		return manager.loadRepository(repoURL, null);
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/spi/p2/core/repository/AbstractRepository.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/spi/p2/core/repository/AbstractRepository.java
+index 6180ded..8e27b76 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/spi/p2/core/repository/AbstractRepository.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/spi/p2/core/repository/AbstractRepository.java
+@@ -24,13 +24,13 @@ import org.eclipse.equinox.p2.core.repository.IRepository;
+ * </p>
+ */
+ public abstract class AbstractRepository extends PlatformObject implements IRepository {
+-	protected String name;
+-	protected String type;
+-	protected String version;
+ 	protected String description;
+-	protected String provider;
+ 	protected transient URL location;
++	protected String name;
+ 	protected Map properties = new OrderedProperties();
++	protected String provider;
++	protected String type;
++	protected String version;
+ 
+ 	protected AbstractRepository(String name, String type, String version, URL location, String description, String provider) {
+ 		this.name = name;
+@@ -42,27 +42,11 @@ public abstract class AbstractRepository extends PlatformObject implements IRepo
+ 	}
+ 
+ 	/**
+-	 * Returns the name of the repository.
+-	 * @return the name of the repository.
+-	 */
+-	public synchronized String getName() {
+-		return name;
+-	}
+-
+-	/**
+-	 * Returns a string representing the type of the repository.
+-	 * @return the type of the repository.
+-	 */
+-	public String getType() {
+-		return type;
+-	}
+-
+-	/**
+-	 * Returns a string representing the version for the repository type.
+-	 * @return the version of the type of the repository.
++	 * Returns a brief description of the repository.
++	 * @return the description of the repository.
+ 	 */
+-	public String getVersion() {
+-		return version;
++	public synchronized String getDescription() {
++		return description;
+ 	}
+ 
+ 	/**
+@@ -76,11 +60,19 @@ public abstract class AbstractRepository extends PlatformObject implements IRepo
+ 	}
+ 
+ 	/**
+-	 * Returns a brief description of the repository.
+-	 * @return the description of the repository.
++	 * Returns the name of the repository.
++	 * @return the name of the repository.
+ 	 */
+-	public synchronized String getDescription() {
+-		return description;
++	public synchronized String getName() {
++		return name;
++	}
++
++	/**
++	 * Returns a read-only collection of the properties of the repository.
++	 * @return the properties of this repository.
++	 */
++	public Map getProperties() {
++		return OrderedProperties.unmodifiableProperties(properties);
+ 	}
+ 
+ 	/**
+@@ -92,27 +84,31 @@ public abstract class AbstractRepository extends PlatformObject implements IRepo
+ 	}
+ 
+ 	/**
+-	 * Returns a read-only collection of the properties of the repository.
+-	 * @return the properties of this repository.
++	 * Returns a string representing the type of the repository.
++	 * @return the type of the repository.
+ 	 */
+-	public Map getProperties() {
+-		return OrderedProperties.unmodifiableProperties(properties);
++	public String getType() {
++		return type;
+ 	}
+ 
+-	public synchronized void setName(String value) {
+-		this.name = value;
++	/**
++	 * Returns a string representing the version for the repository type.
++	 * @return the version of the type of the repository.
++	 */
++	public String getVersion() {
++		return version;
+ 	}
+ 
+-	public synchronized void setDescription(String description) {
+-		this.description = description;
++	public boolean isModifiable() {
++		return false;
+ 	}
+ 
+-	public synchronized void setProvider(String provider) {
+-		this.provider = provider;
++	public synchronized void setDescription(String description) {
++		this.description = description;
+ 	}
+ 
+-	public boolean isModifiable() {
+-		return false;
++	public synchronized void setName(String value) {
++		this.name = value;
+ 	}
+ 
+ 	public String setProperty(String key, String value) {
+@@ -120,4 +116,8 @@ public abstract class AbstractRepository extends PlatformObject implements IRepo
+ 			throw new UnsupportedOperationException("Repository not modifiable"); //$NON-NLS-1$
+ 		return (String) (value == null ? properties.remove(key) : properties.put(key, value));
+ 	}
++
++	public synchronized void setProvider(String provider) {
++		this.provider = provider;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+index 1c4c56f..1746cf0 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+@@ -46,10 +46,10 @@ public class SimpleDirector implements IDirector {
+ 	}
+ 
+ 	private void initializeRollbackRepository() {
+-		new FormerState(getRollbackLocation());
++		new FormerState(getRollbackRepositoryLocation());
+ 	}
+ 
+-	public URL getRollbackLocation() {
++	public URL getRollbackRepositoryLocation() {
+ 		AgentLocation agentLocation = (AgentLocation) ServiceHelper.getService(DirectorActivator.context, AgentLocation.class.getName());
+ 		try {
+ 			return new URL(agentLocation.getDataArea(DirectorActivator.PI_DIRECTOR), ROLLBACK_LOCATION);
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index 3c15233..786d688 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -221,6 +221,8 @@ public class SimplePlanner implements IPlanner {
+ 
+ 		for (int i = 0; i < metadataRepositories.length; i++) {
+ 			IMetadataRepository repository = repoMgr.loadRepository(metadataRepositories[i], null);
++			if (repository == null)
++				continue;
+ 			Collector matches = repository.query(new InstallableUnitQuery(null, VersionRange.emptyRange), new Collector(), null);
+ 			for (Iterator it = matches.iterator(); it.hasNext();)
+ 				results.add(it.next());
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/p2/director/IDirector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/p2/director/IDirector.java
+index ffacc73..7f9eb2c 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/p2/director/IDirector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/p2/director/IDirector.java
+@@ -51,9 +51,9 @@ public interface IDirector {
+ 
+ 	public IStatus revert(IInstallableUnit previous, Profile profile, URL[] metadataRepositories, IProgressMonitor monitor);
+ 
+-	//TODO And many more operations for uninstallation and the rest ! See bug 179819
+-
+-	//TODO we might want to register a service for this instead?
+-	// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=211810
+-	public URL getRollbackLocation();
++	/**
++	 * Returns the location of the director's rollback repository, where information about
++	 * previous profile states is stored.
++	 */
++	public URL getRollbackRepositoryLocation();
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java b/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
+index 635082c..aede173 100644
+--- a/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
++++ b/bundles/org.eclipse.equinox.p2.directorywatcher/src/org/eclipse/equinox/p2/directorywatcher/RepositoryListener.java
+@@ -84,7 +84,7 @@ public class RepositoryListener extends DirectoryChangeListener {
+ 
+ 		IArtifactRepository repository = null;
+ 		try {
+-			repository = manager.getRepository(stateDirURL);
++			repository = manager.loadRepository(stateDirURL, null);
+ 			if (repository == null) {
+ 				repository = manager.createRepository(stateDirURL, "artifact listener " + repositoryName, "org.eclipse.equinox.p2.artifact.repository.simpleRepository");
+ 				repository.setProperty(IRepository.IMPLEMENTATION_ONLY_KEY, Boolean.TRUE.toString());
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Sizing.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Sizing.java
+index 3274880..a565e07 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Sizing.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Sizing.java
+@@ -8,6 +8,7 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.p2.engine.phases;
+ 
++import java.net.URL;
+ import java.util.*;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.IStatus;
+@@ -62,12 +63,15 @@ public class Sizing extends Phase {
+ 		}
+ 
+ 		IArtifactRepositoryManager repoMgr = (IArtifactRepositoryManager) ServiceHelper.getService(EngineActivator.getContext(), IArtifactRepositoryManager.class.getName());
+-		IArtifactRepository[] repositories = repoMgr.getKnownRepositories();
++		URL[] repositories = repoMgr.getKnownRepositories();
+ 
+ 		for (Iterator iterator = artifactsToObtain.iterator(); iterator.hasNext();) {
+ 			IArtifactRequest artifactRequest = (IArtifactRequest) iterator.next();
+ 			for (int i = 0; i < repositories.length; i++) {
+-				IArtifactDescriptor[] descriptors = repositories[i].getArtifactDescriptors(artifactRequest.getArtifactKey());
++				IArtifactRepository repo = repoMgr.loadRepository(repositories[i], null);
++				if (repo == null)
++					continue;
++				IArtifactDescriptor[] descriptors = repo.getArtifactDescriptors(artifactRequest.getArtifactKey());
+ 				if (descriptors.length > 0) {
+ 					if (descriptors[0].getProperty(IArtifactDescriptor.ARTIFACT_SIZE) != null)
+ 						sizeOnDisk += Long.parseLong(descriptors[0].getProperty(IArtifactDescriptor.ARTIFACT_SIZE));
+@@ -83,7 +87,7 @@ public class Sizing extends Phase {
+ 	}
+ 
+ 	protected IStatus initializePhase(IProgressMonitor monitor, Profile profile, Map parameters) {
+-		parameters.put(PARM_ARTIFACT_REQUESTS, new ArrayList()); 
++		parameters.put(PARM_ARTIFACT_REQUESTS, new ArrayList());
+ 		return null;
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
+index b7fab53..5c79f9d 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
+@@ -135,9 +135,10 @@ public class LocalMetadataRepository extends AbstractMetadataRepository {
+ 		}
+ 	}
+ 
+-	public String setProperty(String key, String value) {
+-		String oldValue = super.setProperty(key, value);
+-		save();
++	public String setProperty(String key, String newValue) {
++		String oldValue = super.setProperty(key, newValue);
++		if (oldValue != newValue && (oldValue == null || !oldValue.equals(newValue)))
++			save();
+ 		return oldValue;
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+index 9d77624..70c6e5a 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+@@ -43,8 +43,12 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 	private static final String KEY_VERSION = "version"; //$NON-NLS-1$
+ 	private static final String NODE_REPOSITORIES = "repositories"; //$NON-NLS-1$
+ 
++	/**
++	 * Map of String->RepositoryInfo, where String is the repository key
++	 * obtained vai getKey(URL).
++	 */
+ 	private Map repositories = null;
+-	//lock object to be held when referring repositories field
++	//lock object to be held when referring to the repositories field
+ 	private final Object repositoryLock = new Object();
+ 
+ 	public MetadataRepositoryManager() {
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+index 302b644..f68d288 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/p2/metadata/repository/IMetadataRepositoryManager.java
+@@ -39,7 +39,12 @@ public interface IMetadataRepositoryManager extends IQueryable {
+ 	public IMetadataRepository createRepository(URL location, String name, String type);
+ 
+ 	/**
+-	 * Returns the locations of the repositories managed by this repository manager.
++	 * Returns the metadata repository locations known to the repository manager.
++	 * <p>
++	 * Note that the repository manager does not guarantee that a valid repository
++	 * exists at any of the returned locations at any particular moment in time.
++	 * A subsequent attempt to load a repository at any of the given locations may
++	 * or may not succeed.
+ 	 * 
+ 	 * @return the locations of the repositories managed by this repository manager.
+ 	 */
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/FoldersRepositoryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/FoldersRepositoryTest.java
+index 936073c..a7adbb0 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/FoldersRepositoryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/FoldersRepositoryTest.java
+@@ -52,10 +52,8 @@ public class FoldersRepositoryTest extends TestCase {
+ 		AbstractProvisioningTest.delete(testRepo);
+ 		testRepo.mkdir();
+ 
+-		IArtifactRepository repo = manager.loadRepository(testRepo.toURL(), null);
+-		if (repo != null)
+-			manager.removeRepository(repo);
+-		repo = manager.createRepository(testRepo.toURL(), "testRepo", "org.eclipse.equinox.p2.artifact.repository.simpleRepository");
++		manager.removeRepository(testRepo.toURL());
++		IArtifactRepository repo = manager.createRepository(testRepo.toURL(), "testRepo", "org.eclipse.equinox.p2.artifact.repository.simpleRepository");
+ 		File pluginsFolder = new File(testRepo, "plugins");
+ 		pluginsFolder.mkdir();
+ 
+@@ -94,7 +92,7 @@ public class FoldersRepositoryTest extends TestCase {
+ 		assertEquals(0, repo.getArtifactKeys().length);
+ 		assertEquals(0, pluginsFolder.listFiles(filter).length);
+ 
+-		manager.removeRepository(repo);
++		manager.removeRepository(repo.getLocation());
+ 		AbstractProvisioningTest.delete(testRepo);
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+index 8e3cc3e..23b8c70 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+@@ -14,6 +14,7 @@ import org.eclipse.equinox.internal.p2.core.helpers.Headers;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.artifact.repository.*;
+ import org.eclipse.equinox.p2.core.location.AgentLocation;
++import org.eclipse.equinox.p2.core.repository.IRepository;
+ import org.eclipse.equinox.p2.engine.Profile;
+ import org.eclipse.equinox.p2.metadata.IArtifactKey;
+ import org.eclipse.equinox.p2.metadata.TouchpointData;
+@@ -65,11 +66,11 @@ public class Util {
+ 			// 	the given repo location is not an existing repo so we have to create something
+ 			String repositoryName = location + " - bundle pool"; //$NON-NLS-1$
+ 			bundlePool = manager.createRepository(location, repositoryName, REPOSITORY_TYPE);
++			if (bundlePool == null)
++				throw new IllegalArgumentException("Bundle pool repository not writeable: " + location); //$NON-NLS-1$
++			((IRepository) bundlePool).setProperty(IRepository.IMPLEMENTATION_ONLY_KEY, Boolean.valueOf(true).toString());
+ 		}
+ 
+-		if (bundlePool == null) {
+-			throw new IllegalArgumentException("BundlePool repository not writeable: " + location); //$NON-NLS-1$
+-		}
+ 		return (IFileArtifactRepository) bundlePool;
+ 	}
+ 
+@@ -78,13 +79,14 @@ public class Util {
+ 		bundleRepositories.add(Util.getBundlePoolRepository(profile));
+ 
+ 		IArtifactRepositoryManager manager = getArtifactRepositoryManager();
+-		IArtifactRepository[] knownRepositories = manager.getKnownRepositories();
++		URL[] knownRepositories = manager.getKnownRepositories();
+ 		for (int i = 0; i < knownRepositories.length; i++) {
+-			IArtifactRepository repository = knownRepositories[i];
++			IArtifactRepository repository = manager.loadRepository(knownRepositories[i], null);
++			if (repository == null)
++				continue;
+ 			String profileExtension = (String) repository.getProperties().get(PROFILE_EXTENSION);
+ 			if (profileExtension != null && profileExtension.equals(profile.getProfileId()))
+ 				bundleRepositories.add(repository);
+-
+ 		}
+ 
+ 		return new AggregatedBundleRepository(bundleRepositories);
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+index c48b3e0..b0b9f03 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+@@ -55,7 +55,7 @@ public class ProvisioningUtil {
+ 		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IMetadataRepositoryManager.class.getName());
+ 		if (manager == null)
+ 			throw new ProvisionException(ProvUIMessages.ProvisioningUtil_NoRepositoryManager);
+-		URL location = director.getRollbackLocation();
++		URL location = director.getRollbackRepositoryLocation();
+ 		IMetadataRepository repo = manager.loadRepository(location, monitor);
+ 		if (repo == null) {
+ 			throw new ProvisionException(NLS.bind(ProvUIMessages.ProvisioningUtil_LoadRepositoryFailure, location.toExternalForm()));
+@@ -93,27 +93,8 @@ public class ProvisioningUtil {
+ 		if (manager == null) {
+ 			throw new ProvisionException(ProvUIMessages.ProvisioningUtil_NoRepositoryManager);
+ 		}
+-		IArtifactRepository[] repos = manager.getKnownRepositories();
+-		for (int i = 0; i < repos.length; i++) {
+-			IArtifactRepository repo = repos[i];
+-			if (repo.getLocation().equals(location)) {
+-				manager.removeRepository(repo);
+-				EventObject event = new EventObject(IProvisioningListener.REPO_REMOVED);
+-				ProvUIActivator.getDefault().notifyListeners(event);
+-				return;
+-			}
+-		}
+-	}
+-
+-	public static IArtifactRepository[] getArtifactRepositories() throws ProvisionException {
+-		IArtifactRepositoryManager manager = (IArtifactRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IArtifactRepositoryManager.class.getName());
+-		if (manager == null)
+-			throw new ProvisionException(ProvUIMessages.ProvisioningUtil_NoRepositoryManager);
+-		IArtifactRepository[] repos = manager.getKnownRepositories();
+-		if (repos != null) {
+-			return repos;
+-		}
+-		return new IArtifactRepository[0];
++		if (manager.removeRepository(location))
++			ProvUIActivator.getDefault().notifyListeners(new EventObject(IProvisioningListener.REPO_REMOVED));
+ 	}
+ 
+ 	public static void addProfile(Profile profile, IProgressMonitor monitor) throws ProvisionException {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/query/QueryableArtifactRepositoryManager.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/query/QueryableArtifactRepositoryManager.java
+index cebe4bb..0779e2d 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/query/QueryableArtifactRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/query/QueryableArtifactRepositoryManager.java
+@@ -10,6 +10,7 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.ui.query;
+ 
++import java.net.URL;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+@@ -32,13 +33,14 @@ public class QueryableArtifactRepositoryManager implements IQueryable {
+ 			ProvUI.reportStatus(new Status(IStatus.ERROR, ProvUIActivator.PLUGIN_ID, ProvUIMessages.ProvisioningUtil_NoRepositoryManager));
+ 			return result;
+ 		}
+-		IArtifactRepository[] repos = manager.getKnownRepositories();
++		URL[] repos = manager.getKnownRepositories();
+ 		if (monitor == null)
+ 			monitor = new NullProgressMonitor();
+-		monitor.beginTask(ProvUIMessages.QueryableArtifactRepositoryManager_RepositoryQueryProgress, repos.length);
++		monitor.beginTask(ProvUIMessages.QueryableArtifactRepositoryManager_RepositoryQueryProgress, repos.length * 2);
+ 		for (int i = 0; i < repos.length; i++) {
+-			if (query.isMatch(repos[i]))
+-				result.accept(new ArtifactRepositoryElement(repos[i]));
++			IArtifactRepository repo = manager.loadRepository(repos[i], new SubProgressMonitor(monitor, 1));
++			if (repo != null && query.isMatch(repo))
++				result.accept(new ArtifactRepositoryElement(repo));
+ 			monitor.worked(1);
+ 		}
+ 		monitor.done();

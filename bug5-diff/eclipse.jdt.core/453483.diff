@@ -1,0 +1,1486 @@
+commit 8b644ce068ecf49daa5da8af14e814933ab3df61
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Nov 27 01:05:46 2014 +0100
+
+    Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+     - implement approach (A.2) (record flow info for deferred checking)
+     - added tests from linked bugs, 3 are still disabled
+
+1	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+217	3	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullReferenceTest.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldDeclaration.java
+3	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ForeachStatement.java
+4	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
+5	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NullAnnotationMatching.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+13	12	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Statement.java
+8	7	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
+8	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
+29	17	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LoopingFlowContext.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+index 0036034..f731e3f 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+@@ -6663,7 +6663,7 @@ public void testBug415413() {
+ 		"1. ERROR in ClassF.java (at line 13)\n" + 
+ 		"	needNonNull(o);\n" + 
+ 		"	            ^\n" + 
+-		"Null type mismatch: required \'@NonNull Object\' but the provided value is inferred as @Nullable\n" + 
++		"Null type mismatch: required \'@NonNull Object\' but the provided value is null\n" + 
+ 		"----------\n");
+ }
+ // Bug 415413 - [compiler][null] NullpointerException in Null Analysis caused by interaction of LoopingFlowContext and FinallyFlowContext
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullReferenceTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullReferenceTest.java
+index 859331b..53e4987 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullReferenceTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullReferenceTest.java
+@@ -35,6 +35,7 @@
+  *							bug 384380 - False positive on a "Potential null pointer access" after a continue
+  *							bug 406384 - Internal error with I20130413
+  *							Bug 364326 - [compiler][null] NullPointerException is not found by compiler. FindBugs finds that one
++ *							Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *******************************************************************************/
+ package org.eclipse.jdt.core.tests.compiler.regression;
+ 
+@@ -63,9 +64,11 @@ public NullReferenceTest(String name) {
+ // Only the highest compliance level is run; add the VM argument
+ // -Dcompliance=1.4 (for example) to lower it if needed
+ static {
+-//		TESTS_NAMES = new String[] { "test0037_autounboxing_3" };
+-//		TESTS_NAMES = new String[] { "testBug401088" };
+-//		TESTS_NAMES = new String[] { "testBug402993" };
++//		TESTS_NAMES = new String[] { "testBug441737" };
++//		TESTS_NAMES = new String[] { "testBug453305" };
++//		TESTS_NAMES = new String[] { "testBug431016" };
++//		TESTS_NAMES = new String[] { "testBug432109" };
++//		TESTS_NAMES = new String[] { "testBug418500" }; 
+ //		TESTS_NUMBERS = new int[] { 561 };
+ //		TESTS_RANGE = new int[] { 1, 2049 };
+ }
+@@ -17011,4 +17014,215 @@ public void testBug402993a() {
+ 		"Redundant null check: The variable exc can only be null at this location\n" + 
+ 		"----------\n");
+ }
++public void testBug453305() {
++	if (this.complianceLevel < ClassFileConstants.JDK1_5) return; // uses foreach loop
++	runNegativeTest(
++		new String[] {
++			"NullTest.java",
++			"import java.util.*;\n" + 
++			"public class NullTest {\n" + 
++			"    class SomeOtherClass {\n" + 
++			"\n" + 
++			"        public SomeOtherClass m() {\n" + 
++			"            return new SomeOtherClass();\n" + 
++			"        }\n" + 
++			"\n" + 
++			"        public void doSomething() {\n" + 
++			"        }\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    public Object m1() {\n" + 
++			"        SomeOtherClass result = null;\n" + 
++			"        List<Object> list = new ArrayList<Object>();\n" + 
++			"        for (Object next : list) {\n" + 
++			"            System.out.println(next);\n" + 
++			"            boolean bool = false;\n" + 
++			"            if (bool) {\n" + 
++			"                SomeOtherClass something = new SomeOtherClass();\n" + 
++			"                result = something.m();\n" + 
++			"            } else {\n" + 
++			"                result = new SomeOtherClass();\n" + 
++			"            }\n" + 
++			"            result.doSomething(); // warning is here\n" + 
++			"            break;\n" + 
++			"        }\n" + 
++			"        return null;\n" + 
++			"    }\n" + 
++			"}\n"
++		},
++		"----------\n" + 
++		"1. ERROR in NullTest.java (at line 25)\n" + 
++		"	result.doSomething(); // warning is here\n" + 
++		"	^^^^^^\n" + 
++		"Potential null pointer access: The variable result may be null at this location\n" + 
++		"----------\n");
++}
++// loop-limitation:
++public void _testBug431016() {
++	if (this.complianceLevel < ClassFileConstants.JDK1_5) return; // uses foreach loop
++	runConformTest(
++		new String[] {
++			"Test.java",
++			"public class Test {\n" + 
++			"  void test(Object[] values) {\n" + 
++			"    Object first = null;\n" + 
++			"    for (Object current : values) {\n" + 
++			"        if (first == null) {\n" + 
++			"            first = current;\n" + 
++			"        }\n" + 
++			"\n" + 
++			"        if (current.hashCode() > 0) {\n" + 
++			"            System.out.println(first.hashCode());\n" + 
++			"        }\n" + 
++			"\n" + 
++			"        System.out.println(first.hashCode());\n" + 
++			"      }\n" + 
++			"  }\n" + 
++			"}\n"
++		});
++}
++public void _testBug432109() {
++	if (this.complianceLevel < ClassFileConstants.JDK1_5) return; // uses generics & foreach loop
++	runConformTest(
++		new String[] {
++			"Test.java",
++			"import java.util.Collection;\n" +
++			"public class Test {\n" +
++			"  public void test(Collection <Object> values)\n" + 
++			"  {\n" + 
++			"      boolean condition = false;\n" + 
++			"      \n" + 
++			"      for(Object value : values)\n" + 
++			"      {\n" + 
++			"                  \n" + 
++			"          if(value == null)\n" + 
++			"          {\n" + 
++			"              if( condition )\n" + 
++			"              {\n" + 
++			"                  // without this continue statement, \n" + 
++			"                  // there is no warning below\n" + 
++			"                  continue; \n" + 
++			"              }\n" + 
++			"              \n" + 
++			"              value = getDefaultValue();\n" + 
++			"          }\n" + 
++			"          \n" + 
++			"          // IDE complains here about potential null pointer access\n" + 
++			"          value.toString();\n" + 
++			"      }\n" + 
++			"  }\n" + 
++			"\n" + 
++			"  public String getDefaultValue() { return \"<empty>\"; }\n" +
++			"}\n"
++		});
++}
++public void testBug435528() {
++	runNegativeTest(
++		new String[] {
++			"Test.java",
++			"public class Test\n" + 
++			"{\n" + 
++			"   static final String a = \"A\";\n" + 
++			"\n" + 
++			"   static void main(String args[])\n" + 
++			"   {\n" + 
++			"      String x = null;\n" + 
++			"      while (true) {\n" + 
++			"         x = Math.random() < 0.5 ? a : \"BB\";\n" + 
++			"         if (a != null) {\n" + 
++			"            System.out.println(\"s2 value: \" + x);\n" + 
++			"         }\n" + 
++			"         if (x.equals(\"A\")) {\n" + 
++			"            break;\n" + 
++			"         } else {\n" + 
++			"            x = null;\n" + 
++			"         }\n" + 
++			"      }\n" + 
++			"   }\n" + 
++			"}\n"
++		},
++		"----------\n" + 
++		"1. ERROR in Test.java (at line 13)\n" + 
++		"	if (x.equals(\"A\")) {\n" + 
++		"	    ^\n" + 
++		"Potential null pointer access: The variable x may be null at this location\n" +   // FIXME: fully avoid warning?
++		"----------\n" + 
++		"2. WARNING in Test.java (at line 15)\n" + 
++		"	} else {\n" + 
++		"            x = null;\n" + 
++		"         }\n" + 
++		"	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
++		"Statement unnecessarily nested within else clause. The corresponding then clause does not complete normally\n" + 
++		"----------\n");
++}
++public void testBug418500() {
++	runNegativeTest(
++		new String[] {
++			"Test.java",
++			"import java.util.*;\n" +
++			"public class Test {\n" +
++			(this.complianceLevel < ClassFileConstants.JDK1_5 ? "\n" : "  @SuppressWarnings(\"unchecked\")\n" ) +
++			"  void method() {\n" + 
++			"    Map topMap = new HashMap();\n" + 
++			"    List targets = null;\n" + 
++			"    \n" + 
++			"    for (int idx = 1; idx < 100; idx++) {\n" + 
++			"      String[] targetArray = (String[]) topMap.get(\"a\");\n" + 
++			"      if (targetArray != null) {\n" + 
++			"        targets = Arrays.asList(targetArray);\n" + 
++			"      } else {\n" + 
++			"        targets = new ArrayList(64);\n" + 
++			"      }\n" + 
++			"      if (targets.size() > 0) {\n" + 
++			"        topMap.put(\"b\", targets.toArray(new String[1]));\n" + 
++			"      } else {\n" + 
++			"        topMap.remove(\"b\");\n" + 
++			"      }\n" + 
++			"\n" + 
++			"      // BUG - this statement causes null analysis to\n" + 
++			"      // report that at the targets.size() statement above\n" + 
++			"      // targets must be null. Commenting this line eliminates the error.\n" + 
++			"      targets = null;\n" + 
++			"    }\n" + 
++			"  }\n" +
++			"}\n"
++		},
++		"----------\n" + 
++		"1. ERROR in Test.java (at line 15)\n" + 
++		"	if (targets.size() > 0) {\n" + 
++		"	    ^^^^^^^\n" + 
++		"Potential null pointer access: The variable targets may be null at this location\n" +  // FIXME: fully avoid warning?
++		"----------\n");
++}
++public void _testBug441737() {
++	runConformTest(
++		new String[] {
++			"Bogus.java",
++			"public class Bogus {\n" + 
++			"    static boolean ok = true;\n" + 
++			"    static int count = 0;\n" + 
++			"    public static void main(String[] args) {\n" + 
++			"        Thing x = new Thing();\n" + 
++			"        // if y is left uninitialized here, the warning below disappears\n" + 
++			"        Thing y = null;\n" + 
++			"        do {\n" + 
++			"            y = x;\n" + 
++			"            if (ok) {\n" + 
++			"                // if this assignment is moved out of the if statement\n" + 
++			"                // or commented out, the warning below disappears\n" + 
++			"                x = y.resolve();\n" + 
++			"            }\n" + 
++			"            // a warning about y being potentially null occurs here:\n" + 
++			"            x = y.resolve();\n" + 
++			"        } while (x != y);\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    static class Thing {\n" + 
++			"        public Thing resolve() {\n" + 
++			"            return count++ > 2 ? this : new Thing();\n" + 
++			"        }\n" + 
++			"    }\n" + 
++			"}\n"
++		});
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+index cf86d30..0955c55 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+@@ -27,6 +27,7 @@
+  *							bug 403147 - [compiler][null] FUP of bug 400761: consolidate interaction between unboxing, NPE, and deferred checking
+  *							Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
+  *							Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
++ *							Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -94,7 +95,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 	if (compilerOptions.isAnnotationBasedNullAnalysisEnabled) {
+ 		VariableBinding var = this.lhs.nullAnnotatedVariableBinding(compilerOptions.sourceLevel >= ClassFileConstants.JDK1_8);
+ 		if (var != null) {
+-			nullStatus = NullAnnotationMatching.checkAssignment(currentScope, flowContext, var, nullStatus, this.expression, this.expression.resolvedType);
++			nullStatus = NullAnnotationMatching.checkAssignment(currentScope, flowContext, var, flowInfo, nullStatus, this.expression, this.expression.resolvedType);
+ 			if (nullStatus == FlowInfo.NON_NULL
+ 					&& var instanceof FieldBinding
+ 					&& this.lhs instanceof Reference
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldDeclaration.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldDeclaration.java
+index ca78380..fa73bfd 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldDeclaration.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldDeclaration.java
+@@ -13,6 +13,7 @@
+  *								bug 400761 - [compiler][null] null may be return as boolean without a diagnostic
+  *								Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
+  *								Bug 429403 - [1.8][null] null mismatch from type arguments is not reported at field initializer
++ *								Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *								Bug 409250 - [1.8][compiler] Various loose ends in 308 code generation
+  *******************************************************************************/
+@@ -94,7 +95,7 @@ public FlowInfo analyseCode(MethodScope initializationScope, FlowContext flowCon
+ 		if (options.isAnnotationBasedNullAnalysisEnabled) {
+ 			if (this.binding.isNonNull() || options.sourceLevel >= ClassFileConstants.JDK1_8) {
+ 				int nullStatus = this.initialization.nullStatus(flowInfo, flowContext);
+-				NullAnnotationMatching.checkAssignment(initializationScope, flowContext, this.binding, nullStatus, this.initialization, this.initialization.resolvedType);
++				NullAnnotationMatching.checkAssignment(initializationScope, flowContext, this.binding, flowInfo, nullStatus, this.initialization, this.initialization.resolvedType);
+ 			}
+ 		}
+ 		this.initialization.checkNPEbyUnboxing(initializationScope, flowContext, flowInfo);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ForeachStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ForeachStatement.java
+index 60bcadd..e7f4435 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ForeachStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ForeachStatement.java
+@@ -15,6 +15,7 @@
+  *								bug 393719 - [compiler] inconsistent warnings on iteration variables
+  *								Bug 411964 - [1.8][null] leverage null type annotation in foreach statement
+  *								Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
++ *								Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *     Jesper S Moller -  Contribution for
+  *								bug 401853 - Eclipse Java compiler creates invalid bytecode (java.lang.VerifyError)
+  *******************************************************************************/
+@@ -111,8 +112,8 @@ public class ForeachStatement extends Statement {
+ 		actionInfo.markAsDefinitelyUnknown(elementVarBinding);
+ 		if (currentScope.compilerOptions().isAnnotationBasedNullAnalysisEnabled) {
+ 			int elementNullStatus = FlowInfo.tagBitsToNullStatus(this.collectionElementType.tagBits);
+-			int nullStatus = NullAnnotationMatching.checkAssignment(currentScope, flowContext, elementVarBinding, elementNullStatus,
+-																		this.collection, this.collectionElementType);
++			int nullStatus = NullAnnotationMatching.checkAssignment(currentScope, flowContext, elementVarBinding, null, // have no useful flowinfo for element var
++																		elementNullStatus, this.collection, this.collectionElementType);
+ 			if ((elementVarBinding.type.tagBits & TagBits.IsBaseType) == 0) {
+ 				actionInfo.markNullStatus(elementVarBinding, nullStatus);
+ 			}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 1a13d1a..265f03f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -34,6 +34,7 @@
+  *							Bug 438458 - [1.8][null] clean up handling of null type annotations wrt type variables
+  *							Bug 441693 - [1.8][null] Bogus warning for type argument annotated with @NonNull
+  *							Bug 452788 - [1.8][compiler] Type not correctly inferred in lambda expression
++ *							Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *     Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 405104 - [1.8][compiler][codegen] Implement support for serializeable lambdas
+  *******************************************************************************/
+@@ -539,7 +540,7 @@ public class LambdaExpression extends FunctionalExpression implements IPolyExpre
+ 					&& lambdaInfo.reachMode() == FlowInfo.REACHABLE)
+ 			{
+ 				Expression expression = (Expression)this.body;
+-				checkAgainstNullAnnotation(flowContext, expression, expression.nullStatus(lambdaInfo, flowContext));
++				checkAgainstNullAnnotation(flowContext, expression, flowInfo, expression.nullStatus(lambdaInfo, flowContext));
+ 			}
+ 		}
+ 		return flowInfo;
+@@ -595,12 +596,12 @@ public class LambdaExpression extends FunctionalExpression implements IPolyExpre
+ 	}
+ 
+ 	// simplified version of ReturnStatement.checkAgainstNullAnnotation()
+-	void checkAgainstNullAnnotation(FlowContext flowContext, Expression expression, int nullStatus) {
++	void checkAgainstNullAnnotation(FlowContext flowContext, Expression expression, FlowInfo flowInfo, int nullStatus) {
+ 		if (nullStatus != FlowInfo.NON_NULL) {
+ 			// if we can't prove non-null check against declared null-ness of the descriptor method:
+ 			// Note that this.binding never has a return type declaration, always inherit null-ness from the descriptor
+ 			if ((this.descriptor.returnType.tagBits & TagBits.AnnotationNonNull) != 0) {
+-				flowContext.recordNullityMismatch(this.scope, expression, expression.resolvedType, this.descriptor.returnType, nullStatus);
++				flowContext.recordNullityMismatch(this.scope, expression, expression.resolvedType, this.descriptor.returnType, flowInfo, nullStatus);
+ 			}
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
+index 462a841..fdad3a1 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
+@@ -25,6 +25,7 @@
+  *							Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
+  *							Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
+  *							Bug 430150 - [1.8][null] stricter checking against type variables
++ *							Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *     Jesper S Moller - Contributions for
+  *							Bug 378674 - "The method can be declared as static" is wrong
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+@@ -101,7 +102,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 	}
+ 	flowInfo.markAsDefinitelyAssigned(this.binding);
+ 	if (currentScope.compilerOptions().isAnnotationBasedNullAnalysisEnabled) {
+-		nullStatus = NullAnnotationMatching.checkAssignment(currentScope, flowContext, this.binding, nullStatus, this.initialization, this.initialization.resolvedType);
++		nullStatus = NullAnnotationMatching.checkAssignment(currentScope, flowContext, this.binding, flowInfo, nullStatus, this.initialization, this.initialization.resolvedType);
+ 	}
+ 	if ((this.binding.type.tagBits & TagBits.IsBaseType) == 0) {
+ 		flowInfo.markNullStatus(this.binding, nullStatus);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NullAnnotationMatching.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NullAnnotationMatching.java
+index fc51ba4..be01e6f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NullAnnotationMatching.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NullAnnotationMatching.java
+@@ -77,7 +77,7 @@ public class NullAnnotationMatching {
+ 	
+ 	/** Check null-ness of 'var' against a possible null annotation */
+ 	public static int checkAssignment(BlockScope currentScope, FlowContext flowContext,
+-									   VariableBinding var, int nullStatus, Expression expression, TypeBinding providedType)
++									   VariableBinding var, FlowInfo flowInfo, int nullStatus, Expression expression, TypeBinding providedType)
+ 	{
+ 		long lhsTagBits = 0L;
+ 		boolean hasReported = false;
+@@ -87,8 +87,8 @@ public class NullAnnotationMatching {
+ 			if (expression instanceof ConditionalExpression && expression.isPolyExpression()) {
+ 				// drill into both branches:
+ 				ConditionalExpression ce = ((ConditionalExpression) expression);
+-				int status1 = NullAnnotationMatching.checkAssignment(currentScope, flowContext, var, ce.ifTrueNullStatus, ce.valueIfTrue, ce.valueIfTrue.resolvedType);
+-				int status2 = NullAnnotationMatching.checkAssignment(currentScope, flowContext, var, ce.ifFalseNullStatus, ce.valueIfFalse, ce.valueIfFalse.resolvedType);
++				int status1 = NullAnnotationMatching.checkAssignment(currentScope, flowContext, var, flowInfo, ce.ifTrueNullStatus, ce.valueIfTrue, ce.valueIfTrue.resolvedType);
++				int status2 = NullAnnotationMatching.checkAssignment(currentScope, flowContext, var, flowInfo, ce.ifFalseNullStatus, ce.valueIfFalse, ce.valueIfFalse.resolvedType);
+ 				if (status1 == status2)
+ 					return status1;
+ 				return nullStatus; // if both branches disagree use the precomputed & merged nullStatus
+@@ -99,7 +99,7 @@ public class NullAnnotationMatching {
+ 				currentScope.problemReporter().nullityMismatchingTypeAnnotation(expression, providedType, var.type, annotationStatus);
+ 				hasReported = true;
+ 			} else if (annotationStatus.isUnchecked()) {
+-				flowContext.recordNullityMismatch(currentScope, expression, providedType, var.type, nullStatus);
++				flowContext.recordNullityMismatch(currentScope, expression, providedType, var.type, flowInfo, nullStatus);
+ 				hasReported = true;
+ 			} else if (annotationStatus.nullStatus != FlowInfo.UNKNOWN) {
+ 				return annotationStatus.nullStatus;
+@@ -107,7 +107,7 @@ public class NullAnnotationMatching {
+ 		}
+ 		if (lhsTagBits == TagBits.AnnotationNonNull && nullStatus != FlowInfo.NON_NULL) {
+ 			if (!hasReported)
+-				flowContext.recordNullityMismatch(currentScope, expression, providedType, var.type, nullStatus);
++				flowContext.recordNullityMismatch(currentScope, expression, providedType, var.type, flowInfo, nullStatus);
+ 			return FlowInfo.NON_NULL;
+ 		} else if (lhsTagBits == TagBits.AnnotationNullable && nullStatus == FlowInfo.UNKNOWN) {	// provided a legacy type?
+ 			return FlowInfo.POTENTIALLY_NULL;			// -> use more specific info from the annotation
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+index 77cad03..3231c7a 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+@@ -32,6 +32,7 @@
+  *								Bug 430150 - [1.8][null] stricter checking against type variables
+  *								Bug 435805 - [1.8][compiler][null] Java 8 compiler does not recognize declaration style null annotations
+  *								Bug 452788 - [1.8][compiler] Type not correctly inferred in lambda expression
++ *								Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *     Jesper S Moller - Contributions for
+  *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *******************************************************************************/
+@@ -193,7 +194,7 @@ void checkAgainstNullAnnotation(BlockScope scope, FlowContext flowContext, FlowI
+ 	} else if (nullStatus != FlowInfo.NON_NULL) {
+ 		// if we can't prove non-null check against declared null-ness of the enclosing method:
+ 		if ((tagBits & TagBits.AnnotationNonNull) != 0) {
+-			flowContext.recordNullityMismatch(scope, this.expression, this.expression.resolvedType, methodBinding.returnType, nullStatus);
++			flowContext.recordNullityMismatch(scope, this.expression, this.expression.resolvedType, methodBinding.returnType, flowInfo, nullStatus);
+ 		}
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Statement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Statement.java
+index 6a56fd4..e5b19b6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Statement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Statement.java
+@@ -30,6 +30,7 @@
+  *								Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+  *								Bug 429430 - [1.8] Lambdas and method reference infer wrong exception type with generics (RuntimeException instead of IOException)
+  *								Bug 435805 - [1.8][compiler][null] Java 8 compiler does not recognize declaration style null annotations
++ *								Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *        Andy Clement - Contributions for
+  *                          Bug 383624 - [1.8][compiler] Revive code generation support for type annotations (from Olivier's work)
+  *                          Bug 409250 - [1.8][compiler] Various loose ends in 308 code generation
+@@ -156,7 +157,7 @@ protected void analyseArguments(BlockScope currentScope, FlowContext flowContext
+ 					Expression argument = arguments[i];
+ 					int nullStatus = argument.nullStatus(flowInfo, flowContext); // slight loss of precision: should also use the null info from the receiver.
+ 					if (nullStatus != FlowInfo.NON_NULL) // if required non-null is not provided
+-						flowContext.recordNullityMismatch(currentScope, argument, argument.resolvedType, expectedType, nullStatus);
++						flowContext.recordNullityMismatch(currentScope, argument, argument.resolvedType, expectedType, flowInfo, nullStatus);
+ 				}
+ 			}
+ 		} 
+@@ -167,16 +168,16 @@ void analyseOneArgument18(BlockScope currentScope, FlowContext flowContext, Flow
+ 	if (argument instanceof ConditionalExpression && argument.isPolyExpression()) {
+ 		// drill into both branches using existing nullStatus per branch:
+ 		ConditionalExpression ce = (ConditionalExpression) argument;
+-		ce.internalAnalyseOneArgument18(currentScope, flowContext, expectedType, ce.valueIfTrue, ce.ifTrueNullStatus, expectedNonNullness, originalExpected);
+-		ce.internalAnalyseOneArgument18(currentScope, flowContext, expectedType, ce.valueIfFalse, ce.ifFalseNullStatus, expectedNonNullness, originalExpected);
++		ce.internalAnalyseOneArgument18(currentScope, flowContext, expectedType, ce.valueIfTrue, flowInfo, ce.ifTrueNullStatus, expectedNonNullness, originalExpected);
++		ce.internalAnalyseOneArgument18(currentScope, flowContext, expectedType, ce.valueIfFalse, flowInfo, ce.ifFalseNullStatus, expectedNonNullness, originalExpected);
+ 		return;
+ 	}
+ 	int nullStatus = argument.nullStatus(flowInfo, flowContext);
+-	internalAnalyseOneArgument18(currentScope, flowContext, expectedType, argument, nullStatus,
+-									expectedNonNullness, originalExpected);
++	internalAnalyseOneArgument18(currentScope, flowContext, expectedType, argument, flowInfo,
++									nullStatus, expectedNonNullness, originalExpected);
+ }
+ void internalAnalyseOneArgument18(BlockScope currentScope, FlowContext flowContext, TypeBinding expectedType,
+-		Expression argument, int nullStatus, Boolean expectedNonNullness, TypeBinding originalExpected) 
++		Expression argument, FlowInfo flowInfo, int nullStatus, Boolean expectedNonNullness, TypeBinding originalExpected) 
+ {
+ 	// here we consume special case information generated in the ctor of ParameterizedGenericMethodBinding (see there):
+ 	int statusFromAnnotatedNull = expectedNonNullness == Boolean.TRUE ? nullStatus : 0;  
+@@ -190,7 +191,7 @@ void internalAnalyseOneArgument18(BlockScope currentScope, FlowContext flowConte
+ 		// immediate reporting:
+ 		currentScope.problemReporter().nullityMismatchingTypeAnnotation(argument, argument.resolvedType, expectedType, annotationStatus);
+ 	} else if (annotationStatus.isUnchecked() || (statusFromAnnotatedNull & FlowInfo.POTENTIALLY_NULL) != 0) {
+-		flowContext.recordNullityMismatch(currentScope, argument, argument.resolvedType, expectedType, nullStatus);
++		flowContext.recordNullityMismatch(currentScope, argument, argument.resolvedType, expectedType, flowInfo, nullStatus);
+ 	}
+ }
+ 
+@@ -198,20 +199,20 @@ protected void checkAgainstNullTypeAnnotation(BlockScope scope, TypeBinding requ
+ 	if (expression instanceof ConditionalExpression && expression.isPolyExpression()) {
+ 		// drill into both branches using existing nullStatus per branch:
+ 		ConditionalExpression ce = (ConditionalExpression) expression;
+-		internalCheckAgainstNullTypeAnnotation(scope, requiredType, ce.valueIfTrue, ce.ifTrueNullStatus, flowContext);
+-		internalCheckAgainstNullTypeAnnotation(scope, requiredType, ce.valueIfFalse, ce.ifFalseNullStatus, flowContext);
++		internalCheckAgainstNullTypeAnnotation(scope, requiredType, ce.valueIfTrue, ce.ifTrueNullStatus, flowContext, flowInfo);
++		internalCheckAgainstNullTypeAnnotation(scope, requiredType, ce.valueIfFalse, ce.ifFalseNullStatus, flowContext, flowInfo);
+ 		return;
+ 	}
+ 	int nullStatus = expression.nullStatus(flowInfo, flowContext);
+-	internalCheckAgainstNullTypeAnnotation(scope, requiredType, expression, nullStatus, flowContext);
++	internalCheckAgainstNullTypeAnnotation(scope, requiredType, expression, nullStatus, flowContext, flowInfo);
+ }
+ private void internalCheckAgainstNullTypeAnnotation(BlockScope scope, TypeBinding requiredType, Expression expression,
+-		int nullStatus, FlowContext flowContext) {
++		int nullStatus, FlowContext flowContext, FlowInfo flowInfo) {
+ 	NullAnnotationMatching annotationStatus = NullAnnotationMatching.analyse(requiredType, expression.resolvedType, nullStatus);
+ 	if (annotationStatus.isDefiniteMismatch()) {
+ 		scope.problemReporter().nullityMismatchingTypeAnnotation(expression, expression.resolvedType, requiredType, annotationStatus);
+ 	} else if (annotationStatus.isUnchecked()) {
+-		flowContext.recordNullityMismatch(scope, expression, expression.resolvedType, requiredType, nullStatus);
++		flowContext.recordNullityMismatch(scope, expression, expression.resolvedType, requiredType, flowInfo, nullStatus);
+ 	}
+ }
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
+index 680fb7d..59de606 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -15,6 +15,7 @@
+  *								bug 385626 - @NonNull fails across loop boundaries
+  *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *								bug 403147 - [compiler][null] FUP of bug 400761: consolidate interaction between unboxing, NPE, and deferred checking
++ *								Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *     Jesper S Moller - Contributions for
+  *								bug 404657 - [1.8][compiler] Analysis for effectively final variables fails to consider loops
+  *******************************************************************************/
+@@ -111,7 +112,7 @@ public void complainOnDeferredChecks(FlowInfo flowInfo, BlockScope scope) {
+ 					int nullStatus = flowInfo.nullStatus(this.nullLocals[i]);
+ 					if (nullStatus != FlowInfo.NON_NULL) {
+ 						this.parent.recordNullityMismatch(scope, (Expression) location,
+-								this.providedExpectedTypes[i][0], this.providedExpectedTypes[i][1], nullStatus);
++								this.providedExpectedTypes[i][0], this.providedExpectedTypes[i][1], flowInfo, nullStatus);
+ 					}
+ 					break;
+ 				case IN_UNBOXING:
+@@ -423,7 +424,7 @@ public void complainOnDeferredChecks(FlowInfo flowInfo, BlockScope scope) {
+ 						// never happens
+ 				}
+ 			}
+-			recordNullReference(local, location, checkType);
++			recordNullReference(local, location, checkType, flowInfo);
+ 			// prepare to re-check with try/catch flow info
+ 		}
+ 	}
+@@ -439,7 +440,7 @@ public void complainOnDeferredChecks(FlowInfo flowInfo, BlockScope scope) {
+ 	}
+ 
+ protected void recordNullReference(LocalVariableBinding local,
+-	ASTNode expression, int checkType) {
++	ASTNode expression, int checkType, FlowInfo nullInfo) {
+ 	if (this.nullCount == 0) {
+ 		this.nullLocals = new LocalVariableBinding[5];
+ 		this.nullReferences = new ASTNode[5];
+@@ -465,14 +466,14 @@ public void recordUnboxing(Scope scope, Expression expression, int nullStatus, F
+ 	if (nullStatus == FlowInfo.NULL)
+ 		super.recordUnboxing(scope, expression, nullStatus, flowInfo);
+ 	else // defer checking:
+-		recordNullReference(null, expression, IN_UNBOXING);
++		recordNullReference(null, expression, IN_UNBOXING, flowInfo);
+ }
+-protected boolean internalRecordNullityMismatch(Expression expression, TypeBinding providedType, int nullStatus, TypeBinding expectedType, int checkType) {
++protected boolean internalRecordNullityMismatch(Expression expression, TypeBinding providedType, FlowInfo flowInfo, int nullStatus, TypeBinding expectedType, int checkType) {
+ 	// cf. decision structure inside FinallyFlowContext.recordUsingNullReference(..)
+ 	if (nullStatus == FlowInfo.UNKNOWN ||
+ 			((this.tagBits & FlowContext.DEFER_NULL_DIAGNOSTIC) != 0 && nullStatus != FlowInfo.NULL)) {
+ 		recordProvidedExpectedTypes(providedType, expectedType, this.nullCount);
+-		recordNullReference(expression.localVariableBinding(), expression, checkType);
++		recordNullReference(expression.localVariableBinding(), expression, checkType, flowInfo);
+ 		return true;
+ 	}
+ 	return false;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
+index 79c475b..634d12b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -17,6 +17,7 @@
+  *								bug 402993 - [null] Follow up of bug 401088: Missing warning about redundant null check
+  *								bug 403086 - [compiler][null] include the effect of 'assert' in syntactic null analysis for fields
+  *								bug 403147 - [compiler][null] FUP of bug 400761: consolidate interaction between unboxing, NPE, and deferred checking
++ *								Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.flow;
+ 
+@@ -773,9 +774,10 @@ protected boolean recordFinalAssignment(VariableBinding variable, Reference fina
+  *      {@link #IN_COMPARISON_NON_NULL}, {@link #IN_ASSIGNMENT} or {@link #IN_INSTANCEOF}).
+  *      <br>
+  *      Alternatively, a {@link #IN_UNBOXING} check can e requested.
++ * @param nullInfo the null flow info observed at this first visit of location.
+  */
+ protected void recordNullReference(LocalVariableBinding local,
+-	ASTNode location, int checkType) {
++	ASTNode location, int checkType, FlowInfo nullInfo) {
+ 	// default implementation: do nothing
+ }
+ 
+@@ -986,9 +988,10 @@ public String toString() {
+  * @param expression the expression violating the specification
+  * @param providedType the type of the provided value, i.e., either expression or an element thereof (in ForeachStatements)
+  * @param expectedType the declared type of the spec'ed variable, for error reporting.
++ * @param flowInfo the flowInfo observed when visiting expression
+  * @param nullStatus the null status of expression at the current location
+  */
+-public void recordNullityMismatch(BlockScope currentScope, Expression expression, TypeBinding providedType, TypeBinding expectedType, int nullStatus) {
++public void recordNullityMismatch(BlockScope currentScope, Expression expression, TypeBinding providedType, TypeBinding expectedType, FlowInfo flowInfo, int nullStatus) {
+ 	if (providedType == null) {
+ 		return; // assume type error was already reported
+ 	}
+@@ -1001,7 +1004,7 @@ public void recordNullityMismatch(BlockScope currentScope, Expression expression
+ 			if ((this.tagBits & FlowContext.HIDE_NULL_COMPARISON_WARNING) != 0) {
+ 				isInsideAssert = FlowContext.HIDE_NULL_COMPARISON_WARNING;
+ 			}
+-			if (currentContext.internalRecordNullityMismatch(expression, providedType, nullStatus, expectedType, ASSIGN_TO_NONNULL | isInsideAssert))
++			if (currentContext.internalRecordNullityMismatch(expression, providedType, flowInfo, nullStatus, expectedType, ASSIGN_TO_NONNULL | isInsideAssert))
+ 				return;
+ 			currentContext = currentContext.parent;
+ 		}
+@@ -1010,7 +1013,7 @@ public void recordNullityMismatch(BlockScope currentScope, Expression expression
+ 	char[][] annotationName = currentScope.environment().getNonNullAnnotationName();
+ 	currentScope.problemReporter().nullityMismatch(expression, providedType, expectedType, nullStatus, annotationName);
+ }
+-protected boolean internalRecordNullityMismatch(Expression expression, TypeBinding providedType, int nullStatus, TypeBinding expectedType, int checkType) {
++protected boolean internalRecordNullityMismatch(Expression expression, TypeBinding providedType, FlowInfo flowInfo, int nullStatus, TypeBinding expectedType, int checkType) {
+ 	// nop, to be overridden in subclasses
+ 	return false; // not recorded
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LoopingFlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LoopingFlowContext.java
+index 16cccc6..7b1de3b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LoopingFlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LoopingFlowContext.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -19,6 +19,7 @@
+  *								bug 403147 - [compiler][null] FUP of bug 400761: consolidate interaction between unboxing, NPE, and deferred checking
+  *								bug 406384 - Internal error with I20130413
+  *								Bug 415413 - [compiler][null] NullpointerException in Null Analysis caused by interaction of LoopingFlowContext and FinallyFlowContext
++ *								Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *     Jesper S Moller - contributions for
+  *								bug 404657 - [1.8][compiler] Analysis for effectively final variables fails to consider loops
+  *******************************************************************************/
+@@ -66,6 +67,7 @@ public class LoopingFlowContext extends SwitchFlowContext {
+ 	ASTNode[] nullReferences;	// Expressions for null checking, Statements for resource analysis
+ 								// cast to Expression is safe if corresponding nullCheckType != EXIT_RESOURCE
+ 	int[] nullCheckTypes;
++	UnconditionalFlowInfo[] nullInfos;	// detailed null info observed during the first visit of nullReferences[i], or null
+ 	int nullCount;
+ 	// see also the related field FlowContext#expectedTypes
+ 
+@@ -160,13 +162,16 @@ public void complainOnDeferredNullChecks(BlockScope scope, FlowInfo callerFlowIn
+ 	}
+ 	this.innerFlowContextsCount = 0;
+ 	FlowInfo upstreamCopy = this.upstreamNullFlowInfo.copy();
+-	UnconditionalFlowInfo flowInfo = this.upstreamNullFlowInfo.
++	UnconditionalFlowInfo incomingInfo = this.upstreamNullFlowInfo.
+ 		addPotentialNullInfoFrom(callerFlowInfo.unconditionalInitsWithoutSideEffect());
+ 	if ((this.tagBits & FlowContext.DEFER_NULL_DIAGNOSTIC) != 0) {
+ 		// check only immutable null checks on innermost looping context
+ 		for (int i = 0; i < this.nullCount; i++) {
+ 			LocalVariableBinding local = this.nullLocals[i];
+ 			ASTNode location = this.nullReferences[i];
++			FlowInfo flowInfo =  (this.nullInfos[i] != null)
++									? incomingInfo.copy().addNullInfoFrom(this.nullInfos[i])
++									: incomingInfo;
+ 			// final local variable
+ 			switch (this.nullCheckTypes[i] & ~HIDE_NULL_COMPARISON_WARNING_MASK) {
+ 				case CAN_ONLY_NON_NULL | IN_COMPARISON_NULL:
+@@ -268,7 +273,7 @@ public void complainOnDeferredNullChecks(BlockScope scope, FlowInfo callerFlowIn
+ 				case ASSIGN_TO_NONNULL:
+ 					int nullStatus = flowInfo.nullStatus(local);
+ 					if (nullStatus != FlowInfo.NON_NULL) {
+-						this.parent.recordNullityMismatch(scope, (Expression)location, this.providedExpectedTypes[i][0], this.providedExpectedTypes[i][1], nullStatus);
++						this.parent.recordNullityMismatch(scope, (Expression)location, this.providedExpectedTypes[i][0], this.providedExpectedTypes[i][1], flowInfo, nullStatus);
+ 					}
+ 					continue; // no more delegation to parent
+ 				case EXIT_RESOURCE:
+@@ -306,6 +311,9 @@ public void complainOnDeferredNullChecks(BlockScope scope, FlowInfo callerFlowIn
+ 			ASTNode location = this.nullReferences[i];
+ 			// final local variable
+ 			LocalVariableBinding local = this.nullLocals[i];
++			FlowInfo flowInfo =  (this.nullInfos[i] != null)
++					? incomingInfo.copy().addNullInfoFrom(this.nullInfos[i])
++					: incomingInfo;
+ 			switch (this.nullCheckTypes[i] & ~HIDE_NULL_COMPARISON_WARNING_MASK) {
+ 				case CAN_ONLY_NULL_NON_NULL | IN_COMPARISON_NULL:
+ 				case CAN_ONLY_NULL_NON_NULL | IN_COMPARISON_NON_NULL:
+@@ -418,9 +426,9 @@ public void complainOnDeferredNullChecks(BlockScope scope, FlowInfo callerFlowIn
+ 		}
+ 	}
+ 	// propagate breaks
+-	this.initsOnBreak.addPotentialNullInfoFrom(flowInfo);
++	this.initsOnBreak.addPotentialNullInfoFrom(incomingInfo);
+ 	for (int i = 0; i < this.breakTargetsCount; i++) {
+-		this.breakTargetContexts[i].initsOnBreak.addPotentialNullInfoFrom(flowInfo);
++		this.breakTargetContexts[i].initsOnBreak.addPotentialNullInfoFrom(incomingInfo);
+ 	}
+ }
+ 
+@@ -534,11 +542,12 @@ public void recordContinueFrom(FlowContext innerFlowContext, FlowInfo flowInfo)
+ 	}
+ 
+ protected void recordNullReference(LocalVariableBinding local,
+-	ASTNode expression, int checkType) {
++	ASTNode expression, int checkType, FlowInfo nullInfo) {
+ 	if (this.nullCount == 0) {
+ 		this.nullLocals = new LocalVariableBinding[5];
+ 		this.nullReferences = new ASTNode[5];
+ 		this.nullCheckTypes = new int[5];
++		this.nullInfos = new UnconditionalFlowInfo[5];
+ 	}
+ 	else if (this.nullCount == this.nullLocals.length) {
+ 		System.arraycopy(this.nullLocals, 0,
+@@ -547,16 +556,19 @@ protected void recordNullReference(LocalVariableBinding local,
+ 			this.nullReferences = new ASTNode[this.nullCount * 2], 0, this.nullCount);
+ 		System.arraycopy(this.nullCheckTypes, 0,
+ 			this.nullCheckTypes = new int[this.nullCount * 2], 0, this.nullCount);
++		System.arraycopy(this.nullInfos, 0,
++			this.nullInfos = new UnconditionalFlowInfo[this.nullCount * 2], 0, this.nullCount);
+ 	}
+ 	this.nullLocals[this.nullCount] = local;
+ 	this.nullReferences[this.nullCount] = expression;
+-	this.nullCheckTypes[this.nullCount++] = checkType;
++	this.nullCheckTypes[this.nullCount] = checkType;
++	this.nullInfos[this.nullCount++] = nullInfo.unconditionalCopy();
+ }
+ public void recordUnboxing(Scope scope, Expression expression, int nullStatus, FlowInfo flowInfo) {
+ 	if (nullStatus == FlowInfo.NULL)
+ 		super.recordUnboxing(scope, expression, nullStatus, flowInfo);
+ 	else // defer checking:
+-		recordNullReference(null, expression, IN_UNBOXING);
++		recordNullReference(null, expression, IN_UNBOXING, flowInfo);
+ }
+ 
+ /** Record the fact that we see an early exit (in 'reference') while 'trackingVar' is in scope and may be unclosed. */
+@@ -573,7 +585,7 @@ public boolean recordExitAgainstResource(BlockScope scope, FlowInfo flowInfo, Fa
+ 		scope.problemReporter().potentiallyUnclosedCloseable(trackingVar, reference);
+ 		return true; // handled
+ 	}
+-	recordNullReference(trackingVar.binding, reference, EXIT_RESOURCE);
++	recordNullReference(trackingVar.binding, reference, EXIT_RESOURCE, flowInfo);
+ 	return true; // handled
+ }
+ 
+@@ -612,20 +624,20 @@ public void recordUsingNullReference(Scope scope, LocalVariableBinding local,
+ 				}
+ 			} else if (this.upstreamNullFlowInfo.isDefinitelyNonNull(local) && !flowInfo.isPotentiallyNull(local) && !flowInfo.isPotentiallyUnknown(local)) {
+ 				// https://bugs.eclipse.org/bugs/show_bug.cgi?id=291418
++				recordNullReference(local, reference, checkType, flowInfo);
+ 				flowInfo.markAsDefinitelyNonNull(local);
+-				recordNullReference(local, reference, checkType);
+ 			} else if (flowInfo.cannotBeDefinitelyNullOrNonNull(local)) {
+ 				return; // no reason to complain, since there is definitely some uncertainty making the comparison relevant.
+ 			} else {
+ 					// note: pot non-null & pot null is already captured by cannotBeDefinitelyNullOrNonNull()
+ 					if (flowInfo.isPotentiallyNonNull(local)) {
+ 						// knowing 'local' can be non-null, we're only interested in seeing whether it can *only* be non-null
+-						recordNullReference(local, reference, CAN_ONLY_NON_NULL | checkType & (CONTEXT_MASK|HIDE_NULL_COMPARISON_WARNING_MASK));
++						recordNullReference(local, reference, CAN_ONLY_NON_NULL | checkType & (CONTEXT_MASK|HIDE_NULL_COMPARISON_WARNING_MASK), flowInfo);
+ 					} else if (flowInfo.isPotentiallyNull(local)) {
+ 						// knowing 'local' can be null, we're only interested in seeing whether it can *only* be null
+-						recordNullReference(local, reference, CAN_ONLY_NULL | checkType & (CONTEXT_MASK|HIDE_NULL_COMPARISON_WARNING_MASK));
++						recordNullReference(local, reference, CAN_ONLY_NULL | checkType & (CONTEXT_MASK|HIDE_NULL_COMPARISON_WARNING_MASK), flowInfo);
+ 					} else {
+-						recordNullReference(local, reference, checkType);
++						recordNullReference(local, reference, checkType, flowInfo);
+ 					}
+ 			}
+ 			return;
+@@ -684,7 +696,7 @@ public void recordUsingNullReference(Scope scope, LocalVariableBinding local,
+ 						break;
+ 				}
+ 			}
+-			recordNullReference(local, reference, checkType);
++			recordNullReference(local, reference, checkType, flowInfo);
+ 			return;
+ 		case MAY_NULL :
+ 			if (flowInfo.isDefinitelyNonNull(local)) {
+@@ -698,7 +710,7 @@ public void recordUsingNullReference(Scope scope, LocalVariableBinding local,
+ 				scope.problemReporter().localVariablePotentialNullReference(local, location);
+ 				return;
+ 			}
+-			recordNullReference(local, location, checkType);
++			recordNullReference(local, location, checkType, flowInfo);
+ 			return;
+ 		default:
+ 			// never happens
+@@ -742,9 +754,9 @@ public void recordUsingNullReference(Scope scope, LocalVariableBinding local,
+ 		return this.escapingExceptionCatchSites != null;
+ 	}
+ 
+-	protected boolean internalRecordNullityMismatch(Expression expression, TypeBinding providedType, int nullStatus, TypeBinding expectedType, int checkType) {
++	protected boolean internalRecordNullityMismatch(Expression expression, TypeBinding providedType, FlowInfo flowInfo, int nullStatus, TypeBinding expectedType, int checkType) {
+ 		recordProvidedExpectedTypes(providedType, expectedType, this.nullCount);
+-		recordNullReference(expression.localVariableBinding(), expression, checkType);
++		recordNullReference(expression.localVariableBinding(), expression, checkType, flowInfo);
+ 		return true;
+ 	}
+ }
+commit 23872cdac6fbbd78479a7f309cf6a923f8b64047
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Nov 29 16:00:07 2014 +0100
+
+    Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+     - impl approach (B): new bits UFI.{iNBit/iNNBit} for flow concatenation
+     - adjusted tests in accordance to FIXMEs from previous commit
+     - enabled old tests
+     - disabled NRT.test0525_try_finally_unchecked_exception, see bug 370424
+
+32	30	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullReferenceTest.java
+6	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/ExceptionHandlingFlowContext.java
+126	12	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/UnconditionalFlowInfo.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullReferenceTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullReferenceTest.java
+index 53e4987..4d532e1 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullReferenceTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullReferenceTest.java
+@@ -64,6 +64,7 @@ public NullReferenceTest(String name) {
+ // Only the highest compliance level is run; add the VM argument
+ // -Dcompliance=1.4 (for example) to lower it if needed
+ static {
++//		TESTS_NAMES = new String[] { "test0525_try_finally_unchecked_exception" };
+ //		TESTS_NAMES = new String[] { "testBug441737" };
+ //		TESTS_NAMES = new String[] { "testBug453305" };
+ //		TESTS_NAMES = new String[] { "testBug431016" };
+@@ -5653,7 +5654,7 @@ public void test0524_try_finally() {
+ 
+ // null analysis -- try/finally
+ // https://bugs.eclipse.org/bugs/show_bug.cgi?id=150082
+-public void test0525_try_finally_unchecked_exception() {
++public void _test0525_try_finally_unchecked_exception() {
+ 	this.runNegativeTest(
+ 		new String[] {
+ 			"X.java",
+@@ -8504,7 +8505,7 @@ public void test0744_for_infinite() {
+ 
+ // null analysis - for
+ // https://bugs.eclipse.org/bugs/show_bug.cgi?id=195638
+-public void _test0746_for_try_catch() {
++public void test0746_for_try_catch() {
+ 	runTest(
+ 		new String[] {
+ 			"X.java",
+@@ -16401,8 +16402,8 @@ public void testBug345305_4() {
+ }
+ 
+ // Bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
+-// DISABLED: block-less if involved - info about pot.nn. is lost when checking against loop's info (deferred check)
+-public void _testBug345305_6() {
++// block-less if involved - info about pot.nn. was lost when checking against loop's info (deferred check)
++public void testBug345305_6() {
+ 	runNegativeTest(
+ 		new String[] {
+ 			"X.java",
+@@ -17016,7 +17017,7 @@ public void testBug402993a() {
+ }
+ public void testBug453305() {
+ 	if (this.complianceLevel < ClassFileConstants.JDK1_5) return; // uses foreach loop
+-	runNegativeTest(
++	runConformTest(
+ 		new String[] {
+ 			"NullTest.java",
+ 			"import java.util.*;\n" + 
+@@ -17049,16 +17050,9 @@ public void testBug453305() {
+ 			"        return null;\n" + 
+ 			"    }\n" + 
+ 			"}\n"
+-		},
+-		"----------\n" + 
+-		"1. ERROR in NullTest.java (at line 25)\n" + 
+-		"	result.doSomething(); // warning is here\n" + 
+-		"	^^^^^^\n" + 
+-		"Potential null pointer access: The variable result may be null at this location\n" + 
+-		"----------\n");
++		});
+ }
+-// loop-limitation:
+-public void _testBug431016() {
++public void testBug431016() {
+ 	if (this.complianceLevel < ClassFileConstants.JDK1_5) return; // uses foreach loop
+ 	runConformTest(
+ 		new String[] {
+@@ -17081,7 +17075,26 @@ public void _testBug431016() {
+ 			"}\n"
+ 		});
+ }
+-public void _testBug432109() {
++// originally created for documentation purpose, see https://bugs.eclipse.org/453483#c9
++public void testBug431016_simplified() {
++	runConformTest(
++		new String[] {
++			"Test.java",
++			"public class Test {\n" + 
++			"  void test(Object input, boolean b) {\n" + 
++			"    Object o = null;\n" + 
++			"    while (true) {\n" + 
++			"      if (o == null)\n" + 
++			"        o = input;\n" + 
++			"      if (b)\n" + 
++			"        o.toString();\n" + 
++			"      o.toString();\n" + 
++			"    }\n" + 
++			"  }\n" + 
++			"}\n"
++		});
++}
++public void testBug432109() {
+ 	if (this.complianceLevel < ClassFileConstants.JDK1_5) return; // uses generics & foreach loop
+ 	runConformTest(
+ 		new String[] {
+@@ -17142,12 +17155,7 @@ public void testBug435528() {
+ 			"}\n"
+ 		},
+ 		"----------\n" + 
+-		"1. ERROR in Test.java (at line 13)\n" + 
+-		"	if (x.equals(\"A\")) {\n" + 
+-		"	    ^\n" + 
+-		"Potential null pointer access: The variable x may be null at this location\n" +   // FIXME: fully avoid warning?
+-		"----------\n" + 
+-		"2. WARNING in Test.java (at line 15)\n" + 
++		"1. WARNING in Test.java (at line 15)\n" + 
+ 		"	} else {\n" + 
+ 		"            x = null;\n" + 
+ 		"         }\n" + 
+@@ -17156,7 +17164,7 @@ public void testBug435528() {
+ 		"----------\n");
+ }
+ public void testBug418500() {
+-	runNegativeTest(
++	runConformTest(
+ 		new String[] {
+ 			"Test.java",
+ 			"import java.util.*;\n" +
+@@ -17186,15 +17194,9 @@ public void testBug418500() {
+ 			"    }\n" + 
+ 			"  }\n" +
+ 			"}\n"
+-		},
+-		"----------\n" + 
+-		"1. ERROR in Test.java (at line 15)\n" + 
+-		"	if (targets.size() > 0) {\n" + 
+-		"	    ^^^^^^^\n" + 
+-		"Potential null pointer access: The variable targets may be null at this location\n" +  // FIXME: fully avoid warning?
+-		"----------\n");
++		});
+ }
+-public void _testBug441737() {
++public void testBug441737() {
+ 	runConformTest(
+ 		new String[] {
+ 			"Bogus.java",
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/ExceptionHandlingFlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/ExceptionHandlingFlowContext.java
+index 23fb7b0..90ef3f2 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/ExceptionHandlingFlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/ExceptionHandlingFlowContext.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -10,6 +10,7 @@
+  *     Stephan Herrmann - Contribution for
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
+  *								bug 402993 - [null] Follow up of bug 401088: Missing warning about redundant null check
++ *								Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.flow;
+ 
+@@ -79,7 +80,10 @@ public ExceptionHandlingFlowContext(
+ 		FlowInfo flowInfo) {
+ 	this(parent, tryStatement, handledExceptions, exceptionToCatchBlockMap, 
+ 			tryStatement.catchArguments, initializationParent, scope, flowInfo.unconditionalInits());
+-	this.initsOnFinally = flowInfo.unconditionalCopy();
++	UnconditionalFlowInfo unconditionalCopy = flowInfo.unconditionalCopy();
++	unconditionalCopy.iNBit = -1L;
++	unconditionalCopy.iNNBit = -1L;
++	this.initsOnFinally = unconditionalCopy;
+ }
+ ExceptionHandlingFlowContext(
+ 		FlowContext parent,
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/UnconditionalFlowInfo.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/UnconditionalFlowInfo.java
+index 394486e..6b6dc6c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/UnconditionalFlowInfo.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/UnconditionalFlowInfo.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -7,7 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+- *     Stephan Herrmann <stephan@cs.tu-berlin.de> - Contributions for
++ *     Stephan Herrmann - Contributions for
+  *     						bug 325755 - [compiler] wrong initialization state after conditional expression
+  *     						bug 320170 - [compiler] [null] Whitebox issues in null analysis
+  *     						bug 292478 - Report potentially null across variable assignment
+@@ -17,9 +17,12 @@
+  *							bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
+  *							bug 386181 - [compiler][null] wrong transition in UnconditionalFlowInfo.mergedWith()
+  *							bug 394768 - [compiler][resource] Incorrect resource leak warning when creating stream in conditional
++ *							Bug 453483 - [compiler][null][loop] Improve null analysis for loops
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.flow;
+ 
++import java.util.Arrays;
++
+ import org.eclipse.jdt.internal.compiler.ast.ASTNode;
+ import org.eclipse.jdt.internal.compiler.impl.Constant;
+ import org.eclipse.jdt.internal.compiler.lookup.FieldBinding;
+@@ -80,12 +83,18 @@ public class UnconditionalFlowInfo extends FlowInfo {
+ 		1110	prot. null
+ 		1111	prot. non null
+  */
++	public long 
++		iNBit,	// can an incoming null value reach the current point?
++		iNNBit;	// can an incoming nonnull value reach the current point?
+ 
+ 	// extra segments
+-	public static final int extraLength = 6;
++	public static final int extraLength = 8;
+ 	public long extra[][];
+ 		// extra bit fields for larger numbers of fields/variables
+ 		// extra[0] holds definiteInits values, extra[1] potentialInits, etc.
++		// extra[1+1]... corresponds to nullBits1 ...
++		// extra[IN] is iNBit
++		// extra[INN] is iNNBit
+ 		// lifecycle is extra == null or else all extra[]'s are allocated
+ 		// arrays which have the same size
+ 
+@@ -93,6 +102,8 @@ public class UnconditionalFlowInfo extends FlowInfo {
+ 
+ 	// Constants
+ 	public static final int BitCacheSize = 64; // 64 bits in a long.
++	public static final int IN = 6;
++	public static final int INN = 7;
+ 
+ /* fakeInitializedFlowInfo: For Lambda expressions tentative analysis during overload resolution. 
+    We presume that any and all outer locals touched by the lambda are definitely assigned and 
+@@ -133,6 +144,8 @@ private FlowInfo addInfoFrom(FlowInfo inits, boolean handleInits) {
+ 	// combine null information
+ 	boolean thisHadNulls = (this.tagBits & NULL_FLAG_MASK) != 0,
+ 		otherHasNulls = (otherInits.tagBits & NULL_FLAG_MASK) != 0;
++//	if ((otherInits.iNNBit | otherInits.iNBit) == 0)
++//		thisHadNulls = false; // suppress incoming null info, if none shines through in other
+ 	long
+ 		a1, a2, a3, a4,
+ 		na1, na2, na3, na4,
+@@ -144,6 +157,8 @@ private FlowInfo addInfoFrom(FlowInfo inits, boolean handleInits) {
+ 			this.nullBit2 = otherInits.nullBit2;
+ 			this.nullBit3 = otherInits.nullBit3;
+ 			this.nullBit4 = otherInits.nullBit4;
++			this.iNBit = otherInits.iNBit;
++			this.iNNBit = otherInits.iNNBit;
+ 			if (COVERAGE_TEST_FLAG) {
+ 				if (CoverageTestId == 1) {
+ 				  this.nullBit4 = ~0;
+@@ -151,25 +166,25 @@ private FlowInfo addInfoFrom(FlowInfo inits, boolean handleInits) {
+ 			}
+ 		}
+ 		else {
+-			this.nullBit1 = (b1 = otherInits.nullBit1)
++			long merge1 = (b1 = otherInits.nullBit1)
+                 				| (a1 = this.nullBit1) & ((a3 = this.nullBit3)
+                 					& (a4 = this.nullBit4) & (nb2 = ~(b2 = otherInits.nullBit2))
+                 					& (nb4 = ~(b4 = otherInits.nullBit4))
+                         		| ((na4 = ~a4) | (na3 = ~a3))
+                         			& ((na2 = ~(a2 = this.nullBit2)) & nb2
+                         				| a2 & (nb3 = ~(b3 = otherInits.nullBit3)) & nb4));
+-			this.nullBit2  = b2 & (nb4 | nb3)
++			long merge2  = b2 & (nb4 | nb3)
+                     			| na3 & na4 & b2
+                     			| a2 & (nb3 & nb4
+                                 			| (nb1 = ~b1) & (na3 | (na1 = ~a1))
+                                 			| a1 & b2);
+-			this.nullBit3 = b3 & (nb1 & (b2 | a2 | na1)
++			long merge3 = b3 & (nb1 & (b2 | a2 | na1)
+                         			| b1 & (b4 | nb2 | a1 & a3)
+                          			| na1 & na2 & na4)
+                     			| a3 & nb2 & nb4
+                     			| nb1 & ((na2 & a4 | na1) & a3
+                                 			| a1 & na2 & na4 & b2);
+-			this.nullBit4 = nb1 & (a4 & (na3 & nb3	| (a3 | na2) & nb2)
++			long merge4 = nb1 & (a4 & (na3 & nb3	| (a3 | na2) & nb2)
+                       			| a1 & (a3 & nb2 & b4
+                               			| a2 & b2 & (b4	| a3 & na4 & nb3)))
+                       			| b1 & (a3 & a4 & b4
+@@ -179,6 +194,24 @@ private FlowInfo addInfoFrom(FlowInfo inits, boolean handleInits) {
+                           			| na1 & (b4	| (a4 | a2) & b2 & b3))
+                       			| (na1 & (na3 & nb3 | na2 & nb2)
+                       				| a1 & (nb2 & nb3 | a2 & a3)) & b4;
++
++			// state that breaks the correlation between bits and n or nn, used below:
++			long protNN1111 = merge1&merge2&merge3&merge4;
++
++			// filter 'merge' using iNBit,iNNBit from otherInits:
++			// this implements that otherInit does not accept certain bits which are known to be superseded by info in otherInits.			
++			long acceptNonNull = otherInits.iNNBit;
++			long acceptNull = otherInits.iNBit
++								| b1&b2&b3&b4; // for 1111 don't bother suppressing incoming null (mixing 'merge' & 'b' would break in this case) 
++			this.nullBit1 = merge1;
++			this.nullBit2 = protNN1111 |
++				 				((acceptNull & merge2) | (~acceptNull & b2)); // iNBit selects between info from merge2 vs. b2
++			this.nullBit3 = protNN1111 |
++								((acceptNonNull & merge3) | (~acceptNonNull & b3)); // iNNBit selects between info from merge3 vs. b3
++			this.nullBit4 = merge4;
++			// unconditional sequence, must shine through both to shine through in the end:
++			this.iNBit &= otherInits.iNBit;
++			this.iNNBit &= otherInits.iNNBit;
+ 			if (COVERAGE_TEST_FLAG) {
+ 				if (CoverageTestId == 2) {
+ 				  this.nullBit4 = ~0;
+@@ -243,6 +276,8 @@ private FlowInfo addInfoFrom(FlowInfo inits, boolean handleInits) {
+ 				for (int j = 2; j < extraLength; j++) {
+ 					this.extra[j] = new long[otherLength];
+ 				}
++				System.arraycopy(otherInits.extra[IN], 0, this.extra[IN], 0, otherLength);
++				System.arraycopy(otherInits.extra[INN], 0, this.extra[INN], 0, otherLength);
+ 				if (COVERAGE_TEST_FLAG) {
+ 					if (CoverageTestId == 6) {
+ 						throw new AssertionFailedException("COVERAGE 6"); //$NON-NLS-1$
+@@ -275,25 +310,25 @@ private FlowInfo addInfoFrom(FlowInfo inits, boolean handleInits) {
+ 		  	mergeLimit = 0;
+ 		}
+ 		for (i = 0; i < mergeLimit; i++) {
+-			this.extra[1 + 1][i] = (b1 = otherInits.extra[1 + 1][i])
++			long merge1 = (b1 = otherInits.extra[1 + 1][i])
+                 				| (a1 = this.extra[1 + 1][i]) & ((a3 = this.extra[3 + 1][i])
+                 					& (a4 = this.extra[4 + 1][i]) & (nb2 = ~(b2 = otherInits.extra[2 + 1][i]))
+                 					& (nb4 = ~(b4 = otherInits.extra[4 + 1][i]))
+                         		| ((na4 = ~a4) | (na3 = ~a3))
+                         			& ((na2 = ~(a2 = this.extra[2 + 1][i])) & nb2
+                         				| a2 & (nb3 = ~(b3 = otherInits.extra[3 + 1][i])) & nb4));
+-			this.extra[2 + 1][i]  = b2 & (nb4 | nb3)
++			long merge2 = b2 & (nb4 | nb3)
+                     			| na3 & na4 & b2
+                     			| a2 & (nb3 & nb4
+                                 			| (nb1 = ~b1) & (na3 | (na1 = ~a1))
+                                 			| a1 & b2);
+-			this.extra[3 + 1][i] = b3 & (nb1 & (b2 | a2 | na1)
++			long merge3 = b3 & (nb1 & (b2 | a2 | na1)
+                         			| b1 & (b4 | nb2 | a1 & a3)
+                          			| na1 & na2 & na4)
+                     			| a3 & nb2 & nb4
+                     			| nb1 & ((na2 & a4 | na1) & a3
+                                 			| a1 & na2 & na4 & b2);
+-			this.extra[4 + 1][i] = nb1 & (a4 & (na3 & nb3	| (a3 | na2) & nb2)
++			long merge4 = nb1 & (a4 & (na3 & nb3	| (a3 | na2) & nb2)
+                       			| a1 & (a3 & nb2 & b4
+                               			| a2 & b2 & (b4	| a3 & na4 & nb3)))
+                       			| b1 & (a3 & a4 & b4
+@@ -303,6 +338,25 @@ private FlowInfo addInfoFrom(FlowInfo inits, boolean handleInits) {
+                           			| na1 & (b4	| (a4 | a2) & b2 & b3))
+                       			| (na1 & (na3 & nb3 | na2 & nb2)
+                       				| a1 & (nb2 & nb3 | a2 & a3)) & b4;
++
++			// state that breaks the correlation between bits and n or nn, used below:
++			long protNN1111 = merge1&merge2&merge3&merge4;
++
++			// filter 'merge' using iNBit,iNNBit from otherInits:
++			// this implements that otherInit does not accept certain bits which are known to be superseded by info in otherInits.			
++			long acceptNonNull = otherInits.extra[INN][i];
++			long acceptNull = otherInits.extra[IN][i]
++								| b1&b2&b3&b4; // for 1111 don't bother suppressing incoming null (mixing 'merge' & 'b' would break in this case) 
++			this.extra[1 + 1][i] = merge1;
++			this.extra[2 + 1][i] = protNN1111 |
++				 				((acceptNull & merge2) | (~acceptNull & b2)); // iNBit selects between info from merge2 vs. b2
++			this.extra[3 + 1][i] = protNN1111 |
++								((acceptNonNull & merge3) | (~acceptNonNull & b3)); // iNNBit selects between info from merge3 vs. b3
++			this.extra[4 + 1][i] = merge4;
++			// unconditional sequence, must shine through both to shine through in the end:
++			this.extra[IN][i] &= otherInits.extra[IN][i];
++			this.extra[INN][i] &= otherInits.extra[INN][i];
++
+ 			if (COVERAGE_TEST_FLAG) {
+ 				if (CoverageTestId == 7) {
+ 				  this.extra[5][i] = ~0;
+@@ -420,6 +474,7 @@ public UnconditionalFlowInfo addPotentialNullInfoFrom(
+     			| nb2 & (na3 & b1 & nb3	| na2 & (nb1 & b4 | b1 & nb3 | a4))
+     			| a3 & (a4 & (nb2 | b1 & b3)
+             			| a1 & a2 & (nb1 & b4 | na4 & (b2 | b1) & nb3));
++		// this and then pot.other: leave iNBit & iNNBit untouched
+ 		if (COVERAGE_TEST_FLAG) {
+ 			if (CoverageTestId == 9) {
+ 			  this.nullBit4 = ~0;
+@@ -435,6 +490,7 @@ public UnconditionalFlowInfo addPotentialNullInfoFrom(
+   								(nb1 = ~(b1 = otherInits.nullBit1)));
+   		this.nullBit3 = b3 & (nb1 | (nb2 = ~b2));
+   		this.nullBit4 = ~b1 & ~b3 & (b4 = otherInits.nullBit4) | ~b2 & (b1 & ~b3 | ~b1 & b4);
++		// this and then pot.other: leave iNBit & iNNBit untouched
+ 		if (COVERAGE_TEST_FLAG) {
+ 			if (CoverageTestId == 10) {
+ 			  this.nullBit4 = ~0;
+@@ -501,6 +557,7 @@ public UnconditionalFlowInfo addPotentialNullInfoFrom(
+         			| nb2 & (na3 & b1 & nb3	| na2 & (nb1 & b4 | b1 & nb3 | a4))
+         			| a3 & (a4 & (nb2 | b1 & b3)
+                 			| a1 & a2 & (nb1 & b4 | na4 & (b2 | b1) & nb3));
++    		// this and then pot.other: leave iNBit & iNNBit untouched
+     		if ((this.extra[2 + 1][i] | this.extra[3 + 1][i] | this.extra[4 + 1][i]) != 0) { //  bit1 is redundant
+     		  	thisHasNulls = true;
+     		}
+@@ -517,6 +574,7 @@ public UnconditionalFlowInfo addPotentialNullInfoFrom(
+     								(nb1 = ~(b1 = otherInits.extra[1 + 1][i])));
+     		this.extra[3 + 1][i] = b3 & (nb1 | (nb2 = ~b2));
+     		this.extra[4 + 1][i] = ~b1 & ~b3 & (b4 = otherInits.extra[4 + 1][i]) | ~b2 & (b1 & ~b3 | ~b1 & b4);
++    		// this and then pot.other: leave iNBit & iNNBit untouched
+     		if ((this.extra[2 + 1][i] | this.extra[3 + 1][i] | this.extra[4 + 1][i]) != 0) { //  bit1 is redundant
+     		  	thisHasNulls = true;
+     		}
+@@ -636,6 +694,8 @@ public FlowInfo copy() {
+ 		copy.nullBit3 = this.nullBit3;
+ 		copy.nullBit4 = this.nullBit4;
+ 	}
++	copy.iNBit = this.iNBit;
++	copy.iNNBit = this.iNNBit;
+ 	copy.tagBits = this.tagBits;
+ 	copy.maxFieldCount = this.maxFieldCount;
+ 	if (this.extra != null) {
+@@ -694,6 +754,8 @@ public UnconditionalFlowInfo discardNonFieldInitializations() {
+ 		this.nullBit2 &= mask;
+ 		this.nullBit3 &= mask;
+ 		this.nullBit4 &= mask;
++		this.iNBit &= mask;
++		this.iNNBit &= mask;
+ 	}
+ 	// use extra vector
+ 	if (this.extra == null) {
+@@ -1078,6 +1140,8 @@ public void markAsComparedEqualToNonNull(LocalVariableBinding local) {
+ 			}
+ 			this.nullBit1 |= mask;
+ 			this.nullBit3 |= mask;
++			// it was not null;
++			this.iNBit &= ~mask;
+ 			if (COVERAGE_TEST_FLAG) {
+ 				if (CoverageTestId == 15) {
+ 				  	this.nullBit4 = ~0;
+@@ -1136,6 +1200,8 @@ public void markAsComparedEqualToNonNull(LocalVariableBinding local) {
+   			}
+   			this.extra[1 + 1][vectorIndex] |= mask;
+   			this.extra[3 + 1][vectorIndex] |= mask;
++			// it was not null;
++			this.extra[IN][vectorIndex] &= ~mask;
+ 			if (COVERAGE_TEST_FLAG) {
+ 				if (CoverageTestId == 18) {
+ 				  	this.extra[5][vectorIndex] = ~0;
+@@ -1172,6 +1238,8 @@ public void markAsComparedEqualToNull(LocalVariableBinding local) {
+ 			}
+ 			this.nullBit1 |= mask;
+ 			this.nullBit2 |= mask;
++			// it was null;
++			this.iNNBit &= ~mask;
+ 			if (COVERAGE_TEST_FLAG) {
+ 				if (CoverageTestId == 19) {
+ 				  	this.nullBit4 = ~0;
+@@ -1228,6 +1296,8 @@ public void markAsComparedEqualToNull(LocalVariableBinding local) {
+ 			}
+ 			this.extra[1 + 1][vectorIndex] |= mask;
+ 			this.extra[2 + 1][vectorIndex] |= mask;
++			// it was null;
++			this.extra[INN][vectorIndex] &= ~mask;
+ 		}
+ 	}
+ }
+@@ -1297,6 +1367,9 @@ public void markAsDefinitelyNonNull(LocalVariableBinding local) {
+     		// clear others
+     		this.nullBit2 &= (mask = ~mask);
+     		this.nullBit4 &= mask;
++    		// old value no longer shining through
++    		this.iNBit &= mask;
++    		this.iNNBit &= mask;
+     		if (COVERAGE_TEST_FLAG) {
+     			if(CoverageTestId == 22) {
+ 	    		  	this.nullBit1 = 0;
+@@ -1328,6 +1401,9 @@ public void markAsDefinitelyNonNull(LocalVariableBinding local) {
+     		this.extra[4][vectorIndex] |= mask;
+     		this.extra[3][vectorIndex] &= (mask = ~mask);
+     		this.extra[5][vectorIndex] &= mask;
++    		// old value no longer shining through
++    		this.extra[IN][vectorIndex] &= mask;
++    		this.extra[INN][vectorIndex] &= mask;
+     		if (COVERAGE_TEST_FLAG) {
+     			if(CoverageTestId == 23) {
+ 	    			this.extra[2][vectorIndex] = 0;
+@@ -1351,6 +1427,9 @@ public void markAsDefinitelyNull(LocalVariableBinding local) {
+     		// clear others
+     		this.nullBit3 &= (mask = ~mask);
+     		this.nullBit4 &= mask;
++    		// old value no longer shining through
++    		this.iNBit &= mask;
++    		this.iNNBit &= mask;
+     		if (COVERAGE_TEST_FLAG) {
+     			if(CoverageTestId == 24) {
+ 	    		  	this.nullBit4 = ~0;
+@@ -1382,6 +1461,9 @@ public void markAsDefinitelyNull(LocalVariableBinding local) {
+     		this.extra[3][vectorIndex] |= mask;
+     		this.extra[4][vectorIndex] &= (mask = ~mask);
+     		this.extra[5][vectorIndex] &= mask;
++    		// old value no longer shining through
++    		this.extra[IN][vectorIndex] &= mask;
++    		this.extra[INN][vectorIndex] &= mask;
+     		if (COVERAGE_TEST_FLAG) {
+     			if(CoverageTestId == 25) {
+ 	    			this.extra[5][vectorIndex] = ~0;
+@@ -1412,6 +1494,9 @@ public void markAsDefinitelyUnknown(LocalVariableBinding local) {
+ 			// clear others
+ 			this.nullBit2 &= (mask = ~mask);
+ 			this.nullBit3 &= mask;
++    		// old value no longer shining through
++    		this.iNBit &= mask;
++    		this.iNNBit &= mask;
+ 			if (COVERAGE_TEST_FLAG) {
+ 				if(CoverageTestId == 26) {
+ 				  	this.nullBit4 = 0;
+@@ -1443,6 +1528,9 @@ public void markAsDefinitelyUnknown(LocalVariableBinding local) {
+ 			this.extra[5][vectorIndex] |= mask;
+ 			this.extra[3][vectorIndex] &= (mask = ~mask);
+ 			this.extra[4][vectorIndex] &= mask;
++    		// old value no longer shining through
++    		this.extra[IN][vectorIndex] &= mask;
++    		this.extra[INN][vectorIndex] &= mask;
+ 			if (COVERAGE_TEST_FLAG) {
+ 				if(CoverageTestId == 27) {
+ 					this.extra[5][vectorIndex] = 0;
+@@ -1463,6 +1551,8 @@ public void resetNullInfo(LocalVariableBinding local) {
+             this.nullBit2 &= mask;
+             this.nullBit3 &= mask;
+             this.nullBit4 &= mask;
++            this.iNBit &= mask;
++            this.iNNBit &= mask;
+         } else {
+     		// use extra vector
+     		int vectorIndex = (position / BitCacheSize) - 1;
+@@ -1476,6 +1566,8 @@ public void resetNullInfo(LocalVariableBinding local) {
+     		this.extra[3][vectorIndex] &= mask;
+     		this.extra[4][vectorIndex] &= mask;
+     		this.extra[5][vectorIndex] &= mask;
++    		this.extra[IN][vectorIndex] &= mask;
++    		this.extra[INN][vectorIndex] &= mask;
+     	}
+ 	}
+ }
+@@ -1675,6 +1767,8 @@ public UnconditionalFlowInfo mergedWith(UnconditionalFlowInfo otherInits) {
+ 		this.nullBit2 = otherInits.nullBit2;
+ 		this.nullBit3 = otherInits.nullBit3;
+ 		this.nullBit4 = otherInits.nullBit4;
++		this.iNBit = otherInits.iNBit;
++		this.iNNBit = otherInits.iNNBit;
+ 		thisHadNulls = false;
+ 		thisHasNulls = otherHasNulls;
+ 		this.tagBits = otherInits.tagBits;
+@@ -1719,11 +1813,15 @@ public UnconditionalFlowInfo mergedWith(UnconditionalFlowInfo otherInits) {
+     			}
+     		}
+     	}
++    	this.iNBit |= otherInits.iNBit;
++    	this.iNNBit |= otherInits.iNNBit;
+ 	} else if (otherHasNulls) { // only other had nulls
+   		this.nullBit1 = 0;
+   		this.nullBit2 = (b2 = otherInits.nullBit2) & (nb3 = ~(b3 = otherInits.nullBit3) | (nb1 = ~(b1 = otherInits.nullBit1)));
+   		this.nullBit3 = b3 & ((nb2 = ~b2) & (b4 = otherInits.nullBit4) | nb1) | b1 & nb2 & ~b4;
+   		this.nullBit4 = (nb3 | nb2) & nb1 & b4	| b1 & nb3 & nb2;
++  		this.iNBit |= otherInits.iNBit;
++  		this.iNNBit |= otherInits.iNNBit;
+   		if (COVERAGE_TEST_FLAG) {
+   			if(CoverageTestId == 32) {
+ 	  		  	this.nullBit4 = ~0;
+@@ -1788,6 +1886,8 @@ public UnconditionalFlowInfo mergedWith(UnconditionalFlowInfo otherInits) {
+ 			}
+ 			System.arraycopy(otherInits.extra[1], 0,
+ 				this.extra[1], 0, otherLength);
++			System.arraycopy(otherInits.extra[IN], 0, this.extra[IN], 0, otherLength);
++			System.arraycopy(otherInits.extra[INN], 0, this.extra[INN], 0, otherLength);
+ 			copyLimit = otherLength;
+ 			if (COVERAGE_TEST_FLAG) {
+ 				if(CoverageTestId == 36) {
+@@ -1841,6 +1941,8 @@ public UnconditionalFlowInfo mergedWith(UnconditionalFlowInfo otherInits) {
+                 			| na2 & b3 & b4
+                 			| a2 & (nb1 & b4 | a3 & na4 & b1) & nb3)
+                 	|nb1 & b2 & b3 & b4;
++    		this.extra[IN][i] |= otherInits.extra[IN][i];
++    		this.extra[INN][i] |= otherInits.extra[INN][i];
+ 			thisHasNulls = thisHasNulls ||
+ 				this.extra[3][i] != 0 ||
+ 				this.extra[4][i] != 0 ||
+@@ -1856,6 +1958,8 @@ public UnconditionalFlowInfo mergedWith(UnconditionalFlowInfo otherInits) {
+     		this.extra[2 + 1][i] = (b2 = otherInits.extra[2 + 1][i]) & (nb3 = ~(b3 = otherInits.extra[3 + 1][i]) | (nb1 = ~(b1 = otherInits.extra[1 + 1][i])));
+     		this.extra[3 + 1][i] = b3 & ((nb2 = ~b2) & (b4 = otherInits.extra[4 + 1][i]) | nb1) | b1 & nb2 & ~b4;
+     		this.extra[4 + 1][i] = (nb3 | nb2) & nb1 & b4	| b1 & nb3 & nb2;
++    		this.extra[IN][i] |= otherInits.extra[IN][i];
++    		this.extra[INN][i] |= otherInits.extra[INN][i];
+ 			thisHasNulls = thisHasNulls ||
+ 				this.extra[3][i] != 0 ||
+ 				this.extra[4][i] != 0 ||
+@@ -1912,6 +2016,9 @@ public UnconditionalFlowInfo nullInfoLessUnconditionalCopy() {
+ 	UnconditionalFlowInfo copy = new UnconditionalFlowInfo();
+ 	copy.definiteInits = this.definiteInits;
+ 	copy.potentialInits = this.potentialInits;
++	// no nullness known means: any previous nullness could shine through:
++	copy.iNBit = -1L;
++	copy.iNNBit = -1L;
+ 	copy.tagBits = this.tagBits & ~NULL_FLAG_MASK;
+ 	copy.maxFieldCount = this.maxFieldCount;
+ 	if (this.extra != null) {
+@@ -1925,6 +2032,9 @@ public UnconditionalFlowInfo nullInfoLessUnconditionalCopy() {
+ 		for (int j = 2; j < extraLength; j++) {
+ 			copy.extra[j] = new long[length];
+ 		}
++		// no nullness known means: any previous nullness could shine through:
++		Arrays.fill(copy.extra[IN], -1L);
++		Arrays.fill(copy.extra[INN], -1L);
+ 	}
+ 	return copy;
+ }
+@@ -1970,6 +2080,7 @@ public String toString(){
+ 				+ ", reachable:" + ((this.tagBits & UNREACHABLE) == 0) //$NON-NLS-1$
+ 				+", null: " + this.nullBit1 //$NON-NLS-1$
+ 					+ this.nullBit2 + this.nullBit3 + this.nullBit4
++				+", incoming: " + this.iNBit + this.iNNBit //$NON-NLS-1$
+ 				+">"; //$NON-NLS-1$
+ 		}
+ 		else {
+@@ -1985,7 +2096,8 @@ public String toString(){
+ 				def += "," + this.extra[0][i]; //$NON-NLS-1$
+ 				pot += "," + this.extra[1][i]; //$NON-NLS-1$
+ 				nullS += "," + this.extra[2][i] //$NON-NLS-1$
+-				    + this.extra[3][i] + this.extra[4][i] + this.extra[5][i];
++				    + this.extra[3][i] + this.extra[4][i] + this.extra[5][i]
++					+", incoming: " + this.extra[IN][i] + this.extra[INN]; //$NON-NLS-1$
+ 			}
+ 			if (ceil < this.extra[0].length) {
+ 				def += ",..."; //$NON-NLS-1$
+@@ -2045,6 +2157,8 @@ public UnconditionalFlowInfo unconditionalFieldLessCopy() {
+ 		copy.nullBit2 = this.nullBit2 & mask;
+ 		copy.nullBit3 = this.nullBit3 & mask;
+ 		copy.nullBit4 = this.nullBit4 & mask;
++		copy.iNBit = this.iNBit & mask;
++		copy.iNNBit = this.iNNBit & mask;
+ 	}
+ 	// use extra vector
+ 	if (this.extra == null) {

@@ -1,0 +1,538 @@
+commit 92675ec7751f7421e614b2503cd603a8a4f7d19e
+Author: Andrew Niefer <aniefer>
+Date:   Wed Mar 4 15:55:01 2009 +0000
+
+    bug 264724 - version advice
+
+40	10	bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AbstractPublisherAction.java
+10	29	bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/actions/RootIUAction.java
+45	9	bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/eclipse/ProductAction.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/ActionTest.java
+1	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/RootIUActionTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AbstractPublisherAction.java b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AbstractPublisherAction.java
+index dfd9f37..699d4b6 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AbstractPublisherAction.java
++++ b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AbstractPublisherAction.java
+@@ -23,6 +23,9 @@ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.processin
+ import org.eclipse.equinox.internal.provisional.p2.core.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory.InstallableUnitDescription;
++import org.eclipse.equinox.internal.provisional.p2.metadata.query.InstallableUnitQuery;
++import org.eclipse.equinox.internal.provisional.p2.metadata.query.LatestIUVersionQuery;
++import org.eclipse.equinox.internal.provisional.p2.query.*;
+ import org.eclipse.equinox.p2.publisher.actions.*;
+ import org.eclipse.equinox.spi.p2.publisher.PublisherHelper;
+ 
+@@ -131,7 +134,8 @@ public abstract class AbstractPublisherAction implements IPublisherAction {
+ 				result.add(MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, iu.getId(), range, iu.getFilter(), false, false));
+ 			} else if (next instanceof VersionedName) {
+ 				VersionedName name = (VersionedName) next;
+-				VersionRange range = new VersionRange(name.getVersion(), true, name.getVersion(), true);
++				Version version = name.getVersion();
++				VersionRange range = (version == null || Version.emptyVersion.equals(version)) ? VersionRange.emptyRange : new VersionRange(version, true, version, true);
+ 				String filter = getFilterAdvice(name);
+ 				result.add(MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, name.getId(), range, filter, false, false));
+ 			}
+@@ -305,14 +309,14 @@ public abstract class AbstractPublisherAction implements IPublisherAction {
+ 	 * as a base for relative paths. Then copying the zip into the repository.
+ 	 * @param descriptor used to identify the zip.
+ 	 * @param inclusion the file to be published. files can be <code>null</code> but no action is taken.
+-	 * @param info the publisher info.
++	 * @param publisherInfo the publisher info.
+ 	 */
+-	protected void publishArtifact(IArtifactDescriptor descriptor, File inclusion, IPublisherInfo info) {
++	protected void publishArtifact(IArtifactDescriptor descriptor, File inclusion, IPublisherInfo publisherInfo) {
+ 		// no files to publish so this is done.
+ 		if (inclusion == null)
+ 			return;
+ 		// if the destination already contains the descriptor, there is nothing to do.
+-		IArtifactRepository destination = info.getArtifactRepository();
++		IArtifactRepository destination = publisherInfo.getArtifactRepository();
+ 		if (destination == null || destination.contains(descriptor))
+ 			return;
+ 
+@@ -327,7 +331,7 @@ public abstract class AbstractPublisherAction implements IPublisherAction {
+ 		}
+ 
+ 		// if all we are doing is indexing things then add the descriptor and get on with it
+-		if ((info.getArtifactOptions() & IPublisherInfo.A_PUBLISH) == 0) {
++		if ((publisherInfo.getArtifactOptions() & IPublisherInfo.A_PUBLISH) == 0) {
+ 			destination.addDescriptor(descriptor);
+ 			return;
+ 		}
+@@ -362,19 +366,19 @@ public abstract class AbstractPublisherAction implements IPublisherAction {
+ 	 * @param descriptor used to identify the zip.
+ 	 * @param inclusions and folders to be included in the zip. files can be null.
+ 	 * @param exclusions and folders to be excluded in the zip. files can be null.
+-	 * @param info the publisher info.
++	 * @param publisherInfo the publisher info.
+ 	 * @param prefixComputer
+ 	 */
+-	protected void publishArtifact(IArtifactDescriptor descriptor, File[] inclusions, File[] exclusions, IPublisherInfo info, IPathComputer prefixComputer) {
++	protected void publishArtifact(IArtifactDescriptor descriptor, File[] inclusions, File[] exclusions, IPublisherInfo publisherInfo, IPathComputer prefixComputer) {
+ 		// no files to publish so this is done.
+ 		if (inclusions == null || inclusions.length < 1)
+ 			return;
+ 		// if the destination already contains the descriptor, there is nothing to do.
+-		IArtifactRepository destination = info.getArtifactRepository();
++		IArtifactRepository destination = publisherInfo.getArtifactRepository();
+ 		if (destination == null || destination.contains(descriptor))
+ 			return;
+ 		// if all we are doing is indexing things then add the descriptor and get on with it
+-		if ((info.getArtifactOptions() & IPublisherInfo.A_PUBLISH) == 0) {
++		if ((publisherInfo.getArtifactOptions() & IPublisherInfo.A_PUBLISH) == 0) {
+ 			destination.addDescriptor(descriptor);
+ 			return;
+ 		}
+@@ -404,6 +408,32 @@ public abstract class AbstractPublisherAction implements IPublisherAction {
+ 		}
+ 	}
+ 
+-	public abstract IStatus perform(IPublisherInfo info, IPublisherResult results, IProgressMonitor monitor);
++	/**
++	 * Loop over the known metadata repositories looking for the given IU.
++	 * Return the first IU found.
++	 * @param iuId  the id of the IU to look for
++	 * @return the first matching IU or <code>null</code> if none.
++	 */
++	protected IInstallableUnit queryForIU(IPublisherResult publisherResult, String iuId, Version version) {
++		Query query = null;
++		if (version != null && !Version.emptyVersion.equals(version))
++			query = new InstallableUnitQuery(iuId, version);
++		else
++			query = new CompositeQuery(new Query[] {new InstallableUnitQuery(iuId), new LatestIUVersionQuery()});
++
++		Collector collector = new Collector();
++		if (publisherResult != null)
++			collector = publisherResult.query(query, collector, null);
++		if (collector.isEmpty() && info.getMetadataRepository() != null)
++			collector = info.getMetadataRepository().query(query, collector, new NullProgressMonitor());
++		if (collector.isEmpty() && info.getContextMetadataRepository() != null)
++			collector = info.getContextMetadataRepository().query(query, collector, new NullProgressMonitor());
++
++		if (!collector.isEmpty())
++			return (IInstallableUnit) collector.iterator().next();
++		return null;
++	}
++
++	public abstract IStatus perform(IPublisherInfo publisherInfo, IPublisherResult results, IProgressMonitor monitor);
+ 
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/actions/RootIUAction.java b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/actions/RootIUAction.java
+index 1b0b77b..77fcb84 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/actions/RootIUAction.java
++++ b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/actions/RootIUAction.java
+@@ -17,8 +17,6 @@ import org.eclipse.equinox.internal.provisional.p2.core.Version;
+ import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory.InstallableUnitDescription;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.query.InstallableUnitQuery;
+-import org.eclipse.equinox.internal.provisional.p2.query.Collector;
+ import org.eclipse.equinox.p2.publisher.*;
+ import org.eclipse.equinox.spi.p2.publisher.PublisherHelper;
+ import org.eclipse.osgi.util.NLS;
+@@ -40,14 +38,14 @@ public class RootIUAction extends AbstractPublisherAction {
+ 		this.name = name;
+ 	}
+ 
+-	public IStatus perform(IPublisherInfo info, IPublisherResult results, IProgressMonitor monitor) {
+-		this.info = info;
++	public IStatus perform(IPublisherInfo publisherInfo, IPublisherResult results, IProgressMonitor monitor) {
++		this.info = publisherInfo;
+ 		return generateRootIU(results);
+ 	}
+ 
+ 	protected IStatus generateRootIU(IPublisherResult result) {
+ 		Collection children = getChildren(result);
+-		InstallableUnitDescription descriptor = createTopLevelIUDescription(children, id, version, name, null, false);
++		InstallableUnitDescription descriptor = createTopLevelIUDescription(children, null, false);
+ 		processCapabilityAdvice(descriptor, info);
+ 		processTouchpointAdvice(descriptor, null, info);
+ 		processInstallableUnitPropertiesAdvice(descriptor, info);
+@@ -111,9 +109,7 @@ public class RootIUAction extends AbstractPublisherAction {
+ 					// query the known metadata repos
+ 					if (object instanceof String) {
+ 						String childId = (String) object;
+-						IInstallableUnit iu = result.getIU(childId, null);
+-						if (iu == null)
+-							iu = queryFor(childId);
++						IInstallableUnit iu = queryForIU(result, childId, getVersionAdvice(childId));
+ 						if (iu != null)
+ 							children.add(iu);
+ 					} else if (object instanceof VersionedName) {
+@@ -125,23 +121,7 @@ public class RootIUAction extends AbstractPublisherAction {
+ 		return children;
+ 	}
+ 
+-	/**
+-	 * Loop over the known metadata repositories looking for the given IU.
+-	 * Return the first IU found.
+-	 * @param iuId  the id of the IU to look for
+-	 * @return the first matching IU or <code>null</code> if none.
+-	 */
+-	private IInstallableUnit queryFor(String iuId) {
+-		InstallableUnitQuery query = new InstallableUnitQuery(iuId, getVersionAdvice(iuId));
+-		if (info.getMetadataRepository() == null)
+-			return null;
+-		Collector result = info.getMetadataRepository().query(query, new Collector(), new NullProgressMonitor());
+-		if (!result.isEmpty())
+-			return (IInstallableUnit) result.iterator().next();
+-		return null;
+-	}
+-
+-	private InstallableUnitDescription createTopLevelIUDescription(Collection children, String id, Version version, String name, Collection requires, boolean configureLauncherData) {
++	private InstallableUnitDescription createTopLevelIUDescription(Collection children, Collection requires, boolean configureLauncherData) {
+ 		InstallableUnitDescription root = new MetadataFactory.InstallableUnitDescription();
+ 		root.setSingleton(true);
+ 		root.setId(id);
+@@ -172,10 +152,11 @@ public class RootIUAction extends AbstractPublisherAction {
+ 		for (Iterator i = versionAdvice.iterator(); i.hasNext();) {
+ 			IVersionAdvice advice = (IVersionAdvice) i.next();
+ 			// TODO have to figure a way to know the namespace here.  for now just look everywhere
+-			Version result = advice.getVersion(IVersionAdvice.NS_BUNDLE, iuID);
+-			if (result != null)
+-				return result;
+-			result = advice.getVersion(IVersionAdvice.NS_FEATURE, iuID);
++			Version result = advice.getVersion(IInstallableUnit.NAMESPACE_IU_ID, iuID);
++			if (result == null)
++				result = advice.getVersion(IVersionAdvice.NS_BUNDLE, iuID);
++			if (result == null)
++				result = advice.getVersion(IVersionAdvice.NS_FEATURE, iuID);
+ 			if (result != null)
+ 				return result;
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/eclipse/ProductAction.java b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/eclipse/ProductAction.java
+index afba020..724c097 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/eclipse/ProductAction.java
++++ b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/eclipse/ProductAction.java
+@@ -15,6 +15,7 @@ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.publisher.VersionedName;
+ import org.eclipse.equinox.internal.p2.publisher.eclipse.IProductDescriptor;
+ import org.eclipse.equinox.internal.provisional.p2.core.Version;
++import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.publisher.*;
+ import org.eclipse.equinox.p2.publisher.actions.*;
+ 
+@@ -29,6 +30,7 @@ public class ProductAction extends AbstractPublisherAction {
+ 	//protected String productLocation;
+ 	protected File executablesFeatureLocation;
+ 	protected IProductDescriptor product;
++	protected IPublisherResult publisherResults;
+ 
+ 	public ProductAction(String source, IProductDescriptor product, String flavor, File executablesFeatureLocation) {
+ 		super();
+@@ -39,7 +41,7 @@ public class ProductAction extends AbstractPublisherAction {
+ 		//this.productLocation = productLocation;
+ 	}
+ 
+-	protected IPublisherAction[] createActions() {
++	protected IPublisherAction[] createActions(IPublisherResult results) {
+ 		// generate the advice we can up front.
+ 		createAdvice();
+ 
+@@ -77,15 +79,16 @@ public class ProductAction extends AbstractPublisherAction {
+ 		return new JREAction((String) null);
+ 	}
+ 
+-	public IStatus perform(IPublisherInfo info, IPublisherResult results, IProgressMonitor monitor) {
++	public IStatus perform(IPublisherInfo publisherInfo, IPublisherResult results, IProgressMonitor monitor) {
+ 		monitor = SubMonitor.convert(monitor);
+-		this.info = info;
+-		IPublisherAction[] actions = createActions();
++		this.info = publisherInfo;
++		publisherResults = results;
++		IPublisherAction[] actions = createActions(results);
+ 		MultiStatus finalStatus = new MultiStatus(EclipseInstallAction.class.getName(), 0, "publishing result", null); //$NON-NLS-1$
+ 		for (int i = 0; i < actions.length; i++) {
+ 			if (monitor.isCanceled())
+ 				return Status.CANCEL_STATUS;
+-			finalStatus.merge(actions[i].perform(info, results, monitor));
++			finalStatus.merge(actions[i].perform(publisherInfo, results, monitor));
+ 		}
+ 		if (!finalStatus.isOK())
+ 			return finalStatus;
+@@ -117,9 +120,11 @@ public class ProductAction extends AbstractPublisherAction {
+ 	private void createRootAdvice() {
+ 		Collection list;
+ 		if (product.useFeatures())
+-			list = listElements(product.getFeatures(), ".feature.group"); //$NON-NLS-1$
++			// TODO: We need a real namespace here
++			list = versionElements(listElements(product.getFeatures(), ".feature.group"), IInstallableUnit.NAMESPACE_IU_ID); //$NON-NLS-1$ 
+ 		else
+-			list = listElements(product.getBundles(true), null);
++			//TODO: We need a real namespace here
++			list = versionElements(listElements(product.getBundles(true), null), IInstallableUnit.NAMESPACE_IU_ID);
+ 		info.addAdvice(new RootIUAdvice(list));
+ 	}
+ 
+@@ -133,13 +138,44 @@ public class ProductAction extends AbstractPublisherAction {
+ 			info.addAdvice(new ProductFileAdvice(product, configSpecs[i]));
+ 	}
+ 
++	private Collection versionElements(Collection elements, String namespace) {
++		Collection versionAdvice = info.getAdvice(null, true, null, null, IVersionAdvice.class);
++		List result = new ArrayList();
++		for (Iterator i = elements.iterator(); i.hasNext();) {
++			VersionedName element = (VersionedName) i.next();
++			if (element.getVersion() == null || Version.emptyVersion.equals(element.getVersion())) {
++				Iterator advice = versionAdvice.iterator();
++				Version advisedVersion = null;
++				while (advice.hasNext()) {
++					advisedVersion = ((VersionAdvice) advice.next()).getVersion(namespace, element.getId());
++					break;
++				}
++
++				if (advisedVersion != null) {
++					result.add(new VersionedName(element.getId(), advisedVersion));
++					continue;
++				}
++
++				//	no advice, find highest version
++				IInstallableUnit unit = queryForIU(publisherResults, element.getId(), null);
++				if (unit != null) {
++					result.add(unit);
++					continue;
++				}
++			}
++
++			result.add(element);
++		}
++		return result;
++	}
++
+ 	private Collection listElements(List elements, String suffix) {
+ 		if (suffix == null || suffix.length() == 0)
+ 			return elements;
+ 		ArrayList result = new ArrayList(elements.size());
+ 		for (Iterator i = elements.iterator(); i.hasNext();) {
+-			VersionedName name = (VersionedName) i.next();
+-			result.add(new VersionedName(name.getId() + suffix, name.getVersion()));
++			VersionedName elementName = (VersionedName) i.next();
++			result.add(new VersionedName(elementName.getId() + suffix, elementName.getVersion()));
+ 		}
+ 		return result;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/ActionTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/ActionTest.java
+index 571576c..d7de944 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/ActionTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/ActionTest.java
+@@ -167,7 +167,7 @@ public abstract class ActionTest extends AbstractProvisioningTest {
+ 	 * Do not call this method, it is called by <code>setupPublisherInfo</code>.
+ 	 */
+ 	protected void insertPublisherInfoBehavior() {
+-		//leave empty, for easy insertion of publisherInfo mock
++		expect(publisherInfo.getContextMetadataRepository()).andReturn(null).anyTimes();
+ 	}
+ 
+ 	public void cleanup() {
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/RootIUActionTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/RootIUActionTest.java
+index 65f30f1..09e9cd0 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/RootIUActionTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/publisher/actions/RootIUActionTest.java
+@@ -346,6 +346,7 @@ public class RootIUActionTest extends ActionTest {
+ 		expect(publisherInfo.getAdvice(null, false, rootIU, versionArg, IPropertyAdvice.class)).andReturn(new ArrayList()).anyTimes();
+ 		expect(publisherInfo.getAdvice(null, false, rootIU, versionArg, IAdditionalInstallableUnitAdvice.class)).andReturn(new ArrayList()).anyTimes();
+ 		expect(publisherInfo.getMetadataRepository()).andReturn(metadataRepository).anyTimes();
++		expect(publisherInfo.getContextMetadataRepository()).andReturn(null).anyTimes();
+ 	}
+ 
+ 	public void cleanup() {
+commit 26d3bcd27dd95b580c76bf1ed631b45539f68c23
+Author: Andrew Niefer <aniefer>
+Date:   Wed Mar 4 18:31:58 2009 +0000
+
+    bug 264724 - version advice
+
+28	0	bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/internal/p2/publisher/SingleElementCollector.java
+11	8	bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AbstractPublisherAction.java
+diff --git a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/internal/p2/publisher/SingleElementCollector.java b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/internal/p2/publisher/SingleElementCollector.java
+new file mode 100644
+index 0000000..31cc016
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/internal/p2/publisher/SingleElementCollector.java
+@@ -0,0 +1,28 @@
++/*******************************************************************************
++ * Copyright (c) 2009 IBM Corporation and others. All rights reserved. This
++ * program and the accompanying materials are made available under the terms of
++ * the Eclipse Public License v1.0 which accompanies this distribution, and is
++ * available at http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors: IBM Corporation - initial API and implementation
++ ******************************************************************************/
++package org.eclipse.equinox.internal.p2.publisher;
++
++import org.eclipse.equinox.internal.provisional.p2.query.Collector;
++
++/**
++ * Collect a single element and stop the Query
++ */
++public class SingleElementCollector extends Collector {
++
++	public boolean accept(Object object) {
++		super.accept(object);
++		return false;
++	}
++
++	public Object getElement() {
++		if (!isEmpty())
++			return iterator().next();
++		return null;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AbstractPublisherAction.java b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AbstractPublisherAction.java
+index 699d4b6..d3b560e 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AbstractPublisherAction.java
++++ b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/AbstractPublisherAction.java
+@@ -16,8 +16,7 @@ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.core.helpers.FileUtils.IPathComputer;
+-import org.eclipse.equinox.internal.p2.publisher.Activator;
+-import org.eclipse.equinox.internal.p2.publisher.VersionedName;
++import org.eclipse.equinox.internal.p2.publisher.*;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.*;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.processing.ProcessingStepDescriptor;
+ import org.eclipse.equinox.internal.provisional.p2.core.*;
+@@ -416,18 +415,22 @@ public abstract class AbstractPublisherAction implements IPublisherAction {
+ 	 */
+ 	protected IInstallableUnit queryForIU(IPublisherResult publisherResult, String iuId, Version version) {
+ 		Query query = null;
+-		if (version != null && !Version.emptyVersion.equals(version))
++		Collector collector = null;
++		if (version != null && !Version.emptyVersion.equals(version)) {
+ 			query = new InstallableUnitQuery(iuId, version);
+-		else
++			collector = new SingleElementCollector();
++		} else {
+ 			query = new CompositeQuery(new Query[] {new InstallableUnitQuery(iuId), new LatestIUVersionQuery()});
++			collector = new Collector();
++		}
+ 
+-		Collector collector = new Collector();
++		NullProgressMonitor progress = new NullProgressMonitor();
+ 		if (publisherResult != null)
+-			collector = publisherResult.query(query, collector, null);
++			collector = publisherResult.query(query, collector, progress);
+ 		if (collector.isEmpty() && info.getMetadataRepository() != null)
+-			collector = info.getMetadataRepository().query(query, collector, new NullProgressMonitor());
++			collector = info.getMetadataRepository().query(query, collector, progress);
+ 		if (collector.isEmpty() && info.getContextMetadataRepository() != null)
+-			collector = info.getContextMetadataRepository().query(query, collector, new NullProgressMonitor());
++			collector = info.getContextMetadataRepository().query(query, collector, progress);
+ 
+ 		if (!collector.isEmpty())
+ 			return (IInstallableUnit) collector.iterator().next();
+commit bcaf8235e6f8558fda3b1f47d5e5f273e164d68c
+Author: Andrew Niefer <aniefer>
+Date:   Fri Mar 6 16:23:56 2009 +0000
+
+    bug 264724 - product advice
+
+6	0	bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/actions/VersionAdvice.java
+36	2	bundles/org.eclipse.equinox.p2.publisher/src_ant/org/eclipse/equinox/internal/p2/publisher/ant/ProductPublisherTask.java
+diff --git a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/actions/VersionAdvice.java b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/actions/VersionAdvice.java
+index bede8cf..3777fe2 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/actions/VersionAdvice.java
++++ b/bundles/org.eclipse.equinox.p2.publisher/src/org/eclipse/equinox/p2/publisher/actions/VersionAdvice.java
+@@ -28,6 +28,10 @@ public class VersionAdvice extends AbstractAdvice implements IVersionAdvice {
+ 	 * @param location the location of the mapping file
+ 	 */
+ 	public void load(String namespace, String location) {
++		load(namespace, location, null);
++	}
++
++	public void load(String namespace, String location, String idSuffix) {
+ 		if (namespace == null)
+ 			namespace = "null"; //$NON-NLS-1$
+ 		Properties properties = new Properties();
+@@ -52,6 +56,8 @@ public class VersionAdvice extends AbstractAdvice implements IVersionAdvice {
+ 			Enumeration enumeration = properties.keys();
+ 			while (enumeration.hasMoreElements()) {
+ 				String key = (String) enumeration.nextElement();
++				if (idSuffix != null)
++					key += idSuffix;
+ 				String value = properties.getProperty(key);
+ 				setVersion(namespace, key, new Version(value));
+ 			}
+diff --git a/bundles/org.eclipse.equinox.p2.publisher/src_ant/org/eclipse/equinox/internal/p2/publisher/ant/ProductPublisherTask.java b/bundles/org.eclipse.equinox.p2.publisher/src_ant/org/eclipse/equinox/internal/p2/publisher/ant/ProductPublisherTask.java
+index 5d91b4c..ba8cc48 100644
+--- a/bundles/org.eclipse.equinox.p2.publisher/src_ant/org/eclipse/equinox/internal/p2/publisher/ant/ProductPublisherTask.java
++++ b/bundles/org.eclipse.equinox.p2.publisher/src_ant/org/eclipse/equinox/internal/p2/publisher/ant/ProductPublisherTask.java
+@@ -9,14 +9,15 @@
+ package org.eclipse.equinox.internal.p2.publisher.ant;
+ 
+ import java.io.File;
+-import java.util.ArrayList;
+-import java.util.List;
++import java.util.*;
+ import org.apache.tools.ant.BuildException;
+ import org.eclipse.core.runtime.NullProgressMonitor;
+ import org.eclipse.equinox.internal.p2.publisher.eclipse.IProductDescriptor;
+ import org.eclipse.equinox.internal.p2.publisher.eclipse.ProductFile;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.publisher.*;
++import org.eclipse.equinox.p2.publisher.actions.VersionAdvice;
+ import org.eclipse.equinox.p2.publisher.eclipse.ProductAction;
+ 
+ public class ProductPublisherTask extends AbstractPublishTask {
+@@ -43,11 +44,25 @@ public class ProductPublisherTask extends AbstractPublishTask {
+ 		}
+ 	}
+ 
++	public static class AdviceElement {
++		public String kind;
++		public String file;
++
++		public void setKind(String kind) {
++			this.kind = kind;
++		}
++
++		public void setFile(String file) {
++			this.file = file;
++		}
++	}
++
+ 	private String flavor;
+ 	private String productFile;
+ 	private String executables;
+ 	private String source;
+ 	private List configurations = new ArrayList(3);
++	private List advice = new ArrayList(3);
+ 
+ 	public void execute() throws BuildException {
+ 		try {
+@@ -79,9 +94,24 @@ public class ProductPublisherTask extends AbstractPublishTask {
+ 
+ 		PublisherInfo info = super.getInfo();
+ 		info.setConfigurations(configStrings);
++		processAdvice(info);
+ 		return info;
+ 	}
+ 
++	protected void processAdvice(PublisherInfo info) {
++		for (Iterator iterator = advice.iterator(); iterator.hasNext();) {
++			AdviceElement element = (AdviceElement) iterator.next();
++			if (element.kind == null || element.file == null)
++				continue;
++
++			if (element.kind.equals("featureVersions") || element.kind.equals("pluginVersions")) { //$NON-NLS-1$ //$NON-NLS-2$
++				VersionAdvice versionAdvice = new VersionAdvice();
++				versionAdvice.load(IInstallableUnit.NAMESPACE_IU_ID, element.file, element.kind.startsWith("features") ? ".feature.group" : null); //$NON-NLS-1$ //$NON-NLS-2$
++				info.addAdvice(versionAdvice);
++			}
++		}
++	}
++
+ 	public void setFlavor(String flavor) {
+ 		this.flavor = flavor;
+ 	}
+@@ -102,4 +132,8 @@ public class ProductPublisherTask extends AbstractPublishTask {
+ 		this.configurations.add(config);
+ 	}
+ 
++	public void addConfiguredAdvice(AdviceElement element) {
++		this.advice.add(element);
++	}
++
+ }

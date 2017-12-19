@@ -1,0 +1,927 @@
+commit 5138a70372af4817aefdd3da44dfadf7f7557bf3
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Mon Feb 4 03:38:52 2013 -0500
+
+    Bug 399224: Implementation to compute functional descriptor of
+    interfaces.
+
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+14	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
+12	21	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodVerifier.java
+0	8	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodVerifier15.java
+62	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+158	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+index 53008ed..1bc88f7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+@@ -47,7 +47,7 @@ public abstract class FunctionalExpression extends Expression {
+ 	
+ 	public /* @NonNull */ TypeBinding resolveType(BlockScope blockScope) {
+ 		this.constant = Constant.NotAConstant;
+-		this.singleAbstractMethod = this.expectedType == null ? null : this.expectedType.getSingleAbstractMethod();
++		this.singleAbstractMethod = this.expectedType == null ? null : this.expectedType.getSingleAbstractMethod(blockScope);
+ 		if (this.singleAbstractMethod == null || !this.singleAbstractMethod.isValidBinding()) {
+ 			blockScope.problemReporter().targetTypeIsNotAFunctionalInterface(this);
+ 			char [][] name = this.expectedType == null ? CharOperation.NO_CHAR_CHAR : CharOperation.splitOn('.', this.expectedType.shortReadableName());
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
+index 352e279..79f758b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -1183,4 +1183,17 @@ public boolean hasNonNullDefault() {
+ 		return false;
+ 	return this.declaringClass.hasNonNullDefault();
+ }
++
++public boolean redeclaresPublicObjectMethod(Scope scope) {
++	ReferenceBinding javaLangObject = scope.getJavaLangObject();
++	MethodBinding [] methods = javaLangObject.getMethods(this.selector);
++	for (int i = 0, length = methods == null ? 0 : methods.length; i < length; i++) {
++		final MethodBinding method = methods[i];
++		if (!method.isPublic() || method.isStatic() || method.parameters.length != this.parameters.length) 
++			continue;
++		if (MethodVerifier.doesMethodOverride(this, method, scope.environment())) 
++			return true;
++	}
++	return false;
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodVerifier.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodVerifier.java
+index bb91b37..2f260c8 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodVerifier.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodVerifier.java
+@@ -39,8 +39,7 @@ public abstract class MethodVerifier extends ImplicitNullAnnotationVerifier {
+ 	HashtableOfObject inheritedMethods;
+ 	HashtableOfObject currentMethods;
+ 	LookupEnvironment environment;
+-	private boolean allowCompatibleReturnTypes;
+-/*
++	/*
+ Binding creation is responsible for reporting all problems with types:
+ 	- all modifier problems (duplicates & multiple visibility modifiers + incompatible combinations - abstract/final)
+ 		- plus invalid modifiers given the context (the verifier did not do this before)
+@@ -63,9 +62,6 @@ MethodVerifier(LookupEnvironment environment) {
+ 	this.inheritedMethods = null;
+ 	this.currentMethods = null;
+ 	this.environment = environment;
+-	this.allowCompatibleReturnTypes =
+-		environment.globalOptions.complianceLevel >= ClassFileConstants.JDK1_5
+-			&& environment.globalOptions.sourceLevel < ClassFileConstants.JDK1_5;
+ }
+ boolean areMethodsCompatible(MethodBinding one, MethodBinding two) {
+ 	return areMethodsCompatible(one, two, this.environment);
+@@ -81,26 +77,21 @@ static boolean areMethodsCompatible(MethodBinding one, MethodBinding two, Lookup
+ 	return isParameterSubsignature(one, two, environment);
+ }
+ boolean areReturnTypesCompatible(MethodBinding one, MethodBinding two) {
++	return areReturnTypesCompatible(one, two, this.type.scope.environment());
++}
++static boolean areReturnTypesCompatible(MethodBinding one, MethodBinding two, LookupEnvironment environment) {
+ 	if (one.returnType == two.returnType) return true;
++	if (environment.globalOptions.sourceLevel >= ClassFileConstants.JDK1_5) {
++		// short is compatible with int, but as far as covariance is concerned, its not
++		if (one.returnType.isBaseType()) return false;
+ 
+-	if (areTypesEqual(one.returnType, two.returnType)) return true;
++		if (!one.declaringClass.isInterface() && one.declaringClass.id == TypeIds.T_JavaLangObject)
++			return two.returnType.isCompatibleWith(one.returnType); // interface methods inherit from Object
+ 
+-	// when sourceLevel < 1.5 but compliance >= 1.5, allow return types in binaries to be compatible instead of just equal
+-	if (this.allowCompatibleReturnTypes &&
+-			one.declaringClass instanceof BinaryTypeBinding &&
+-			two.declaringClass instanceof BinaryTypeBinding) {
+-		return areReturnTypesCompatible0(one, two);
++		return one.returnType.isCompatibleWith(two.returnType);
++	} else {
++		return areTypesEqual(one.returnType.erasure(), two.returnType.erasure());
+ 	}
+-	return false;
+-}
+-boolean areReturnTypesCompatible0(MethodBinding one, MethodBinding two) {
+-	// short is compatible with int, but as far as covariance is concerned, its not
+-	if (one.returnType.isBaseType()) return false;
+-
+-	if (!one.declaringClass.isInterface() && one.declaringClass.id == TypeIds.T_JavaLangObject)
+-		return two.returnType.isCompatibleWith(one.returnType); // interface methods inherit from Object
+-
+-	return one.returnType.isCompatibleWith(two.returnType);
+ }
+ boolean canSkipInheritedMethods() {
+ 	if (this.type.superclass() != null && this.type.superclass().isAbstract())
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodVerifier15.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodVerifier15.java
+index 2aa6f10..c1c3eff 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodVerifier15.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodVerifier15.java
+@@ -40,14 +40,6 @@ class MethodVerifier15 extends MethodVerifier {
+ MethodVerifier15(LookupEnvironment environment) {
+ 	super(environment);
+ }
+-boolean areReturnTypesCompatible(MethodBinding one, MethodBinding two) {
+-	if (one.returnType == two.returnType) return true;
+-	if (this.type.scope.compilerOptions().sourceLevel >= ClassFileConstants.JDK1_5) {
+-		return areReturnTypesCompatible0(one, two);
+-	} else {
+-		return areTypesEqual(one.returnType.erasure(), two.returnType.erasure());
+-	}
+-}
+ // Given `overridingMethod' which overrides `inheritedMethod' answer whether some subclass method that
+ // differs in erasure from overridingMethod could override `inheritedMethod'
+ protected boolean canOverridingMethodDifferInErasure(MethodBinding overridingMethod, MethodBinding inheritedMethod) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+index b99b044..296e732 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2005, 2012 IBM Corporation and others.
++ * Copyright (c) 2005, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -1147,4 +1147,65 @@ public class ParameterizedTypeBinding extends ReferenceBinding implements Substi
+ 	public FieldBinding[] unResolvedFields() {
+ 		return this.fields;
+ 	}
++	public MethodBinding getSingleAbstractMethod(final Scope scope) {
++		MethodBinding theAbstractMethod = genericType().getSingleAbstractMethod(scope);
++		if (theAbstractMethod == null || !theAbstractMethod.isValidBinding())
++			return theAbstractMethod;
++		
++		TypeBinding [] typeArguments = this.arguments; // A1 ... An 
++		TypeVariableBinding [] typeParameters = genericType().typeVariables(); // P1 ... Pn
++		TypeBinding [] types = new TypeBinding[typeArguments.length];  // T1 ... Tn
++		for (int i = 0, length = typeArguments.length; i < length; i++) {
++			TypeBinding typeArgument = typeArguments[i];
++			switch (typeArgument.kind()) {
++				case Binding.WILDCARD_TYPE :
++					WildcardBinding wildcard = (WildcardBinding) typeArgument;
++					switch(wildcard.boundKind) {
++	    				case Wildcard.EXTENDS :
++	    				case Wildcard.SUPER :
++	    					types[i] = wildcard.bound;
++	    					break;
++	    				case Wildcard.UNBOUND :
++	    					// if Pi has upper bound Bi that mentions none of P1...Pn, then Ti = Bi; otherwise, Ti = Object
++	    					final TypeBinding upperBound = typeParameters[i].firstBound;
++							if (upperBound == null || typeParametersMentioned(upperBound)) {
++	    						types[i] = scope.getJavaLangObject();
++	    					} else {
++	    						types[i] = upperBound;
++	    					}
++	    					break;
++					}
++					break;
++				default :
++					types[i] = typeArgument;
++					break;
++			}
++			if (typeParameters[i].boundCheck(null, types[i]) != TypeConstants.OK)
++				return this.singleAbstractMethod = new ProblemMethodBinding(TypeConstants.ANONYMOUS_METHOD, null, ProblemReasons.NoSuchSingleAbstractMethod);
++		}
++		ParameterizedTypeBinding parameterizedType = scope.environment().createParameterizedType(genericType(), types, this.enclosingType);
++		return this.singleAbstractMethod = new ParameterizedMethodBinding(parameterizedType, theAbstractMethod);
++	}
++
++	private boolean typeParametersMentioned(TypeBinding upperBound) {
++		class MentionListener implements Substitution {
++			private boolean typeParametersMentioned = false;
++			public TypeBinding substitute(TypeVariableBinding typeVariable) {
++				this.typeParametersMentioned = true;
++				return typeVariable;
++			}
++			public boolean isRawSubstitution() {
++				return false;
++			}
++			public LookupEnvironment environment() {
++				return null;
++			}
++			public boolean typeParametersMentioned() {
++				return this.typeParametersMentioned;
++			}
++		}
++		MentionListener mentionListener = new MentionListener();
++		Scope.substitute(mentionListener, upperBound);
++		return mentionListener.typeParametersMentioned();
++	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+index 50e168d..4041937 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+@@ -28,6 +28,7 @@ import java.util.Arrays;
+ import java.util.Comparator;
+ 
+ import org.eclipse.jdt.core.compiler.CharOperation;
++import org.eclipse.jdt.core.compiler.InvalidInputException;
+ import org.eclipse.jdt.internal.compiler.ast.MethodDeclaration;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+@@ -56,7 +57,7 @@ abstract public class ReferenceBinding extends TypeBinding {
+ 	private SimpleLookupTable compatibleCache;
+ 
+ 	int typeBits; // additional bits characterizing this type
+-	private MethodBinding singleAbstractMethod;
++	protected MethodBinding singleAbstractMethod;
+ 
+ 	public static final ReferenceBinding LUB_GENERIC = new ReferenceBinding() { /* used for lub computation */
+ 		public boolean hasTypeBit(int bit) { return false; }
+@@ -1578,15 +1579,167 @@ protected int applyCloseableWhitelists() {
+ 	return 0;
+ }
+ 
+-public MethodBinding getSingleAbstractMethod() {
++
++private MethodBinding [] getInterfaceAbstractContracts(Scope scope) throws InvalidInputException {
++	
++	if (!isInterface() || !isValidBinding()) {
++		throw new InvalidInputException("Not a functional interface"); //$NON-NLS-1$
++	}
++	
++	MethodBinding [] methods = methods();
++	MethodBinding [] contracts = new MethodBinding[0];
++	int contractsCount = 0;
++	int contractsLength = 0;
++	MethodBinding aContract = null;
++	int contractParameterLength = 0;
++	char [] contractSelector = null;
++	
++	for (int i = 0, length = methods == null ? 0 : methods.length; i < length; i++) {
++		final MethodBinding method = methods[i];
++		if (!method.isAbstract() || method.redeclaresPublicObjectMethod(scope)) continue; // skips statics, defaults, public object methods ...
++		final boolean validBinding = method.isValidBinding();
++		if (aContract == null && validBinding) {
++			aContract = method;
++			contractParameterLength = aContract.parameters.length;
++			contractSelector = aContract.selector;
++		} else {
++			if (!validBinding || method.parameters.length != contractParameterLength || !CharOperation.equals(contractSelector, method.selector)) {
++				throw new InvalidInputException("Not a functional interface"); //$NON-NLS-1$
++			}
++		}
++		if (contractsCount == contractsLength) {
++			System.arraycopy(contracts, 0, contracts = new MethodBinding[contractsLength += 16], 0, contractsCount);
++		}
++		contracts[contractsCount++] = method;
++	}
++	ReferenceBinding [] superInterfaces = superInterfaces();
++	for (int i = 0, length = superInterfaces.length; i < length; i++) {
++		MethodBinding [] superInterfaceContracts = superInterfaces[i].getInterfaceAbstractContracts(scope);
++		final int superInterfaceContractsLength = superInterfaceContracts == null  ? 0 : superInterfaceContracts.length;
++		
++		if (superInterfaceContractsLength == 0) continue;
++		if (aContract == null) {
++			aContract = superInterfaceContracts[0];
++			contractParameterLength = aContract.parameters.length;
++			contractSelector = aContract.selector;
++			contracts = superInterfaceContracts;
++			contractsCount = contractsLength = superInterfaceContractsLength;
++		} else {
++			if (superInterfaceContracts[0].parameters.length != contractParameterLength || !CharOperation.equals(contractSelector, superInterfaceContracts[0].selector)) {
++				throw new InvalidInputException("Not a functional interface"); //$NON-NLS-1$
++			}
++			if (contractsLength < contractsCount + superInterfaceContractsLength) {
++				System.arraycopy(contracts, 0, contracts = new MethodBinding[contractsLength = contractsCount + superInterfaceContractsLength], 0, contractsCount);
++			}
++			System.arraycopy(superInterfaceContracts, 0, contracts, contractsCount,	superInterfaceContractsLength);
++			contractsCount += superInterfaceContractsLength;
++		}
++	}
++	if (contractsCount < contractsLength) {
++		System.arraycopy(contracts, 0, contracts = new MethodBinding[contractsCount], 0, contractsCount);
++	}
++	return contracts;
++}
++public MethodBinding getSingleAbstractMethod(Scope scope) {
+ 	
+ 	if (this.singleAbstractMethod != null) {
+ 		return this.singleAbstractMethod;
+ 	}
+-	MethodBinding [] methods;
+-	if (!isInterface() || (methods = methods()).length != 1) {
++
++	MethodBinding[] methods = null;
++	try {
++		methods = getInterfaceAbstractContracts(scope);
++	} catch (InvalidInputException e) {
+ 		return this.singleAbstractMethod = new ProblemMethodBinding(TypeConstants.ANONYMOUS_METHOD, null, ProblemReasons.NoSuchSingleAbstractMethod);
+ 	}
+-	return this.singleAbstractMethod = methods[0];
++	if (methods != null && methods.length == 1)
++		return this.singleAbstractMethod = methods[0];
++	
++	final LookupEnvironment environment = scope.environment();
++	boolean genericMethodSeen = false;
++	next:for (int i = 0, length = methods.length; i < length; i++) {
++		MethodBinding method = methods[i], otherMethod = null;
++		if (method.typeVariables != Binding.NO_TYPE_VARIABLES)
++			genericMethodSeen = true;
++		for (int j = 0; j < length; j++) {
++			if (i == j) continue;
++			otherMethod = methods[j];
++			if (otherMethod.typeVariables != Binding.NO_TYPE_VARIABLES)
++				genericMethodSeen = true;
++			if (!MethodVerifier.isParameterSubsignature(method, otherMethod, environment) || !MethodVerifier.areReturnTypesCompatible(method, otherMethod, environment)) 
++				continue next; 
++		}
++		// If we reach here, we found a method that is override equivalent with every other method and is also return type substitutable. Compute kosher exceptions now ...
++		ReferenceBinding [] exceptions = new ReferenceBinding[0];
++		int exceptionsCount = 0, exceptionsLength = 0;
++		final MethodBinding theAbstractMethod = method;
++		boolean shouldEraseThrows = theAbstractMethod.typeVariables == Binding.NO_TYPE_VARIABLES && genericMethodSeen;
++		boolean shouldAdaptThrows = theAbstractMethod.typeVariables != Binding.NO_TYPE_VARIABLES;
++		final int typeVariableLength = theAbstractMethod.typeVariables.length;
++		
++		none:for (i = 0; i < length; i++) {
++			method = methods[i];
++			ReferenceBinding[] methodThrownExceptions = method.thrownExceptions;
++			int methodExceptionsLength = methodThrownExceptions == null ? 0: methodThrownExceptions.length;
++			if (methodExceptionsLength == 0) break none;
++			if (shouldAdaptThrows && method != theAbstractMethod) {
++				System.arraycopy(methodThrownExceptions, 0, methodThrownExceptions = new ReferenceBinding[methodExceptionsLength], 0, methodExceptionsLength);
++				for (int tv = 0; tv < typeVariableLength; tv++) {
++					if (methodThrownExceptions[tv] instanceof TypeVariableBinding) {
++						methodThrownExceptions[tv] = theAbstractMethod.typeVariables[tv];
++					}
++				}
++			}
++			nextException: for (int j = 0; j < methodExceptionsLength; j++) {
++				ReferenceBinding methodException = methodThrownExceptions[j];
++				if (shouldEraseThrows)
++					methodException = (ReferenceBinding) methodException.erasure();
++				nextMethod: for (int k = 0; k < length; k++) {
++					if (i == k) continue;
++					otherMethod = methods[k];
++					ReferenceBinding[] otherMethodThrownExceptions = otherMethod.thrownExceptions;
++					int otherMethodExceptionsLength =  otherMethodThrownExceptions == null ? 0 : otherMethodThrownExceptions.length;
++					if (otherMethodExceptionsLength == 0) break none;
++					if (shouldAdaptThrows && otherMethod != theAbstractMethod) {
++						System.arraycopy(otherMethodThrownExceptions, 
++								0, 
++								otherMethodThrownExceptions = new ReferenceBinding[otherMethodExceptionsLength], 
++								0, 
++								otherMethodExceptionsLength);
++						for (int tv = 0; tv < typeVariableLength; tv++) {
++							if (otherMethodThrownExceptions[tv] instanceof TypeVariableBinding) {
++								otherMethodThrownExceptions[tv] = theAbstractMethod.typeVariables[tv];
++							}
++						}
++					}
++					for (int l = 0; l < otherMethodExceptionsLength; l++) {
++						ReferenceBinding otherException = otherMethodThrownExceptions[l];
++						if (shouldEraseThrows)
++							otherException = (ReferenceBinding) otherException.erasure();
++						if (methodException.isCompatibleWith(otherException))
++							continue nextMethod;
++					}
++					continue nextException;
++				}
++				// If we reach here, method exception or its super type is covered by every throws clause.
++				if (exceptionsCount == exceptionsLength) {
++					System.arraycopy(exceptions, 0, exceptions = new ReferenceBinding[exceptionsLength += 16], 0, exceptionsCount);
++				}
++				exceptions[exceptionsCount++] = methodException;
++			}
++		}
++		if (exceptionsCount != exceptionsLength) {
++			System.arraycopy(exceptions, 0, exceptions = new ReferenceBinding[exceptionsCount], 0, exceptionsCount);
++		}
++		this.singleAbstractMethod = new MethodBinding(theAbstractMethod.modifiers, 
++				theAbstractMethod.selector, 
++				theAbstractMethod.returnType, 
++				theAbstractMethod.parameters, 
++				exceptions, 
++				theAbstractMethod.declaringClass);
++	    this.singleAbstractMethod.typeVariables = theAbstractMethod.typeVariables;
++		return this.singleAbstractMethod;
++	}
++	return this.singleAbstractMethod = new ProblemMethodBinding(TypeConstants.ANONYMOUS_METHOD, null, ProblemReasons.NoSuchSingleAbstractMethod);
+ }
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
+index d737230..35d9fa0 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
+@@ -1230,10 +1230,11 @@ public TypeVariableBinding[] typeVariables() {
+ 
+ /**
+  * Return the single abstract method of a functional interface, or null, if the receiver is not a functional interface as defined in JLS 9.8.
++ * @param scope scope
+  *  
+  * @return The single abstract method of a functional interface, or null, if the receiver is not a functional interface. 
+  */
+-public MethodBinding getSingleAbstractMethod() {
++public MethodBinding getSingleAbstractMethod(Scope scope) {
+ 	return null;
+ }
+ 
+commit 0848b8a6a9afff16623dfc6b0821adb833326b41
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Thu Feb 7 06:13:12 2013 -0500
+
+    Fixed Bug 399224 - [1.8][compiler][internal] Implement
+    TypeBinding.getSingleAbstractMethod
+
+2	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+215	11	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+6	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+11	7	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+7	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+13	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+1	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+index 1ccfaa5..88bebdc 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+@@ -762,6 +762,7 @@ public void test011_problem_categories() {
+ 		expectedProblemAttributes.put("NeedToEmulateMethodAccess", new ProblemAttributes(CategorizedProblem.CAT_CODE_STYLE));
+ 		expectedProblemAttributes.put("NoAdditionalBoundAfterTypeVariable", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+ 		expectedProblemAttributes.put("NoFieldOnBaseType", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
++		expectedProblemAttributes.put("NoGenericLambda", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+ 		expectedProblemAttributes.put("NoImplicitStringConversionForCharArrayExpression", new ProblemAttributes(CategorizedProblem.CAT_POTENTIAL_PROGRAMMING_PROBLEM));
+ 		expectedProblemAttributes.put("NoMessageSendOnArrayType", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+ 		expectedProblemAttributes.put("NoMessageSendOnBaseType", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+@@ -1503,6 +1504,7 @@ public void test012_compiler_problems_tuning() {
+ 		expectedProblemAttributes.put("NeedToEmulateMethodAccess", new ProblemAttributes(JavaCore.COMPILER_PB_SYNTHETIC_ACCESS_EMULATION));
+ 		expectedProblemAttributes.put("NoAdditionalBoundAfterTypeVariable", SKIP);
+ 		expectedProblemAttributes.put("NoFieldOnBaseType", SKIP);
++		expectedProblemAttributes.put("NoGenericLambda", SKIP);
+ 		expectedProblemAttributes.put("NoImplicitStringConversionForCharArrayExpression", new ProblemAttributes(JavaCore.COMPILER_PB_CHAR_ARRAY_IN_STRING_CONCATENATION));
+ 		expectedProblemAttributes.put("NoMessageSendOnArrayType", SKIP);
+ 		expectedProblemAttributes.put("NoMessageSendOnBaseType", SKIP);
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+index 35d2cc7..ada6fca 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+@@ -17,6 +17,10 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.core.tests.compiler.regression;
+ 
++import java.util.Map;
++
++import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
++
+ import junit.framework.Test;
+ public class NegativeLambdaExpressionsTest extends AbstractRegressionTest {
+ 
+@@ -1428,10 +1432,12 @@ public void test040() {
+ 			"}\n"
+ 			},
+ 			"----------\n" + 
+-			"1. ERROR in X.java (at line 11)\n" + 
+-			"	throw new Exception(); \n" + 
+-			"	^^^^^^^^^^^^^^^^^^^^^^\n" + 
+-			"Unhandled exception type Exception\n" + 
++			"1. ERROR in X.java (at line 10)\n" + 
++			"	G g1 = () -> {\n" + 
++			"	    throw new Exception(); \n" + 
++			"	};\n" + 
++			"	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
++			"Illegal lambda expression: Method m of type J is generic \n" + 
+ 			"----------\n");
+ }
+ // https://bugs.eclipse.org/bugs/show_bug.cgi?id=399537 - [1.8][compiler] Exceptions thrown from lambda body must match specification per function descriptor 
+@@ -1450,7 +1456,7 @@ public void test041() {
+ 			"interface G extends G1, G2 {} // G has descriptor <F extends Exception> ()->String throws F\n" +
+ 			"public class X {\n" +
+ 			"	G g = (x) -> { // Elided type is inferred from descriptor to be F\n" +
+-			"	    throw x;    // ~== throw new F()\n" + // javac 8b74 complains here.
++			"	    throw x;    // ~== throw new F()\n" +
+ 			"	};\n" +
+ 			"}\n" +
+ 			"class Y implements G {\n" +
+@@ -1467,12 +1473,19 @@ public void test041() {
+ 
+ 			},
+ 			"----------\n" + 
+-			"1. ERROR in X.java (at line 20)\n" + 
++			"1. ERROR in X.java (at line 11)\n" + 
++			"	G g = (x) -> { // Elided type is inferred from descriptor to be F\n" + 
++			"	    throw x;    // ~== throw new F()\n" + 
++			"	};\n" + 
++			"	      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
++			"Illegal lambda expression: Method m of type G2 is generic \n" + 
++			"----------\n" + 
++			"2. ERROR in X.java (at line 20)\n" + 
+ 			"	g1.m(new IOException());\n" + 
+ 			"	^^^^^^^^^^^^^^^^^^^^^^^\n" + 
+ 			"Unhandled exception type IOException\n" + 
+ 			"----------\n" + 
+-			"2. ERROR in X.java (at line 23)\n" + 
++			"3. ERROR in X.java (at line 23)\n" + 
+ 			"	g2.m(new SQLException());\n" + 
+ 			"	^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
+ 			"Unhandled exception type Exception\n" + 
+@@ -1504,15 +1517,206 @@ public void test042() {
+ 			"----------\n" + 
+ 			"1. ERROR in X.java (at line 11)\n" + 
+ 			"	G g1 = (F x) -> {\n" + 
+-			"	        ^\n" + 
+-			"F cannot be resolved to a type\n" + 
++			"	    throw x;\n" + 
++			"	};\n" + 
++			"	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
++			"Illegal lambda expression: Method m of type G2 is generic \n" + 
+ 			"----------\n" + 
+ 			"2. ERROR in X.java (at line 14)\n" + 
+ 			"	G g2 = (IOException x) -> {\n" + 
+-			"	        ^^^^^^^^^^^\n" + 
+-			"Incompatible type specified for lambda expression\'s parameter x\n" + 
++			"	    throw x;\n" + 
++			"	};\n" + 
++			"	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
++			"Illegal lambda expression: Method m of type G2 is generic \n" + 
+ 			"----------\n");
+ }
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=399224 - [1.8][compiler][internal] Implement TypeBinding.getSingleAbstractMethod 
++public void test043() {
++	Map options = getCompilerOptions();
++	options.put(CompilerOptions.OPTION_ReportUnusedWarningToken, CompilerOptions.ERROR);
++	options.put(CompilerOptions.OPTION_ReportUncheckedTypeOperation, CompilerOptions.IGNORE);
++	options.put(CompilerOptions.OPTION_ReportRawTypeReference, CompilerOptions.IGNORE);
++	options.put(CompilerOptions.OPTION_ReportTypeParameterHiding, CompilerOptions.IGNORE);
++
++	this.runNegativeTest(
++			new String[] {
++			"X.java",
++            "import java.util.List;\n" +
++			"interface A { void foo(); }\n" +  // yes
++			"interface B { boolean equals(Object obj); }\n" + // no
++			"interface C extends B { void foo(); }\n" + // yes
++			"interface D<T> { boolean equals(Object obj); void foo(); }\n" + // yes
++			"interface E { void foo(); Object clone(); }\n" + // no
++			"interface F { void foo(List<String> p); }\n" + // yes
++            "interface G { void foo(List<String> p); }\n" + // yes
++            "interface H extends F, G {}\n" + // yes
++            "interface I { List foo(List<String> p); }\n" + // yes
++            "interface J { List<String> foo(List arg); }\n" + // yes
++            "interface K extends I, J {}\n" + // yes
++            "interface L { void foo(List<Integer> p); }\n" +  // yes
++            "interface M extends I, L {}\n" + // no
++            "interface N { void foo(List<String> p, Class q); }\n" + // yes
++            "interface O { void foo(List p, Class<?> q); }\n" + // yes
++            "interface P extends N, O {}\n" + // no
++            "interface Q { long foo(); }\n" + // yes
++            "interface R { int foo(); }\n" + // yes
++            "interface S extends Q, R {}\n" + // no
++            "interface T<P> { void foo(P p); }\n" + // yes
++            "interface U<P> { void foo(P p); }\n" + // yes
++            "interface V<P, Q> extends T<P>, U<Q> {}\n" + // no
++            "interface W<T, N extends Number> { void m(T arg); void m(N arg); }\n" + // no
++            "interface X extends W<String, Integer> {}\n" + // no
++            "interface Y extends W<Integer, Integer> {}\n" + // yes
++
++            "class Z {\n" +
++            "    A a              =    () -> {};\n" +
++            "    B b              =    () -> {};\n" +
++            "    C c              =    () -> {};\n" +
++            "    D<?> d           =    () -> {};\n" +
++            "    E e              =    () -> {};\n" +
++            "    F f              =    (p0) -> {};\n" +
++            "    G g              =    (p0) -> {};\n" +
++            "    H h              =    (p0) -> {};\n" +
++            "    I i              =    (p0) -> { return null; };\n" +
++            "    J j              =    (p0) -> { return null; };\n" +
++            "    K k              =    (p0) -> { return null; };\n" +
++            "    L l              =    (p0) -> {};\n" +
++            "    M m              =    (p0) -> {};\n" +
++            "    N n              =    (p0, q0) -> {};\n" +
++            "    O o              =    (p0, q0) -> {};\n" +
++            "    P p              =    (p0, q0) -> {};\n" +
++            "    Q q              =    () -> { return 0;};\n" +
++            "    R r              =    () -> { return 0;};\n" +
++            "    S s              =    () -> {};\n" +
++            "    T<?> t           =    (p0) -> {};\n" +
++            "    U<?> u           =    (p0) -> {};\n" +
++            "    V<?,?> v         =    (p0) -> {};\n" +
++            "    W<?,?> w         =    (p0) -> {};\n" +
++            "    X x              =    (p0) -> {};\n" +
++            "    Y y              =    (p0) -> {};\n" +
++			"}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 17)\n" + 
++			"	interface P extends N, O {}\n" + 
++			"	          ^\n" + 
++			"Name clash: The method foo(List, Class<?>) of type O has the same erasure as foo(List<String>, Class) of type N but does not override it\n" + 
++			"----------\n" + 
++			"2. ERROR in X.java (at line 20)\n" + 
++			"	interface S extends Q, R {}\n" + 
++			"	          ^\n" + 
++			"The return types are incompatible for the inherited methods Q.foo(), R.foo()\n" + 
++			"----------\n" + 
++			"3. ERROR in X.java (at line 23)\n" + 
++			"	interface V<P, Q> extends T<P>, U<Q> {}\n" + 
++			"	          ^\n" + 
++			"Name clash: The method foo(P) of type U<P> has the same erasure as foo(P) of type T<P> but does not override it\n" + 
++			"----------\n" + 
++			"4. ERROR in X.java (at line 29)\n" + 
++			"	B b              =    () -> {};\n" + 
++			"	                      ^^^^^^^^\n" + 
++			"The target type of this expression must be a functional interface\n" + 
++			"----------\n" + 
++			"5. ERROR in X.java (at line 32)\n" + 
++			"	E e              =    () -> {};\n" + 
++			"	                      ^^^^^^^^\n" + 
++			"The target type of this expression must be a functional interface\n" + 
++			"----------\n" + 
++			"6. ERROR in X.java (at line 40)\n" + 
++			"	M m              =    (p0) -> {};\n" + 
++			"	                      ^^^^^^^^^^\n" + 
++			"The target type of this expression must be a functional interface\n" + 
++			"----------\n" + 
++			"7. ERROR in X.java (at line 43)\n" + 
++			"	P p              =    (p0, q0) -> {};\n" + 
++			"	                      ^^^^^^^^^^^^^^\n" + 
++			"The target type of this expression must be a functional interface\n" + 
++			"----------\n" + 
++			"8. ERROR in X.java (at line 46)\n" + 
++			"	S s              =    () -> {};\n" + 
++			"	                      ^^^^^^^^\n" + 
++			"The target type of this expression must be a functional interface\n" + 
++			"----------\n" + 
++			"9. ERROR in X.java (at line 49)\n" + 
++			"	V<?,?> v         =    (p0) -> {};\n" + 
++			"	                      ^^^^^^^^^^\n" + 
++			"The target type of this expression must be a functional interface\n" + 
++			"----------\n" + 
++			"10. ERROR in X.java (at line 50)\n" + 
++			"	W<?,?> w         =    (p0) -> {};\n" + 
++			"	                      ^^^^^^^^^^\n" + 
++			"The target type of this expression must be a functional interface\n" + 
++			"----------\n" + 
++			"11. ERROR in X.java (at line 51)\n" + 
++			"	X x              =    (p0) -> {};\n" + 
++			"	                      ^^^^^^^^^^\n" + 
++			"The target type of this expression must be a functional interface\n" + 
++			"----------\n",
++			null,
++			false,
++			options);
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=399224 - [1.8][compiler][internal] Implement TypeBinding.getSingleAbstractMethod 
++public void test044() {
++	Map options = getCompilerOptions();
++	options.put(CompilerOptions.OPTION_ReportUnusedWarningToken, CompilerOptions.ERROR);
++	options.put(CompilerOptions.OPTION_ReportUncheckedTypeOperation, CompilerOptions.IGNORE);
++	options.put(CompilerOptions.OPTION_ReportRawTypeReference, CompilerOptions.IGNORE);
++	options.put(CompilerOptions.OPTION_ReportTypeParameterHiding, CompilerOptions.IGNORE);
++
++	this.runNegativeTest(
++			new String[] {
++			"X.java",
++			"import java.util.List;\n" +
++			"interface A { <T> T foo(List<T> p); }\n" +
++			"interface B { <S> S foo(List<S> p); }\n" +
++			"interface C { <T, S> S foo(List<T> p); }\n" +
++			"interface D extends A, B {}\n" +
++			"interface E extends A, C {}\n" +
++
++			"class Z {\n" +
++	        "    A a              =    (p) -> { return null;};\n" +
++	        "    B b              =    (p) -> { return null;};\n" +
++	        "    C c              =    (p) -> { return null;};\n" +
++	        "    D d              =    (p) -> { return null;};\n" +
++	        "    E e              =    (p) -> { return null;};\n" +
++			"}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 6)\n" + 
++			"	interface E extends A, C {}\n" + 
++			"	          ^\n" + 
++			"Name clash: The method foo(List<T>) of type C has the same erasure as foo(List<T>) of type A but does not override it\n" + 
++			"----------\n" + 
++			"2. ERROR in X.java (at line 8)\n" + 
++			"	A a              =    (p) -> { return null;};\n" + 
++			"	                      ^^^^^^^^^^^^^^^^^^^^^^\n" + 
++			"Illegal lambda expression: Method foo of type A is generic \n" + 
++			"----------\n" + 
++			"3. ERROR in X.java (at line 9)\n" + 
++			"	B b              =    (p) -> { return null;};\n" + 
++			"	                      ^^^^^^^^^^^^^^^^^^^^^^\n" + 
++			"Illegal lambda expression: Method foo of type B is generic \n" + 
++			"----------\n" + 
++			"4. ERROR in X.java (at line 10)\n" + 
++			"	C c              =    (p) -> { return null;};\n" + 
++			"	                      ^^^^^^^^^^^^^^^^^^^^^^\n" + 
++			"Illegal lambda expression: Method foo of type C is generic \n" + 
++			"----------\n" + 
++			"5. ERROR in X.java (at line 11)\n" + 
++			"	D d              =    (p) -> { return null;};\n" + 
++			"	                      ^^^^^^^^^^^^^^^^^^^^^^\n" + 
++			"Illegal lambda expression: Method foo of type A is generic \n" + 
++			"----------\n" + 
++			"6. ERROR in X.java (at line 12)\n" + 
++			"	E e              =    (p) -> { return null;};\n" + 
++			"	                      ^^^^^^^^^^^^^^^^^^^^^^\n" + 
++			"The target type of this expression must be a functional interface\n" + 
++			"----------\n",
++			null,
++			false,
++			options);
++}
+ public static Class testClass() {
+ 	return NegativeLambdaExpressionsTest.class;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+index 80781a4..f2886aa 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+@@ -1349,6 +1349,8 @@ void setSourceStart(int sourceStart);
+     int lambdaParameterTypeMismatched = Internal + TypeRelated + 657;
+     /** @since 3.9 */
+     int IncompatibleLambdaParameterType = Internal + TypeRelated + 658;
++    /** @since 3.9 */
++    int NoGenericLambda = Internal + TypeRelated + 659;
+     /**
+ 	 * More problems in generics
+ 	 */
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+index a574ca4..3332e25 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+@@ -27,7 +27,7 @@ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ public abstract class FunctionalExpression extends Expression {
+ 	
+ 	TypeBinding expectedType;
+-	MethodBinding singleAbstractMethod;
++	MethodBinding descriptor;
+ 	
+ 	public FunctionalExpression() {
+ 		super();
+@@ -43,13 +43,13 @@ public abstract class FunctionalExpression extends Expression {
+ 	
+ 	public TypeBinding resolveType(BlockScope blockScope) {
+ 		this.constant = Constant.NotAConstant;
+-		MethodBinding descriptor = this.expectedType == null ? null : this.expectedType.getSingleAbstractMethod(blockScope);
+-		if (descriptor == null) {
++		MethodBinding sam = this.expectedType == null ? null : this.expectedType.getSingleAbstractMethod(blockScope);
++		if (sam == null) {
+ 			blockScope.problemReporter().targetTypeIsNotAFunctionalInterface(this);
+ 			return null;
+ 		}
+-		if (!descriptor.isValidBinding()) {
+-			switch (descriptor.problemId()) {
++		if (!sam.isValidBinding()) {
++			switch (sam.problemId()) {
+ 				case ProblemReasons.NoSuchSingleAbstractMethod:
+ 					blockScope.problemReporter().targetTypeIsNotAFunctionalInterface(this);
+ 					break;
+@@ -59,7 +59,7 @@ public abstract class FunctionalExpression extends Expression {
+ 			}
+ 			return null;
+ 		}
+-		this.singleAbstractMethod = descriptor;
++		this.descriptor = sam;
+ 		return this.resolvedType = this.expectedType;  // if interface IJ extends I, J() & IJ's descriptor is I.foo, can't return I
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 30957cc..b3d218b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -65,23 +65,27 @@ public class LambdaExpression extends FunctionalExpression implements ProblemSev
+ 		super.resolveType(blockScope); // compute & capture interface function descriptor in singleAbstractMethod.
+ 		
+ 		final boolean argumentsTypeElided = argumentsTypeElided();
+-		final boolean haveDescriptor = this.singleAbstractMethod != null;
++		final boolean haveDescriptor = this.descriptor != null;
+ 		
++		if (haveDescriptor && this.descriptor.typeVariables != Binding.NO_TYPE_VARIABLES) {
++			blockScope.problemReporter().lambdaExpressionCannotImplementGenericMethod(this, this.descriptor);
++			return this.resolvedType = null;
++		}
+ 		if (!haveDescriptor && argumentsTypeElided) 
+ 			return null; // FUBAR, bail out...
+ 
+ 		this.scope = new MethodScope(blockScope, this, blockScope.methodScope().isStatic);
+ 		
+ 		this.binding = new MethodBinding(ClassFileConstants.AccPublic | ExtraCompilerModifiers.AccUnresolved,
+-							haveDescriptor ? this.singleAbstractMethod.selector : TypeConstants.ANONYMOUS_METHOD, 
+-							haveDescriptor ? this.singleAbstractMethod.returnType : null, 
++							haveDescriptor ? this.descriptor.selector : TypeConstants.ANONYMOUS_METHOD, 
++							haveDescriptor ? this.descriptor.returnType : null, 
+ 							Binding.NO_PARAMETERS, // for now. 
+-							haveDescriptor ? this.singleAbstractMethod.thrownExceptions : Binding.NO_EXCEPTIONS, 
++							haveDescriptor ? this.descriptor.thrownExceptions : Binding.NO_EXCEPTIONS, 
+ 							blockScope.enclosingSourceType()); // declaring class, for now - this is needed for annotation holder and such.
+ 		this.binding.typeVariables = Binding.NO_TYPE_VARIABLES; // descriptor may have type variables, but they are useless in lambda and lambda cannot be generic.
+ 		
+ 		if (haveDescriptor) {
+-			int descriptorParameterCount = this.singleAbstractMethod.parameters.length;
++			int descriptorParameterCount = this.descriptor.parameters.length;
+ 			int lambdaArgumentCount = this.arguments != null ? this.arguments.length : 0;
+             if (descriptorParameterCount != lambdaArgumentCount) {
+             	this.scope.problemReporter().lambdaSignatureMismatched(this);
+@@ -107,7 +111,7 @@ public class LambdaExpression extends FunctionalExpression implements ProblemSev
+ 			}
+ 			
+ 			TypeBinding parameterType;
+-			final TypeBinding expectedParameterType = haveDescriptor && i < this.singleAbstractMethod.parameters.length ? this.singleAbstractMethod.parameters[i] : null;
++			final TypeBinding expectedParameterType = haveDescriptor && i < this.descriptor.parameters.length ? this.descriptor.parameters[i] : null;
+ 			parameterType = argumentsTypeElided ? expectedParameterType : argument.type.resolveType(this.scope, true /* check bounds*/);
+ 			if (parameterType == null) {
+ 				buggyArguments = true;
+@@ -284,7 +288,7 @@ public class LambdaExpression extends FunctionalExpression implements ProblemSev
+ 	}
+ 
+ 	public TypeBinding expectedResultType() {
+-		return this.singleAbstractMethod != null && this.singleAbstractMethod.isValidBinding() ? this.singleAbstractMethod.returnType : null;
++		return this.descriptor != null && this.descriptor.isValidBinding() ? this.descriptor.returnType : null;
+ 	}
+ 	
+ 	public void traverse(ASTVisitor visitor, BlockScope blockScope) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+index b239cae..9619ba4 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+@@ -1684,7 +1684,13 @@ public MethodBinding getSingleAbstractMethod(Scope scope) {
+ 			otherMethod = methods[j];
+ 			if (otherMethod.typeVariables != Binding.NO_TYPE_VARIABLES)
+ 				genericMethodSeen = true;
+-			if (!MethodVerifier.isParameterSubsignature(method, otherMethod, environment) || !MethodVerifier.areReturnTypesCompatible(method, otherMethod, environment)) 
++			
++			if (genericMethodSeen) { // adapt type parameters.
++				otherMethod = MethodVerifier.computeSubstituteMethod(otherMethod, method, environment);
++				if (otherMethod == null)
++					continue next;
++			}
++			if (!MethodVerifier.isSubstituteParameterSubsignature(method, otherMethod, environment) || !MethodVerifier.areReturnTypesCompatible(method, otherMethod, environment)) 
+ 				continue next; 
+ 		}
+ 		// If we reach here, we found a method that is override equivalent with every other method and is also return type substitutable. Compute kosher exceptions now ...
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index b39a983..50e00bd 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -75,6 +75,7 @@ import org.eclipse.jdt.internal.compiler.ast.Expression;
+ import org.eclipse.jdt.internal.compiler.ast.FakedTrackingVariable;
+ import org.eclipse.jdt.internal.compiler.ast.FieldDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.FieldReference;
++import org.eclipse.jdt.internal.compiler.ast.FunctionalExpression;
+ import org.eclipse.jdt.internal.compiler.ast.ImportReference;
+ import org.eclipse.jdt.internal.compiler.ast.Initializer;
+ import org.eclipse.jdt.internal.compiler.ast.InstanceOfExpression;
+@@ -1281,7 +1282,7 @@ public void cannotUseSuperInJavaLangObject(ASTNode reference) {
+ 		reference.sourceStart,
+ 		reference.sourceEnd);
+ }
+-public void targetTypeIsNotAFunctionalInterface(ASTNode target) {
++public void targetTypeIsNotAFunctionalInterface(FunctionalExpression target) {
+ 	this.handle(
+ 		IProblem.TargetTypeNotAFunctionalInterface,
+ 		NoArgument,
+@@ -1289,7 +1290,7 @@ public void targetTypeIsNotAFunctionalInterface(ASTNode target) {
+ 		target.sourceStart,
+ 		target.sourceEnd);
+ }
+-public void illFormedParameterizationOfFunctionalInterface(ASTNode target) {
++public void illFormedParameterizationOfFunctionalInterface(FunctionalExpression target) {
+ 	this.handle(
+ 		IProblem.illFormedParameterizationOfFunctionalInterface,
+ 		NoArgument,
+@@ -1297,7 +1298,7 @@ public void illFormedParameterizationOfFunctionalInterface(ASTNode target) {
+ 		target.sourceStart,
+ 		target.sourceEnd);
+ }
+-public void lambdaSignatureMismatched(ASTNode target) {
++public void lambdaSignatureMismatched(LambdaExpression target) {
+ 	this.handle(
+ 		IProblem.lambdaSignatureMismatched,
+ 		NoArgument,
+@@ -1317,6 +1318,15 @@ public void lambdaParameterTypeMismatched(Argument argument, TypeReference type,
+ 			type.sourceStart,
+ 			type.sourceEnd);
+ }
++public void lambdaExpressionCannotImplementGenericMethod(LambdaExpression lambda, MethodBinding sam) {
++	final String selector = new String(sam.selector);
++	this.handle(
++			IProblem.NoGenericLambda, 
++			new String[] { selector, new String(sam.declaringClass.readableName())},
++			new String[] { selector, new String(sam.declaringClass.shortReadableName())},
++			lambda.sourceStart,
++			lambda.sourceEnd);
++}
+ public void caseExpressionMustBeConstant(Expression expression) {
+ 	this.handle(
+ 		IProblem.NonConstantExpression,
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+index 9772a5e..924e6bb 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+@@ -617,6 +617,7 @@
+ 656 = Lambda expression's signature does not match the signature of the functional interface method
+ 657 = Lambda expression's parameter {0} is expected to be of type {1}
+ 658 = Incompatible type specified for lambda expression's parameter {0}
++659 = Illegal lambda expression: Method {0} of type {1} is generic 
+ ### MORE GENERICS
+ 660 = Unused type arguments for the non generic constructor {0}({1}) of type {2}; it should not be parameterized with arguments <{3}>
+ 661 = Unused type parameter {0}

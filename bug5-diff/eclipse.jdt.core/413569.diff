@@ -1,0 +1,2894 @@
+commit 810d2a46e73e304780d3a58f117d6c63103b4e72
+Author: Markus Keller <markus_keller@ch.ibm.com>
+Date:   Tue Oct 15 20:58:13 2013 +0200
+
+    Bug 413569 comment 29: [1.8][dom ast] AST for annotated multi-dimensional array type is not well-formed
+
+61	10	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
+8	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/AbstractASTTests.java
+1	1	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingExpressionsTest.java
+9	9	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingStatementsTest.java
+13	12	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
+11	8	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
+4	0	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTNode.java
+50	53	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ArrayType.java
+2	2	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Type.java
+8	5	org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+7	4	org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
+index 73afc7c..d310a8a 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
+@@ -27,6 +27,7 @@ import org.eclipse.jdt.core.dom.AnnotatableType;
+ import org.eclipse.jdt.core.dom.ArrayCreation;
+ import org.eclipse.jdt.core.dom.ArrayType;
+ import org.eclipse.jdt.core.dom.CompilationUnit;
++import org.eclipse.jdt.core.dom.ExtraDimension;
+ import org.eclipse.jdt.core.dom.ITypeBinding;
+ import org.eclipse.jdt.core.dom.MethodDeclaration;
+ import org.eclipse.jdt.core.dom.SimpleType;
+@@ -108,6 +109,56 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		annotation = (ASTNode) annotations.get(0);
+ 		checkSourceRange(annotation, "@Marker", contents);
+ 	}
++	/*
++	 * Type Annotations on Variable Argument of ArrayType
++	 */
++	// https://bugs.eclipse.org/bugs/show_bug.cgi?id=413569
++	public void test413569() throws JavaModelException {
++		String contents =
++			"import java.lang.annotation.*;\n" +
++			"public class X {\n" +
++			"	@Target(ElementType.TYPE_USE) static @interface A {}\n" + 
++			"	@Target(ElementType.TYPE_USE) static @interface B {}\n" + 
++			"	@Target(ElementType.TYPE_USE) static @interface C { Class<?> value() default Object.class; }\n" + 
++			"	@Target(ElementType.TYPE_USE) static @interface D { Class<?> d(); }\n" + 
++			"	void foo(@A int @B()[] @C(int[].class) [] @D(d=String[].class)... arg) {}\n" +
++			"}";
++		this.workingCopy = getWorkingCopy("/Converter18/src/X.java", true/*resolve*/);
++		ASTNode node = buildAST(
++			contents,
++			this.workingCopy);
++		assertEquals("Not a compilation unit", ASTNode.COMPILATION_UNIT, node.getNodeType());
++		CompilationUnit compilationUnit = (CompilationUnit) node;
++		assertProblemsSize(compilationUnit, 0);
++		node = getASTNode(compilationUnit, 0, 4);
++		assertTrue("Not a method declaration", node.getNodeType() == ASTNode.METHOD_DECLARATION);
++		MethodDeclaration methodDeclaration = (MethodDeclaration) node;
++		List parameters = methodDeclaration.parameters();
++		assertEquals("wrong size", 1, parameters.size());
++		SingleVariableDeclaration parameter = (SingleVariableDeclaration) parameters.get(0);
++		
++		ArrayType type = (ArrayType) parameter.getType();
++		List dimensions = type.dimensions();
++		assertEquals(2, dimensions.size());
++		
++		ExtraDimension dimension = (ExtraDimension) dimensions.get(0);
++		List annotations = dimension.annotations();
++		assertEquals("Wrong number of annotations", 1, annotations.size());
++		Annotation annotation = (Annotation) annotations.get(0);
++		checkSourceRange(annotation, "@B()", contents);
++		
++		dimension = (ExtraDimension) dimensions.get(1);
++		annotations = dimension.annotations();
++		assertEquals("Wrong number of annotations", 1, annotations.size());
++		annotation = (Annotation) annotations.get(0);
++		checkSourceRange(annotation, "@C(int[].class)", contents);
++		
++		annotations = parameter.varargsAnnotations();
++		assertEquals("Wrong number of annotations", 1, annotations.size());
++		annotation = (Annotation) annotations.get(0);
++		checkSourceRange(annotation, "@D(d=String[].class)", contents);
++		
++	}
+ 	/**
+ 	 * https://bugs.eclipse.org/bugs/show_bug.cgi?id=395886 tests annotations on
+ 	 * QTR in multiple scenarios of occurrence.
+@@ -1139,11 +1190,11 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		Type type = creation.getType();
+ 		assertEquals("Incorrect type", true, type.isArrayType());
+ 		checkSourceRange(type, "@Marker2 int @Marker @Marker2 [2] @Marker2 @Marker3 [bar()] @Marker3 @Marker []", contents.toCharArray());
+-		ExtraDimension extraDimension = ((ArrayType) type).getDimensionAt(0);
++		ExtraDimension extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(2);
+ 		assertEquals("Incorrect annotations", "@Marker3 @Marker ", convertAnnotationsList(extraDimension.annotations()));
+-		extraDimension = ((ArrayType) type).getDimensionAt(1);
++		extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(1);
+ 		assertEquals("Incorrect annotations", "@Marker2 @Marker3 ", convertAnnotationsList(extraDimension.annotations()));
+-		extraDimension = ((ArrayType) type).getDimensionAt(2);
++		extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(0);
+ 		assertEquals("Incorrect annotations", "@Marker @Marker2 ", convertAnnotationsList(extraDimension.annotations()));
+ 		List dimensions = creation.dimensions();
+ 		assertEquals("Incorrect expressions", 2, dimensions.size());
+@@ -1158,11 +1209,11 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		
+ 		type = creation.getType();
+ 		assertEquals("Incorrect type", true, type.isArrayType());
+-		extraDimension = ((ArrayType) type).getDimensionAt(0);
++		extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(2);
+ 		assertEquals("Incorrect annotations", "@Marker2 @Marker3 ", convertAnnotationsList(extraDimension.annotations()));
+-		extraDimension = ((ArrayType) type).getDimensionAt(1);
++		extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(1);
+ 		assertEquals("Incorrect annotations", "@Marker @Marker2 ", convertAnnotationsList(extraDimension.annotations()));
+-		extraDimension = ((ArrayType) type).getDimensionAt(2);
++		extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(0);
+ 		assertEquals("Incorrect annotations", "@Marker3 @Marker ", convertAnnotationsList(extraDimension.annotations()));
+ 		dimensions = creation.dimensions();
+ 		assertEquals("Incorrect expressions", 2, dimensions.size());
+@@ -2939,9 +2990,9 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		checkSourceRange(arrayType, "@NonEmpty(0) int @NonNull(value1 = 1) [] @NonEmpty(1) [ ]", contents);
+ 		PrimitiveType primitiveType = (PrimitiveType) arrayType.getElementType();
+ 		checkSourceRange(primitiveType, "@NonEmpty(0) int", contents);
+-		ExtraDimension extraDimension = arrayType.getDimensionAt(1);
++		ExtraDimension extraDimension = (ExtraDimension) arrayType.dimensions().get(0);
+ 		checkSourceRange(extraDimension, "@NonNull(value1 = 1) []", contents);
+-		extraDimension = arrayType.getDimensionAt(0);
++		extraDimension = (ExtraDimension) arrayType.dimensions().get(1);
+ 		checkSourceRange(extraDimension, "@NonEmpty(1) [ ]", contents);
+ 		
+ 		field = (FieldDeclaration) type.bodyDeclarations().get(count++);
+@@ -2996,9 +3047,9 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		checkSourceRange(arrayType, "@TakeType(int[][].class) int @TakeType(float.class) [] @TakeType(double.class) []", contents);
+ 		checkSourceRange(arrayType.getElementType(), "@TakeType(int[][].class) int", contents);
+ 		assertTrue(arrayType.getElementType().isPrimitiveType());
+-		extraDimension = arrayType.getDimensionAt(1);
++		extraDimension = (ExtraDimension) arrayType.dimensions().get(0);
+ 		checkSourceRange(extraDimension, "@TakeType(float.class) []", contents);
+-		extraDimension = arrayType.getDimensionAt(0);
++		extraDimension = (ExtraDimension) arrayType.dimensions().get(1);
+ 		Annotation annotation = (Annotation) extraDimension.annotations().get(0);
+ 		assertTrue(annotation.isSingleMemberAnnotation());
+ 		singleMemberAnnotation = (SingleMemberAnnotation) annotation;
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/AbstractASTTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/AbstractASTTests.java
+index cd3cecc..7ef4438 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/AbstractASTTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/AbstractASTTests.java
+@@ -60,6 +60,7 @@ import org.eclipse.jdt.core.tests.model.ModifyingResourceTests;
+ import org.eclipse.jdt.core.tests.util.Util;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
++import org.eclipse.jdt.internal.core.dom.SourceRangeVerifier;
+ 
+ public class AbstractASTTests extends ModifyingResourceTests implements DefaultMarkedNodeLabelProviderOptions {
+ 
+@@ -88,6 +89,13 @@ public class AbstractASTTests extends ModifyingResourceTests implements DefaultM
+ 		super(name);
+ 	}
+ 
++	public void setUpSuite() throws Exception {
++		super.setUpSuite();
++		
++		SourceRangeVerifier.DEBUG = true;
++		SourceRangeVerifier.DEBUG_THROW = true;
++	}
++	
+ 	/*
+ 	 * Removes the *start* and *end* markers from the given source
+ 	 * and remembers the positions.
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingExpressionsTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingExpressionsTest.java
+index 835fb8b..927f481 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingExpressionsTest.java
+@@ -263,7 +263,7 @@ public class ASTRewritingExpressionsTest extends ASTRewritingTest {
+ 			memberValuePair.setName(ast.newSimpleName("v"));
+ 			memberValuePair.setValue(ast.newNumberLiteral("99"));
+ 			annotationC.values().add(memberValuePair);
+-			ExtraDimension dim0 = arrayType.getDimensionAt(0);
++			ExtraDimension dim0 = (ExtraDimension) arrayType.dimensions().get(0);
+ 			dim0.annotations().add(annotationC);
+ 			
+ 			SingleMemberAnnotation annotationB= ast.newSingleMemberAnnotation();
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingStatementsTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingStatementsTest.java
+index eb8e53b..aaa8f64 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingStatementsTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingStatementsTest.java
+@@ -5981,17 +5981,17 @@ public class ASTRewritingStatementsTest extends ASTRewritingTest {
+ 			Expression exp = (Expression) expressions.get(1);
+ 			listRewrite.remove(exp, null);
+ 
+-			ExtraDimension dim = creationType.getDimensionAt(2);
++			ExtraDimension dim = (ExtraDimension) creationType.dimensions().get(0);
+ 			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
+ 			MarkerAnnotation annotation = (MarkerAnnotation) dim.annotations().get(0);
+ 			listRewrite.remove(annotation, null);
+ 
+-			dim = creationType.getDimensionAt(1);
++			dim = (ExtraDimension) creationType.dimensions().get(1);
+ 			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(1);
+ 			listRewrite.remove(annotation, null);
+ 
+-			dim = creationType.getDimensionAt(0);
++			dim = (ExtraDimension) creationType.dimensions().get(2);
+ 			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(1);
+ 			listRewrite.remove(annotation, null);
+@@ -6000,21 +6000,21 @@ public class ASTRewritingStatementsTest extends ASTRewritingTest {
+ 
+ 			creation = (ArrayCreation) fragment.getInitializer();
+ 			creationType = creation.getType();
+-			dim = creationType.getDimensionAt(2);
++			dim = (ExtraDimension) creationType.dimensions().get(0);
+ 			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(1);
+ 			listRewrite.remove(annotation, null);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(0);
+ 			listRewrite.remove(annotation, null);
+ 
+-			dim = creationType.getDimensionAt(1);
++			dim = (ExtraDimension) creationType.dimensions().get(1);
+ 			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(1);
+ 			listRewrite.remove(annotation, null);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(0);
+ 			listRewrite.remove(annotation, null);
+ 
+-			dim = creationType.getDimensionAt(0);
++			dim = (ExtraDimension) creationType.dimensions().get(2);
+ 			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(1);
+ 			listRewrite.remove(annotation, null);
+@@ -6090,7 +6090,7 @@ public class ASTRewritingStatementsTest extends ASTRewritingTest {
+ 			ArrayCreation creation = (ArrayCreation) fragment.getInitializer();
+ 
+ 			ArrayType arrayType = creation.getType();
+-			ExtraDimension dim = arrayType.getDimensionAt(1);
++			ExtraDimension dim = (ExtraDimension) arrayType.dimensions().get(1);
+ 			ListRewrite listRewrite= rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
+ 			listRewrite.remove((ASTNode)dim.annotations().get(0), null);
+ 			listRewrite.remove((ASTNode)dim.annotations().get(1), null);
+@@ -6105,12 +6105,12 @@ public class ASTRewritingStatementsTest extends ASTRewritingTest {
+ 			assertEquals("Incorrect type", ASTNode.ARRAY_TYPE, type.getNodeType());
+ 			ArrayCreation creation = (ArrayCreation) fragment.getInitializer();
+ 			ArrayType creationType = creation.getType();
+-			rewrite.remove(creationType.getDimensionAt(0), null);
++			rewrite.remove((ASTNode) creationType.dimensions().get(2), null);
+ 			fragment = (VariableDeclarationFragment) fragments.get(1);
+ 			creation = (ArrayCreation) fragment.getInitializer();
+ 			creationType = creation.getType();
+ 
+-			rewrite.remove(creationType.getDimensionAt(0), null);
++			rewrite.remove((ASTNode) creationType.dimensions().get(2), null);
+ 		}
+ 		// Get new code
+ 		String preview= evaluateRewrite(cu, rewrite);
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
+index 70e3f7c..6992eae 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
+@@ -1117,31 +1117,32 @@ public final class AST {
+ 
+ 	/**
+ 	 * Creates and returns a new unparented array type node with the given
+-	 * component type, which may be another array type for levels less than JLS8.
+-	 * For JLS8 and above this type has to be an annotatable type.
++	 * element type, which cannot be an array type for API levels JLS8 and later.
++	 * <p>
++	 * For JLS4 and before, the given component type may be another array type.
+ 	 *
+-	 * @param type the component type (possibly another array type) for level less than JLS8, 
+-	 * a <code>AnnotatableType</code>  for JLS8 and above
++	 * @param elementType element type for API level JLS8 and later, or the
++	 * component type (possibly another array type) for levels less than JLS8
+ 	 * @return a new unparented array type node
+ 	 * @exception IllegalArgumentException if:
+ 	 * <ul>
+ 	 * <li>the node belongs to a different AST</li>
+ 	 * <li>the node already has a parent</li>
+-	 * <li> level is greater than or equal to JLS8 and type not an array type</li>
++	 * <li>API level is JLS8 or later and type is an array type</li>
+ 	 * </ul>
+ 	 */
+-	public ArrayType newArrayType(Type type) {
++	public ArrayType newArrayType(Type elementType) {
+ 		ArrayType result;
+ 		if (this.apiLevel < AST.JLS8) {
+ 			result = new ArrayType(this);
+-			setArrayComponentType(result, type);
++			setArrayComponentType(result, elementType);
+ 			return result;
+ 		}
+-		if (type.isArrayType()) {
++		if (elementType.isArrayType()) {
+ 			throw new IllegalArgumentException();
+ 		}
+ 		result = new ArrayType(this);
+-		result.setElementType(type);
++		result.setElementType(elementType);
+ 		return result;
+ 	}
+ 
+@@ -1149,11 +1150,11 @@ public final class AST {
+ 	 * Creates and returns a new unparented array type node with the given
+ 	 * element type and number of (additional) dimensions.
+ 	 * <p>
+-	 * Note that if the element type passed in is an array type, the
++	 * For JLS4 and before, the element type passed in can be an array type, but in that case, the
+ 	 * element type of the result will not be the same as what was passed in.
+ 	 * </p>
+ 	 *
+-	 * @param elementType the element type (can be an array type for JLS8. For level JLS8 and above this should be an <code>AnnotatableType</code>)
++	 * @param elementType the element type (cannot be an array type for JLS8 and later)
+ 	 * @param dimensions the number of dimensions, a positive number
+ 	 * @return a new unparented array type node
+ 	 * @exception IllegalArgumentException if:
+@@ -1163,7 +1164,7 @@ public final class AST {
+ 	 * <li>the element type is null</li>
+ 	 * <li>the number of dimensions is lower than 1</li>
+ 	 * <li>the number of dimensions is greater than 1000</li>
+-	 * <li>for levels from JLS8 and later, if the element type is not an array type </li>
++	 * <li>for levels from JLS8 and later, if the element type is an array type </li>
+ 	 * </ul>
+ 	 */
+ 	public ArrayType newArrayType(Type elementType, int dimensions) {
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
+index d31b51e..4018bf1 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
+@@ -926,17 +926,20 @@ class ASTConverter {
+ 		 * See PR http://bugs.eclipse.org/bugs/show_bug.cgi?id=23284
+ 		 */
+ 		if (isVarArgs) {
++			ExtraDimension lastDimension = null;
++			if (this.ast.apiLevel() >= AST.JLS8) {
++				if (type.isArrayType()) { // should always be true
++					List dimensions = ((ArrayType) type).dimensions();
++					if (!dimensions.isEmpty()) {
++						lastDimension = (ExtraDimension) dimensions.get(dimensions.size() - 1);
++					}
++				}
++			}
+ 			setTypeForSingleVariableDeclaration(variableDecl, type, extraDimensions + 1);
+ 			// https://bugs.eclipse.org/bugs/show_bug.cgi?id=391898
+ 			if (this.ast.apiLevel() >= AST.JLS8) {
+-				List annotations  = null;
+-				if (type.isAnnotatable()) {
+-					annotations = ((AnnotatableType) type).annotations();
+-				} else if (type.isArrayType()) {
+-					ArrayType arrayType = (ArrayType) type;
+-					annotations = arrayType.dimensions().isEmpty() ? null : ((arrayType.getDimensionAt(0)).annotations());
+-				}
+-				if (annotations != null) {
++				if (lastDimension != null) { // should always be true
++					List annotations = lastDimension.annotations();
+ 					Iterator iter = annotations.iterator();
+ 					while (iter.hasNext()) {
+ 						Annotation annotation = (Annotation) iter.next();
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTNode.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTNode.java
+index 5885d33..52b6996 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTNode.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTNode.java
+@@ -1229,11 +1229,15 @@ public abstract class ASTNode {
+ 	private StructuralPropertyDescriptor location = null;
+ 
+ 	/** Internal convenience constant indicating that there is definite risk of cycles.
++	 * @see ChildPropertyDescriptor#cycleRisk()
++	 * @see ChildListPropertyDescriptor#cycleRisk()
+ 	 * @since 3.0
+ 	 */
+ 	static final boolean CYCLE_RISK = true;
+ 
+ 	/** Internal convenience constant indicating that there is no risk of cycles.
++	 * @see ChildPropertyDescriptor#cycleRisk()
++	 * @see ChildListPropertyDescriptor#cycleRisk()
+ 	 * @since 3.0
+ 	 */
+ 	static final boolean NO_CYCLE_RISK = false;
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ArrayType.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ArrayType.java
+index c3e3f75..100b882 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ArrayType.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ArrayType.java
+@@ -21,15 +21,27 @@ import java.util.List;
+ /**
+  * Type node for an array type.
+  * <p>
+- * Array types are expressed in a recursive manner, one dimension at a time. From JLS8 onwards,
+- * instead of this recursive manner, arrays are represented by a base element type (which cannot
+- * be an Array type) and a list of dimensions each of which may have a list of annotations.
++ * In JLS8 and later, array types are represented by a base element type (which cannot
++ * be an array type) and a list of dimensions, each of which may have a list of annotations.
+  * </p>
+  * <pre>
+  * ArrayType: 
+- *    Type ExtraDimension { ExtraDimension }
++ *    Type ExtraDimension <b>{</b> ExtraDimension <b>}</b>
+  * </pre>
++ * 
++ * In JLS4 and before, array types were expressed in a recursive manner, one dimension at a time:
++ * <pre>
++ * ArrayType:
++ *    Type <b>[</b> <b>]</b></pre>
+  *
++ * This structure became untenable with the advent of type-use annotations, because
++ * array dimensions bind from left to right, whereas a recursive structure binds from right to left.
++ * <p>
++ * Example:<br>
++ * <code>int @A[] @B[] @C[]</code><br>
++ * is an <code>@A</code>-array of <code>int @B[] @C[]</code>,
++ * but such a component type is not representable by nested <code>ArrayType</code>s with contiguous source ranges.
++ * 
+  * @since 2.0
+  * @noinstantiate This class is not intended to be instantiated by clients.
+  */
+@@ -37,7 +49,7 @@ public class ArrayType extends Type {
+ 
+ 	/**
+ 	 * The "componentType" structural property of this node type (child type: {@link Type}).
+-	 * Not supported from JLS8 onwards.
++	 * @deprecated In the JLS8 API, this property is replaced by {@link #ELEMENT_TYPE_PROPERTY} and {@link #DIMENSIONS_PROPERTY}.
+ 	 * @since 3.0
+ 	 */
+ 	public static final ChildPropertyDescriptor COMPONENT_TYPE_PROPERTY =
+@@ -45,6 +57,7 @@ public class ArrayType extends Type {
+ 
+ 	/**
+ 	 * The "elementType" structural property of this node type (child type: {@link Type}) (added in JLS8 API).
++	 * Cannot be an array type.
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+ 	public static final ChildPropertyDescriptor ELEMENT_TYPE_PROPERTY =
+@@ -106,13 +119,13 @@ public class ArrayType extends Type {
+ 	}
+ 
+ 	/**
+-	 * The component type; lazily initialized; defaults to a simple type with
+-	 * an unspecified, but legal, name. reused for element type from JLS8 onwards.
++	 * The element type (before JLS8: component type); lazily initialized; defaults to a simple type with
++	 * an unspecified, but legal, name.
+ 	 */
+-	private Type componentType = null;
++	private Type type = null;
+ 
+ 	/**
+-	 * List of extra dimensions this node has with optional annotations
++	 * List of dimensions this node has with optional annotations
+ 	 * (element type: {@link ExtraDimension}).
+ 	 * Null before JLS8. Added in JLS8; defaults to a list with one element
+ 	 * (see constructor).
+@@ -255,25 +268,27 @@ public class ArrayType extends Type {
+ 	 * may be another array type.
+ 	 *
+ 	 * @return the component type node
+-	 * @deprecated from JLS8 and later, the recursive structure is not valid
++	 * @exception UnsupportedOperationException if this operation is used in
++	 * an AST later than JLS4
++	 * @deprecated In the JLS8 API, the recursive structure is not valid.
+ 	 */
+ 	public Type getComponentType() {
+ 		supportedOnlyIn2_3_4();
+-		return internalGetComponentType(COMPONENT_TYPE_PROPERTY);
++		return internalGetType(COMPONENT_TYPE_PROPERTY);
+ 	}
+ 
+-	private Type internalGetComponentType(ChildPropertyDescriptor property) {
+-		if (this.componentType == null) {
++	private Type internalGetType(ChildPropertyDescriptor property) {
++		if (this.type == null) {
+ 			// lazy init must be thread-safe for readers
+ 			synchronized (this) {
+-				if (this.componentType == null) {
++				if (this.type == null) {
+ 					preLazyInit();
+-					this.componentType = new SimpleType(this.ast);
+-					postLazyInit(this.componentType, property);
++					this.type = new SimpleType(this.ast);
++					postLazyInit(this.type, property);
+ 				}
+ 			}
+ 		}
+-		return this.componentType;
++		return this.type;
+ 	}
+ 
+ 	/**
+@@ -287,30 +302,31 @@ public class ArrayType extends Type {
+ 	 * <li>the node already has a parent</li>
+ 	 * <li>a cycle in would be created</li>
+ 	 * </ul>
+-	 * @deprecated from JLS8 and later, the recursive structure is not valid
++	 * @exception UnsupportedOperationException if this operation is used in
++	 * an AST later than JLS4
++	 * @deprecated In the JLS8 API, the recursive structure is not valid.
+ 	 */
+ 	public void setComponentType(Type componentType) {
+ 		supportedOnlyIn2_3_4();
+ 		if (componentType == null) {
+ 			throw new IllegalArgumentException();
+ 		}
+-		internalSetComponentType(componentType, COMPONENT_TYPE_PROPERTY);
++		internalSetType(componentType, COMPONENT_TYPE_PROPERTY);
+ 	}
+ 
+-	private void internalSetComponentType(Type type, ChildPropertyDescriptor property) {
+-		ASTNode oldChild = this.componentType;
+-		preReplaceChild(oldChild, type, property);
+-		this.componentType = type;
+-		postReplaceChild(oldChild, type, property);
++	private void internalSetType(Type componentType, ChildPropertyDescriptor property) {
++		ASTNode oldChild = this.type;
++		preReplaceChild(oldChild, componentType, property);
++		this.type = componentType;
++		postReplaceChild(oldChild, componentType, property);
+ 	}
+ 
+ 	/**
+ 	 * Returns the element type of this array type. The element type is
+ 	 * never an array type.
+ 	 * <p>
+-	 * This is a convenience method that descends a chain of nested array types
+-	 * until it reaches a non-array type until JLS4. From JLS8 and later, this returns the
+-	 * element type directly.
++	 * In JLS4 and earlier, this is a convenience method that descends a chain of nested array types
++	 * until it reaches a non-array type.
+ 	 * </p>
+ 	 *
+ 	 * @return the element type node
+@@ -323,7 +339,7 @@ public class ArrayType extends Type {
+ 			}
+ 			return t;
+ 		}
+-		return internalGetComponentType(ELEMENT_TYPE_PROPERTY);
++		return internalGetType(ELEMENT_TYPE_PROPERTY);
+ 	}
+ 
+ 	/**
+@@ -336,21 +352,22 @@ public class ArrayType extends Type {
+ 	 * <li>the node already has a parent</li>
+ 	 * <li>the node is an array type</li>
+ 	 * </ul>
++	 * @exception UnsupportedOperationException if this operation is used below JLS8
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+ 	public void setElementType(Type type) {
++		unsupportedIn2_3_4();
+ 		if (type == null || type instanceof ArrayType) {
+ 			throw new IllegalArgumentException();
+ 		}
+-		internalSetComponentType(type, ELEMENT_TYPE_PROPERTY);
++		internalSetType(type, ELEMENT_TYPE_PROPERTY);
+ 	}
+ 
+ 	/**
+ 	 * Returns the number of dimensions in this array type.
+ 	 * <p>
+-	 * This is a convenience method that descends a chain of nested array types
+-	 * until it reaches a non-array type (until JLS4). From JLS8 onwards, 
+-	 * this returns the size of the dimensions list.
++	 * In JLS4 and earlier, this is a convenience method that descends a chain of nested array types
++	 * until it reaches a non-array type.
+ 	 * </p>
+ 	 *
+ 	 * @return the number of dimensions (always positive)
+@@ -369,26 +386,6 @@ public class ArrayType extends Type {
+ 	}
+ 
+ 	/**
+-	 * Returns the dimension d in this array type.
+-	 * <p>
+-	 * This is a convenience method that returns the dimension at the given number d.
+-	 * </p>
+-	 * @param d dimension no
+-	 * @return Dimension at number d, null if d out of range
+-	 * 
+-	 * @since 3.9 BETA_JAVA8
+-	 */
+-	public ExtraDimension getDimensionAt(int d) {
+-		unsupportedIn2_3_4();
+-		ExtraDimension extraDimension = null;
+-		int n = getDimensions() - 1;
+-		if (d >= 0 && d <= n) {
+-			extraDimension = (ExtraDimension) dimensions().get(n - d);
+-		}
+-		return extraDimension;
+-	}
+-
+-	/**
+ 	 * Returns the live ordered list of dimensions with optional annotations (added in JLS8 API).
+ 	 * 
+ 	 * @return the live list of dimensions with optional annotations (element type: {@link ExtraDimension})
+@@ -416,7 +413,7 @@ public class ArrayType extends Type {
+ 	int treeSize() {
+ 		return
+ 			memSize()
+-			+ (this.componentType == null ? 0 : (this.ast.apiLevel() < AST.JLS8 ? getComponentType().treeSize() : getElementType().treeSize())
++			+ (this.type == null ? 0 : (this.ast.apiLevel() < AST.JLS8 ? getComponentType().treeSize() : getElementType().treeSize())
+ 			+ (this.dimensions == null ? 0 : this.dimensions.listSize()));
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Type.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Type.java
+index 336deda..5d91ac9 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Type.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Type.java
+@@ -30,11 +30,11 @@ package org.eclipse.jdt.core.dom;
+  * Type:
+  *    AnnotatableType:
+  *       PrimitiveType
+- *       ArrayType
+  *       SimpleType
+  *       QualifiedType
+  *       PackageQualifiedType
+  *       WildcardType
++ *    ArrayType
+  *    ParameterizedType
+  *    UnionType
+  *    IntersectionType
+@@ -50,7 +50,7 @@ package org.eclipse.jdt.core.dom;
+  *    { Annotation } <b>boolean</b>
+  *    { Annotation } <b>void</b>
+  * {@link ArrayType}:
+- *    Type { Annotation } <b>'['</b> <b>']'</b>
++ *    Type ExtraDimension <b>{</b> ExtraDimension <b>}</b>
+  * {@link SimpleType}:
+  *    { Annotation } TypeName
+  * {@link QualifiedType}:
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+index ae1ee68..5234b1e 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+@@ -65,6 +65,9 @@ import org.eclipse.text.edits.TextEditGroup;
+ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 
+ 	/** @deprecated using deprecated code */
++	private static final ChildPropertyDescriptor INTERNAL_ARRAY_COMPONENT_TYPE_PROPERTY = ArrayType.COMPONENT_TYPE_PROPERTY;
++
++	/** @deprecated using deprecated code */
+ 	private static final SimplePropertyDescriptor INTERNAL_FIELD_MODIFIERS_PROPERTY = FieldDeclaration.MODIFIERS_PROPERTY;
+ 
+ 	/** @deprecated using deprecated code */
+@@ -2204,9 +2207,9 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 		if (parent.getAST().apiLevel() >= AST.JLS8) {
+ 			return (Type) getOriginalValue(parent, ArrayType.ELEMENT_TYPE_PROPERTY);
+ 		}
+-		Type t = (Type) getOriginalValue(parent, ArrayType.COMPONENT_TYPE_PROPERTY);
++		Type t = (Type) getOriginalValue(parent, INTERNAL_ARRAY_COMPONENT_TYPE_PROPERTY);
+ 		while (t.isArrayType()) {
+-			t = (Type) getOriginalValue(t, ArrayType.COMPONENT_TYPE_PROPERTY);
++			t = (Type) getOriginalValue(t, INTERNAL_ARRAY_COMPONENT_TYPE_PROPERTY);
+ 		}
+ 		return t;
+ 	}
+@@ -2215,11 +2218,11 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 		if (parent.getAST().apiLevel() >= AST.JLS8) {
+ 			return ((List) getOriginalValue(parent, ArrayType.DIMENSIONS_PROPERTY)).size();
+ 		}
+-		Type t = (Type) getOriginalValue(parent, ArrayType.COMPONENT_TYPE_PROPERTY);
++		Type t = (Type) getOriginalValue(parent, INTERNAL_ARRAY_COMPONENT_TYPE_PROPERTY);
+ 		int dimensions = 1; // always include this array type
+ 		while (t.isArrayType()) {
+ 			dimensions++;
+-			t = (Type) getOriginalValue(t, ArrayType.COMPONENT_TYPE_PROPERTY);
++			t = (Type) getOriginalValue(t, INTERNAL_ARRAY_COMPONENT_TYPE_PROPERTY);
+ 		}
+ 		return dimensions;
+ 	}
+@@ -2247,7 +2250,7 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 			return doVisitUnchangedChildren(node);
+ 		}
+ 		if (node.getAST().apiLevel() < AST.JLS8) {
+-			rewriteRequiredNode(node, ArrayType.COMPONENT_TYPE_PROPERTY);
++			rewriteRequiredNode(node, INTERNAL_ARRAY_COMPONENT_TYPE_PROPERTY);
+ 		} else {
+ 			int pos = rewriteRequiredNode(node, ArrayType.ELEMENT_TYPE_PROPERTY);
+ 			rewriteNodeList(node, ArrayType.DIMENSIONS_PROPERTY, pos, Util.EMPTY_STRING, " "); //$NON-NLS-1$
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
+index 033b496..c9d3fa4 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
+@@ -22,6 +22,9 @@ import org.eclipse.jdt.internal.compiler.util.Util;
+ public class ASTRewriteFlattener extends ASTVisitor {
+ 
+ 	/** @deprecated using deprecated code */
++	private static final ChildPropertyDescriptor INTERNAL_ARRAY_COMPONENT_TYPE_PROPERTY = ArrayType.COMPONENT_TYPE_PROPERTY;
++
++	/** @deprecated using deprecated code */
+ 	private static final SimplePropertyDescriptor INTERNAL_FIELD_MODIFIERS_PROPERTY = FieldDeclaration.MODIFIERS_PROPERTY;
+ 
+ 	/** @deprecated using deprecated code */
+@@ -238,16 +241,16 @@ public class ASTRewriteFlattener extends ASTVisitor {
+ 		// get the element type and count dimensions
+ 		Type elementType;
+ 		int dimensions;
+-		boolean astLevelGTE8 = node.getAST().apiLevel() >= AST.JLS8 ? true : false;
++		boolean astLevelGTE8 = node.getAST().apiLevel() >= AST.JLS8;
+ 		if (astLevelGTE8) {
+ 			elementType = (Type) getChildNode(arrayType, ArrayType.ELEMENT_TYPE_PROPERTY);
+ 			dimensions = getChildList(arrayType, ArrayType.DIMENSIONS_PROPERTY).size();
+ 		} else {
+-			elementType = (Type) getChildNode(arrayType, ArrayType.COMPONENT_TYPE_PROPERTY);
++			elementType = (Type) getChildNode(arrayType, INTERNAL_ARRAY_COMPONENT_TYPE_PROPERTY);
+ 			dimensions = 1; // always include this array type
+ 			while (elementType.isArrayType()) {
+ 				dimensions++;
+-				elementType = (Type) getChildNode(elementType, ArrayType.COMPONENT_TYPE_PROPERTY);
++				elementType = (Type) getChildNode(elementType, INTERNAL_ARRAY_COMPONENT_TYPE_PROPERTY);
+ 			}
+ 		}
+ 
+@@ -297,7 +300,7 @@ public class ASTRewriteFlattener extends ASTVisitor {
+ 	 */
+ 	public boolean visit(ArrayType node) {
+ 		if (node.getAST().apiLevel() < AST.JLS8) {
+-			getChildNode(node, ArrayType.COMPONENT_TYPE_PROPERTY).accept(this);
++			getChildNode(node, INTERNAL_ARRAY_COMPONENT_TYPE_PROPERTY).accept(this);
+ 			this.result.append("[]"); //$NON-NLS-1$
+ 		} else {
+ 			getChildNode(node, ArrayType.ELEMENT_TYPE_PROPERTY).accept(this);
+commit 43bf242c384a6b4ad5daf26c5b4617ec68564235
+Author: Markus Keller <markus_keller@ch.ibm.com>
+Date:   Tue Oct 15 21:45:23 2013 +0200
+
+    Bug 413569 comment 30: renamed ExtraDimension node to Dimension
+
+34	34	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
+12	12	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterAST8Test.java
+1	1	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterJavadocFlattener.java
+3	3	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTMatcherTest.java
+10	10	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTTest.java
+3	3	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTVisitorTest.java
+1	1	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ConverterTestSetup.java
+1	1	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/SampleASTs.java
+3	3	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingExpressionsTest.java
+19	19	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingMethodDeclTest.java
+19	19	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingStatementsTest.java
+15	15	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingTypeDeclTest.java
+5	5	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
+14	14	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
+23	23	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTMatcher.java
+7	7	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTNode.java
+14	14	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTVisitor.java
+7	7	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ArrayType.java
+8	6	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/DefaultASTVisitor.java
+168	0	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Dimension.java
+0	167	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ExtraDimension.java
+7	7	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/MethodDeclaration.java
+2	2	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/SingleVariableDeclaration.java
+1	1	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Type.java
+7	7	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/VariableDeclaration.java
+2	2	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/VariableDeclarationFragment.java
+11	11	org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/NaiveASTFlattener.java
+10	10	org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+11	11	org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
+index d310a8a..bdf63b7 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
+@@ -27,7 +27,7 @@ import org.eclipse.jdt.core.dom.AnnotatableType;
+ import org.eclipse.jdt.core.dom.ArrayCreation;
+ import org.eclipse.jdt.core.dom.ArrayType;
+ import org.eclipse.jdt.core.dom.CompilationUnit;
+-import org.eclipse.jdt.core.dom.ExtraDimension;
++import org.eclipse.jdt.core.dom.Dimension;
+ import org.eclipse.jdt.core.dom.ITypeBinding;
+ import org.eclipse.jdt.core.dom.MethodDeclaration;
+ import org.eclipse.jdt.core.dom.SimpleType;
+@@ -141,13 +141,13 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		List dimensions = type.dimensions();
+ 		assertEquals(2, dimensions.size());
+ 		
+-		ExtraDimension dimension = (ExtraDimension) dimensions.get(0);
++		Dimension dimension = (Dimension) dimensions.get(0);
+ 		List annotations = dimension.annotations();
+ 		assertEquals("Wrong number of annotations", 1, annotations.size());
+ 		Annotation annotation = (Annotation) annotations.get(0);
+ 		checkSourceRange(annotation, "@B()", contents);
+ 		
+-		dimension = (ExtraDimension) dimensions.get(1);
++		dimension = (Dimension) dimensions.get(1);
+ 		annotations = dimension.annotations();
+ 		assertEquals("Wrong number of annotations", 1, annotations.size());
+ 		annotation = (Annotation) annotations.get(0);
+@@ -1190,12 +1190,12 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		Type type = creation.getType();
+ 		assertEquals("Incorrect type", true, type.isArrayType());
+ 		checkSourceRange(type, "@Marker2 int @Marker @Marker2 [2] @Marker2 @Marker3 [bar()] @Marker3 @Marker []", contents.toCharArray());
+-		ExtraDimension extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(2);
+-		assertEquals("Incorrect annotations", "@Marker3 @Marker ", convertAnnotationsList(extraDimension.annotations()));
+-		extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(1);
+-		assertEquals("Incorrect annotations", "@Marker2 @Marker3 ", convertAnnotationsList(extraDimension.annotations()));
+-		extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(0);
+-		assertEquals("Incorrect annotations", "@Marker @Marker2 ", convertAnnotationsList(extraDimension.annotations()));
++		Dimension dimension = (Dimension) ((ArrayType) type).dimensions().get(2);
++		assertEquals("Incorrect annotations", "@Marker3 @Marker ", convertAnnotationsList(dimension.annotations()));
++		dimension = (Dimension) ((ArrayType) type).dimensions().get(1);
++		assertEquals("Incorrect annotations", "@Marker2 @Marker3 ", convertAnnotationsList(dimension.annotations()));
++		dimension = (Dimension) ((ArrayType) type).dimensions().get(0);
++		assertEquals("Incorrect annotations", "@Marker @Marker2 ", convertAnnotationsList(dimension.annotations()));
+ 		List dimensions = creation.dimensions();
+ 		assertEquals("Incorrect expressions", 2, dimensions.size());
+ 		assertEquals("Incorrect expressions", "2", dimensions.get(0).toString());
+@@ -1209,12 +1209,12 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		
+ 		type = creation.getType();
+ 		assertEquals("Incorrect type", true, type.isArrayType());
+-		extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(2);
+-		assertEquals("Incorrect annotations", "@Marker2 @Marker3 ", convertAnnotationsList(extraDimension.annotations()));
+-		extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(1);
+-		assertEquals("Incorrect annotations", "@Marker @Marker2 ", convertAnnotationsList(extraDimension.annotations()));
+-		extraDimension = (ExtraDimension) ((ArrayType) type).dimensions().get(0);
+-		assertEquals("Incorrect annotations", "@Marker3 @Marker ", convertAnnotationsList(extraDimension.annotations()));
++		dimension = (Dimension) ((ArrayType) type).dimensions().get(2);
++		assertEquals("Incorrect annotations", "@Marker2 @Marker3 ", convertAnnotationsList(dimension.annotations()));
++		dimension = (Dimension) ((ArrayType) type).dimensions().get(1);
++		assertEquals("Incorrect annotations", "@Marker @Marker2 ", convertAnnotationsList(dimension.annotations()));
++		dimension = (Dimension) ((ArrayType) type).dimensions().get(0);
++		assertEquals("Incorrect annotations", "@Marker3 @Marker ", convertAnnotationsList(dimension.annotations()));
+ 		dimensions = creation.dimensions();
+ 		assertEquals("Incorrect expressions", 2, dimensions.size());
+ 		assertEquals("Incorrect expressions", "2", dimensions.get(0).toString());
+@@ -2990,20 +2990,20 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		checkSourceRange(arrayType, "@NonEmpty(0) int @NonNull(value1 = 1) [] @NonEmpty(1) [ ]", contents);
+ 		PrimitiveType primitiveType = (PrimitiveType) arrayType.getElementType();
+ 		checkSourceRange(primitiveType, "@NonEmpty(0) int", contents);
+-		ExtraDimension extraDimension = (ExtraDimension) arrayType.dimensions().get(0);
+-		checkSourceRange(extraDimension, "@NonNull(value1 = 1) []", contents);
+-		extraDimension = (ExtraDimension) arrayType.dimensions().get(1);
+-		checkSourceRange(extraDimension, "@NonEmpty(1) [ ]", contents);
++		Dimension dimension = (Dimension) arrayType.dimensions().get(0);
++		checkSourceRange(dimension, "@NonNull(value1 = 1) []", contents);
++		dimension = (Dimension) arrayType.dimensions().get(1);
++		checkSourceRange(dimension, "@NonEmpty(1) [ ]", contents);
+ 		
+ 		field = (FieldDeclaration) type.bodyDeclarations().get(count++);
+ 		checkSourceRange(field, "@Annot int @Annot1 [] a1 @Annot2 @Annot3 @NonNull (value = int[].class, value1 = 0)[/* [] */ ] @Annot3 @Annot2 [] @Annot4 [];", contents);
+ 		arrayType = (ArrayType) field.getType();
+ 		checkSourceRange(arrayType, "int @Annot1 []", contents);
+ 		fragment = (VariableDeclarationFragment) field.fragments().get(0);
+-		extraDimension = (ExtraDimension) fragment.extraDimensions().get(0);
+-		checkSourceRange(extraDimension, "@Annot2 @Annot3 @NonNull (value = int[].class, value1 = 0)[/* [] */ ]", contents);
+-		extraDimension = (ExtraDimension) fragment.extraDimensions().get(1);
+-		checkSourceRange(extraDimension, "@Annot3 @Annot2 []", contents);
++		dimension = (Dimension) fragment.extraDimensions().get(0);
++		checkSourceRange(dimension, "@Annot2 @Annot3 @NonNull (value = int[].class, value1 = 0)[/* [] */ ]", contents);
++		dimension = (Dimension) fragment.extraDimensions().get(1);
++		checkSourceRange(dimension, "@Annot3 @Annot2 []", contents);
+ 		
+ 		field = (FieldDeclaration) type.bodyDeclarations().get(count++);
+ 		checkSourceRange(field, "int[] xxx[];", contents);
+@@ -3047,10 +3047,10 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		checkSourceRange(arrayType, "@TakeType(int[][].class) int @TakeType(float.class) [] @TakeType(double.class) []", contents);
+ 		checkSourceRange(arrayType.getElementType(), "@TakeType(int[][].class) int", contents);
+ 		assertTrue(arrayType.getElementType().isPrimitiveType());
+-		extraDimension = (ExtraDimension) arrayType.dimensions().get(0);
+-		checkSourceRange(extraDimension, "@TakeType(float.class) []", contents);
+-		extraDimension = (ExtraDimension) arrayType.dimensions().get(1);
+-		Annotation annotation = (Annotation) extraDimension.annotations().get(0);
++		dimension = (Dimension) arrayType.dimensions().get(0);
++		checkSourceRange(dimension, "@TakeType(float.class) []", contents);
++		dimension = (Dimension) arrayType.dimensions().get(1);
++		Annotation annotation = (Annotation) dimension.annotations().get(0);
+ 		assertTrue(annotation.isSingleMemberAnnotation());
+ 		singleMemberAnnotation = (SingleMemberAnnotation) annotation;
+ 		typeLiteral = (TypeLiteral) singleMemberAnnotation.getValue();
+@@ -3072,9 +3072,9 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		assertTrue(arrayType.getDimensions() == 1);
+ 		
+ 		MethodDeclaration method = (MethodDeclaration) type.bodyDeclarations().get(count++);
+-		extraDimension = (ExtraDimension) method.extraDimensions().get(0);
+-		checkSourceRange(extraDimension, "@TakeType(int[].class) []", contents);
+-		singleMemberAnnotation = (SingleMemberAnnotation) extraDimension.annotations().get(0);
++		dimension = (Dimension) method.extraDimensions().get(0);
++		checkSourceRange(dimension, "@TakeType(int[].class) []", contents);
++		singleMemberAnnotation = (SingleMemberAnnotation) dimension.annotations().get(0);
+ 		typeLiteral = (TypeLiteral) singleMemberAnnotation.getValue();
+ 		arrayType = (ArrayType) typeLiteral.getType();
+ 		assertTrue(arrayType.getElementType().isPrimitiveType());
+@@ -3089,13 +3089,13 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		ForStatement forStatement = (ForStatement) method.getBody().statements().get(1);
+ 		VariableDeclarationExpression variableDeclarationExpression = (VariableDeclarationExpression) forStatement.initializers().get(0);
+ 		fragment = (VariableDeclarationFragment) variableDeclarationExpression.fragments().get(0);
+-		extraDimension = (ExtraDimension) fragment.extraDimensions().get(0);
+-		checkSourceRange(extraDimension, "@TakeType(int[].class) []", contents);
++		dimension = (Dimension) fragment.extraDimensions().get(0);
++		checkSourceRange(dimension, "@TakeType(int[].class) []", contents);
+ 		forStatement = (ForStatement) method.getBody().statements().get(1);
+ 		variableDeclarationExpression = (VariableDeclarationExpression) forStatement.initializers().get(0);
+ 		fragment = (VariableDeclarationFragment) variableDeclarationExpression.fragments().get(0);
+-		extraDimension = (ExtraDimension) fragment.extraDimensions().get(0);
+-		checkSourceRange(extraDimension, "@TakeType(int[].class) []", contents);
++		dimension = (Dimension) fragment.extraDimensions().get(0);
++		checkSourceRange(dimension, "@TakeType(int[].class) []", contents);
+ 		
+ 		method = (MethodDeclaration) type.bodyDeclarations().get(count++);
+ 		singleVariableDeclaration = (SingleVariableDeclaration) method.parameters().get(0);
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterAST8Test.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterAST8Test.java
+index d4130e5..c28118c 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterAST8Test.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterAST8Test.java
+@@ -2732,7 +2732,7 @@ public class ASTConverterAST8Test extends ConverterTestSetup {
+ 		fragment.setName(this.ast.newSimpleName("z"));//$NON-NLS-1$
+ 		fragment.setInitializer(this.ast.newNullLiteral());
+ 		fragment.extraDimensions().clear();
+-		fragment.extraDimensions().add(this.ast.newExtraDimension());
++		fragment.extraDimensions().add(this.ast.newDimension());
+ 		statement.fragments().add(fragment);
+ 		fragment = this.ast.newVariableDeclarationFragment();
+ 		fragment.setName(this.ast.newSimpleName("i"));//$NON-NLS-1$
+@@ -2741,8 +2741,8 @@ public class ASTConverterAST8Test extends ConverterTestSetup {
+ 		fragment = this.ast.newVariableDeclarationFragment();
+ 		fragment.setName(this.ast.newSimpleName("j"));//$NON-NLS-1$
+ 		fragment.extraDimensions().clear();
+-		fragment.extraDimensions().add(this.ast.newExtraDimension());
+-		fragment.extraDimensions().add(this.ast.newExtraDimension());
++		fragment.extraDimensions().add(this.ast.newDimension());
++		fragment.extraDimensions().add(this.ast.newDimension());
+ 		statement.fragments().add(fragment);
+ 		statement.setType(this.ast.newPrimitiveType(PrimitiveType.INT));
+ 		assertTrue("Both AST trees should be identical", statement.subtreeMatch(new ASTMatcher(), node));		//$NON-NLS-1$
+@@ -2775,7 +2775,7 @@ public class ASTConverterAST8Test extends ConverterTestSetup {
+ 		fragment.setName(this.ast.newSimpleName("z"));//$NON-NLS-1$
+ 		fragment.setInitializer(this.ast.newNullLiteral());
+ 		fragment.extraDimensions().clear();
+-		fragment.extraDimensions().add(this.ast.newExtraDimension());
++		fragment.extraDimensions().add(this.ast.newDimension());
+ 		statement.fragments().add(fragment);
+ 		fragment = this.ast.newVariableDeclarationFragment();
+ 		fragment.setName(this.ast.newSimpleName("i"));//$NON-NLS-1$
+@@ -2784,8 +2784,8 @@ public class ASTConverterAST8Test extends ConverterTestSetup {
+ 		fragment = this.ast.newVariableDeclarationFragment();
+ 		fragment.setName(this.ast.newSimpleName("j"));//$NON-NLS-1$
+ 		fragment.extraDimensions().clear();
+-		fragment.extraDimensions().add(this.ast.newExtraDimension());
+-		fragment.extraDimensions().add(this.ast.newExtraDimension());
++		fragment.extraDimensions().add(this.ast.newDimension());
++		fragment.extraDimensions().add(this.ast.newDimension());
+ 		statement.fragments().add(fragment);
+ 		statement.setType(this.ast.newArrayType(this.ast.newPrimitiveType(PrimitiveType.INT), 1));
+ 		assertTrue("Both AST trees should be identical", statement.subtreeMatch(new ASTMatcher(), node));		//$NON-NLS-1$
+@@ -2812,7 +2812,7 @@ public class ASTConverterAST8Test extends ConverterTestSetup {
+ 		variableDeclarationFragment.setName(this.ast.newSimpleName("tab")); //$NON-NLS-1$
+ 		variableDeclarationFragment.setInitializer(this.ast.newNullLiteral());//$NON-NLS-1$
+ 		variableDeclarationFragment.extraDimensions().clear();
+-		variableDeclarationFragment.extraDimensions().add(this.ast.newExtraDimension());
++		variableDeclarationFragment.extraDimensions().add(this.ast.newDimension());
+ 		VariableDeclarationExpression variableDeclarationExpression = this.ast.newVariableDeclarationExpression(variableDeclarationFragment);
+ 		variableDeclarationExpression.setType(this.ast.newArrayType(this.ast.newSimpleType(this.ast.newSimpleName("String")), 1));//$NON-NLS-1$
+ 		forStatement.initializers().add(variableDeclarationExpression);
+@@ -2841,7 +2841,7 @@ public class ASTConverterAST8Test extends ConverterTestSetup {
+ 		variableDeclarationFragment.setName(this.ast.newSimpleName("tab")); //$NON-NLS-1$
+ 		variableDeclarationFragment.setInitializer(this.ast.newNullLiteral());//$NON-NLS-1$
+ 		variableDeclarationFragment.extraDimensions().clear();
+-		variableDeclarationFragment.extraDimensions().add(this.ast.newExtraDimension());
++		variableDeclarationFragment.extraDimensions().add(this.ast.newDimension());
+ 		VariableDeclarationExpression variableDeclarationExpression = this.ast.newVariableDeclarationExpression(variableDeclarationFragment);
+ 		variableDeclarationExpression.setType(this.ast.newSimpleType(this.ast.newSimpleName("String")));//$NON-NLS-1$
+ 		forStatement.initializers().add(variableDeclarationExpression);
+@@ -2870,7 +2870,7 @@ public class ASTConverterAST8Test extends ConverterTestSetup {
+ 		variableDeclarationFragment.setName(this.ast.newSimpleName("tab")); //$NON-NLS-1$
+ 		variableDeclarationFragment.setInitializer(this.ast.newNullLiteral());//$NON-NLS-1$
+ 		variableDeclarationFragment.extraDimensions().clear();
+-		variableDeclarationFragment.extraDimensions().add(this.ast.newExtraDimension());
++		variableDeclarationFragment.extraDimensions().add(this.ast.newDimension());
+ 		VariableDeclarationExpression variableDeclarationExpression = this.ast.newVariableDeclarationExpression(variableDeclarationFragment);
+ 		variableDeclarationExpression.setType(this.ast.newSimpleType(this.ast.newSimpleName("String")));//$NON-NLS-1$
+ 		forStatement.initializers().add(variableDeclarationExpression);
+@@ -2928,7 +2928,7 @@ public class ASTConverterAST8Test extends ConverterTestSetup {
+ 		fragment = this.ast.newVariableDeclarationFragment();
+ 		fragment.setName(this.ast.newSimpleName("y"));//$NON-NLS-1$
+ 		fragment.extraDimensions().clear();
+-		fragment.extraDimensions().add(this.ast.newExtraDimension());
++		fragment.extraDimensions().add(this.ast.newDimension());
+ 		fragment.setInitializer(this.ast.newNullLiteral());
+ 		fieldDeclaration.fragments().add(fragment);
+ 		fragment = this.ast.newVariableDeclarationFragment();
+@@ -2938,8 +2938,8 @@ public class ASTConverterAST8Test extends ConverterTestSetup {
+ 		fragment = this.ast.newVariableDeclarationFragment();
+ 		fragment.setName(this.ast.newSimpleName("j"));//$NON-NLS-1$
+ 		fragment.extraDimensions().clear();
+-		fragment.extraDimensions().add(this.ast.newExtraDimension());
+-		fragment.extraDimensions().add(this.ast.newExtraDimension());
++		fragment.extraDimensions().add(this.ast.newDimension());
++		fragment.extraDimensions().add(this.ast.newDimension());
+ 		fieldDeclaration.fragments().add(fragment);
+ 		assertTrue("Both AST trees should be identical", fieldDeclaration.subtreeMatch(new ASTMatcher(), node));		//$NON-NLS-1$
+ 		checkSourceRange(node, "public int x= 10, y[] = null, i, j[][];", source); //$NON-NLS-1$
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterJavadocFlattener.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterJavadocFlattener.java
+index 3f396b9..83d6ec4 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterJavadocFlattener.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterJavadocFlattener.java
+@@ -69,7 +69,7 @@ public boolean visit(ArrayType node) {
+ 	} else {
+ 		node.getElementType().accept(this);
+ 		for (int i = 0;  i < node.getDimensions(); ++i) {
+-			((ExtraDimension) node.dimensions().get(i)).accept(this);
++			((Dimension) node.dimensions().get(i)).accept(this);
+ 		}
+ 	}
+ 	return false;
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTMatcherTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTMatcherTest.java
+index aedf076..c86504d 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTMatcherTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTMatcherTest.java
+@@ -558,7 +558,7 @@ public class ASTMatcherTest extends org.eclipse.jdt.core.tests.junit.extension.T
+ 		public boolean match(WildcardType node, Object other) {
+ 			return standardBody(node, other, this.superMatch ? super.match(node, other) : false);
+ 		}
+-		public boolean match(ExtraDimension node, Object other) {
++		public boolean match(Dimension node, Object other) {
+ 			return standardBody(node, other, this.superMatch ? super.match(node, other) : false);
+ 		}
+ 		public boolean match(InstanceofExpression node, Object other) {
+@@ -1615,12 +1615,12 @@ public class ASTMatcherTest extends org.eclipse.jdt.core.tests.junit.extension.T
+ 		}
+ 		VariableDeclarationFragment x1 = this.ast.newVariableDeclarationFragment();
+ 		x1.setName(this.N1);
+-		ExtraDimension x2 = this.ast.newExtraDimension();
++		Dimension x2 = this.ast.newDimension();
+ 		Annotation Annot = this.ast.newMarkerAnnotation();
+ 		Annot.setTypeName(this.ast.newSimpleName("NewAnnot1"));
+ 		x2.annotations().add(Annot);
+ 		x1.extraDimensions().add(x2);
+-		x2 = this.ast.newExtraDimension();
++		x2 = this.ast.newDimension();
+ 		Annot = this.ast.newMarkerAnnotation();
+ 		Annot.setTypeName(this.ast.newSimpleName("NewAnnot2"));
+ 		x2.annotations().add(Annot);
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTTest.java
+index df737c8..989df2a 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTTest.java
+@@ -3215,7 +3215,7 @@ public class ASTTest extends org.eclipse.jdt.core.tests.junit.extension.TestCase
+ 		if (this.ast.apiLevel() < AST.JLS8) {
+ 			x.setExtraDimensions(1);
+ 		} else {
+-			x.extraDimensions().add(this.ast.newExtraDimension());
++			x.extraDimensions().add(this.ast.newDimension());
+ 		}
+ 		assertTrue(this.ast.modificationCount() > previousCount);
+ 		assertTrue(x.getExtraDimensions() == 1);
+@@ -3326,9 +3326,9 @@ public class ASTTest extends org.eclipse.jdt.core.tests.junit.extension.TestCase
+ 
+ 		if (this.ast.apiLevel() >= AST.JLS8) {
+ 			genericPropertyListTest(x, x.extraDimensions(),
+-					new Property("ExtraDimensions", true, ExtraDimension.class) { //$NON-NLS-1$
++					new Property("ExtraDimensions", true, Dimension.class) { //$NON-NLS-1$
+ 						public ASTNode sample(AST targetAst, boolean parented) {
+-							ExtraDimension result = targetAst.newExtraDimension();
++							Dimension result = targetAst.newDimension();
+ 							if (parented) {
+ 								targetAst.newMethodDeclaration().extraDimensions().add(result);
+ 							}
+@@ -3385,7 +3385,7 @@ public class ASTTest extends org.eclipse.jdt.core.tests.junit.extension.TestCase
+ 		if (this.ast.apiLevel() < AST.JLS8) {
+ 			setExtraDimensions(x, 1);
+ 		} else {
+-			x.extraDimensions().add(this.ast.newExtraDimension());
++			x.extraDimensions().add(this.ast.newDimension());
+ 		}
+ 		assertTrue(this.ast.modificationCount() > previousCount);
+ 		assertTrue(x.getExtraDimensions() == 1);
+@@ -3427,9 +3427,9 @@ public class ASTTest extends org.eclipse.jdt.core.tests.junit.extension.TestCase
+ 
+ 		if (this.ast.apiLevel() >= AST.JLS8) {
+ 			genericPropertyListTest(x, x.extraDimensions(),
+-					new Property("ExtraDimensions", true, ExtraDimension.class) { //$NON-NLS-1$
++					new Property("ExtraDimensions", true, Dimension.class) { //$NON-NLS-1$
+ 						public ASTNode sample(AST targetAst, boolean parented) {
+-							ExtraDimension result = targetAst.newExtraDimension();
++							Dimension result = targetAst.newDimension();
+ 							if (parented) {
+ 								targetAst.newMethodDeclaration().extraDimensions().add(result);
+ 							}
+@@ -3547,7 +3547,7 @@ public class ASTTest extends org.eclipse.jdt.core.tests.junit.extension.TestCase
+ 		if (this.ast.apiLevel() < AST.JLS8) {
+ 			x.setExtraDimensions(1);
+ 		} else {
+-			x.extraDimensions().add(this.ast.newExtraDimension());
++			x.extraDimensions().add(this.ast.newDimension());
+ 		}
+ 		assertTrue(this.ast.modificationCount() > previousCount);
+ 		assertTrue(x.getExtraDimensions() == 1);
+@@ -3633,9 +3633,9 @@ public class ASTTest extends org.eclipse.jdt.core.tests.junit.extension.TestCase
+ 
+ 		if (this.ast.apiLevel() >= AST.JLS8) {
+ 			genericPropertyListTest(x, x.extraDimensions(),
+-					new Property("ExtraDimensions", true, ExtraDimension.class) { //$NON-NLS-1$
++					new Property("ExtraDimensions", true, Dimension.class) { //$NON-NLS-1$
+ 						public ASTNode sample(AST targetAst, boolean parented) {
+-							ExtraDimension result = targetAst.newExtraDimension();
++							Dimension result = targetAst.newDimension();
+ 							if (parented) {
+ 								targetAst.newMethodDeclaration().extraDimensions().add(result);
+ 							}
+@@ -8827,7 +8827,7 @@ public class ASTTest extends org.eclipse.jdt.core.tests.junit.extension.TestCase
+ 			ASTNode.ANNOTATION_TYPE_MEMBER_DECLARATION,
+ 			ASTNode.MODIFIER,
+ 			ASTNode.UNION_TYPE,
+-			ASTNode.EXTRA_DIMENSION,
++			ASTNode.DIMENSION,
+ 			ASTNode.LAMBDA_EXPRESSION,
+ 			ASTNode.INTERSECTION_TYPE,
+ 			ASTNode.PACKAGE_QUALIFIED_TYPE,
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTVisitorTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTVisitorTest.java
+index 076d46a..59d8b23 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTVisitorTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTVisitorTest.java
+@@ -1094,11 +1094,11 @@ public class ASTVisitorTest extends org.eclipse.jdt.core.tests.junit.extension.T
+ 			ASTVisitorTest.this.b.append("MOD)"); //$NON-NLS-1$
+ 		}
+ 
+-		public boolean visit(ExtraDimension node) {
++		public boolean visit(Dimension node) {
+ 			ASTVisitorTest.this.b.append("(@ED"); //$NON-NLS-1$
+ 			return isVisitingChildren();
+ 		}
+-		public void endVisit(ExtraDimension node) {
++		public void endVisit(Dimension node) {
+ 			ASTVisitorTest.this.b.append("@ED)"); //$NON-NLS-1$
+ 		}
+ 		
+@@ -1548,7 +1548,7 @@ public class ASTVisitorTest extends org.eclipse.jdt.core.tests.junit.extension.T
+ 		if (this.ast.apiLevel() < AST.JLS8) {
+ 			return;
+ 		}
+-		ExtraDimension x1 = this.ast.newExtraDimension();
++		Dimension x1 = this.ast.newDimension();
+ 		x1.annotations().add(this.ANO1);
+ 		x1.annotations().add(this.ANO2);
+ 		TestVisitor v1 = new TestVisitor();
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ConverterTestSetup.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ConverterTestSetup.java
+index 076cb30..cde2cc4 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ConverterTestSetup.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ConverterTestSetup.java
+@@ -164,7 +164,7 @@ public abstract class ConverterTestSetup extends AbstractASTTests {
+ 		StringBuffer buffer = new StringBuffer();
+ 		Iterator iter = dimensions.iterator();
+ 		while(iter.hasNext()) {
+-			ExtraDimension dim = (ExtraDimension) iter.next();
++			Dimension dim = (Dimension) iter.next();
+ 			buffer.append(convertAnnotationsList(dim.annotations()));
+ 			if (iter.hasNext()) {
+ 				buffer.append("[] ");
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/SampleASTs.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/SampleASTs.java
+index 7536623..a2e84df 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/SampleASTs.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/SampleASTs.java
+@@ -93,7 +93,7 @@ public class SampleASTs {
+ 			md.setReturnType2(pmt);
+ 		}
+ 		if (target.apiLevel() >= AST.JLS8) {
+-			ExtraDimension ed = target.newExtraDimension();
++			Dimension ed = target.newDimension();
+ 			md.extraDimensions().add(ed);
+ 		}
+ 
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingExpressionsTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingExpressionsTest.java
+index 927f481..a780167 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingExpressionsTest.java
+@@ -263,19 +263,19 @@ public class ASTRewritingExpressionsTest extends ASTRewritingTest {
+ 			memberValuePair.setName(ast.newSimpleName("v"));
+ 			memberValuePair.setValue(ast.newNumberLiteral("99"));
+ 			annotationC.values().add(memberValuePair);
+-			ExtraDimension dim0 = (ExtraDimension) arrayType.dimensions().get(0);
++			Dimension dim0 = (Dimension) arrayType.dimensions().get(0);
+ 			dim0.annotations().add(annotationC);
+ 			
+ 			SingleMemberAnnotation annotationB= ast.newSingleMemberAnnotation();
+ 			annotationB.setTypeName(ast.newSimpleName("B"));
+ 			annotationB.setValue(ast.newNumberLiteral("0"));
+-			ExtraDimension dim1 = ast.newExtraDimension();
++			Dimension dim1 = ast.newDimension();
+ 			dim1.annotations().add(annotationB);
+ 			arrayType.dimensions().add(0, dim1);
+ 			
+ 			MarkerAnnotation annotationA= ast.newMarkerAnnotation();
+ 			annotationA.setTypeName(ast.newSimpleName("A"));
+-			ExtraDimension dim2 = ast.newExtraDimension();
++			Dimension dim2 = ast.newDimension();
+ 			dim2.annotations().add(annotationA);
+ 			arrayType.dimensions().add(0, dim2);
+ 			
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingMethodDeclTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingMethodDeclTest.java
+index 55bd874..2d7055f 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingMethodDeclTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingMethodDeclTest.java
+@@ -111,7 +111,7 @@ public class ASTRewritingMethodDeclTest extends ASTRewritingTest {
+ 				listRewrite.remove(extraDimension, null);
+ 			}
+ 			for (int i= 0; i < extraDimensions; i++) {
+-				listRewrite.insertFirst(methodDecl.getAST().newExtraDimension(), null);
++				listRewrite.insertFirst(methodDecl.getAST().newDimension(), null);
+ 			}
+ 		}
+ 	}
+@@ -3152,13 +3152,13 @@ public class ASTRewritingMethodDeclTest extends ASTRewritingTest {
+ 			MethodDeclaration methodDecl= findMethodDeclaration(type, "foo1");
+ 
+ 			ListRewrite listRewrite= rewrite.getListRewrite(methodDecl, MethodDeclaration.EXTRA_DIMENSIONS2_PROPERTY);
+-			ExtraDimension dim= ast.newExtraDimension();
++			Dimension dim= ast.newDimension();
+ 			MarkerAnnotation markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot1"));
+ 			dim.annotations().add(markerAnnotation);
+ 			listRewrite.insertAt(dim, 1, null);
+ 
+-			dim= ast.newExtraDimension();
++			dim= ast.newDimension();
+ 			markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot2"));
+ 			dim.annotations().add(markerAnnotation);
+@@ -3171,7 +3171,7 @@ public class ASTRewritingMethodDeclTest extends ASTRewritingTest {
+ 			MethodDeclaration methodDecl= findMethodDeclaration(type, "foo2");
+ 			ListRewrite listRewrite= rewrite.getListRewrite(methodDecl, MethodDeclaration.EXTRA_DIMENSIONS2_PROPERTY);
+ 
+-			ExtraDimension dim= ast.newExtraDimension();
++			Dimension dim= ast.newDimension();
+ 			MarkerAnnotation markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot1"));
+ 			dim.annotations().add(markerAnnotation);
+@@ -3185,7 +3185,7 @@ public class ASTRewritingMethodDeclTest extends ASTRewritingTest {
+ 			MethodDeclaration methodDecl= findMethodDeclaration(type, "foo3");
+ 			ListRewrite listRewrite= rewrite.getListRewrite(methodDecl, MethodDeclaration.EXTRA_DIMENSIONS2_PROPERTY);
+ 
+-			ExtraDimension dim= ast.newExtraDimension();
++			Dimension dim= ast.newDimension();
+ 			MarkerAnnotation markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot1"));
+ 			dim.annotations().add(markerAnnotation);
+@@ -3197,15 +3197,15 @@ public class ASTRewritingMethodDeclTest extends ASTRewritingTest {
+ 		}
+ 		{
+ 			MethodDeclaration methodDecl= findMethodDeclaration(type, "foo4");
+-			ExtraDimension dim= (ExtraDimension) methodDecl.extraDimensions().get(0);
+-			ListRewrite listRewrite= rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			Dimension dim= (Dimension) methodDecl.extraDimensions().get(0);
++			ListRewrite listRewrite= rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 
+ 			MarkerAnnotation markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot2"));
+ 			listRewrite.insertAt(markerAnnotation, 0, null);
+ 
+-			dim= (ExtraDimension) methodDecl.extraDimensions().get(1);
+-			listRewrite= rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			dim= (Dimension) methodDecl.extraDimensions().get(1);
++			listRewrite= rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 
+ 			markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot1"));
+@@ -3213,33 +3213,33 @@ public class ASTRewritingMethodDeclTest extends ASTRewritingTest {
+ 		}
+ 		{
+ 			MethodDeclaration methodDecl= findMethodDeclaration(type, "foo5");
+-			ExtraDimension dim= (ExtraDimension) methodDecl.extraDimensions().get(0);
++			Dimension dim= (Dimension) methodDecl.extraDimensions().get(0);
+ 			Annotation annot= (Annotation) dim.annotations().get(0);
+-			ListRewrite listRewrite= rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			ListRewrite listRewrite= rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			listRewrite.remove(annot, null);
+ 
+-			dim= (ExtraDimension) methodDecl.extraDimensions().get(1);
+-			listRewrite= rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			dim= (Dimension) methodDecl.extraDimensions().get(1);
++			listRewrite= rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			listRewrite.insertAt(annot, 1, null);
+ 		}
+ 		{
+ 			MethodDeclaration methodDecl= findMethodDeclaration(type, "foo6");
+-			ExtraDimension dim= (ExtraDimension) methodDecl.extraDimensions().get(0);
++			Dimension dim= (Dimension) methodDecl.extraDimensions().get(0);
+ 			Annotation annot= (Annotation) dim.annotations().get(0);
+-			ListRewrite listRewrite= rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			ListRewrite listRewrite= rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			listRewrite.remove(annot, null);
+ 
+-			dim= (ExtraDimension) methodDecl.extraDimensions().get(1);
++			dim= (Dimension) methodDecl.extraDimensions().get(1);
+ 			annot= (Annotation) dim.annotations().get(0);
+-			listRewrite= rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			listRewrite= rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			listRewrite.remove(annot, null);
+ 		}
+ 		{
+ 			MethodDeclaration methodDecl= findMethodDeclaration(type, "foo7");
+ 			ListRewrite listRewrite= rewrite.getListRewrite(methodDecl, MethodDeclaration.EXTRA_DIMENSIONS2_PROPERTY);
+-			ExtraDimension dim= (ExtraDimension) methodDecl.extraDimensions().get(0);
++			Dimension dim= (Dimension) methodDecl.extraDimensions().get(0);
+ 			listRewrite.remove(dim, null);
+-			dim= (ExtraDimension) methodDecl.extraDimensions().get(1);
++			dim= (Dimension) methodDecl.extraDimensions().get(1);
+ 			listRewrite.remove(dim, null);
+ 		}
+ 
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingStatementsTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingStatementsTest.java
+index aaa8f64..fe13150 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingStatementsTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingStatementsTest.java
+@@ -40,7 +40,7 @@ import org.eclipse.jdt.core.dom.ContinueStatement;
+ import org.eclipse.jdt.core.dom.DoStatement;
+ import org.eclipse.jdt.core.dom.Expression;
+ import org.eclipse.jdt.core.dom.ExpressionStatement;
+-import org.eclipse.jdt.core.dom.ExtraDimension;
++import org.eclipse.jdt.core.dom.Dimension;
+ import org.eclipse.jdt.core.dom.ForStatement;
+ import org.eclipse.jdt.core.dom.IfStatement;
+ import org.eclipse.jdt.core.dom.InfixExpression;
+@@ -103,7 +103,7 @@ public class ASTRewritingStatementsTest extends ASTRewritingTest {
+ 			node.setExtraDimensions(dimensions);
+ 		} else {
+ 			while (dimensions > 0) {
+-				node.extraDimensions().add(node.getAST().newExtraDimension());
++				node.extraDimensions().add(node.getAST().newDimension());
+ 			}
+ 		}
+ 	}
+@@ -5942,15 +5942,15 @@ public class ASTRewritingStatementsTest extends ASTRewritingTest {
+ 			ArrayCreation creation = (ArrayCreation) fragment.getInitializer();
+ 
+ 			ListRewrite listRewrite= rewrite.getListRewrite(fragment, VariableDeclarationFragment.EXTRA_DIMENSIONS2_PROPERTY);
+-			ExtraDimension dim= ast.newExtraDimension();
++			Dimension dim= ast.newDimension();
+ 			MarkerAnnotation markerAnnotation;
+ 			listRewrite.insertFirst(dim, null);
+ 
+ 			ArrayType creationType = creation.getType();
+ 			ArrayType newArrayType = (ArrayType) ASTNode.copySubtree(ast, creationType);
+-			newArrayType.dimensions().add(ast.newExtraDimension());
++			newArrayType.dimensions().add(ast.newDimension());
+ 			
+-			ExtraDimension dim0 = ast.newExtraDimension();
++			Dimension dim0 = ast.newDimension();
+ 			markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot3"));
+ 			dim0.annotations().add(markerAnnotation);
+@@ -5981,18 +5981,18 @@ public class ASTRewritingStatementsTest extends ASTRewritingTest {
+ 			Expression exp = (Expression) expressions.get(1);
+ 			listRewrite.remove(exp, null);
+ 
+-			ExtraDimension dim = (ExtraDimension) creationType.dimensions().get(0);
+-			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			Dimension dim = (Dimension) creationType.dimensions().get(0);
++			listRewrite = rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			MarkerAnnotation annotation = (MarkerAnnotation) dim.annotations().get(0);
+ 			listRewrite.remove(annotation, null);
+ 
+-			dim = (ExtraDimension) creationType.dimensions().get(1);
+-			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			dim = (Dimension) creationType.dimensions().get(1);
++			listRewrite = rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(1);
+ 			listRewrite.remove(annotation, null);
+ 
+-			dim = (ExtraDimension) creationType.dimensions().get(2);
+-			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			dim = (Dimension) creationType.dimensions().get(2);
++			listRewrite = rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(1);
+ 			listRewrite.remove(annotation, null);
+ 
+@@ -6000,22 +6000,22 @@ public class ASTRewritingStatementsTest extends ASTRewritingTest {
+ 
+ 			creation = (ArrayCreation) fragment.getInitializer();
+ 			creationType = creation.getType();
+-			dim = (ExtraDimension) creationType.dimensions().get(0);
+-			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			dim = (Dimension) creationType.dimensions().get(0);
++			listRewrite = rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(1);
+ 			listRewrite.remove(annotation, null);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(0);
+ 			listRewrite.remove(annotation, null);
+ 
+-			dim = (ExtraDimension) creationType.dimensions().get(1);
+-			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			dim = (Dimension) creationType.dimensions().get(1);
++			listRewrite = rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(1);
+ 			listRewrite.remove(annotation, null);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(0);
+ 			listRewrite.remove(annotation, null);
+ 
+-			dim = (ExtraDimension) creationType.dimensions().get(2);
+-			listRewrite = rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			dim = (Dimension) creationType.dimensions().get(2);
++			listRewrite = rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(1);
+ 			listRewrite.remove(annotation, null);
+ 			annotation = (MarkerAnnotation) dim.annotations().get(0);
+@@ -6090,8 +6090,8 @@ public class ASTRewritingStatementsTest extends ASTRewritingTest {
+ 			ArrayCreation creation = (ArrayCreation) fragment.getInitializer();
+ 
+ 			ArrayType arrayType = creation.getType();
+-			ExtraDimension dim = (ExtraDimension) arrayType.dimensions().get(1);
+-			ListRewrite listRewrite= rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			Dimension dim = (Dimension) arrayType.dimensions().get(1);
++			ListRewrite listRewrite= rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			listRewrite.remove((ASTNode)dim.annotations().get(0), null);
+ 			listRewrite.remove((ASTNode)dim.annotations().get(1), null);
+ 			rewrite.set(creation, ArrayCreation.TYPE_PROPERTY, arrayType, null);
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingTypeDeclTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingTypeDeclTest.java
+index 4829a51..eacb130 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingTypeDeclTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/rewrite/describing/ASTRewritingTypeDeclTest.java
+@@ -37,7 +37,7 @@ import org.eclipse.jdt.core.dom.EnumConstantDeclaration;
+ import org.eclipse.jdt.core.dom.EnumDeclaration;
+ import org.eclipse.jdt.core.dom.Expression;
+ import org.eclipse.jdt.core.dom.ExpressionStatement;
+-import org.eclipse.jdt.core.dom.ExtraDimension;
++import org.eclipse.jdt.core.dom.Dimension;
+ import org.eclipse.jdt.core.dom.FieldDeclaration;
+ import org.eclipse.jdt.core.dom.ImportDeclaration;
+ import org.eclipse.jdt.core.dom.MarkerAnnotation;
+@@ -1767,7 +1767,7 @@ public class ASTRewritingTypeDeclTest extends ASTRewritingTest {
+ 			rewrite.replace(fragment.getName(), name, null);
+ 
+ 			ListRewrite listRewrite= rewrite.getListRewrite(fragment, VariableDeclarationFragment.EXTRA_DIMENSIONS2_PROPERTY);
+-			ExtraDimension dim= ast.newExtraDimension();
++			Dimension dim= ast.newDimension();
+ 			MarkerAnnotation markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot1"));
+ 			dim.annotations().add(markerAnnotation);
+@@ -1789,7 +1789,7 @@ public class ASTRewritingTypeDeclTest extends ASTRewritingTest {
+ 			rewrite.remove(fragment.getInitializer(), null);
+ 
+ 			ListRewrite listRewrite= rewrite.getListRewrite(fragment, VariableDeclarationFragment.EXTRA_DIMENSIONS2_PROPERTY);
+-			ExtraDimension dim= ast.newExtraDimension();
++			Dimension dim= ast.newDimension();
+ 			MarkerAnnotation markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot1"));
+ 			dim.annotations().add(markerAnnotation);
+@@ -1807,7 +1807,7 @@ public class ASTRewritingTypeDeclTest extends ASTRewritingTest {
+ 
+ 			ListRewrite listRewrite= rewrite.getListRewrite(fragment, VariableDeclarationFragment.EXTRA_DIMENSIONS2_PROPERTY);
+ 
+-			ExtraDimension dim= ast.newExtraDimension();
++			Dimension dim= ast.newDimension();
+ 			MarkerAnnotation markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot1"));
+ 			dim.annotations().add(markerAnnotation);
+@@ -1820,20 +1820,20 @@ public class ASTRewritingTypeDeclTest extends ASTRewritingTest {
+ 		{ // remove one dimension and add annotations for the rest of the dimensions
+ 			VariableDeclarationFragment fragment= (VariableDeclarationFragment) fragments.get(4);
+ 
+-			ExtraDimension dim= (ExtraDimension) fragment.extraDimensions().get(1);
+-			ListRewrite listRewrite= rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			Dimension dim= (Dimension) fragment.extraDimensions().get(1);
++			ListRewrite listRewrite= rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			MarkerAnnotation markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot1"));
+ 			listRewrite.insertAt(markerAnnotation, 0, null);
+ 
+-			dim= (ExtraDimension) fragment.extraDimensions().get(2);
++			dim= (Dimension) fragment.extraDimensions().get(2);
+ 			markerAnnotation= ast.newMarkerAnnotation();
+ 			markerAnnotation.setTypeName(ast.newSimpleName("Annot2"));
+-			listRewrite= rewrite.getListRewrite(dim, ExtraDimension.ANNOTATIONS_PROPERTY);
++			listRewrite= rewrite.getListRewrite(dim, Dimension.ANNOTATIONS_PROPERTY);
+ 			listRewrite.insertAt(markerAnnotation, 0, null);
+ 
+ 			listRewrite= rewrite.getListRewrite(fragment, VariableDeclarationFragment.EXTRA_DIMENSIONS2_PROPERTY);
+-			listRewrite.remove((ExtraDimension) fragment.extraDimensions().get(0), null);
++			listRewrite.remove((Dimension) fragment.extraDimensions().get(0), null);
+ 		}
+ 		{ // remove a fragment
+ 			ListRewrite listRewrite= rewrite.getListRewrite(variableDeclStatement, VariableDeclarationStatement.FRAGMENTS_PROPERTY);
+@@ -1887,7 +1887,7 @@ public class ASTRewritingTypeDeclTest extends ASTRewritingTest {
+ 		{ // add modifier, move extra dimensions from one variable to another
+ 			SingleVariableDeclaration decl= (SingleVariableDeclaration) arguments.get(0);
+ 			SingleVariableDeclaration decl2= (SingleVariableDeclaration) arguments.get(1);
+-			ExtraDimension dim= (ExtraDimension) decl2.extraDimensions().get(0);
++			Dimension dim= (Dimension) decl2.extraDimensions().get(0);
+ 			ListRewrite listRewrite= rewrite.getListRewrite(decl, SingleVariableDeclaration.MODIFIERS2_PROPERTY);
+ 			listRewrite.insertFirst(ast.newModifier(Modifier.ModifierKeyword.FINAL_KEYWORD), null);
+ 
+@@ -1898,21 +1898,21 @@ public class ASTRewritingTypeDeclTest extends ASTRewritingTest {
+ 		}
+ 		{ // move annotations from one dim to another
+ 			SingleVariableDeclaration decl= (SingleVariableDeclaration) arguments.get(2);
+-			ExtraDimension dim1= (ExtraDimension) decl.extraDimensions().get(0);
+-			ExtraDimension dim2= (ExtraDimension) decl.extraDimensions().get(1);
++			Dimension dim1= (Dimension) decl.extraDimensions().get(0);
++			Dimension dim2= (Dimension) decl.extraDimensions().get(1);
+ 			Annotation annot1= (Annotation) dim1.annotations().get(0);
+ 			Annotation annot2= (Annotation) dim2.annotations().get(0);
+ 
+-			ListRewrite listRewrite= rewrite.getListRewrite(dim1, ExtraDimension.ANNOTATIONS_PROPERTY);
++			ListRewrite listRewrite= rewrite.getListRewrite(dim1, Dimension.ANNOTATIONS_PROPERTY);
+ 			listRewrite.replace(annot1, annot2, null);
+ 
+-			listRewrite= rewrite.getListRewrite(dim2, ExtraDimension.ANNOTATIONS_PROPERTY);
++			listRewrite= rewrite.getListRewrite(dim2, Dimension.ANNOTATIONS_PROPERTY);
+ 			listRewrite.replace(annot2, annot1, null);
+ 		}
+ 		{ // remove extra dim
+ 			SingleVariableDeclaration decl= (SingleVariableDeclaration) arguments.get(3);
+ 			ListRewrite listRewrite= rewrite.getListRewrite(decl, SingleVariableDeclaration.EXTRA_DIMENSIONS2_PROPERTY);
+-			listRewrite.remove((ExtraDimension) decl.extraDimensions().get(0), null);
++			listRewrite.remove((Dimension) decl.extraDimensions().get(0), null);
+ 		}
+ 
+ 		String preview= evaluateRewrite(cu, rewrite);
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
+index 6992eae..26d2c8e 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
+@@ -1192,7 +1192,7 @@ public final class AST {
+ 		result.setElementType(elementType);
+ 		// index starting from 1 since there is a dimension already available by default.
+ 		for (int i = 1; i < dimensions; ++i) {
+-			result.dimensions().add(new ExtraDimension(this));
++			result.dimensions().add(new Dimension(this));
+ 		}
+ 		return result;
+ 
+@@ -1501,10 +1501,10 @@ public final class AST {
+ 	}
+ 
+ 	/**
+-	 * Creates and returns a new unparented annotatable extra dimension node
++	 * Creates and returns a new unparented annotatable dimension node
+ 	 * (Supported only in JLS8 level).
+ 	 *
+-	 * @return a new unparented annotatable extra dimension node
++	 * @return a new unparented annotatable dimension node
+ 	 * @exception IllegalArgumentException if:
+ 	 * <ul>
+ 	 * <li>the node belongs to a different AST</li>
+@@ -1514,8 +1514,8 @@ public final class AST {
+ 	 *            in a JLS2, JLS3 or JLS4 AST
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+-	public ExtraDimension newExtraDimension() {
+-		ExtraDimension result = new ExtraDimension(this);
++	public Dimension newDimension() {
++		Dimension result = new Dimension(this);
+ 		return result;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
+index 4018bf1..9d268f3 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTConverter.java
+@@ -926,12 +926,12 @@ class ASTConverter {
+ 		 * See PR http://bugs.eclipse.org/bugs/show_bug.cgi?id=23284
+ 		 */
+ 		if (isVarArgs) {
+-			ExtraDimension lastDimension = null;
++			Dimension lastDimension = null;
+ 			if (this.ast.apiLevel() >= AST.JLS8) {
+ 				if (type.isArrayType()) { // should always be true
+ 					List dimensions = ((ArrayType) type).dimensions();
+ 					if (!dimensions.isEmpty()) {
+-						lastDimension = (ExtraDimension) dimensions.get(dimensions.size() - 1);
++						lastDimension = (Dimension) dimensions.get(dimensions.size() - 1);
+ 					}
+ 				}
+ 			}
+@@ -3283,9 +3283,9 @@ class ASTConverter {
+ 		return variableDecl;
+ 	}
+ 
+-	private ExtraDimension convertToExtraDimensions(int start, int end, org.eclipse.jdt.internal.compiler.ast.Annotation[] annotation) {
++	private Dimension convertToDimensions(int start, int end, org.eclipse.jdt.internal.compiler.ast.Annotation[] annotation) {
+ 		int length = annotation == null ? 0 : annotation.length;
+-		ExtraDimension dimension = this.ast.newExtraDimension();
++		Dimension dimension = this.ast.newDimension();
+ 		for (int i = 0; i < length; i++) {
+ 			Annotation annot = convert(annotation[i]);
+ 			dimension.annotations().add(annot);
+@@ -3388,14 +3388,14 @@ class ASTConverter {
+ 			org.eclipse.jdt.internal.compiler.ast.Annotation[][] annotationsOnDims = type.getAnnotationsOnDimensions(true);
+ 			int length = (annotationsOnDims == null) ? 0 : annotationsOnDims.length;
+ 			for (int i = (length - extraDimension); i < length; i++) {
+-				ExtraDimension dim = convertToExtraDimensions(start, end, (annotationsOnDims == null) ? null : annotationsOnDims[i]);
++				Dimension dim = convertToDimensions(start, end, (annotationsOnDims == null) ? null : annotationsOnDims[i]);
+ 				extraAnnotatedDimensions.add(dim);
+ 				start = dim.getStartPosition() + dim.getLength();
+ 			}
+ 		}
+ 	}
+ 
+-	private void setTypeAnnotationsOnDimension(ExtraDimension currentDimension, org.eclipse.jdt.internal.compiler.ast.Annotation[][] annotationsOnDimensions, int dimension) {
++	private void setTypeAnnotationsOnDimension(Dimension currentDimension, org.eclipse.jdt.internal.compiler.ast.Annotation[][] annotationsOnDimensions, int dimension) {
+ 		if (annotationsOnDimensions == null) return;
+ 		org.eclipse.jdt.internal.compiler.ast.Annotation[] annotations = annotationsOnDimensions[dimension];
+ 		if (annotations != null) {
+@@ -3417,7 +3417,7 @@ class ASTConverter {
+ 		
+ 		start = endElement;
+ 		for (int i = 0; i < dimensions.size(); i++) {
+-			ExtraDimension currentDimension = (ExtraDimension) dimensions.get(i);
++			Dimension currentDimension = (Dimension) dimensions.get(i);
+ 			setTypeAnnotationsOnDimension(currentDimension, annotationsOnDimensions, i);
+ 			retrieveDimensionAndSetPositions(start, end, currentDimension);
+ 			start = currentDimension.getStartPosition() + currentDimension.getLength();
+@@ -4758,7 +4758,7 @@ class ASTConverter {
+ 		return dimensions;
+ 	}
+ 
+-	protected void retrieveDimensionAndSetPositions(int start, int end, ExtraDimension dim) {
++	protected void retrieveDimensionAndSetPositions(int start, int end, Dimension dim) {
+ 		this.scanner.resetTo(start, end);
+ 		int token;
+ 		int count = 0, lParenCount = 0;
+@@ -5689,23 +5689,23 @@ class ASTConverter {
+ 	/** extracts the subArrayType for a given declaration for AST levels less
+ 	 * @param arrayType parent type
+ 	 * @param remainingDimensions 
+-	 * @param extraDimensions
++	 * @param dimensionsToRemove
+ 	 * @return an ArrayType
+ 	 */
+-	private ArrayType extractSubArrayType(ArrayType arrayType, int remainingDimensions, int extraDimensions) {
++	private ArrayType extractSubArrayType(ArrayType arrayType, int remainingDimensions, int dimensionsToRemove) {
+ 		ArrayType subArrayType = arrayType;
+ 		int start = subArrayType.getStartPosition();
+ 		if (this.ast.apiLevel() < AST.JLS8) {
+-			while (extraDimensions > 0 ) {
++			while (dimensionsToRemove > 0 ) {
+ 				subArrayType = (ArrayType) componentType(subArrayType);
+-				extraDimensions--;
++				dimensionsToRemove--;
+ 			}
+ 			updateInnerPositions(subArrayType, remainingDimensions);
+ 		} else {
+ 			List dimensions = subArrayType.dimensions();
+-			while (extraDimensions > 0 ) {
++			while (dimensionsToRemove > 0 ) {
+ 				dimensions.remove(dimensions.size() - 1);
+-				extraDimensions--;
++				dimensionsToRemove--;
+ 			}
+ 		}
+ 		int end = retrieveProperRightBracketPosition(remainingDimensions, start);
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTMatcher.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTMatcher.java
+index b043365..7f19254 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTMatcher.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTMatcher.java
+@@ -735,6 +735,29 @@ public class ASTMatcher {
+ 	 * @return <code>true</code> if the subtree matches, or
+ 	 *   <code>false</code> if they do not match or the other object has a
+ 	 *   different node type or is <code>null</code>
++	 * @since 3.9 BETA_JAVA8
++	 */
++	public boolean match(Dimension node, Object other) {
++		if (!(other instanceof Dimension)) {
++			return false;
++		}
++		Dimension o = (Dimension) other;
++		return safeSubtreeListMatch(node.annotations(), o.annotations());
++	}
++
++	/**
++	 * Returns whether the given node and the other object match.
++	 * <p>
++	 * The default implementation provided by this class tests whether the
++	 * other object is a node of the same type with structurally isomorphic
++	 * child subtrees. Subclasses may override this method as needed.
++	 * </p>
++	 *
++	 * @param node the node
++	 * @param other the other object, or <code>null</code>
++	 * @return <code>true</code> if the subtree matches, or
++	 *   <code>false</code> if they do not match or the other object has a
++	 *   different node type or is <code>null</code>
+ 	 */
+ 	public boolean match(DoStatement node, Object other) {
+ 		if (!(other instanceof DoStatement)) {
+@@ -915,29 +938,6 @@ public class ASTMatcher {
+ 	 * @return <code>true</code> if the subtree matches, or
+ 	 *   <code>false</code> if they do not match or the other object has a
+ 	 *   different node type or is <code>null</code>
+-	 * @since 3.9 BETA_JAVA8
+-	 */
+-	public boolean match(ExtraDimension node, Object other) {
+-		if (!(other instanceof ExtraDimension)) {
+-			return false;
+-		}
+-		ExtraDimension o = (ExtraDimension) other;
+-		return safeSubtreeListMatch(node.annotations(), o.annotations());
+-	}
+-
+-	/**
+-	 * Returns whether the given node and the other object match.
+-	 * <p>
+-	 * The default implementation provided by this class tests whether the
+-	 * other object is a node of the same type with structurally isomorphic
+-	 * child subtrees. Subclasses may override this method as needed.
+-	 * </p>
+-	 *
+-	 * @param node the node
+-	 * @param other the other object, or <code>null</code>
+-	 * @return <code>true</code> if the subtree matches, or
+-	 *   <code>false</code> if they do not match or the other object has a
+-	 *   different node type or is <code>null</code>
+ 	 */
+ 	public boolean match(FieldAccess node, Object other) {
+ 		if (!(other instanceof FieldAccess)) {
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTNode.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTNode.java
+index 52b6996..644042e 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTNode.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTNode.java
+@@ -835,12 +835,12 @@ public abstract class ASTNode {
+ 
+ 	/**
+ 	 * Node type constant indicating a node of type
+-	 * <code>ExtraDimension</code>.
++	 * <code>Dimension</code>.
+ 	 *
+-	 * @see ExtraDimension
++	 * @see Dimension
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+-	public static final int EXTRA_DIMENSION = 85;
++	public static final int DIMENSION = 85;
+ 
+ 	/**
+ 	 * Node type constant indicating a node of type
+@@ -955,8 +955,8 @@ public abstract class ASTNode {
+ 				return ContinueStatement.class;
+ 			case CREATION_REFERENCE :
+ 				return CreationReference.class;
+-			case UNION_TYPE :
+-				return UnionType.class;
++			case DIMENSION:
++				return Dimension.class;
+ 			case DO_STATEMENT :
+ 				return DoStatement.class;
+ 			case EMPTY_STATEMENT :
+@@ -971,8 +971,6 @@ public abstract class ASTNode {
+ 				return ExpressionMethodReference.class;
+ 			case EXPRESSION_STATEMENT :
+ 				return ExpressionStatement.class;
+-			case EXTRA_DIMENSION:
+-				return ExtraDimension.class;
+ 			case FIELD_ACCESS :
+ 				return FieldAccess.class;
+ 			case FIELD_DECLARATION :
+@@ -1085,6 +1083,8 @@ public abstract class ASTNode {
+ 				return TypeLiteral.class;
+ 			case TYPE_PARAMETER :
+ 				return TypeParameter.class;
++			case UNION_TYPE :
++				return UnionType.class;
+ 			case VARIABLE_DECLARATION_EXPRESSION :
+ 				return VariableDeclarationExpression.class;
+ 			case VARIABLE_DECLARATION_FRAGMENT :
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTVisitor.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTVisitor.java
+index b4ffbaf..a23f1d0 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTVisitor.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ASTVisitor.java
+@@ -559,8 +559,9 @@ public abstract class ASTVisitor {
+ 	 * @return <code>true</code> if the children of this node should be
+ 	 * visited, and <code>false</code> if the children of this node should
+ 	 * be skipped
++	 * @since 3.9 BETA_JAVA8
+ 	 */
+-	public boolean visit(DoStatement node) {
++	public boolean visit(Dimension node) {
+ 		return true;
+ 	}
+ 
+@@ -576,7 +577,7 @@ public abstract class ASTVisitor {
+ 	 * visited, and <code>false</code> if the children of this node should
+ 	 * be skipped
+ 	 */
+-	public boolean visit(EmptyStatement node) {
++	public boolean visit(DoStatement node) {
+ 		return true;
+ 	}
+ 
+@@ -591,9 +592,8 @@ public abstract class ASTVisitor {
+ 	 * @return <code>true</code> if the children of this node should be
+ 	 * visited, and <code>false</code> if the children of this node should
+ 	 * be skipped
+-	 * @since 3.1
+ 	 */
+-	public boolean visit(EnhancedForStatement node) {
++	public boolean visit(EmptyStatement node) {
+ 		return true;
+ 	}
+ 
+@@ -610,7 +610,7 @@ public abstract class ASTVisitor {
+ 	 * be skipped
+ 	 * @since 3.1
+ 	 */
+-	public boolean visit(EnumConstantDeclaration node) {
++	public boolean visit(EnhancedForStatement node) {
+ 		return true;
+ 	}
+ 
+@@ -627,7 +627,7 @@ public abstract class ASTVisitor {
+ 	 * be skipped
+ 	 * @since 3.1
+ 	 */
+-	public boolean visit(EnumDeclaration node) {
++	public boolean visit(EnumConstantDeclaration node) {
+ 		return true;
+ 	}
+ 
+@@ -635,16 +635,16 @@ public abstract class ASTVisitor {
+ 	 * Visits the given type-specific AST node.
+ 	 * <p>
+ 	 * The default implementation does nothing and return true.
+-	 * Subclasses may re-implement.
++	 * Subclasses may reimplement.
+ 	 * </p>
+ 	 *
+ 	 * @param node the node to visit
+ 	 * @return <code>true</code> if the children of this node should be
+ 	 * visited, and <code>false</code> if the children of this node should
+ 	 * be skipped
+-	 * @since 3.9 BETA_JAVA8
++	 * @since 3.1
+ 	 */
+-	public boolean visit(ExpressionMethodReference node) {
++	public boolean visit(EnumDeclaration node) {
+ 		return true;
+ 	}
+ 
+@@ -652,15 +652,16 @@ public abstract class ASTVisitor {
+ 	 * Visits the given type-specific AST node.
+ 	 * <p>
+ 	 * The default implementation does nothing and return true.
+-	 * Subclasses may reimplement.
++	 * Subclasses may re-implement.
+ 	 * </p>
+ 	 *
+ 	 * @param node the node to visit
+ 	 * @return <code>true</code> if the children of this node should be
+ 	 * visited, and <code>false</code> if the children of this node should
+ 	 * be skipped
++	 * @since 3.9 BETA_JAVA8
+ 	 */
+-	public boolean visit(ExpressionStatement node) {
++	public boolean visit(ExpressionMethodReference node) {
+ 		return true;
+ 	}
+ 
+@@ -675,9 +676,8 @@ public abstract class ASTVisitor {
+ 	 * @return <code>true</code> if the children of this node should be
+ 	 * visited, and <code>false</code> if the children of this node should
+ 	 * be skipped
+-	 * @since 3.9 BETA_JAVA8
+ 	 */
+-	public boolean visit(ExtraDimension node) {
++	public boolean visit(ExpressionStatement node) {
+ 		return true;
+ 	}
+ 
+@@ -2090,7 +2090,7 @@ public abstract class ASTVisitor {
+ 	 * @param node the node to visit
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+-	public void endVisit(ExtraDimension node) {
++	public void endVisit(Dimension node) {
+ 		// do nothing by default
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ArrayType.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ArrayType.java
+index 100b882..a99b8b4 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ArrayType.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ArrayType.java
+@@ -26,7 +26,7 @@ import java.util.List;
+  * </p>
+  * <pre>
+  * ArrayType: 
+- *    Type ExtraDimension <b>{</b> ExtraDimension <b>}</b>
++ *    Type Dimension <b>{</b> Dimension <b>}</b>
+  * </pre>
+  * 
+  * In JLS4 and before, array types were expressed in a recursive manner, one dimension at a time:
+@@ -64,11 +64,11 @@ public class ArrayType extends Type {
+ 			new ChildPropertyDescriptor(ArrayType.class, "elementType", Type.class, MANDATORY, CYCLE_RISK); //$NON-NLS-1$	
+ 	
+ 	/**
+-	 * The "dimensions" structural property of this node type (element type: {@link ExtraDimension}) (added in JLS8 API).
++	 * The "dimensions" structural property of this node type (element type: {@link Dimension}) (added in JLS8 API).
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+ 	public static final ChildListPropertyDescriptor DIMENSIONS_PROPERTY =
+-			new ChildListPropertyDescriptor(ArrayType.class, "dimensions", ExtraDimension.class, CYCLE_RISK); //$NON-NLS-1$	
++			new ChildListPropertyDescriptor(ArrayType.class, "dimensions", Dimension.class, CYCLE_RISK); //$NON-NLS-1$	
+ 	/**
+ 	 * A list of property descriptors (element type:
+ 	 * {@link StructuralPropertyDescriptor}),
+@@ -126,7 +126,7 @@ public class ArrayType extends Type {
+ 
+ 	/**
+ 	 * List of dimensions this node has with optional annotations
+-	 * (element type: {@link ExtraDimension}).
++	 * (element type: {@link Dimension}).
+ 	 * Null before JLS8. Added in JLS8; defaults to a list with one element
+ 	 * (see constructor).
+ 	 * 
+@@ -148,7 +148,7 @@ public class ArrayType extends Type {
+ 		if (ast.apiLevel >= AST.JLS8) {
+ 			this.dimensions = new ASTNode.NodeList(DIMENSIONS_PROPERTY);
+ 			// single dimension array is the default
+-			this.dimensions().add(this.ast.newExtraDimension());
++			this.dimensions().add(this.ast.newDimension());
+ 		}
+ 	}
+ 
+@@ -168,7 +168,7 @@ public class ArrayType extends Type {
+ 		unsupportedIn2_3_4();
+ 		this.dimensions = new ASTNode.NodeList(DIMENSIONS_PROPERTY);
+ 		for (int i = 0; i < dimensions; ++i) {
+-			this.dimensions().add(this.ast.newExtraDimension());
++			this.dimensions().add(this.ast.newDimension());
+ 		}
+ 	}
+ 
+@@ -388,7 +388,7 @@ public class ArrayType extends Type {
+ 	/**
+ 	 * Returns the live ordered list of dimensions with optional annotations (added in JLS8 API).
+ 	 * 
+-	 * @return the live list of dimensions with optional annotations (element type: {@link ExtraDimension})
++	 * @return the live list of dimensions with optional annotations (element type: {@link Dimension})
+ 	 * @exception UnsupportedOperationException if this operation is used below JLS8
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/DefaultASTVisitor.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/DefaultASTVisitor.java
+index c8bffe5..1594d42 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/DefaultASTVisitor.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/DefaultASTVisitor.java
+@@ -95,6 +95,10 @@ class DefaultASTVisitor extends ASTVisitor {
+ 	public void endVisit(CreationReference node) {
+ 		endVisitNode(node);
+ 	}
++	public void endVisit(Dimension node) {
++		endVisitNode(node);
++	}
++
+ 	public void endVisit(DoStatement node) {
+ 		endVisitNode(node);
+ 	}
+@@ -116,9 +120,6 @@ class DefaultASTVisitor extends ASTVisitor {
+ 	public void endVisit(ExpressionStatement node) {
+ 		endVisitNode(node);
+ 	}
+-	public void endVisit(ExtraDimension node) {
+-		endVisitNode(node);
+-	}
+ 	public void endVisit(FieldAccess node) {
+ 		endVisitNode(node);
+ 	}
+@@ -377,6 +378,10 @@ class DefaultASTVisitor extends ASTVisitor {
+ 	public boolean visit(CreationReference node) {
+ 		return visitNode(node);
+ 	}
++	public boolean visit(Dimension node) {
++		return visitNode(node);
++	}
++
+ 	public boolean visit(DoStatement node) {
+ 		return visitNode(node);
+ 	}
+@@ -398,9 +403,6 @@ class DefaultASTVisitor extends ASTVisitor {
+ 	public boolean visit(ExpressionStatement node) {
+ 		return visitNode(node);
+ 	}
+-	public boolean visit(ExtraDimension node) {
+-		return visitNode(node);
+-	}
+ 	public boolean visit(FieldAccess node) {
+ 		return visitNode(node);
+ 	}
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Dimension.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Dimension.java
+new file mode 100644
+index 0000000..eb91189
+--- /dev/null
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Dimension.java
+@@ -0,0 +1,168 @@
++/*******************************************************************************
++ * Copyright (c) 2013 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.core.dom;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * AST node for an array dimension (added in JLS8 API).
++ * <p>
++ * A dimension, represented as <b>[]</b>, can have type annotations. The dimension node is used for:
++ * </p>
++ * <ul>
++ * <li>the dimensions of an {@link ArrayType}</li>
++ * <li>extra dimension in the following node types:
++ * {@link SingleVariableDeclaration}, {@link VariableDeclarationFragment}, {@link MethodDeclaration}</li>
++ * </ul>
++ * 
++ * <pre>
++ * Dimension:
++ * 	{ Annotation } <b>[]</b>
++ * </pre>
++ *
++ * @since 3.9 BETA_JAVA8
++ * @noinstantiate This class is not intended to be instantiated by clients.
++ */
++public class Dimension extends ASTNode {
++
++	/**
++	 * The "annotations" structural property of this node type (element type: {@link Annotation}).
++	 */
++	public static final ChildListPropertyDescriptor ANNOTATIONS_PROPERTY =
++		new ChildListPropertyDescriptor(Dimension.class, "annotations", Annotation.class, NO_CYCLE_RISK); //$NON-NLS-1$
++
++	/**
++	 * A list of property descriptors (element type:
++	 * {@link StructuralPropertyDescriptor}),
++	 * or null if uninitialized.
++	 */
++	private static final List PROPERTY_DESCRIPTORS_8_0;
++
++	static {
++		List propertyList = new ArrayList(2);
++		createPropertyList(Dimension.class, propertyList);
++		addProperty(ANNOTATIONS_PROPERTY, propertyList);
++		PROPERTY_DESCRIPTORS_8_0 = reapPropertyList(propertyList);
++	}
++
++	/**
++	 * Returns a list of structural property descriptors for this node type.
++	 * Clients must not modify the result.
++	 *
++	 * @param apiLevel the API level; one of the
++	 * <code>AST.JLS*</code> constants
++	 * @return a list of property descriptors (element type:
++	 * {@link StructuralPropertyDescriptor})
++	 */
++	public static List propertyDescriptors(int apiLevel) {
++		return PROPERTY_DESCRIPTORS_8_0;
++	}
++
++	/**
++	 * The list of annotations for this dimension (element type: {@link Annotation}).
++	 * Defaults to an empty list.
++	 */
++	private ASTNode.NodeList annotations = new ASTNode.NodeList(ANNOTATIONS_PROPERTY);
++
++	/**
++	 * Creates a new dimension node (supported only in level JLS8 or above).
++	 * <p>
++	 * N.B. This constructor is package-private.
++	 * </p>
++	 *
++	 * @param ast the AST that is to own this node
++	 * @exception UnsupportedOperationException if this operation is used
++	 *            in a JLS2, JLS3 or JLS4 AST
++	 */
++	Dimension(AST ast) {
++		super(ast);
++		unsupportedIn2_3_4();
++	}
++
++	/* (omit javadoc for this method)
++	 * Method declared on ASTNode.
++	 */
++	final List internalStructuralPropertiesForType(int apiLevel) {
++		return propertyDescriptors(apiLevel);
++	}
++
++	/* (omit javadoc for this method)
++	 * Method declared on ASTNode.
++	 */
++	final List internalGetChildListProperty(ChildListPropertyDescriptor property) {
++		if (property == ANNOTATIONS_PROPERTY) {
++			return annotations();
++		}
++		// allow default implementation to flag the error
++		return super.internalGetChildListProperty(property);
++	}
++
++	/* (omit javadoc for this method)
++	 * Method declared on ASTNode.
++	 */
++	final int getNodeType0() {
++		return DIMENSION;
++	}
++
++	/* (omit javadoc for this method)
++	 * Method declared on ASTNode.
++	 */
++	ASTNode clone0(AST target) {
++		Dimension result = new Dimension(target);
++		result.annotations().addAll(
++				ASTNode.copySubtrees(target, annotations()));
++		return result;
++	}
++
++	/* (omit javadoc for this method)
++	 * Method declared on ASTNode.
++	 */
++	final boolean subtreeMatch0(ASTMatcher matcher, Object other) {
++		// dispatch to correct overloaded match method
++		return matcher.match(this, other);
++	}
++
++	/* (omit javadoc for this method)
++	 * Method declared on ASTNode.
++	 */
++	void accept0(ASTVisitor visitor) {
++		boolean visitChildren = visitor.visit(this);
++		if (visitChildren) {
++			// visit children in normal left to right reading order
++			acceptChildren(visitor, this.annotations);
++		}
++		visitor.endVisit(this);
++	}
++
++	/**
++	 * Returns the live ordered list of annotations for this dimension.
++	 *
++	 * @return the live list of annotations (element type: {@link Annotation})
++	 */
++	public List annotations() {
++		return this.annotations;
++	}
++
++	int memSize() {
++		return BASE_NODE_SIZE + 1 * 4;
++	}
++
++	int treeSize() {
++		return
++			memSize()
++			+ this.annotations.listSize();
++	}
++}
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ExtraDimension.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ExtraDimension.java
+deleted file mode 100644
+index 306abe9..0000000
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ExtraDimension.java
++++ /dev/null
+@@ -1,167 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2013 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * This is an implementation of an early-draft specification developed under the Java
+- * Community Process (JCP) and is made available for testing and evaluation purposes
+- * only. The code is not compatible with any specification of the JCP.
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.jdt.core.dom;
+-
+-import java.util.ArrayList;
+-import java.util.List;
+-
+-/**
+- * The extra dimension node. An extra dimension, represented as <b>[]</b>, can have
+- * type annotations. This node type is supported only in JLS8 or later.
+- * <p>
+- * The extra dimension node is used to represent an extra dimension in the following node types:
+- * {@link SingleVariableDeclaration}, {@link VariableDeclarationFragment}, {@link MethodDeclaration}.
+- * It is not used for annotations on an {@link ArrayType}, since that type extends {@link AnnotatableType} now.
+- * </p>
+- * 
+- * <pre>
+- * ExtraDimension:
+- * 	{ Annotation } <b>[]</b>
+- * </pre>
+- *
+- * @since 3.9 BETA_JAVA8
+- * @noinstantiate This class is not intended to be instantiated by clients.
+- */
+-public class ExtraDimension extends ASTNode {
+-
+-	/**
+-	 * The "annotations" structural property of this node type (element type: {@link Annotation}).
+-	 */
+-	public static final ChildListPropertyDescriptor ANNOTATIONS_PROPERTY =
+-		new ChildListPropertyDescriptor(ExtraDimension.class, "annotations", Annotation.class, NO_CYCLE_RISK); //$NON-NLS-1$
+-
+-	/**
+-	 * A list of property descriptors (element type:
+-	 * {@link StructuralPropertyDescriptor}),
+-	 * or null if uninitialized.
+-	 */
+-	private static final List PROPERTY_DESCRIPTORS_8_0;
+-
+-	static {
+-		List propertyList = new ArrayList(2);
+-		createPropertyList(ExtraDimension.class, propertyList);
+-		addProperty(ANNOTATIONS_PROPERTY, propertyList);
+-		PROPERTY_DESCRIPTORS_8_0 = reapPropertyList(propertyList);
+-	}
+-
+-	/**
+-	 * Returns a list of structural property descriptors for this node type.
+-	 * Clients must not modify the result.
+-	 *
+-	 * @param apiLevel the API level; one of the
+-	 * <code>AST.JLS*</code> constants
+-	 * @return a list of property descriptors (element type:
+-	 * {@link StructuralPropertyDescriptor})
+-	 */
+-	public static List propertyDescriptors(int apiLevel) {
+-		return PROPERTY_DESCRIPTORS_8_0;
+-	}
+-
+-	/**
+-	 * The list of annotations for this dimension (element type: {@link Annotation}).
+-	 * Defaults to an empty list.
+-	 */
+-	private ASTNode.NodeList annotations = new ASTNode.NodeList(ANNOTATIONS_PROPERTY);
+-
+-	/**
+-	 * Creates a new extra dimension node (Supported only in level
+-	 * JLS8 or above).
+-	 * <p>
+-	 * N.B. This constructor is package-private.
+-	 * </p>
+-	 *
+-	 * @param ast the AST that is to own this node
+-	 * @exception UnsupportedOperationException if this operation is used
+-	 *            in a JLS2, JLS3 or JLS4 AST
+-	 */
+-	ExtraDimension(AST ast) {
+-		super(ast);
+-		unsupportedIn2_3_4();
+-	}
+-
+-	/* (omit javadoc for this method)
+-	 * Method declared on ASTNode.
+-	 */
+-	final List internalStructuralPropertiesForType(int apiLevel) {
+-		return propertyDescriptors(apiLevel);
+-	}
+-
+-	/* (omit javadoc for this method)
+-	 * Method declared on ASTNode.
+-	 */
+-	final List internalGetChildListProperty(ChildListPropertyDescriptor property) {
+-		if (property == ANNOTATIONS_PROPERTY) {
+-			return annotations();
+-		}
+-		// allow default implementation to flag the error
+-		return super.internalGetChildListProperty(property);
+-	}
+-
+-	/* (omit javadoc for this method)
+-	 * Method declared on ASTNode.
+-	 */
+-	final int getNodeType0() {
+-		return EXTRA_DIMENSION;
+-	}
+-
+-	/* (omit javadoc for this method)
+-	 * Method declared on ASTNode.
+-	 */
+-	ASTNode clone0(AST target) {
+-		ExtraDimension result = new ExtraDimension(target);
+-		result.annotations().addAll(
+-				ASTNode.copySubtrees(target, annotations()));
+-		return result;
+-	}
+-
+-	/* (omit javadoc for this method)
+-	 * Method declared on ASTNode.
+-	 */
+-	final boolean subtreeMatch0(ASTMatcher matcher, Object other) {
+-		// dispatch to correct overloaded match method
+-		return matcher.match(this, other);
+-	}
+-
+-	/* (omit javadoc for this method)
+-	 * Method declared on ASTNode.
+-	 */
+-	void accept0(ASTVisitor visitor) {
+-		boolean visitChildren = visitor.visit(this);
+-		if (visitChildren) {
+-			// visit children in normal left to right reading order
+-			acceptChildren(visitor, this.annotations);
+-		}
+-		visitor.endVisit(this);
+-	}
+-
+-	/**
+-	 * Returns the live ordered list of annotations for this dimension.
+-	 *
+-	 * @return the live list of annotations (element type: {@link Annotation})
+-	 */
+-	public List annotations() {
+-		return this.annotations;
+-	}
+-
+-	int memSize() {
+-		return BASE_NODE_SIZE + 1 * 4;
+-	}
+-
+-	int treeSize() {
+-		return
+-			memSize()
+-			+ this.annotations.listSize();
+-	}
+-}
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/MethodDeclaration.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/MethodDeclaration.java
+index b00d0de..c03425b 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/MethodDeclaration.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/MethodDeclaration.java
+@@ -27,14 +27,14 @@ import java.util.List;
+  *    [ Javadoc ] { ExtendedModifier } [ <b>&lt;</b> TypeParameter { <b>,</b> TypeParameter } <b>&gt;</b> ] ( Type | <b>void</b> )
+  *        Identifier <b>(</b>
+  *            [ ReceiverParameter <b>,</b> ] [ FormalParameter { <b>,</b> FormalParameter } ]
+- *        <b>)</b> { ExtraDimension }
++ *        <b>)</b> { Dimension }
+  *        [ <b>throws</b> Type { <b>,</b> Type } ]
+  *        ( Block | <b>;</b> )
+  * ConstructorDeclaration:
+  *    [ Javadoc ] { ExtendedModifier } [ <b>&lt;</b> TypeParameter { <b>,</b> TypeParameter } <b>&gt;</b> ]
+  *        Identifier <b>(</b>
+  *            [ ReceiverParameter <b>,</b> ] [ FormalParameter { <b>,</b> FormalParameter } ]
+- *        <b>)</b> { ExtraDimension }
++ *        <b>)</b> { Dimension }
+  *        [ <b>throws</b> Type { <b>,</b> Type } ]
+  *        ( Block | <b>;</b> )
+  * </pre>
+@@ -120,11 +120,11 @@ public class MethodDeclaration extends BodyDeclaration {
+ 		new SimplePropertyDescriptor(MethodDeclaration.class, "extraDimensions", int.class, MANDATORY); //$NON-NLS-1$
+ 	
+ 	/**
+-	 * The "extraDimensions2" structural property of this node type (element type: {@link ExtraDimension}) (added in JLS8 API).
++	 * The "extraDimensions2" structural property of this node type (element type: {@link Dimension}) (added in JLS8 API).
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+ 	public static final ChildListPropertyDescriptor EXTRA_DIMENSIONS2_PROPERTY =
+-			new ChildListPropertyDescriptor(MethodDeclaration.class, "extraDimensions2", ExtraDimension.class, NO_CYCLE_RISK); //$NON-NLS-1$
++			new ChildListPropertyDescriptor(MethodDeclaration.class, "extraDimensions2", Dimension.class, NO_CYCLE_RISK); //$NON-NLS-1$
+ 
+ 	/**
+ 	 * The "typeParameters" structural property of this node type (element type: {@link TypeParameter}) (added in JLS3 API).
+@@ -331,7 +331,7 @@ public class MethodDeclaration extends BodyDeclaration {
+ 
+ 	/**
+ 	 * List of extra dimensions this node has with optional annotations
+-	 * (element type: {@link ExtraDimension}).
++	 * (element type: {@link Dimension}).
+ 	 * Null before JLS8. Added in JLS8; defaults to an empty list
+ 	 * (see constructor).
+ 	 * 
+@@ -1065,7 +1065,7 @@ public class MethodDeclaration extends BodyDeclaration {
+ 	 * a JLS8 or later AST 
+ 	 * @since 2.1
+ 	 * @deprecated In the JLS8 API, this method is replaced by
+-	 * {@link #extraDimensions()} which contains a list of {@link ExtraDimension} nodes.
++	 * {@link #extraDimensions()} which contains a list of {@link Dimension} nodes.
+ 	 */
+ 	public void setExtraDimensions(int dimensions) {
+ 		// more efficient than just calling supportedOnlyIn2_3_4() to check
+@@ -1083,7 +1083,7 @@ public class MethodDeclaration extends BodyDeclaration {
+ 	/**
+ 	 * Returns the live ordered list of extra dimensions with optional annotations (added in JLS8 API).
+ 	 * 
+-	 * @return the live list of extra dimensions with optional annotations (element type: {@link ExtraDimension})
++	 * @return the live list of extra dimensions with optional annotations (element type: {@link Dimension})
+ 	 * @exception UnsupportedOperationException if this operation is used below JLS8
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/SingleVariableDeclaration.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/SingleVariableDeclaration.java
+index 1045a6a..c3a62a3 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/SingleVariableDeclaration.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/SingleVariableDeclaration.java
+@@ -26,7 +26,7 @@ import java.util.List;
+  * and regular variable declaration statements.
+  * <pre>
+  * SingleVariableDeclaration:
+- *    { ExtendedModifier } Type {Annotation} [ <b>...</b> ] Identifier { ExtraDimension } [ <b>=</b> Expression ]
++ *    { ExtendedModifier } Type {Annotation} [ <b>...</b> ] Identifier { Dimension } [ <b>=</b> Expression ]
+  * </pre>
+  * <p>
+  * Note: There's currently no construct in the Java language that allows an initializer on a SingleVariableDeclaration.
+@@ -92,7 +92,7 @@ public class SingleVariableDeclaration extends VariableDeclaration {
+ 			internalExtraDimensionsPropertyFactory(SingleVariableDeclaration.class);
+ 
+ 	/**
+-	 * The "extraDimensions2" structural property of this node type (element type: {@link ExtraDimension}) (added in JLS8 API).
++	 * The "extraDimensions2" structural property of this node type (element type: {@link Dimension}) (added in JLS8 API).
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+ 	public static final ChildListPropertyDescriptor EXTRA_DIMENSIONS2_PROPERTY =
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Type.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Type.java
+index 5d91ac9..50854d2 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Type.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/Type.java
+@@ -50,7 +50,7 @@ package org.eclipse.jdt.core.dom;
+  *    { Annotation } <b>boolean</b>
+  *    { Annotation } <b>void</b>
+  * {@link ArrayType}:
+- *    Type ExtraDimension <b>{</b> ExtraDimension <b>}</b>
++ *    Type Dimension <b>{</b> Dimension <b>}</b>
+  * {@link SimpleType}:
+  *    { Annotation } TypeName
+  * {@link QualifiedType}:
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/VariableDeclaration.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/VariableDeclaration.java
+index c13bd9b..e06343f 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/VariableDeclaration.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/VariableDeclaration.java
+@@ -47,7 +47,7 @@ public abstract class VariableDeclaration extends ASTNode {
+ 
+ 	/**
+ 	 * List of extra dimensions this node has with optional annotations
+-	 * (element type: {@link ExtraDimension}).
++	 * (element type: {@link Dimension}).
+ 	 * Null before JLS8. Added in JLS8; defaults to an empty list
+ 	 * (see constructor).
+ 	 * 
+@@ -84,12 +84,12 @@ public abstract class VariableDeclaration extends ASTNode {
+ 	
+ 	/**
+ 	 * Creates and returns a structural property descriptor for the
+-	 * "extraDimensions2" property declared on the given concrete node type (element type: {@link ExtraDimension}).
++	 * "extraDimensions2" property declared on the given concrete node type (element type: {@link Dimension}).
+ 	 *
+ 	 * @return the property descriptor
+ 	 */
+ 	static final ChildListPropertyDescriptor internalExtraDimensions2PropertyFactory(Class nodeClass) {
+-		return 	new ChildListPropertyDescriptor(nodeClass, "extraDimensions2", ExtraDimension.class, CYCLE_RISK); //$NON-NLS-1$
++		return 	new ChildListPropertyDescriptor(nodeClass, "extraDimensions2", Dimension.class, CYCLE_RISK); //$NON-NLS-1$
+ 	}
+ 	
+ 	/**
+@@ -147,7 +147,7 @@ public abstract class VariableDeclaration extends ASTNode {
+ 
+ 	/**
+ 	 * Returns the structural property descriptor for the "extraDimensions" property
+-	 * of this node (element type: {@link ExtraDimension}) (added in JLS8 API).
++	 * of this node (element type: {@link Dimension}) (added in JLS8 API).
+ 	 *
+ 	 * @return the property descriptor
+ 	 * @since 3.9 BETA_JAVA8
+@@ -156,7 +156,7 @@ public abstract class VariableDeclaration extends ASTNode {
+ 	
+ 	/**
+ 	 * Returns the structural property descriptor for the "extraDimensions" property
+-	 * of this node (element type: {@link ExtraDimension}) (added in JLS8 API).
++	 * of this node (element type: {@link Dimension}) (added in JLS8 API).
+ 	 *
+ 	 * @return the property descriptor
+ 	 * @since 3.9 BETA_JAVA8
+@@ -288,7 +288,7 @@ public abstract class VariableDeclaration extends ASTNode {
+ 	 * @exception UnsupportedOperationException if this operation is used in
+ 	 * a JLS8 or later AST 
+ 	 * @deprecated In the JLS8 API, this method is replaced by
+-	 * {@link #extraDimensions()} which contains a list of {@link ExtraDimension} nodes.
++	 * {@link #extraDimensions()} which contains a list of {@link Dimension} nodes.
+ 	 * @since 2.1
+ 	 */
+ 	public void setExtraDimensions(int dimensions) {
+@@ -317,7 +317,7 @@ public abstract class VariableDeclaration extends ASTNode {
+ 	/**
+ 	 * Returns the live ordered list of extra dimensions with optional annotations (added in JLS8 API).
+ 	 *
+-	 * @return the live list of extra dimensions with optional annotations (element type: {@link ExtraDimension})
++	 * @return the live list of extra dimensions with optional annotations (element type: {@link Dimension})
+ 	 * @exception UnsupportedOperationException if this operation is used below JLS8
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/VariableDeclarationFragment.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/VariableDeclarationFragment.java
+index 7d990e9..4929579 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/VariableDeclarationFragment.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/VariableDeclarationFragment.java
+@@ -23,7 +23,7 @@ import java.util.List;
+  *
+  * <pre>
+  * VariableDeclarationFragment:
+- *    Identifier { ExtraDimension } [ <b>=</b> Expression ]
++ *    Identifier { Dimension } [ <b>=</b> Expression ]
+  * </pre>
+  * @since 2.0
+  * @noinstantiate This class is not intended to be instantiated by clients.
+@@ -47,7 +47,7 @@ public class VariableDeclarationFragment extends VariableDeclaration {
+ 			internalExtraDimensionsPropertyFactory(VariableDeclarationFragment.class);
+ 
+ 	/**
+-	 * The "extraDimensions2" structural property of this node type (element type: {@link ExtraDimension}) (added in JLS8 API).
++	 * The "extraDimensions2" structural property of this node type (element type: {@link Dimension}) (added in JLS8 API).
+ 	 * @since 3.9 BETA_JAVA8
+ 	 */
+ 	public static final ChildListPropertyDescriptor EXTRA_DIMENSIONS2_PROPERTY =
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/NaiveASTFlattener.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/NaiveASTFlattener.java
+index 6d556c3..f3093d3 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/NaiveASTFlattener.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/NaiveASTFlattener.java
+@@ -377,7 +377,7 @@ public class NaiveASTFlattener extends ASTVisitor {
+ 			node.getElementType().accept(this);
+ 			List dimensions = node.dimensions();
+ 			for (int i = 0; i < dimensions.size() ; i++) {
+-				ExtraDimension aDimension = (ExtraDimension) dimensions.get(i);
++				Dimension aDimension = (Dimension) dimensions.get(i);
+ 				aDimension.accept(this);
+ 			}
+ 		}
+@@ -618,6 +618,13 @@ public class NaiveASTFlattener extends ASTVisitor {
+ 		return false;
+ 	}
+ 
++	public boolean visit(Dimension node) {
++		this.buffer.append(" ");//$NON-NLS-1$
++		visitAnnotationsList(node.annotations());
++		this.buffer.append("[]"); //$NON-NLS-1$
++		return false;
++	}
++
+ 	/*
+ 	 * @see ASTVisitor#visit(DoStatement)
+ 	 */
+@@ -751,13 +758,6 @@ public class NaiveASTFlattener extends ASTVisitor {
+ 		return false;
+ 	}
+ 
+-	public boolean visit(ExtraDimension node) {
+-		this.buffer.append(" ");//$NON-NLS-1$
+-		visitAnnotationsList(node.annotations());
+-		this.buffer.append("[]"); //$NON-NLS-1$
+-		return false;
+-	}
+-
+ 	/*
+ 	 * @see ASTVisitor#visit(FieldAccess)
+ 	 */
+@@ -1076,7 +1076,7 @@ public class NaiveASTFlattener extends ASTVisitor {
+ 		if (node.getAST().apiLevel() >= AST.JLS8) {
+ 			List dimensions = node.extraDimensions();
+ 			for (int i = 0; i < size; i++) {
+-				visit((ExtraDimension) dimensions.get(i));
++				visit((Dimension) dimensions.get(i));
+ 			}
+ 		} else {
+ 			for (int i = 0; i < size; i++) {
+@@ -1427,7 +1427,7 @@ public class NaiveASTFlattener extends ASTVisitor {
+ 		if (node.getAST().apiLevel() >= AST.JLS8) {
+ 			List dimensions = node.extraDimensions();
+ 			for (int i = 0; i < size; i++) {
+-				visit((ExtraDimension) dimensions.get(i));
++				visit((Dimension) dimensions.get(i));
+ 			}
+ 		} else {
+ 			for (int i = 0; i < size; i++) {
+@@ -1883,7 +1883,7 @@ public class NaiveASTFlattener extends ASTVisitor {
+ 		if (node.getAST().apiLevel() >= AST.JLS8) {
+ 			List dimensions = node.extraDimensions();
+ 			for (int i = 0; i < size; i++) {
+-				visit((ExtraDimension) dimensions.get(i));
++				visit((Dimension) dimensions.get(i));
+ 			}
+ 		} else {
+ 			for (int i = 0; i < size; i++) {
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+index 5234b1e..dd5fb41 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+@@ -1913,11 +1913,11 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 		return offset;
+ 	}
+ 
+-	public boolean visit(ExtraDimension node) {
++	public boolean visit(Dimension node) {
+ 		if (!hasChildrenChanges(node)) {
+ 			return doVisitUnchangedChildren(node);
+ 		}
+-		rewriteNodeList(node, ExtraDimension.ANNOTATIONS_PROPERTY, node.getStartPosition(), Util.EMPTY_STRING, " "); //$NON-NLS-1$
++		rewriteNodeList(node, Dimension.ANNOTATIONS_PROPERTY, node.getStartPosition(), Util.EMPTY_STRING, " "); //$NON-NLS-1$
+ 		return false;
+ 	}
+ 
+@@ -2088,7 +2088,7 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 			int offset= elementType.getStartPosition() + elementType.getLength();
+ 			while(currentLevel != null || astLevelGTE8) {
+ 				if (i < dimSize) {
+-					if (astLevelGTE8) internalExtraDimensionRewrite(replacingType, i, offset);
++					if (astLevelGTE8) internalDimensionRewrite(replacingType, i, offset);
+ 					 offset= getScanner().getTokenEndOffset(TerminalTokens.TokenNameLBRACKET, offset);
+ 					if (hasDimensionChanges) {
+ 						RewriteEvent event= events[i];
+@@ -2123,10 +2123,10 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 						offset= retrieveRightBracketEndPosition(offset, 1, true);
+ 					}
+ 				} else if (i < nOldBrackets) {
+-					if (astLevelGTE8) internalExtraDimensionRewrite(replacingType, i, offset);
++					if (astLevelGTE8) internalDimensionRewrite(replacingType, i, offset);
+ 					offset= retrieveRightBracketEndPosition(offset, 1, false);
+ 				} else {
+-					internalExtraDimensionAddition(replacingType, i, offset, editGroup, astLevelGTE8);
++					internalDimensionAddition(replacingType, i, offset, editGroup, astLevelGTE8);
+ 					doTextInsert(offset, "[]", editGroup); //$NON-NLS-1$
+ 				}
+ 				i++;
+@@ -2155,10 +2155,10 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 		return false;
+ 	}
+ 
+-	private void internalExtraDimensionAddition(ArrayType replacingType, int index, int pos, TextEditGroup editGroup,
++	private void internalDimensionAddition(ArrayType replacingType, int index, int pos, TextEditGroup editGroup,
+ 			boolean astLevelGTE8) {
+ 		if (astLevelGTE8) {
+-			ExtraDimension dim = (ExtraDimension) replacingType.dimensions().get(index);
++			Dimension dim = (Dimension) replacingType.dimensions().get(index);
+ 			List annotations = dim.annotations();
+ 			if (annotations != null) {
+ 				for (int j = 0; j < annotations.size(); j++) {
+@@ -2170,9 +2170,9 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 		}
+ 	}
+ 
+-	private void internalExtraDimensionRewrite(ArrayType replacingType, int index, int pos) {
+-		ExtraDimension dim = (ExtraDimension) replacingType.dimensions().get(index);
+-		rewriteTypeAnnotations(dim, ExtraDimension.ANNOTATIONS_PROPERTY, pos);
++	private void internalDimensionRewrite(ArrayType replacingType, int index, int pos) {
++		Dimension dim = (Dimension) replacingType.dimensions().get(index);
++		rewriteTypeAnnotations(dim, Dimension.ANNOTATIONS_PROPERTY, pos);
+ 	}
+ 
+ 	/**
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
+index c9d3fa4..cb57eeb 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
+@@ -259,7 +259,7 @@ public class ASTRewriteFlattener extends ASTVisitor {
+ 		// add "<annotations> [ <dimension> ]" for each dimension expression
+ 		List list= getChildList(node, ArrayCreation.DIMENSIONS_PROPERTY);
+ 		for (int i= 0; i < list.size(); i++) {
+-			internalVisitExtraDimensionAnnotations(arrayType, i, astLevelGTE8);
++			internalVisitDimensionAnnotations(arrayType, i, astLevelGTE8);
+ 			this.result.append('[');
+ 			((ASTNode) list.get(i)).accept(this);
+ 			this.result.append(']');
+@@ -267,7 +267,7 @@ public class ASTRewriteFlattener extends ASTVisitor {
+ 
+ 		// add "<annotations> []" for each extra array dimension
+ 		for (int i= list.size(); i < dimensions; i++) {
+-			internalVisitExtraDimensionAnnotations(arrayType, i, astLevelGTE8);
++			internalVisitDimensionAnnotations(arrayType, i, astLevelGTE8);
+ 			this.result.append("[]"); //$NON-NLS-1$
+ 		}
+ 
+@@ -278,10 +278,10 @@ public class ASTRewriteFlattener extends ASTVisitor {
+ 		return false;
+ 	}
+ 
+-	private void internalVisitExtraDimensionAnnotations(ArrayType arrayType, int index, boolean astLevelGTE8) {
++	private void internalVisitDimensionAnnotations(ArrayType arrayType, int index, boolean astLevelGTE8) {
+ 		if (astLevelGTE8) {
+-			ExtraDimension extraDimension = (ExtraDimension) arrayType.dimensions().get(index);
+-			visitList(extraDimension, ExtraDimension.ANNOTATIONS_PROPERTY, String.valueOf(' '), Util.EMPTY_STRING, String.valueOf(' '));
++			Dimension dimension = (Dimension) arrayType.dimensions().get(index);
++			visitList(dimension, Dimension.ANNOTATIONS_PROPERTY, String.valueOf(' '), Util.EMPTY_STRING, String.valueOf(' '));
+ 		}
+ 	}
+ 
+@@ -493,6 +493,12 @@ public class ASTRewriteFlattener extends ASTVisitor {
+ 		return false;
+ 	}
+ 
++	public boolean visit(Dimension node) {
++		visitList(node, Dimension.ANNOTATIONS_PROPERTY, String.valueOf(' '), String.valueOf(' '), String.valueOf(' '));
++		this.result.append("[]"); //$NON-NLS-1$
++		return false;
++	}
++
+ 	/*
+ 	 * @see ASTVisitor#visit(DoStatement)
+ 	 */
+@@ -522,12 +528,6 @@ public class ASTRewriteFlattener extends ASTVisitor {
+ 		return false;
+ 	}
+ 
+-	public boolean visit(ExtraDimension node) {
+-		visitList(node, ExtraDimension.ANNOTATIONS_PROPERTY, String.valueOf(' '), String.valueOf(' '), String.valueOf(' '));
+-		this.result.append("[]"); //$NON-NLS-1$
+-		return false;
+-	}
+-
+ 	/*
+ 	 * @see ASTVisitor#visit(FieldAccess)
+ 	 */
+commit e56e767173dc5b5ba970e3e7ca9256e9541ebffc
+Author: M N Palat <manpalat@in.ibm.com>
+Date:   Sun Oct 27 10:45:40 2013 +0530
+
+    Bug 413569 [1.8][dom ast] AST for annotated multi-dimensional array type
+    is not well-formed review
+
+6	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
+5	2	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterJavadocFlattener.java
+3	3	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
+2	1	org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/NaiveASTFlattener.java
+8	7	org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+2	1	org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
+index 0ddfc9f..d2d7d5e 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter18Test.java
+@@ -3200,6 +3200,7 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		ITypeBinding tBinding1 = mBinding.getReturnType();
+ 		assertNotNull("Should not be null", tBinding1);
+ 		
++		/* public @Marker("1") String foo(int @Marker @Marker2 [] args) */
+ 		List params = methodDeclaration.parameters();
+ 		assertEquals("Incorrect params", 1, params.size());
+ 		SingleVariableDeclaration param = (SingleVariableDeclaration) params.get(0);
+@@ -3211,6 +3212,7 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		assertEquals("Incorrect annotation", "@Marker()", annots[0].toString());
+ 		assertEquals("Incorrect annotation", "@Marker2()", annots[1].toString());
+ 		
++		/* public @Marker("3") String bar()*/
+ 		node = getASTNode(compilationUnit, 2, 1);
+ 		assertTrue("Not a method declaration", node.getNodeType() == ASTNode.METHOD_DECLARATION);
+ 		methodDeclaration = (MethodDeclaration) node;
+@@ -3228,6 +3230,7 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		annot = annots[0];
+ 		assertEquals("Incorrect annotation", "@Marker(value = 3)", annot.toString());
+ 
++		/* public String @Marker("i0") @Marker2 [] [] @Marker("i1") [] str = null; */
+ 		node = getASTNode(compilationUnit, 2, 2);
+ 		assertTrue("Not a field declaration", node.getNodeType() == ASTNode.FIELD_DECLARATION);
+ 		FieldDeclaration field = (FieldDeclaration) node;
+@@ -3251,6 +3254,7 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		assertEquals("Incorrect type annotations", 1, annots.length);
+ 		assertEquals("Incorrect annotation", "@Marker(value = i1)", annots[0].toString());
+ 		
++		/* public @Marker String str2 = null; */
+ 		node = getASTNode(compilationUnit, 2, 3);
+ 		assertTrue("Not a field declaration", node.getNodeType() == ASTNode.FIELD_DECLARATION);
+ 		field = (FieldDeclaration) node;
+@@ -3261,6 +3265,7 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		assertNotNull("Should not be null", variable);
+ 		tBinding1 = variable.getType();
+ 		
++		/* public @Marker String str3 = null; */
+ 		node = getASTNode(compilationUnit, 2, 4);
+ 		assertTrue("Not a field declaration", node.getNodeType() == ASTNode.FIELD_DECLARATION);
+ 		field = (FieldDeclaration) node;
+@@ -3273,6 +3278,7 @@ public class ASTConverter18Test extends ConverterTestSetup {
+ 		assertSame("Type bindings should be same", tBinding1, tBinding2);
+ 		assertTrue("Unannotated bindings should be same", tBinding1.isEqualTo(tBinding2));
+ 		
++		/* public String str4 = null; */
+ 		node = getASTNode(compilationUnit, 2, 5);
+ 		assertTrue("Not a field declaration", node.getNodeType() == ASTNode.FIELD_DECLARATION);
+ 		field = (FieldDeclaration) node;
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterJavadocFlattener.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterJavadocFlattener.java
+index 83d6ec4..0180de7 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterJavadocFlattener.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverterJavadocFlattener.java
+@@ -15,6 +15,7 @@
+ package org.eclipse.jdt.core.tests.dom;
+ 
+ import java.util.Iterator;
++import java.util.List;
+ 
+ import org.eclipse.jdt.core.dom.*;
+ 
+@@ -68,8 +69,10 @@ public boolean visit(ArrayType node) {
+ 		this.buffer.append("[]");//$NON-NLS-1$
+ 	} else {
+ 		node.getElementType().accept(this);
+-		for (int i = 0;  i < node.getDimensions(); ++i) {
+-			((Dimension) node.dimensions().get(i)).accept(this);
++		int noOfDimensions = node.getDimensions();
++		List dimensions = node.dimensions();
++		for (int i = 0;  i < noOfDimensions; ++i) {
++			((Dimension) dimensions.get(i)).accept(this);
+ 		}
+ 	}
+ 	return false;
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
+index 584157b..f3c3083 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/AST.java
+@@ -1165,7 +1165,7 @@ public final class AST {
+ 	 * <li>the node already has a parent</li>
+ 	 * <li>the element type is null</li>
+ 	 * <li>the number of dimensions is lower than 0 (for JLS4 and before: lower than 1)</li>
+-	 * <li>the number of dimensions is greater than 1000</li>
++	 * <li>the number of dimensions is greater than 255</li>
+ 	 * <li>for levels from JLS8 and later, if the element type is an array type </li>
+ 	 * </ul>
+ 	 */
+@@ -1173,8 +1173,8 @@ public final class AST {
+ 		if (elementType == null) {
+ 			throw new IllegalArgumentException();
+ 		}
+-		if (dimensions < 0 || dimensions > 1000) {
+-			// we would blow our stacks anyway with a 1000-D array
++		if (dimensions < 0 || dimensions > 255) {
++			// max as per Java VM spec
+ 			throw new IllegalArgumentException();
+ 		}
+ 		ArrayType result;
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/NaiveASTFlattener.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/NaiveASTFlattener.java
+index 6305d7f..194a476 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/NaiveASTFlattener.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/NaiveASTFlattener.java
+@@ -376,7 +376,8 @@ public class NaiveASTFlattener extends ASTVisitor {
+ 		} else {
+ 			node.getElementType().accept(this);
+ 			List dimensions = node.dimensions();
+-			for (int i = 0; i < dimensions.size() ; i++) {
++			int size = dimensions.size();
++			for (int i = 0; i < size; i++) {
+ 				Dimension aDimension = (Dimension) dimensions.get(i);
+ 				aDimension.accept(this);
+ 			}
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+index dd5fb41..9eb0fc1 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteAnalyzer.java
+@@ -2080,7 +2080,7 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 			RewriteEvent dimEvent= getEvent(node, ArrayCreation.DIMENSIONS_PROPERTY);
+ 			boolean hasDimensionChanges= (dimEvent != null && dimEvent.getChangeKind() != RewriteEvent.UNCHANGED);
+ 			RewriteEvent[] events= hasDimensionChanges ? dimEvent.getChildren() : null;
+-			boolean astLevelGTE8 = node.getAST().apiLevel() >= AST.JLS8 ? true : false;
++			boolean astLevelGTE8 = node.getAST().apiLevel() >= AST.JLS8;
+ 			ArrayType currentLevel = astLevelGTE8 ? null : (ArrayType) replacingType.getElementType().getParent();
+ 			int replacingTypeDimensions = replacingType.getDimensions();
+ 			int i=0, dimSize= (events == null) ? 0 : events.length;
+@@ -2088,7 +2088,7 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 			int offset= elementType.getStartPosition() + elementType.getLength();
+ 			while(currentLevel != null || astLevelGTE8) {
+ 				if (i < dimSize) {
+-					if (astLevelGTE8) internalDimensionRewrite(replacingType, i, offset);
++					if (astLevelGTE8) rewriteAnnotationsOnDimension(replacingType, i, offset);
+ 					 offset= getScanner().getTokenEndOffset(TerminalTokens.TokenNameLBRACKET, offset);
+ 					if (hasDimensionChanges) {
+ 						RewriteEvent event= events[i];
+@@ -2123,10 +2123,10 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 						offset= retrieveRightBracketEndPosition(offset, 1, true);
+ 					}
+ 				} else if (i < nOldBrackets) {
+-					if (astLevelGTE8) internalDimensionRewrite(replacingType, i, offset);
++					if (astLevelGTE8) rewriteAnnotationsOnDimension(replacingType, i, offset);
+ 					offset= retrieveRightBracketEndPosition(offset, 1, false);
+ 				} else {
+-					internalDimensionAddition(replacingType, i, offset, editGroup, astLevelGTE8);
++					insertAnnotationsOnDimension(replacingType, i, offset, editGroup, astLevelGTE8);
+ 					doTextInsert(offset, "[]", editGroup); //$NON-NLS-1$
+ 				}
+ 				i++;
+@@ -2155,13 +2155,14 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 		return false;
+ 	}
+ 
+-	private void internalDimensionAddition(ArrayType replacingType, int index, int pos, TextEditGroup editGroup,
++	private void insertAnnotationsOnDimension(ArrayType replacingType, int index, int pos, TextEditGroup editGroup,
+ 			boolean astLevelGTE8) {
+ 		if (astLevelGTE8) {
+ 			Dimension dim = (Dimension) replacingType.dimensions().get(index);
+ 			List annotations = dim.annotations();
+ 			if (annotations != null) {
+-				for (int j = 0; j < annotations.size(); j++) {
++				int size = annotations.size();
++				for (int j = 0; j < size; j++) {
+ 					Annotation annotation = (Annotation) annotations.get(j);
+ 					doTextInsert(pos, annotation.toString() + " ", editGroup); //$NON-NLS-1$
+ 				}
+@@ -2170,7 +2171,7 @@ public final class ASTRewriteAnalyzer extends ASTVisitor {
+ 		}
+ 	}
+ 
+-	private void internalDimensionRewrite(ArrayType replacingType, int index, int pos) {
++	private void rewriteAnnotationsOnDimension(ArrayType replacingType, int index, int pos) {
+ 		Dimension dim = (Dimension) replacingType.dimensions().get(index);
+ 		rewriteTypeAnnotations(dim, Dimension.ANNOTATIONS_PROPERTY, pos);
+ 	}
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
+index cb57eeb..74f0b23 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/internal/core/dom/rewrite/ASTRewriteFlattener.java
+@@ -258,7 +258,8 @@ public class ASTRewriteFlattener extends ASTVisitor {
+ 
+ 		// add "<annotations> [ <dimension> ]" for each dimension expression
+ 		List list= getChildList(node, ArrayCreation.DIMENSIONS_PROPERTY);
+-		for (int i= 0; i < list.size(); i++) {
++		int size = list.size();
++		for (int i= 0; i < size; i++) {
+ 			internalVisitDimensionAnnotations(arrayType, i, astLevelGTE8);
+ 			this.result.append('[');
+ 			((ASTNode) list.get(i)).accept(this);

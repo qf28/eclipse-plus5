@@ -1,0 +1,498 @@
+commit 589050186c89abf7f6363daf924cc76bd3ce26c4
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Jan 29 20:12:57 2015 +0100
+
+    Bug 458396 - NPE in CodeStream.invoke()
+    
+    Change-Id: Id7d52a8702cd5bd53e68864fb1d41e6bac5e82da
+    Signed-off-by: Stephan Herrmann <stephan.herrmann@berlin.de>
+
+33	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+4	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldDeclaration.java
+4	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldReference.java
+8	7	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+4	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+16	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/FieldBinding.java
+10	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/VariableBinding.java
+25	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemHandler.java
+5	3	org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetFieldReference.java
+7	5	org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
+5	3	org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetSingleNameReference.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+index 4757be9..db37afe 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+@@ -5012,4 +5012,37 @@ public void testBug457079() {
+ 			"}\n"
+ 		});
+ }
++public void testBug458396() {
++	runNegativeTest(
++		new String[] {
++			"Main.java",
++			"import java.util.List;\n" + 
++			"\n" + 
++			"interface MyTickContext { }\n" + 
++			"abstract class MyEntity {\n" + 
++			"	abstract void tick(MyTickContext ctx);\n" + 
++			"}\n" + 
++			"\n" + 
++			"public class Main {\n" + 
++			"\n" + 
++			"	protected static final MyTickContext tickContext = new MyTickContext() {\n" + 
++			"		public void method1(MyEntity e) {\n" + 
++			"			removeEntity( e );\n" + 
++			"		}\n" + 
++			"	};\n" + 
++			"\n" + 
++			"	public static final class Game  {\n" + 
++			"		public void method2(List<MyEntity> ents) {\n" + 
++			"			ents.forEach( e -> e.tick(tickContext) );\n" + 
++			"		}\n" + 
++			"	}\n" + 
++			"}\n"
++		},
++		"----------\n" + 
++		"1. ERROR in Main.java (at line 12)\n" + 
++		"	removeEntity( e );\n" + 
++		"	^^^^^^^^^^^^\n" + 
++		"The method removeEntity(MyEntity) is undefined for the type new MyTickContext(){}\n" + 
++		"----------\n");
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldDeclaration.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldDeclaration.java
+index fa73bfd..14d372e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldDeclaration.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldDeclaration.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -14,6 +14,7 @@
+  *								Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
+  *								Bug 429403 - [1.8][null] null mismatch from type arguments is not reported at field initializer
+  *								Bug 453483 - [compiler][null][loop] Improve null analysis for loops
++ *								Bug 458396 - NPE in CodeStream.invoke()
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *								Bug 409250 - [1.8][compiler] Various loose ends in 308 code generation
+  *******************************************************************************/
+@@ -75,7 +76,7 @@ public FlowInfo analyseCode(MethodScope initializationScope, FlowContext flowCon
+ 	if (this.binding != null
+ 			&& this.binding.isValidBinding()
+ 			&& this.binding.isStatic()
+-			&& this.binding.constant() == Constant.NotAConstant
++			&& this.binding.constant(initializationScope) == Constant.NotAConstant
+ 			&& this.binding.declaringClass.isNestedType()
+ 			&& !this.binding.declaringClass.isStatic()) {
+ 		initializationScope.problemReporter().unexpectedStaticModifierForField(
+@@ -318,7 +319,7 @@ public void resolve(MethodScope initializationScope) {
+ 	} finally {
+ 		initializationScope.initializedField = previousField;
+ 		initializationScope.lastVisibleFieldID = previousFieldID;
+-		if (this.binding.constant() == null)
++		if (this.binding.constant(initializationScope) == null)
+ 			this.binding.setConstant(Constant.NotAConstant);
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldReference.java
+index a8a4d69..a9b9c86 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -13,6 +13,7 @@
+  *								bug 383368 - [compiler][null] syntactic null analysis for field references
+  *								Bug 412203 - [compiler] Internal compiler error: java.lang.IllegalArgumentException: info cannot be null
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
++ *								Bug 458396 - NPE in CodeStream.invoke()
+  *     Jesper S Moller - Contributions for
+  *								Bug 378674 - "The method can be declared as static" is wrong
+  *******************************************************************************/
+@@ -515,7 +516,7 @@ public void manageSyntheticAccessIfNecessary(BlockScope currentScope, FlowInfo f
+ 	FieldBinding codegenBinding = this.binding.original();
+ 	if (this.binding.isPrivate()) {
+ 		if ((TypeBinding.notEquals(currentScope.enclosingSourceType(), codegenBinding.declaringClass))
+-				&& this.binding.constant() == Constant.NotAConstant) {
++				&& this.binding.constant(currentScope) == Constant.NotAConstant) {
+ 			if (this.syntheticAccessors == null)
+ 				this.syntheticAccessors = new MethodBinding[2];
+ 			this.syntheticAccessors[isReadAccess ? FieldReference.READ : FieldReference.WRITE] =
+@@ -673,7 +674,7 @@ public TypeBinding resolveType(BlockScope scope) {
+ 		scope.problemReporter().deprecatedField(fieldBinding, this);
+ 	}
+ 	boolean isImplicitThisRcv = this.receiver.isImplicitThis();
+-	this.constant = isImplicitThisRcv ? fieldBinding.constant() : Constant.NotAConstant;
++	this.constant = isImplicitThisRcv ? fieldBinding.constant(scope) : Constant.NotAConstant;
+ 	if (fieldBinding.isStatic()) {
+ 		// static field accessed through receiver? legal but unoptimal (optional warning)
+ 		if (!(isImplicitThisRcv
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+index 1c6c749..35b0563 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -14,6 +14,7 @@
+  *								bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
+  *								Bug 414380 - [compiler][internal] QualifiedNameReference#indexOfFirstFieldBinding does not point to the first field
++ *								Bug 458396 - NPE in CodeStream.invoke()
+  *     Jesper S Moller - Contributions for
+  *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *								bug 331649 - [compiler][null] consider null annotations for fields
+@@ -725,7 +726,7 @@ public TypeBinding getOtherFieldBindings(BlockScope scope) {
+ 	TypeBinding type = ((VariableBinding) this.binding).type;
+ 	int index = this.indexOfFirstFieldBinding;
+ 	if (index == length) { //	restrictiveFlag == FIELD
+-		this.constant = ((FieldBinding) this.binding).constant();
++		this.constant = ((FieldBinding) this.binding).constant(scope);
+ 		// perform capture conversion if read access
+ 		return (type != null && (this.bits & ASTNode.IsStrictlyAssigned) == 0)
+ 				? type.capture(scope, this.sourceStart, this.sourceEnd)
+@@ -737,7 +738,7 @@ public TypeBinding getOtherFieldBindings(BlockScope scope) {
+ 	this.otherDepths = new int[otherBindingsLength];
+ 
+ 	// fill the first constant (the one of the binding)
+-	this.constant = ((VariableBinding) this.binding).constant();
++	this.constant = ((VariableBinding) this.binding).constant(scope);
+ 	// save first depth, since will be updated by visibility checks of other bindings
+ 	int firstDepth = (this.bits & ASTNode.DepthMASK) >> ASTNode.DepthSHIFT;
+ 	// iteration on each field
+@@ -769,7 +770,7 @@ public TypeBinding getOtherFieldBindings(BlockScope scope) {
+ 			}
+ 			// constant propagation can only be performed as long as the previous one is a constant too.
+ 			if (this.constant != Constant.NotAConstant) {
+-				this.constant = field.constant();
++				this.constant = field.constant(scope);
+ 			}
+ 
+ 			if (field.isStatic()) {
+@@ -786,7 +787,7 @@ public TypeBinding getOtherFieldBindings(BlockScope scope) {
+ 					}					
+ 					// check if accessing enum static field in initializer
+ 					if ((TypeBinding.equalsEquals(sourceType, declaringClass) || TypeBinding.equalsEquals(sourceType.superclass, declaringClass)) // enum constant body
+-							&& field.constant() == Constant.NotAConstant
++							&& field.constant(scope) == Constant.NotAConstant
+ 							&& !methodScope.isStatic
+ 							&& methodScope.isInsideInitializerOrConstructor()) {
+ 						scope.problemReporter().enumStaticFieldUsedDuringInitialization(field, this);
+@@ -881,7 +882,7 @@ public void manageEnclosingInstanceAccessIfNecessary(BlockScope currentScope, Fl
+ public void manageSyntheticAccessIfNecessary(BlockScope currentScope, FieldBinding fieldBinding, int index, FlowInfo flowInfo) {
+ 	if ((flowInfo.tagBits & FlowInfo.UNREACHABLE_OR_DEAD) != 0) return;
+ 	// index == 0 denotes the first fieldBinding, index > 0 denotes one of the 'otherBindings', index < 0 denotes a write access (to last binding)
+-	if (fieldBinding.constant() != Constant.NotAConstant)
++	if (fieldBinding.constant(currentScope) != Constant.NotAConstant)
+ 		return;
+ 
+ 	if (fieldBinding.isPrivate()) { // private access
+@@ -1046,7 +1047,7 @@ public TypeBinding resolveType(BlockScope scope) {
+ 						// check if accessing enum static field in initializer
+ 						if (declaringClass.isEnum()) {
+ 							if ((TypeBinding.equalsEquals(sourceType, declaringClass) || TypeBinding.equalsEquals(sourceType.superclass, declaringClass)) // enum constant body
+-									&& fieldBinding.constant() == Constant.NotAConstant
++									&& fieldBinding.constant(scope) == Constant.NotAConstant
+ 									&& !methodScope.isStatic
+ 									&& methodScope.isInsideInitializerOrConstructor()) {
+ 								scope.problemReporter().enumStaticFieldUsedDuringInitialization(fieldBinding, this);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+index 54363b4..dbeea60 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -13,6 +13,7 @@
+  *								bug 331649 - [compiler][null] consider null annotations for fields
+  *								bug 383368 - [compiler][null] syntactic null analysis for field references
+  *								Bug 412203 - [compiler] Internal compiler error: java.lang.IllegalArgumentException: info cannot be null
++ *								Bug 458396 - NPE in CodeStream.invoke()
+  *     Jesper S Moller - <jesper@selskabet.org>   - Contributions for 
+  *     							bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *								bug 378674 - "The method can be declared as static" is wrong
+@@ -207,7 +208,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 
+ public TypeBinding checkFieldAccess(BlockScope scope) {
+ 	FieldBinding fieldBinding = (FieldBinding) this.binding;
+-	this.constant = fieldBinding.constant();
++	this.constant = fieldBinding.constant(scope);
+ 
+ 	this.bits &= ~ASTNode.RestrictiveFlagMASK; // clear bits
+ 	this.bits |= Binding.FIELD;
+@@ -999,7 +1000,7 @@ public TypeBinding resolveType(BlockScope scope) {
+ 								scope.problemReporter().cannotReferToNonFinalOuterLocal((LocalVariableBinding)variable, this);
+ 						}
+ 						variableType = variable.type;
+-						this.constant = (this.bits & ASTNode.IsStrictlyAssigned) == 0 ? variable.constant() : Constant.NotAConstant;
++						this.constant = (this.bits & ASTNode.IsStrictlyAssigned) == 0 ? variable.constant(scope) : Constant.NotAConstant;
+ 					} else {
+ 						// a field
+ 						variableType = checkFieldAccess(scope);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/FieldBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/FieldBinding.java
+index e905582..df8b779 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/FieldBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/FieldBinding.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -13,15 +13,18 @@
+  *								Bug 417295 - [1.8[[null] Massage type annotated null analysis to gel well with deep encoded type bindings.
+  *								Bug 447088 - [null] @Nullable on fully qualified field type is ignored
+  *								Bug 435805 - [1.8][compiler][null] Java 8 compiler does not recognize declaration style null annotations
++ *								Bug 458396 - NPE in CodeStream.invoke()
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+ import org.eclipse.jdt.core.compiler.CharOperation;
++import org.eclipse.jdt.internal.compiler.IErrorHandlingPolicy;
+ import org.eclipse.jdt.internal.compiler.ast.ASTNode;
+ import org.eclipse.jdt.internal.compiler.ast.FieldDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.impl.Constant;
++import org.eclipse.jdt.internal.compiler.problem.ProblemReporter;
+ 
+ public class FieldBinding extends VariableBinding {
+ 	public ReferenceBinding declaringClass;
+@@ -228,6 +231,18 @@ public Constant constant() {
+ 	return fieldConstant;
+ }
+ 
++public Constant constant(Scope scope) {
++	if (this.constant != null)
++		return this.constant;
++	ProblemReporter problemReporter = scope.problemReporter();
++	IErrorHandlingPolicy suspendedPolicy = problemReporter.suspendTempErrorHandlingPolicy();
++	try {
++		return constant();
++	} finally {
++		problemReporter.resumeTempErrorHandlingPolicy(suspendedPolicy);
++	}
++}
++
+ public void fillInDefaultNonNullness(FieldDeclaration sourceField, Scope scope) {
+ 	LookupEnvironment environment = scope.environment();
+ 	if (   this.type != null
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/VariableBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/VariableBinding.java
+index c634a1f..99fa5db 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/VariableBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/VariableBinding.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -10,6 +10,7 @@
+  *     Stephan Herrmann - Contribution for
+  *								bug 331649 - [compiler][null] consider null annotations for fields
+  *								Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
++ *								Bug 458396 - NPE in CodeStream.invoke()
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -39,6 +40,14 @@ public abstract class VariableBinding extends Binding {
+ 	public Constant constant() {
+ 		return this.constant;
+ 	}
++	
++	/**
++	 * Call this variant during resolve / analyse, so we can handle the case 
++	 * when a tentative lambda resolve triggers resolving of outside code.
++	 */
++	public Constant constant(Scope scope) {
++		return constant();
++	}
+ 
+ 	public abstract AnnotationBinding[] getAnnotations();
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemHandler.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemHandler.java
+index 7b9e784..ea8ec68 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemHandler.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemHandler.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -7,6 +7,8 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Stephan Herrmann - Contribution for
++ *								Bug 458396 - NPE in CodeStream.invoke()
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.problem;
+ 
+@@ -38,6 +40,9 @@ public class ProblemHandler {
+ 	public IErrorHandlingPolicy policy;
+ 	public final IProblemFactory problemFactory;
+ 	public final CompilerOptions options;
++	
++	/* When temporarily switching policies, store here the original root policy (for temporary resume). */
++	private IErrorHandlingPolicy rootPolicy;
+ /*
+  * Problem handler can be supplied with a policy to specify
+  * its behavior in error handling. Also see static methods for
+@@ -230,8 +235,27 @@ public void record(CategorizedProblem problem, CompilationResult unitResult, Ref
+ }
+ /** @return old policy. */
+ public IErrorHandlingPolicy switchErrorHandlingPolicy(IErrorHandlingPolicy newPolicy) {
++	if (this.rootPolicy == null)
++		this.rootPolicy = this.policy;
+ 	IErrorHandlingPolicy presentPolicy = this.policy;
+ 	this.policy = newPolicy;
+ 	return presentPolicy;
+ }
++/**
++ * Temporarily suspend a temporary error handling policy.
++ * @return old policy.
++ */
++public IErrorHandlingPolicy suspendTempErrorHandlingPolicy() {
++	IErrorHandlingPolicy presentPolicy = this.policy;
++	if (this.rootPolicy != null)
++		this.policy = this.rootPolicy;
++	return presentPolicy;
++}
++/**
++ * Resume from a corresponding {@link #suspendTempErrorHandlingPolicy()}.
++ * @param previousPolicy the result value of the matching suspend call
++ */
++public void resumeTempErrorHandlingPolicy(IErrorHandlingPolicy previousPolicy) {
++	this.policy = previousPolicy;
++}
+ }
+diff --git a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetFieldReference.java b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetFieldReference.java
+index 9d0ea5e..feafadd 100644
+--- a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetFieldReference.java
++++ b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetFieldReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2011 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -7,7 +7,9 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+- *     Stephan Herrmann <stephan@cs.tu-berlin.de> - Contribution for bug 185682 - Increment/decrement operators mark local variables as read
++ *     Stephan Herrmann - Contributions for
++ *								Bug 185682 - Increment/decrement operators mark local variables as read
++ *								Bug 458396 - NPE in CodeStream.invoke()
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.eval;
+ 
+@@ -330,7 +332,7 @@ public TypeBinding resolveType(BlockScope scope) {
+ 		scope.problemReporter().deprecatedField(this.binding, this);
+ 	}
+ 	// check for this.x in static is done in the resolution of the receiver
+-	this.constant = this.receiver.isImplicitThis() ? this.binding.constant() : Constant.NotAConstant;
++	this.constant = this.receiver.isImplicitThis() ? this.binding.constant(scope) : Constant.NotAConstant;
+ 	if (!this.receiver.isThis()) { // TODO need to check if shouldn't be isImplicitThis check (and then removed)
+ 		this.constant = Constant.NotAConstant;
+ 	}
+diff --git a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
+index 3768648..fcd00ef 100644
+--- a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
++++ b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -7,7 +7,9 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+- *     Stephan Herrmann <stephan@cs.tu-berlin.de> - Contribution for bug 185682 - Increment/decrement operators mark local variables as read
++ *     Stephan Herrmann - Contributions for
++ *								Bug 185682 - Increment/decrement operators mark local variables as read
++ *								Bug 458396 - NPE in CodeStream.invoke()
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.eval;
+ 
+@@ -473,7 +475,7 @@ public TypeBinding getOtherFieldBindings(BlockScope scope) {
+ 	TypeBinding type = ((VariableBinding) this.binding).type;
+ 	int index = this.indexOfFirstFieldBinding;
+ 	if (index == length) { //	restrictiveFlag == FIELD
+-		this.constant = ((FieldBinding) this.binding).constant();
++		this.constant = ((FieldBinding) this.binding).constant(scope);
+ 		return type;
+ 	}
+ 
+@@ -482,7 +484,7 @@ public TypeBinding getOtherFieldBindings(BlockScope scope) {
+ 	this.otherBindings = new FieldBinding[otherBindingsLength];
+ 
+ 	// fill the first constant (the one of the binding)
+-	this.constant =((VariableBinding) this.binding).constant();
++	this.constant =((VariableBinding) this.binding).constant(scope);
+ 
+ 	// iteration on each field
+ 	while (index < length) {
+@@ -517,7 +519,7 @@ public TypeBinding getOtherFieldBindings(BlockScope scope) {
+ 			}
+ 			// constant propagation can only be performed as long as the previous one is a constant too.
+ 			if (this.constant != Constant.NotAConstant){
+-				this.constant = field.constant();
++				this.constant = field.constant(scope);
+ 			}
+ 			type = field.type;
+ 			index++;
+diff --git a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetSingleNameReference.java b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetSingleNameReference.java
+index eb04d34..9f4676c 100644
+--- a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetSingleNameReference.java
++++ b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetSingleNameReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -7,7 +7,9 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+- *     Stephan Herrmann <stephan@cs.tu-berlin.de> - Contribution for bug 185682 - Increment/decrement operators mark local variables as read
++ *     Stephan Herrmann - Contributions for
++ *								Bug 185682 - Increment/decrement operators mark local variables as read
++ *								Bug 458396 - NPE in CodeStream.invoke()
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.eval;
+ 
+@@ -101,7 +103,7 @@ public TypeBinding checkFieldAccess(BlockScope scope) {
+ 			return null;
+ 		}
+ 	}
+-	this.constant = fieldBinding.constant();
++	this.constant = fieldBinding.constant(scope);
+ 
+ 	if (isFieldUseDeprecated(fieldBinding, scope, this.bits)) {
+ 		scope.problemReporter().deprecatedField(fieldBinding, this);

@@ -1,0 +1,231 @@
+commit 2575bc1675526f9cf1bae80cf41843bf7eedd3c4
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Mar 1 23:22:56 2014 +0100
+
+    Bug 416182 - [1.8][compiler][null] Contradictory null annotations not
+    rejected
+
+5	5	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+13	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NullAnnotationMatching.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+16	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
+5	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+index c12f7d1..12a23ce 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+@@ -3185,7 +3185,7 @@ public class NullTypeAnnotationTest extends AbstractNullAnnotationTest {
+ 				"		return t;\n" + 
+ 				"	}\n" + 
+ 				"	public static void main(String[] args) {\n" + 
+-				"		X<@Nullable String> xs = new X<String>();\n" + // TODO(stephan): must detect that foo() now has contradictory annots, see bug 416190 
++				"		X<@Nullable String> xs = new X<String>();\n" + 
+ 				"		xs.foo(null);\n" + 
+ 				"	}\n" + 
+ 				"	\n" +
+@@ -3199,10 +3199,10 @@ public class NullTypeAnnotationTest extends AbstractNullAnnotationTest {
+ 			},
+ 			getCompilerOptions(),
+ 			"----------\n" + 
+-			"1. WARNING in X.java (at line 9)\n" + 
+-			"	X<@Nullable String> xs = new X<String>();\n" + 
+-			"	                         ^^^^^^^^^^^^^^^\n" + 
+-			"Null type safety (type annotations): The expression of type 'X<String>' needs unchecked conversion to conform to 'X<@Nullable String>'\n" + 
++			"1. ERROR in X.java (at line 10)\n" + 
++			"	xs.foo(null);\n" + 
++			"	^^^^^^^^^^^^\n" + 
++			"Contradictory null annotations: method was inferred as \'@Nullable String foo(@NonNull @Nullable String)\', but only one of \'@NonNull\' and \'@Nullable\' can be effective at any location\n" + 
+ 			"----------\n" + 
+ 			"2. WARNING in X.java (at line 14)\n" + 
+ 			"	X<@Nullable String> xs = x;\n" + 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NullAnnotationMatching.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NullAnnotationMatching.java
+index 214bc5b..6294ced 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NullAnnotationMatching.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NullAnnotationMatching.java
+@@ -22,8 +22,10 @@ import org.eclipse.jdt.internal.compiler.lookup.ArrayBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
+ import org.eclipse.jdt.internal.compiler.lookup.CaptureBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.InvocationSite;
+-import org.eclipse.jdt.internal.compiler.lookup.ParameterizedGenericMethodBinding;
++import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.ParameterizedTypeBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ProblemMethodBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ProblemReasons;
+ import org.eclipse.jdt.internal.compiler.lookup.RawTypeBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.Scope;
+@@ -323,8 +325,12 @@ public class NullAnnotationMatching {
+ 		return 0; // OK by tagBits
+ 	}
+ 
+-	public static ParameterizedGenericMethodBinding checkForContraditions(
+-			final ParameterizedGenericMethodBinding method, final InvocationSite invocationSite, final Scope scope) {
++	/**
++	 * After a method has substituted type parameters, check if this resulted in any contradictory null annotations.
++	 * Problems are either reported directly (if scope != null) or by returning a ProblemMethodBinding.
++	 */
++	public static MethodBinding checkForContraditions(
++			final MethodBinding method, final InvocationSite invocationSite, final Scope scope) {
+ 		
+ 		class SearchContradictions extends TypeBindingVisitor {
+ 			ReferenceBinding typeWithContradiction;
+@@ -349,6 +355,8 @@ public class NullAnnotationMatching {
+ 		SearchContradictions searchContradiction = new SearchContradictions();
+ 		TypeBindingVisitor.visit(searchContradiction, method.returnType);
+ 		if (searchContradiction.typeWithContradiction != null) {
++			if (scope == null)
++				return new ProblemMethodBinding(method, method.selector, method.parameters, ProblemReasons.ContradictoryNullAnnotations);
+ 			scope.problemReporter().contradictoryNullAnnotationsInferred(method, invocationSite);
+ 			// note: if needed, we might want to update the method by removing the contradictory annotations??
+ 			return method;
+@@ -360,6 +368,8 @@ public class NullAnnotationMatching {
+ 		for (int i = 0; i < method.parameters.length; i++) {
+ 			TypeBindingVisitor.visit(searchContradiction, method.parameters[i]);
+ 			if (searchContradiction.typeWithContradiction != null) {
++				if (scope == null)
++					return new ProblemMethodBinding(method, method.selector, method.parameters, ProblemReasons.ContradictoryNullAnnotations);
+ 				if (arguments != null && i < arguments.length)
+ 					scope.problemReporter().contradictoryNullAnnotationsInferred(method, arguments[i]);
+ 				else
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index 9059e10..5157bef 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -530,7 +530,7 @@ public class InferenceContext18 {
+ 				if (solutions != null) {
+ 					finalMethod = this.environment.createParameterizedGenericMethod(original, solutions);
+ 					if (this.scope.compilerOptions().isAnnotationBasedNullAnalysisEnabled)
+-						finalMethod = NullAnnotationMatching.checkForContraditions(finalMethod, invocation, this.scope);
++						NullAnnotationMatching.checkForContraditions(finalMethod, invocation, this.scope);
+ 					invocation.registerInferenceContext(finalMethod, this);
+ 					this.solutionsPerTargetType.put(targetType, new Solution(finalMethod, result));
+ 				}
+@@ -1430,6 +1430,8 @@ public class InferenceContext18 {
+ 					TypeBinding[] arguments = getSolutions(declaringClass.typeVariables(), innerMessage, bounds);
+ 					declaringClass = this.environment.createParameterizedType(declaringClass, arguments, declaringClass.enclosingType());
+ 					original = ((ParameterizedTypeBinding)declaringClass).createParameterizedMethod(original);
++					if (this.environment.globalOptions.isAnnotationBasedNullAnalysisEnabled)
++						NullAnnotationMatching.checkForContraditions(original, innerMessage, this.scope);
+ 				}
+ 				
+ 				// apply results of the combined inference onto the binding of the inner invocation:
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+index 598d2b4..eef93ab 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+@@ -21,6 +21,7 @@
+  *								Bug 423505 - [1.8] Implement "18.5.4 More Specific Method Inference"
+  *								Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
+  *								Bug 418743 - [1.8][null] contradictory annotations on invocation of generic method not reported
++ *								Bug 416182 - [1.8][compiler][null] Contradictory null annotations not rejected
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -164,7 +165,7 @@ public class ParameterizedGenericMethodBinding extends ParameterizedMethodBindin
+ 							}
+ 							if (invocationTypeInferred) {
+ 								if (compilerOptions.isAnnotationBasedNullAnalysisEnabled)
+-									methodSubstitute = NullAnnotationMatching.checkForContraditions(methodSubstitute, invocationSite, scope);
++									NullAnnotationMatching.checkForContraditions(methodSubstitute, invocationSite, scope);
+ 								infCtx18.rebindInnerPolies(result, methodSubstitute.parameters);
+ 								return methodSubstitute.boundCheck18(scope, arguments);
+ 							} else {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+index 66c51e5..a647cad 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+@@ -35,6 +35,7 @@
+  *								Bug 426792 - [1.8][inference][impl] generify new type inference engine
+  *								Bug 428294 - [1.8][compiler] Type mismatch: cannot convert from List<Object> to Collection<Object[]>
+  *								Bug 427199 - [1.8][resource] avoid resource leak warnings on Streams that have no resource
++ *								Bug 416182 - [1.8][compiler][null] Contradictory null annotations not rejected
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -43,8 +44,10 @@ import java.util.List;
+ import java.util.Set;
+ 
+ import org.eclipse.jdt.core.compiler.CharOperation;
++import org.eclipse.jdt.internal.compiler.ast.NullAnnotationMatching;
+ import org.eclipse.jdt.internal.compiler.ast.TypeReference;
+ import org.eclipse.jdt.internal.compiler.ast.Wildcard;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ 
+ /**
+@@ -664,9 +667,14 @@ public class ParameterizedTypeBinding extends ReferenceBinding implements Substi
+ 		    if (length == 0) return Binding.NO_METHODS;
+ 
+ 		    parameterizedMethods = new MethodBinding[length];
+-		    for (int i = 0; i < length; i++)
++		    CompilerOptions options = this.environment.globalOptions;
++			boolean useNullTypeAnnotations = options.isAnnotationBasedNullAnalysisEnabled && options.sourceLevel >= ClassFileConstants.JDK1_8;
++		    for (int i = 0; i < length; i++) {
+ 		    	// substitute methods, so as to get updated declaring class at least
+ 	            parameterizedMethods[i] = createParameterizedMethod(originalMethods[i]);
++	            if (useNullTypeAnnotations)
++	            	parameterizedMethods[i] = NullAnnotationMatching.checkForContraditions(parameterizedMethods[i], null, null);
++		    }
+ 		    if (this.methods == null) {
+ 				MethodBinding[] temp = new MethodBinding[length];
+ 				System.arraycopy(parameterizedMethods, 0, temp, 0, length);
+@@ -932,9 +940,15 @@ public class ParameterizedTypeBinding extends ReferenceBinding implements Substi
+ 		    MethodBinding[] originalMethods = this.type.methods();
+ 		    int length = originalMethods.length;
+ 		    MethodBinding[] parameterizedMethods = new MethodBinding[length];
+-		    for (int i = 0; i < length; i++)
++		    CompilerOptions options = this.environment.globalOptions;
++			boolean useNullTypeAnnotations = options.isAnnotationBasedNullAnalysisEnabled && options.sourceLevel >= ClassFileConstants.JDK1_8;
++		    for (int i = 0; i < length; i++) {
+ 		    	// substitute all methods, so as to get updated declaring class at least
+ 	            parameterizedMethods[i] = createParameterizedMethod(originalMethods[i]);
++	            if (useNullTypeAnnotations)
++	            	parameterizedMethods[i] = NullAnnotationMatching.checkForContraditions(parameterizedMethods[i], null, null);
++		    }
++
+ 		    this.methods = parameterizedMethods;
+ 		} finally {
+ 			// if the original methods cannot be retrieved (ex. AbortCompilation), then assume we do not have any methods
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
+index 3e324ec..b96cedd 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
+@@ -16,6 +16,7 @@
+  *	   Stephan Herrmann - Contribution for
+  *								bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
++ *								Bug 416182 - [1.8][compiler][null] Contradictory null annotations not rejected
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -45,4 +46,5 @@ public interface ProblemReasons {
+ 	final int DefectiveContainerAnnotationType = 22;
+ 	final int ParameterizedMethodExpectedTypeProblem = 23;
+ 	final int ApplicableMethodOverriddenByInapplicable = 24;
++	final int ContradictoryNullAnnotations = 25;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index ed9b517..c985bc3 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -58,6 +58,7 @@
+  *								bug 412151 - [1.8][compiler] Check repeating annotation's collection type
+  *								bug 419209 - [1.8] Repeating container annotations should be rejected in the presence of annotation it contains
+  *								Bug 429384 - [1.8][null] implement conformance rules for null-annotated lower / upper type bounds
++ *								Bug 416182 - [1.8][compiler][null] Contradictory null annotations not rejected
+  ********************************************************************************/
+ package org.eclipse.jdt.internal.compiler.problem;
+ 
+@@ -4273,6 +4274,10 @@ public void invalidMethod(MessageSend messageSend, MethodBinding method) {
+ 				(int) (messageSend.nameSourcePosition >>> 32),
+ 				(int) messageSend.nameSourcePosition);
+ 			return;
++		case ProblemReasons.ContradictoryNullAnnotations:
++			problemMethod = (ProblemMethodBinding) method;
++			contradictoryNullAnnotationsInferred(problemMethod.closestMatch, (ASTNode)messageSend);
++			return;
+ 		case ProblemReasons.NoError : // 0
+ 		default :
+ 			needImplementation(messageSend); // want to fail to see why we were here...

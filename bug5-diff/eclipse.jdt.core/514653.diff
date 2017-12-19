@@ -1,0 +1,154 @@
+commit e232b72c7a6cb40ac8b5afb084b7767f2892e6ea
+Author: Andrey Loskutov <loskutov@gmx.de>
+Date:   Mon Apr 3 18:20:14 2017 +0200
+
+    Bug 514653 - JobManager sleep time is longer then indexing itself
+    
+    Only sleep after submitting a job if job indicates that this is really
+    needed. Also reduce wait time from 50 to 10 ms, which seem to be more
+    appropriate with today's hardware.
+    
+    The main part of the speedup is coming from the IndexRequest instances
+    scheduled via IndexManager.scheduleDocumentIndexing(...), which do NOT
+    require an implicit wait now because they are doing only IO read and
+    in-memory index write operations.
+    
+    Change-Id: I8b52405accdb643dd494a73979accd41b8d9f5b7
+    Signed-off-by: Andrey Loskutov <loskutov@gmx.de>
+
+5	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/PatternSearchJob.java
+4	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+4	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexRequest.java
+10	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/IJob.java
+4	2	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/PatternSearchJob.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/PatternSearchJob.java
+index 567c568..e4098a1 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/PatternSearchJob.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/PatternSearchJob.java
+@@ -90,6 +90,11 @@ public Index[] getIndexes(IProgressMonitor progressMonitor) {
+ 	this.areIndexesReady = indexes.length == length;
+ 	return indexes;
+ }
++
++@Override
++public boolean waitNeeded() {
++	return true;
++}
+ public String getJobFamily() {
+ 	return ""; //$NON-NLS-1$
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+index 31455cf..b0b6186 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+@@ -1044,6 +1044,10 @@ public void scheduleDocumentIndexing(final SearchDocument searchDocument, IPath
+ 		public String toString() {
+ 			return "indexing " + searchDocument.getPath(); //$NON-NLS-1$
+ 		}
++		@Override
++		public boolean waitNeeded() {
++			return false;
++		}
+ 	});
+ }
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexRequest.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexRequest.java
+index d919fe5..1347183 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexRequest.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexRequest.java
+@@ -42,4 +42,8 @@ public abstract class IndexRequest implements IJob {
+ 	protected Integer updatedIndexState() {
+ 		return IndexManager.UPDATING_STATE;
+ 	}
++	@Override
++	public boolean waitNeeded() {
++		return true;
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/IJob.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/IJob.java
+index db444bf..46b9f0b 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/IJob.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/IJob.java
+@@ -45,4 +45,14 @@ public interface IJob {
+ 	 * Returns this job's family
+ 	 */
+ 	public String getJobFamily();
++
++	/**
++	 * Answers if we need some sleep after index write operations. Default implementation returns {@code false}.
++	 *
++	 * @return true if the job manager should sleep a bit after this job is done to avoid IO tasks overloading OS (which
++	 *         could cause UI freezes etc).
++	 */
++	public default boolean waitNeeded() {
++		return false;
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
+index 7c07d0f..418eb89 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
+@@ -400,8 +400,10 @@ public abstract class JobManager implements Runnable {
+ 						if (VERBOSE)
+ 							Util.verbose("FINISHED background job - " + job); //$NON-NLS-1$
+ 						moveToNextJob();
+-						if (this.awaitingClients == 0)
+-							Thread.sleep(50);
++						if (this.awaitingClients == 0 && job.waitNeeded()) {
++							Util.verbose("WAITING after job - " + job); //$NON-NLS-1$
++							Thread.sleep(10);
++						}
+ 					}
+ 				} catch (InterruptedException e) { // background indexing was interrupted
+ 				}
+commit 14b1d11c535e007b5bf634dae4834f6a2e81a29d
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Tue Apr 4 11:17:28 2017 -0700
+
+    Bug 514653 - JobManager sleep time is longer then indexing itself
+    
+    Fix unconditional verbose logging introduced by previous patch.
+    
+    Change-Id: I744e4ff3a19fa24e987bba2287e85f930be2a576
+
+3	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
+index 418eb89..e1505bd 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
+@@ -401,7 +401,9 @@ public abstract class JobManager implements Runnable {
+ 							Util.verbose("FINISHED background job - " + job); //$NON-NLS-1$
+ 						moveToNextJob();
+ 						if (this.awaitingClients == 0 && job.waitNeeded()) {
+-							Util.verbose("WAITING after job - " + job); //$NON-NLS-1$
++							if (VERBOSE) {
++								Util.verbose("WAITING after job - " + job); //$NON-NLS-1$
++							}
+ 							Thread.sleep(10);
+ 						}
+ 					}
+commit 014c06267ac1095468f04c8ad5976b803ebd32b0
+Author: Andrey Loskutov <loskutov@gmx.de>
+Date:   Fri Apr 7 11:37:14 2017 +0200
+
+    Bug 514653 - JobManager sleep time is longer then indexing itself
+    
+    Further reducing the sleep after discussion on the bug.
+    
+    Change-Id: I6c2231c6c538a9b4faff1b6f28927033707d7d42
+    Signed-off-by: Andrey Loskutov <loskutov@gmx.de>
+
+1	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
+index e1505bd..a7cdccf 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/processing/JobManager.java
+@@ -404,7 +404,7 @@ public abstract class JobManager implements Runnable {
+ 							if (VERBOSE) {
+ 								Util.verbose("WAITING after job - " + job); //$NON-NLS-1$
+ 							}
+-							Thread.sleep(10);
++							Thread.sleep(5);
+ 						}
+ 					}
+ 				} catch (InterruptedException e) { // background indexing was interrupted

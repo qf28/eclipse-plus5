@@ -1,0 +1,597 @@
+commit f5d7f3f14e69a955635d98e0e88aeb491988cae5
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Mon Nov 3 22:04:23 2014 +0530
+
+    Fixed Bug 448794 - [1.8][compiler] Eliminate reinference of inner poly
+    expressions by forwarding results from aggregate inference
+
+1	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+32	9	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+14	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+6	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+8	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+0	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+5	9	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+39	18	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+55	40	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+3	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+8	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+index 0800e28..2e5672b 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+@@ -8557,7 +8557,7 @@ public void test428177() {
+ 		"5. ERROR in X.java (at line 38)\n" + 
+ 		"	return stream.collect(Collectors.toList()); // NO ERROR\n" + 
+ 		"	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
+-		"Type mismatch: cannot convert from List<capture#19-of ? extends String> to Stream<String>\n" + 
++		"Type mismatch: cannot convert from List<capture#18-of ? extends String> to Stream<String>\n" + 
+ 		"----------\n");
+ }
+ // https://bugs.eclipse.org/bugs/show_bug.cgi?id=428795, - [1.8]Internal compiler error: java.lang.NullPointerException at org.eclipse.jdt.internal.compiler.ast.MessageSend.analyseCode
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+index 9fc7930..26995c9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+@@ -49,6 +49,8 @@ package org.eclipse.jdt.internal.compiler.ast;
+ 
+ import static org.eclipse.jdt.internal.compiler.ast.ExpressionContext.*;
+ 
++import java.util.HashMap;
++
+ import org.eclipse.jdt.core.compiler.IProblem;
+ import org.eclipse.jdt.internal.compiler.ASTVisitor;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+@@ -77,6 +79,7 @@ public class AllocationExpression extends Expression implements Invocation {
+ 
+ 	 // hold on to this context from invocation applicability inference until invocation type inference (per method candidate):
+ 	private SimpleLookupTable/*<PMB,IC18>*/ inferenceContexts;
++	public HashMap<TypeBinding, MethodBinding> solutionsPerTargetType;
+ 	public boolean argsContainCast;
+ 	public TypeBinding[] argumentTypes = Binding.NO_PARAMETERS;
+ 	public boolean argumentsHaveErrors = false;
+@@ -518,11 +521,14 @@ public boolean isCompatibleWith(TypeBinding targetType, final Scope scope) {
+ 	if (isPolyExpression()) {
+ 		TypeBinding originalExpectedType = this.typeExpected;
+ 		try {
+-			this.typeExpected = targetType;
+-			TypeBinding [] inferredTypes = inferElidedTypes(scope);
+-			if (inferredTypes == null)
+-				return false;
+-			allocationType = scope.environment().createParameterizedType(((ParameterizedTypeBinding) this.resolvedType).genericType(), inferredTypes, this.resolvedType.enclosingType());
++			MethodBinding method = this.solutionsPerTargetType != null ? this.solutionsPerTargetType.get(targetType) : null;
++			if (method == null) {
++				this.typeExpected = targetType;
++				method = inferConstructorOfElidedParameterizedType(scope); // caches result already.
++				if (method == null || !method.isValidBinding())
++					return false;
++			}
++			allocationType = method.declaringClass;
+ 		} finally {
+ 			this.typeExpected = originalExpectedType;
+ 		}
+@@ -531,7 +537,11 @@ public boolean isCompatibleWith(TypeBinding targetType, final Scope scope) {
+ }
+ 
+ public MethodBinding inferConstructorOfElidedParameterizedType(final Scope scope) {
+-	
++	if (this.typeExpected != null && this.binding != null) {
++		MethodBinding cached = this.solutionsPerTargetType != null ? this.solutionsPerTargetType.get(this.typeExpected) : null;
++		if (cached != null)
++			return cached;
++	}
+ 	ReferenceBinding genericType = ((ParameterizedTypeBinding) this.resolvedType).genericType();
+ 	ReferenceBinding enclosingType = this.resolvedType.enclosingType();
+ 	ParameterizedTypeBinding allocationType = scope.environment().createParameterizedType(genericType, genericType.typeVariables(), enclosingType);
+@@ -549,9 +559,12 @@ public MethodBinding inferConstructorOfElidedParameterizedType(final Scope scope
+ 												constructorTypeArguments, 0, constructorTypeArguments.length);
+ 		MethodBinding constructor = sfmb.applyTypeArgumentsOnConstructor(((ParameterizedTypeBinding)factory.returnType).arguments, constructorTypeArguments);
+ 		if (constructor instanceof ParameterizedGenericMethodBinding && scope.compilerOptions().sourceLevel >= ClassFileConstants.JDK1_8) {
+-			// force an inference context to be established, but avoid tunneling through overload resolution. We know this is the MSMB.
+-			return ParameterizedGenericMethodBinding.computeCompatibleMethod18(constructor.shallowOriginal(), this.argumentTypes, scope, this);
++			// force an inference context to be established for nested poly allocations (to be able to transfer b2), but avoid tunneling through overload resolution. We know this is the MSMB.
++			if (this.expressionContext == INVOCATION_CONTEXT && this.typeExpected == null)
++				constructor = ParameterizedGenericMethodBinding.computeCompatibleMethod18(constructor.shallowOriginal(), this.argumentTypes, scope, this);
+ 		}
++		if (this.typeExpected != null)
++			registerResult(this.typeExpected, constructor);
+ 		return constructor;
+ 	}
+ 	return null;
+@@ -679,7 +692,7 @@ public boolean statementExpression() {
+ }
+ 
+ //-- interface Invocation: --
+-public MethodBinding binding(TypeBinding targetType, Scope scope) {
++public MethodBinding binding() {
+ 	return this.binding;
+ }
+ public Expression[] arguments() {
+@@ -691,6 +704,16 @@ public void registerInferenceContext(ParameterizedGenericMethodBinding method, I
+ 		this.inferenceContexts = new SimpleLookupTable();
+ 	this.inferenceContexts.put(method, infCtx18);
+ }
++
++@Override
++public void registerResult(TypeBinding targetType, MethodBinding method) {
++	if (method != null && method.isConstructor()) { // ignore the factory.
++		if (this.solutionsPerTargetType == null)
++			this.solutionsPerTargetType = new HashMap<TypeBinding, MethodBinding>();
++		this.solutionsPerTargetType.put(targetType, method);
++	}
++}
++
+ public InferenceContext18 getInferenceContext(ParameterizedMethodBinding method) {
+ 	if (this.inferenceContexts == null)
+ 		return null;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+index c9442d2..2f8cf57 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+@@ -717,6 +717,20 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext,
+ 		return this.expressionContext;
+ 	}
+ 	
++	@Override
++	public Expression[] getPolyExpressions() {
++		Expression [] truePolys = this.valueIfTrue.getPolyExpressions();
++		Expression [] falsePolys = this.valueIfFalse.getPolyExpressions();
++		if (truePolys.length == 0)
++			return falsePolys;
++		if (falsePolys.length == 0)
++			return truePolys;
++		Expression [] allPolys = new Expression [truePolys.length + falsePolys.length];
++		System.arraycopy(truePolys, 0, allPolys, 0, truePolys.length);
++		System.arraycopy(falsePolys, 0, allPolys, truePolys.length, falsePolys.length);
++		return allPolys;
++	}
++	
+ 	public boolean isPertinentToApplicability(TypeVariableBinding typeVariable, MethodBinding method) {
+ 		return this.valueIfTrue.isPertinentToApplicability(typeVariable, method) 
+ 				&& this.valueIfFalse.isPertinentToApplicability(typeVariable, method);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+index a16132a..65f6d2c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+@@ -490,7 +490,7 @@ public class ExplicitConstructorCall extends Statement implements Invocation {
+ 	}
+ 
+ 	// -- interface Invocation
+-	public MethodBinding binding(TypeBinding targetType, Scope scope) {
++	public MethodBinding binding() {
+ 		return this.binding;
+ 	}
+ 
+@@ -498,6 +498,11 @@ public class ExplicitConstructorCall extends Statement implements Invocation {
+ 		// Nothing to do.
+ 	}
+ 	
++	@Override
++	public void registerResult(TypeBinding targetType, MethodBinding method) {
++		// Nothing to do.
++	}
++	
+ 	public InferenceContext18 getInferenceContext(ParameterizedMethodBinding method) {
+ 		return null;
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+index f39f2a3..63f18ca 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+@@ -71,6 +71,9 @@ public abstract class Expression extends Statement {
+ 
+ 	public int implicitConversion;
+ 	public TypeBinding resolvedType;
++	
++	static Expression [] NO_EXPRESSIONS = new Expression[0];
++	
+ 
+ public static final boolean isConstantValueRepresentable(Constant constant, int constantTypeID, int targetTypeID) {
+ 	//true if there is no loss of precision while casting.
+@@ -1243,4 +1246,9 @@ public VariableBinding nullAnnotatedVariableBinding(boolean supportTypeAnnotatio
+ public boolean isFunctionalType() {
+ 	return false;
+ }
++
++/** Returns contained poly expressions, result could be 0, 1 or more (for conditional expression) */
++public Expression [] getPolyExpressions() {
++	return isPolyExpression() ? new Expression [] { this } : NO_EXPRESSIONS;
++}
+ }
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+index 1405887..6bf0935 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+@@ -57,7 +57,6 @@ public abstract class FunctionalExpression extends Expression {
+ 	protected MethodBinding actualMethodBinding;  // void of synthetics.
+ 	boolean ignoreFurtherInvestigation;
+ 	protected ExpressionContext expressionContext = VANILLA_CONTEXT;
+-	static Expression [] NO_EXPRESSIONS = new Expression[0];
+ 	protected Expression [] resultExpressions = NO_EXPRESSIONS;
+ 	public CompilationResult compilationResult;
+ 	public BlockScope enclosingScope;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+index 38dc9dc..f77cd13 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+@@ -15,7 +15,6 @@ import org.eclipse.jdt.internal.compiler.lookup.InvocationSite;
+ import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.ParameterizedGenericMethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.ParameterizedMethodBinding;
+-import org.eclipse.jdt.internal.compiler.lookup.Scope;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ 
+ /**
+@@ -25,14 +24,8 @@ public interface Invocation extends InvocationSite {
+ 
+ 	Expression[] arguments();
+ 
+-	/**
+-	 * Answer the resolved method binding of this invocation.
+-	 * If a target type is given, the invocation gets a chance to do repeated method lookup.
+-	 * @param targetType the target type of this invocation or null if not yet known
+-	 * @param scope the scope to use for lookup.
+-	 * 
+-	 */
+-	MethodBinding binding(TypeBinding targetType, Scope scope);
++	/** Answer the resolved method binding of this invocation */
++	MethodBinding binding();
+ 	
+ 	/**
+ 	 * Register the given inference context, which produced the given method as its intermediate result.
+@@ -49,4 +42,7 @@ public interface Invocation extends InvocationSite {
+ 	 */
+ 	InferenceContext18 getInferenceContext(ParameterizedMethodBinding method);
+ 
++	/** Record result against target type */
++	void registerResult(TypeBinding targetType, MethodBinding method);
++
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index 0f5e0cf..05c1083 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -58,6 +58,8 @@ package org.eclipse.jdt.internal.compiler.ast;
+ 
+ import static org.eclipse.jdt.internal.compiler.ast.ExpressionContext.*;
+ 
++import java.util.HashMap;
++
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.ASTVisitor;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+@@ -117,6 +119,8 @@ public class MessageSend extends Expression implements Invocation {
+ 
+ 	 // hold on to this context from invocation applicability inference until invocation type inference (per method candidate):
+ 	private SimpleLookupTable/*<PGMB,InferenceContext18>*/ inferenceContexts;
++	private HashMap<TypeBinding, MethodBinding> solutionsPerTargetType;
++	
+ 	private boolean receiverIsType;
+ 	protected boolean argsContainCast;
+ 	public TypeBinding[] argumentTypes = Binding.NO_PARAMETERS;
+@@ -867,19 +871,20 @@ public TypeBinding resolveType(BlockScope scope) {
+ 
+ protected TypeBinding findMethodBinding(BlockScope scope) {
+ 	
+-	
+-	this.binding = this.receiver.isImplicitThis() ? 
+-			scope.getImplicitMethod(this.selector, this.argumentTypes, this) 
+-			: scope.getMethod(this.actualReceiverType, this.selector, this.argumentTypes, this);
++	if (this.expectedType != null && this.binding instanceof PolyParameterizedGenericMethodBinding) {
++		this.binding = this.solutionsPerTargetType.get(this.expectedType);
++	}
++	if (this.binding == null) { // first look up or a "cache miss" somehow.
++		this.binding = this.receiver.isImplicitThis() ? 
++				scope.getImplicitMethod(this.selector, this.argumentTypes, this) 
++				: scope.getMethod(this.actualReceiverType, this.selector, this.argumentTypes, this);
+ 
+-	if (this.binding == null) // can't happen ? I think we always get a problem binding, anyways.
+-		return null;
+-	
+-	if (this.binding instanceof PolyParameterizedGenericMethodBinding)
+-		return new PolyTypeBinding(this);
+-	
++	    if (this.binding instanceof PolyParameterizedGenericMethodBinding) {
++		    this.solutionsPerTargetType = new HashMap<TypeBinding, MethodBinding>();
++		    return new PolyTypeBinding(this);
++	    }
++	}
+ 	resolvePolyExpressionArguments(this, this.binding, this.argumentTypes, scope);
+-	
+ 	return this.binding.returnType;
+ }
+ 
+@@ -924,9 +929,13 @@ public boolean isBoxingCompatibleWith(TypeBinding targetType, Scope scope) {
+ 		return false;
+ 	TypeBinding originalExpectedType = this.expectedType;
+ 	try {
+-		this.expectedType = targetType;
+-		// No need to tunnel through overload resolution. this.binding is the MSMB.
+-		MethodBinding method = isPolyExpression() ? ParameterizedGenericMethodBinding.computeCompatibleMethod18(this.binding.shallowOriginal(), this.argumentTypes, scope, this) : this.binding;
++		MethodBinding method = this.solutionsPerTargetType != null ? this.solutionsPerTargetType.get(targetType) : null;
++		if (method == null) {
++			this.expectedType = targetType;
++			// No need to tunnel through overload resolution. this.binding is the MSMB.
++			method = isPolyExpression() ? ParameterizedGenericMethodBinding.computeCompatibleMethod18(this.binding.shallowOriginal(), this.argumentTypes, scope, this) : this.binding;
++			registerResult(targetType, method);
++		}
+ 		if (method == null || !method.isValidBinding() || method.returnType == null || !method.returnType.isValidBinding())
+ 			return false;
+ 		return super.isBoxingCompatible(method.returnType.capture(scope, this.sourceStart, this.sourceEnd), targetType, this, scope);
+@@ -940,9 +949,13 @@ public boolean isCompatibleWith(TypeBinding targetType, final Scope scope) {
+ 		return false;
+ 	TypeBinding originalExpectedType = this.expectedType;
+ 	try {
+-		this.expectedType = targetType;
+-		// No need to tunnel through overload resolution. this.binding is the MSMB.
+-		MethodBinding method = isPolyExpression() ? ParameterizedGenericMethodBinding.computeCompatibleMethod18(this.binding.shallowOriginal(), this.argumentTypes, scope, this) : this.binding;
++		MethodBinding method = this.solutionsPerTargetType != null ? this.solutionsPerTargetType.get(targetType) : null;
++		if (method == null) {
++			this.expectedType = targetType;
++			// No need to tunnel through overload resolution. this.binding is the MSMB.
++			method = isPolyExpression() ? ParameterizedGenericMethodBinding.computeCompatibleMethod18(this.binding.shallowOriginal(), this.argumentTypes, scope, this) : this.binding;
++			registerResult(targetType, method);
++		}
+ 		TypeBinding returnType;
+ 		if (method == null || !method.isValidBinding() || (returnType = method.returnType) == null || !returnType.isValidBinding())
+ 			return false;
+@@ -1017,7 +1030,7 @@ public boolean receiverIsImplicitThis() {
+ 	return this.receiver.isImplicitThis();
+ }
+ // -- interface Invocation: --
+-public MethodBinding binding(TypeBinding targetType, Scope scope) {
++public MethodBinding binding() {
+ 	return this.binding;
+ }
+ 
+@@ -1026,6 +1039,14 @@ public void registerInferenceContext(ParameterizedGenericMethodBinding method, I
+ 		this.inferenceContexts = new SimpleLookupTable();
+ 	this.inferenceContexts.put(method, infCtx18);
+ }
++
++@Override
++public void registerResult(TypeBinding targetType, MethodBinding method) {
++	if (this.solutionsPerTargetType == null)
++		this.solutionsPerTargetType = new HashMap<TypeBinding, MethodBinding>();
++	this.solutionsPerTargetType.put(targetType, method);
++}
++
+ public InferenceContext18 getInferenceContext(ParameterizedMethodBinding method) {
+ 	if (this.inferenceContexts == null)
+ 		return null;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+index 105bdc1..ec01160 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+@@ -64,7 +64,7 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 			// - parenthesized expression : these are transparent in our AST
+ 			if (this.left instanceof Invocation) {
+ 				Invocation invocation = (Invocation) this.left;
+-				MethodBinding previousMethod = invocation.binding(this.right, inferenceContext.scope);
++				MethodBinding previousMethod = invocation.binding();
+ 				if (previousMethod == null)  	// can happen, e.g., if inside a copied lambda with ignored errors
+ 					return null; 				// -> proceed with no new constraints
+ 				MethodBinding method = previousMethod;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+index 93ce632..0443277 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+@@ -317,7 +317,7 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 			case Binding.POLY_TYPE:
+ 				PolyTypeBinding poly = (PolyTypeBinding) superCandidate;
+ 				Invocation invocation = (Invocation) poly.expression;
+-				MethodBinding binding = invocation.binding(subCandidate, scope);
++				MethodBinding binding = invocation.binding();
+ 				if (binding == null || !binding.isValidBinding())
+ 					return FALSE;
+ 				return reduceSubType(scope, subCandidate, binding.returnType.capture(scope, invocation.sourceStart(), invocation.sourceEnd()));
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index 565c6a8..9855ee9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -138,9 +138,6 @@ public class InferenceContext18 {
+ 	/** The accumulated type bounds etc. */
+ 	BoundSet currentBounds;
+ 
+-	/** For each candidate target type imposed from the outside store the solution of invocation type inference. */
+-	Map<TypeBinding,Solution> solutionsPerTargetType = new HashMap<TypeBinding, Solution>();
+-
+ 	/** One of CHECK_STRICT, CHECK_LOOSE, or CHECK_VARARGS. */
+ 	int inferenceKind;
+ 	/** Marks how much work has been done so far? Used to avoid performing any of these tasks more than once. */
+@@ -151,8 +148,6 @@ public class InferenceContext18 {
+ 	public static final int APPLICABILITY_INFERRED = 1;
+ 	/** Invocation Type Inference (18.5.2) has been completed (for some target type). */
+ 	public static final int TYPE_INFERRED = 2;
+-	/** All nested elements have been fully resolved. */
+-	public static final int BINDINGS_UPDATED = 3;
+ 	
+ 	/** Signals whether any type compatibility makes use of unchecked conversion. */
+ 	public List<ConstraintFormula> constraintsWithUncheckedConversion;
+@@ -183,18 +178,6 @@ public class InferenceContext18 {
+ 		}
+ 	}
+ 	
+-	/** Record for a candidate solution of Invocation Type Inference for one specific target type. */
+-	static class Solution {
+-		TypeBinding resolvedType;
+-		MethodBinding method;
+-		BoundSet bounds;
+-		Solution(MethodBinding method, BoundSet bounds) {
+-			this.method = method;
+-			this.resolvedType = method.isConstructor() ? method.declaringClass : method.returnType;
+-			this.bounds = bounds;
+-		}
+-	}
+-
+ 	/** Construct an inference context for an invocation (method/constructor). */
+ 	public InferenceContext18(Scope scope, Expression[] arguments, InvocationSite site) {
+ 		this.scope = scope;
+@@ -482,7 +465,7 @@ public class InferenceContext18 {
+ 				return true;
+ 			
+ 			Invocation invocation = (Invocation) expri;
+-			MethodBinding innerMethod = invocation.binding(substF, this.scope);
++			MethodBinding innerMethod = invocation.binding();
+ 			if (innerMethod == null)
+ 				return true; 		  // -> proceed with no new C set elements.
+ 			
+@@ -531,26 +514,6 @@ public class InferenceContext18 {
+ 		}
+ 	}
+ 
+-	public boolean hasResultFor(TypeBinding targetType) {
+-		if (targetType == null)
+-			return this.stepCompleted >= TYPE_INFERRED;
+-		else
+-			return this.solutionsPerTargetType.containsKey(targetType);
+-	}
+-	
+-	public Solution getResultFor(TypeBinding targetType) {
+-		return this.solutionsPerTargetType.get(targetType);
+-	}
+-
+-	public boolean registerSolution(TypeBinding targetType, MethodBinding updatedBinding) {
+-		Solution solution = this.solutionsPerTargetType.get(targetType);
+-		if (solution != null)
+-			return false; // no update
+-		this.solutionsPerTargetType.put(targetType, new Solution(updatedBinding, null));
+-		this.stepCompleted = Math.max(this.stepCompleted, TYPE_INFERRED);
+-		return true;
+-	}
+-
+ 	/**
+ 	 * 18.5.3 Functional Interface Parameterization Inference
+ 	 */
+@@ -1444,7 +1407,6 @@ public class InferenceContext18 {
+ 			case NOT_INFERRED: buf.append(" (initial)");break; //$NON-NLS-1$
+ 			case APPLICABILITY_INFERRED: buf.append(" (applicability inferred)");break; //$NON-NLS-1$
+ 			case TYPE_INFERRED: buf.append(" (type inferred)");break; //$NON-NLS-1$
+-			case BINDINGS_UPDATED: buf.append(" (bindings updated)");break; //$NON-NLS-1$
+ 		}
+ 		switch (this.inferenceKind) {
+ 			case CHECK_STRICT: buf.append(" (strict)");break; //$NON-NLS-1$
+@@ -1548,4 +1510,57 @@ public class InferenceContext18 {
+ 	public static void missingImplementation(String msg) {
+ 		throw new UnsupportedOperationException(msg);
+ 	}
+-}
++
++	public void forwardResults(BoundSet result, Invocation invocation, ParameterizedMethodBinding pmb, TypeBinding targetType) {
++		if (targetType != null)
++			invocation.registerResult(targetType, pmb);
++		Expression[] arguments = invocation.arguments();
++		for (int i = 0, length = arguments == null ? 0 : arguments.length; i < length; i++) {
++			Expression [] expressions = arguments[i].getPolyExpressions();
++			for (int j = 0, jLength = expressions.length; j < jLength; j++) {
++				Expression expression = expressions[j];
++				if (!(expression instanceof Invocation))
++					continue;
++				Invocation polyInvocation = (Invocation) expression;
++				MethodBinding binding = polyInvocation.binding();
++				if (binding == null || !binding.isValidBinding())
++					continue;
++				ParameterizedMethodBinding methodSubstitute = null;
++				if (binding instanceof ParameterizedGenericMethodBinding) {
++					MethodBinding shallowOriginal = binding.shallowOriginal();
++					TypeBinding[] solutions = getSolutions(shallowOriginal.typeVariables(), polyInvocation, result);
++					if (solutions == null)  // in CEF.reduce, we lift inner poly expressions into outer context only if their target type has inference variables. 
++						continue;
++					methodSubstitute = this.environment.createParameterizedGenericMethod(shallowOriginal, solutions);
++				} else {
++					if (!binding.isConstructor() || !(binding instanceof ParameterizedMethodBinding))
++						continue; // throw ISE ?
++					MethodBinding shallowOriginal = binding.shallowOriginal();
++					ReferenceBinding genericType = shallowOriginal.declaringClass;
++					TypeBinding[] solutions = getSolutions(genericType.typeVariables(), polyInvocation, result);
++					if (solutions == null)  // in CEF.reduce, we lift inner poly expressions into outer context only if their target type has inference variables. 
++						continue;
++					ParameterizedTypeBinding parameterizedType = this.environment.createParameterizedType(genericType, solutions, binding.declaringClass.enclosingType());
++					for (MethodBinding parameterizedMethod : parameterizedType.methods()) {
++						if (parameterizedMethod.original() == shallowOriginal) {
++							methodSubstitute = (ParameterizedMethodBinding) parameterizedMethod;
++							break;
++						}
++					}
++				}
++				if (methodSubstitute == null || !methodSubstitute.isValidBinding())
++					continue;
++				boolean variableArity = pmb.isVarargs();
++				final TypeBinding[] parameters = pmb.parameters;
++				if (variableArity && parameters.length == arguments.length && i == length - 1) {
++					TypeBinding returnType = methodSubstitute.returnType.capture(this.scope, expression.sourceStart, expression.sourceEnd);
++					if (returnType.isCompatibleWith(parameters[parameters.length - 1], this.scope)) {
++						variableArity = false;
++					}
++				}
++				TypeBinding parameterType = InferenceContext18.getParameter(parameters, i, variableArity);
++				forwardResults(result, polyInvocation, methodSubstitute, parameterType);		
++			}
++		}
++	}
++}
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+index a33c7fd..a3aea13 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+@@ -31,7 +31,6 @@ import org.eclipse.jdt.internal.compiler.ast.ReferenceExpression;
+ import org.eclipse.jdt.internal.compiler.ast.Wildcard;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+-import org.eclipse.jdt.internal.compiler.lookup.InferenceContext18.Solution;
+ 
+ /**
+  * Binding denoting a generic method after type parameter substitutions got performed.
+@@ -211,7 +210,7 @@ public class ParameterizedGenericMethodBinding extends ParameterizedMethodBindin
+ 			// Applicability succeeded, proceed to infer invocation type, if possible.
+ 			TypeBinding expectedType = invocationSite.invocationTargetType();
+ 			boolean hasReturnProblem = false;
+-			if (expectedType != null || !invocationSite.getExpressionContext().definesTargetType()) {
++			if (expectedType != null || !invocationSite.getExpressionContext().definesTargetType() || !isPolyExpression) {
+ 				// ---- 18.5.2 (Invocation type): ----
+ 				provisionalResult = result;
+ 				result = infCtx18.inferInvocationType(expectedType, invocationSite, originalMethod);
+@@ -225,6 +224,8 @@ public class ParameterizedGenericMethodBinding extends ParameterizedMethodBindin
+ 				TypeBinding[] solutions = infCtx18.getSolutions(typeVariables, invocationSite, result);
+ 				if (solutions != null) {
+ 					methodSubstitute = scope.environment().createParameterizedGenericMethod(originalMethod, solutions);
++					if (invocationSite instanceof Invocation)
++						infCtx18.forwardResults(result, (Invocation) invocationSite, methodSubstitute, expectedType);
+ 					if (hasReturnProblem) { // illegally working from the provisional result?
+ 						MethodBinding problemMethod = infCtx18.getReturnProblemMethodIfNeeded(expectedType, methodSubstitute);
+ 						if (problemMethod instanceof ProblemMethodBinding) {
+@@ -238,7 +239,6 @@ public class ParameterizedGenericMethodBinding extends ParameterizedMethodBindin
+ 						if (problemMethod != null) {
+ 							return problemMethod;
+ 						}
+-						infCtx18.solutionsPerTargetType.put(expectedType, new Solution(methodSubstitute, result));
+ 					} else {
+ 						methodSubstitute = new PolyParameterizedGenericMethodBinding(methodSubstitute);
+ 					}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index 20f361c..e1f8402 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -4602,10 +4602,15 @@ public abstract class Scope {
+ 					TypeBinding parameter = InferenceContext18.getParameter(method.parameters, i, context.isVarArgs());
+ 					if (argument.isCompatibleWith(parameter, this))
+ 						continue;
+-					TypeBinding shallowParameter = InferenceContext18.getParameter(shallowOriginal.parameters, i, context.isVarArgs());
+-					if (shallowParameter.isPertinentToApplicability(argument, shallowOriginal))
++					if (context.stepCompleted >= InferenceContext18.TYPE_INFERRED)
+ 						return NOT_COMPATIBLE;
+-					
++					// Next 6 lines have dubious sanction. Needs a rigorous solution.
++					TypeBinding shallowParameter = InferenceContext18.getParameter(shallowOriginal.parameters, i, context.isVarArgs());
++					if (!shallowParameter.isPertinentToApplicability(argument, shallowOriginal))
++						continue;
++					if (((Invocation) site).arguments()[i] instanceof ReferenceExpression)
++						continue;
++					return NOT_COMPATIBLE;
+ 					/* We ask the inverted question here, because we do want to check compatibility against lambdas and reference expressions that are not pertinent to
+ 					  applicability on account of being type elided and not being an exact method reference respectively i.e if we call 
+ 					  argument.isPertinentToApplicability(shallowParameter, shallowOriginal), it will answer true if type elided and we will miss catching incompatibilities.

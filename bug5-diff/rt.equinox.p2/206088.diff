@@ -1,0 +1,290 @@
+commit b000b174de35858846f26f6a0c9a68bf2d20a0a8
+Author: John Arthorne <johna>
+Date:   Wed Oct 24 02:57:45 2007 +0000
+
+    Bug 206088 [prov] Engine could do better with progress monitors
+
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/DefaultPhaseSet.java
+6	5	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
+13	3	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
+4	3	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Configure.java
+4	3	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+2	3	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Unconfigure.java
+2	3	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/DefaultPhaseSet.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/DefaultPhaseSet.java
+index 04cc35a..6aec15d 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/DefaultPhaseSet.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/DefaultPhaseSet.java
+@@ -15,7 +15,7 @@ import org.eclipse.equinox.p2.engine.phases.*;
+ public class DefaultPhaseSet extends PhaseSet {
+ 
+ 	public DefaultPhaseSet() {
+-		super(new Phase[] {new Collect(10), new Unconfigure(10), new Uninstall(10), new Install(10), new Configure(10)});
++		super(new Phase[] {new Collect(100), new Unconfigure(10), new Uninstall(50), new Install(50), new Configure(10)});
+ 	}
+ 
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
+index e0f651e..dba18c1 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Phase.java
+@@ -68,7 +68,7 @@ public abstract class Phase {
+ 		Map touchpointParameters = (Map) touchpointToTouchpointParameters.get(touchpoint);
+ 		Map parameters = new HashMap(touchpointParameters);
+ 		parameters.put("operand", operand);
+-		status.add(initializeOperand(operand, parameters));
++		status.add(initializeOperand(operand, parameters, null));
+ 		status.add(touchpoint.initializeOperand(operand, phaseId, parameters));
+ 		parameters = Collections.unmodifiableMap(parameters);
+ 		for (int j = 0; j < actions.length; j++) {
+@@ -129,9 +129,9 @@ public abstract class Phase {
+ 	}
+ 
+ 	private void mainPerform(MultiStatus status, EngineSession session, Profile profile, Operand[] operands, SubMonitor subMonitor) {
+-		// TODO: Support Monitor
+-		// int operandWork = PERFORM_WORK / operands.length;
++		subMonitor.beginTask("", operands.length); //$NON-NLS-1$
+ 		for (int i = 0; i < operands.length; i++) {
++			subMonitor.setWorkRemaining(operands.length - i);
+ 			if (subMonitor.isCanceled())
+ 				throw new OperationCanceledException();
+ 			Operand operand = operands[i];
+@@ -151,7 +151,7 @@ public abstract class Phase {
+ 			Map touchpointParameters = (Map) touchpointToTouchpointParameters.get(touchpoint);
+ 			Map parameters = new HashMap(touchpointParameters);
+ 			parameters.put("operand", operand);
+-			status.add(initializeOperand(operand, parameters));
++			status.add(initializeOperand(operand, parameters, subMonitor));
+ 			status.add(touchpoint.initializeOperand(operand, phaseId, parameters));
+ 			parameters = Collections.unmodifiableMap(parameters);
+ 			if (actions != null) {
+@@ -165,6 +165,7 @@ public abstract class Phase {
+ 			}
+ 			status.add(touchpoint.completeOperand(operand, phaseId, parameters));
+ 			status.add(completeOperand(operand, parameters));
++			subMonitor.worked(1);
+ 		}
+ 	}
+ 
+@@ -242,7 +243,7 @@ public abstract class Phase {
+ 		return Status.OK_STATUS;
+ 	}
+ 
+-	protected IStatus initializeOperand(Operand operand, Map parameters) {
++	protected IStatus initializeOperand(Operand operand, Map parameters, IProgressMonitor monitor) {
+ 		return Status.OK_STATUS;
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
+index e5137fd..50adf99 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/PhaseSet.java
+@@ -26,7 +26,7 @@ public abstract class PhaseSet {
+ 
+ 	public final MultiStatus perform(EngineSession session, Profile profile, Operand[] deltas, IProgressMonitor monitor) {
+ 		MultiStatus result = new MultiStatus();
+-		int[] weights = getProgressWeights();
++		int[] weights = getProgressWeights(deltas);
+ 		int totalWork = getTotalWork(weights);
+ 		SubMonitor pm = SubMonitor.convert(monitor, totalWork);
+ 		try {
+@@ -53,11 +53,21 @@ public abstract class PhaseSet {
+ 		return sum;
+ 	}
+ 
+-	private int[] getProgressWeights() {
++	private int[] getProgressWeights(Operand[] operands) {
+ 		int[] weights = new int[phases.length];
+ 		for (int i = 0; i < phases.length; i += 1) {
+-			weights[i] = phases[i].weight;
++			//alter weights according to the number of operands applicable to that phase
++			weights[i] = phases[i].weight * (countApplicable(phases[i], operands) / operands.length);
+ 		}
+ 		return weights;
+ 	}
++
++	private int countApplicable(Phase phase, Operand[] operands) {
++		int count = 0;
++		for (int i = 0; i < operands.length; i++) {
++			if (phase.isApplicable(operands[i]))
++				count++;
++		}
++		return count;
++	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Configure.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Configure.java
+index b137ad4..6d45351 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Configure.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Configure.java
+@@ -9,10 +9,10 @@
+ package org.eclipse.equinox.p2.engine.phases;
+ 
+ import java.util.Map;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Status;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.p2.engine.*;
+ import org.eclipse.equinox.p2.metadata.*;
++import org.eclipse.osgi.util.NLS;
+ 
+ public class Configure extends Phase {
+ 
+@@ -34,8 +34,9 @@ public class Configure extends Phase {
+ 		return getActions(unit, phaseId);
+ 	}
+ 
+-	protected IStatus initializeOperand(Operand operand, Map parameters) {
++	protected IStatus initializeOperand(Operand operand, Map parameters, IProgressMonitor monitor) {
+ 		IResolvedInstallableUnit iu = operand.second();
++		monitor.subTask(NLS.bind("Configuring {0}", iu.getId()));
+ 		parameters.put("iu", iu);
+ 
+ 		IArtifactKey[] artifacts = iu.getArtifacts();
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+index 0e9c8e0..a0122eb 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+@@ -11,13 +11,13 @@
+ package org.eclipse.equinox.p2.engine.phases;
+ 
+ import java.util.Map;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Status;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+ import org.eclipse.equinox.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.p2.engine.*;
+ import org.eclipse.equinox.p2.metadata.*;
++import org.eclipse.osgi.util.NLS;
+ 
+ public class Install extends Phase {
+ 
+@@ -92,8 +92,9 @@ public class Install extends Phase {
+ 		return actions;
+ 	}
+ 
+-	protected IStatus initializeOperand(Operand operand, Map parameters) {
++	protected IStatus initializeOperand(Operand operand, Map parameters, IProgressMonitor monitor) {
+ 		IResolvedInstallableUnit iu = operand.second();
++		monitor.subTask(NLS.bind("Installing {0}", iu.getId()));
+ 		parameters.put("iu", iu);
+ 
+ 		IArtifactKey[] artifacts = iu.getArtifacts();
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Unconfigure.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Unconfigure.java
+index c2a7497..9c91dcb 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Unconfigure.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Unconfigure.java
+@@ -9,8 +9,7 @@
+ package org.eclipse.equinox.p2.engine.phases;
+ 
+ import java.util.Map;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Status;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.p2.engine.*;
+ import org.eclipse.equinox.p2.metadata.*;
+ 
+@@ -34,7 +33,7 @@ public class Unconfigure extends Phase {
+ 		return getActions(unit, phaseId);
+ 	}
+ 
+-	protected IStatus initializeOperand(Operand operand, Map parameters) {
++	protected IStatus initializeOperand(Operand operand, Map parameters, IProgressMonitor monitor) {
+ 		IResolvedInstallableUnit iu = operand.first();
+ 		parameters.put("iu", iu);
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+index 7dff96b..104301d 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Uninstall.java
+@@ -11,8 +11,7 @@
+ package org.eclipse.equinox.p2.engine.phases;
+ 
+ import java.util.Map;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Status;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
+ import org.eclipse.equinox.p2.core.helpers.ServiceHelper;
+@@ -91,7 +90,7 @@ public class Uninstall extends Phase {
+ 		return actions;
+ 	}
+ 
+-	protected IStatus initializeOperand(Operand operand, Map parameters) {
++	protected IStatus initializeOperand(Operand operand, Map parameters, IProgressMonitor monitor) {
+ 		IResolvedInstallableUnit iu = operand.first();
+ 		parameters.put("iu", iu);
+ 
+commit e718386186a90261bb7a40d14834f006f5945795
+Author: John Arthorne <johna>
+Date:   Thu Oct 25 21:17:41 2007 +0000
+
+    Bug 206088 [prov] Engine could do better with progress monitors
+
+2	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+2	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+17	6	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+index c79a968..1ad109c 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+@@ -45,6 +45,8 @@ public class ProvUIMessages extends NLS {
+ 	public static String ProvisioningUtil_NoRepositoryManager;
+ 	public static String ProvisioningUtil_AddRepositoryFailure;
+ 	public static String ProvisioningUtil_CreateRepositoryFailure;
++	public static String ProvisioningUtil_InstallManyTask;
++	public static String ProvisioningUtil_InstallOneTask;
+ 	public static String ProvisioningUtil_RepoNotWritable;
+ 	public static String ProvisioningUtil_RepositoryNotFound;
+ 	public static String ProvisioningUtil_NoProfileRegistryFound;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index abbc238..2a4050b 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -12,6 +12,8 @@
+ ProvisioningUtil_NoRepositoryManager=No repository manager was found
+ ProvisioningUtil_AddRepositoryFailure=Unable to add repository {0}
+ ProvisioningUtil_CreateRepositoryFailure=Unable to create repository {0}
++ProvisioningUtil_InstallManyTask=Installing {0} features into {1}
++ProvisioningUtil_InstallOneTask=Installing {0} into {1}
+ ProvisioningUtil_RepositoryNotFound=Could not find repository {0}
+ ProvisioningUtil_RepoNotWritable=Repository is not writable
+ ProvisioningUtil_NoProfileRegistryFound=No profile registry was found
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+index c706a08..88a4a11 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/operations/ProvisioningUtil.java
+@@ -285,13 +285,24 @@ public class ProvisioningUtil {
+ 	}
+ 
+ 	public static IStatus performInstall(ProvisioningPlan plan, Profile profile, IInstallableUnit[] installRoots, IProgressMonitor monitor) throws ProvisionException {
+-		IStatus engineResult = performProvisioningPlan(plan, profile, PERFORM_ALL, monitor);
+-		if (engineResult.isOK()) {
+-			// mark the roots as such
+-			for (int i = 0; i < installRoots.length; i++)
+-				profile.setInstallableUnitProfileProperty(installRoots[i], IInstallableUnitConstants.PROFILE_ROOT_IU, Boolean.toString(true));
++		String taskMessage;
++		if (installRoots.length == 1)
++			taskMessage = NLS.bind(ProvUIMessages.ProvisioningUtil_InstallOneTask, installRoots[0].getId(), profile.getProfileId());
++		else
++			taskMessage = NLS.bind(ProvUIMessages.ProvisioningUtil_InstallManyTask, Integer.toString(installRoots.length), profile.getProfileId());
++		try {
++			SubMonitor sub = SubMonitor.convert(monitor, taskMessage, 100);
++			monitor.beginTask(taskMessage, 100);
++			IStatus engineResult = performProvisioningPlan(plan, profile, PERFORM_ALL, sub.newChild(100));
++			if (engineResult.isOK()) {
++				// mark the roots as such
++				for (int i = 0; i < installRoots.length; i++)
++					profile.setInstallableUnitProfileProperty(installRoots[i], IInstallableUnitConstants.PROFILE_ROOT_IU, Boolean.toString(true));
++			}
++			return engineResult;
++		} finally {
++			monitor.done();
+ 		}
+-		return engineResult;
+ 	}
+ 
+ 	public static IStatus performProvisioningPlan(ProvisioningPlan plan, Profile profile, int phases, IProgressMonitor monitor) throws ProvisionException {

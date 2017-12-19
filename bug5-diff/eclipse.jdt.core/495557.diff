@@ -1,0 +1,979 @@
+commit 63a36cbb8f64b6b425c4ec21ef10bb4e21366435
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Tue Jun 7 15:25:01 2016 -0700
+
+    Bug 495557 - Record stats about index usage
+    
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+1	1	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/BTreeTests.java
+11	11	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTest.java
+12	0	org.eclipse.jdt.core/.options
+9	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+7	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+1	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNode.java
+0	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNodeTypeRegistry.java
+2	2	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdRawLinkedList.java
+7	7	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/RawGrowableArray.java
+4	4	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/BTree.java
+4	4	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/DBProperties.java
+35	7	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+6	6	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LongString.java
+220	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/MemoryStats.java
+2	2	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/NdStringSet.java
+2	2	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/ShortString.java
+27	9	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+3	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/BTreeTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/BTreeTests.java
+index 971b626..0b4bd46 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/BTreeTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/BTreeTests.java
+@@ -230,7 +230,7 @@ public class BTreeTests extends BaseTestCase {
+ 		 */
+ 		public BTMockRecord(Database db, int value) throws CoreException {
+ 			this.db = db;
+-			record = db.malloc(BTMockRecord.RECORD_SIZE);
++			record = db.malloc(BTMockRecord.RECORD_SIZE, Database.POOL_MISC);
+ 			db.putInt(record + VALUE_PTR, value);
+ 		}
+ 
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTest.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTest.java
+index 22d8aa1..1f4ddb5 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTest.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/nd/DatabaseTest.java
+@@ -55,7 +55,7 @@ public class DatabaseTest extends BaseTestCase {
+ 		// Allocate all database chunks up to TEST_OFFSET.
+ 		int count = 0;
+ 		for (long offset = 0; offset < TEST_OFFSET;) {
+-			offset = db.malloc(Database.MAX_MALLOC_SIZE);
++			offset = db.malloc(Database.MAX_MALLOC_SIZE, Database.POOL_MISC);
+ 			if (++count >= 1000) {
+ 				db.flush();
+ 				count = 0;
+@@ -85,9 +85,9 @@ public class DatabaseTest extends BaseTestCase {
+ 		final int blocksize = deltas * Database.BLOCK_SIZE_DELTA;
+ 		final int freeDeltas= Database.CHUNK_SIZE / Database.BLOCK_SIZE_DELTA - deltas;
+ 
+-		long mem = db.malloc(realsize);
++		long mem = db.malloc(realsize, Database.POOL_MISC);
+ 		assertEquals(-blocksize, db.getShort(mem - Database.BLOCK_HEADER_SIZE));
+-		db.free(mem);
++		db.free(mem, Database.POOL_MISC);
+ 		assertEquals(blocksize, db.getShort(mem - Database.BLOCK_HEADER_SIZE));
+ 		assertEquals(mem, db.getRecPtr((deltas - Database.MIN_BLOCK_DELTAS +1 ) * Database.INT_SIZE));
+ 		assertEquals(mem + blocksize, db.getRecPtr((freeDeltas - Database.MIN_BLOCK_DELTAS + 1) * Database.INT_SIZE));
+@@ -123,10 +123,10 @@ public class DatabaseTest extends BaseTestCase {
+ 		final int blocksize = deltas * Database.BLOCK_SIZE_DELTA;
+ 		final int freeDeltas= Database.MIN_BLOCK_DELTAS - deltas;
+ 
+-		long mem1 = db.malloc(realsize);
+-		long mem2 = db.malloc(realsize);
+-		db.free(mem1);
+-		db.free(mem2);
++		long mem1 = db.malloc(realsize, Database.POOL_MISC);
++		long mem2 = db.malloc(realsize, Database.POOL_MISC);
++		db.free(mem1, Database.POOL_MISC);
++		db.free(mem2, Database.POOL_MISC);
+ 		assertEquals(mem2, db.getRecPtr((deltas - Database.MIN_BLOCK_DELTAS + 1) * Database.INT_SIZE));
+ 		assertEquals(0, db.getRecPtr(mem2));
+ 		assertEquals(mem1, db.getRecPtr(mem2 + Database.INT_SIZE));
+@@ -135,9 +135,9 @@ public class DatabaseTest extends BaseTestCase {
+ 	}
+ 
+ 	public void testSimpleAllocationLifecycle() throws Exception {
+-		long mem1 = db.malloc(42);
+-		db.free(mem1);
+-		long mem2 = db.malloc(42);
++		long mem1 = db.malloc(42, Database.POOL_MISC);
++		db.free(mem1, Database.POOL_MISC);
++		long mem2 = db.malloc(42, Database.POOL_MISC);
+ 		assertEquals(mem2, mem1);
+ 	}
+ 
+@@ -206,7 +206,7 @@ public class DatabaseTest extends BaseTestCase {
+ 		BTree btree = new BTree(nd, Database.DATA_AREA_OFFSET, comparator);
+ 		for (int i = 0; i < names.length; ++i) {
+ 			String name = names[i];
+-			long record = db.malloc(8);
++			long record = db.malloc(8, Database.POOL_MISC);
+ 			db.putInt(record + 0, i);
+ 			IString string = db.newString(name);
+ 			db.putRecPtr(record + 4, string.getRecord());
+diff --git a/org.eclipse.jdt.core/.options b/org.eclipse.jdt.core/.options
+index 00bf709..5490678 100644
+--- a/org.eclipse.jdt.core/.options
++++ b/org.eclipse.jdt.core/.options
+@@ -53,6 +53,18 @@ org.eclipse.jdt.core/debug/javamodel=false
+ # Reports Java model elements opening/closing
+ org.eclipse.jdt.core/debug/javamodel/cache=false
+ 
++# Prints information about when the indexer runs and what files are being indexed
++org.eclipse.jdt.core/debug/newindex/indexer=false
++
++# Prints diagnostic information about index database locks
++org.eclipse.jdt.core/debug/newindex/locks=false
++
++# Prints statistics about database memory usage
++org.eclipse.jdt.core/debug/newindex/space=false
++
++# Prints statistics about indexing time
++org.eclipse.jdt.core/debug/newindex/timing=false
++
+ # Reports post actions addition/run
+ org.eclipse.jdt.core/debug/postaction=false
+ 
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+index 2ce053f..7ef0370 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+@@ -129,6 +129,7 @@ import org.eclipse.jdt.internal.core.builder.JavaBuilder;
+ import org.eclipse.jdt.internal.core.dom.SourceRangeVerifier;
+ import org.eclipse.jdt.internal.core.dom.rewrite.RewriteEventStore;
+ import org.eclipse.jdt.internal.core.hierarchy.TypeHierarchy;
++import org.eclipse.jdt.internal.core.nd.Nd;
+ import org.eclipse.jdt.internal.core.nd.indexer.Indexer;
+ import org.eclipse.jdt.internal.core.search.AbstractSearchScope;
+ import org.eclipse.jdt.internal.core.search.BasicSearchEngine;
+@@ -349,6 +350,10 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	private static final String SEARCH_DEBUG = JavaCore.PLUGIN_ID + "/debug/search" ; //$NON-NLS-1$
+ 	private static final String SOURCE_MAPPER_DEBUG_VERBOSE = JavaCore.PLUGIN_ID + "/debug/sourcemapper" ; //$NON-NLS-1$
+ 	private static final String FORMATTER_DEBUG = JavaCore.PLUGIN_ID + "/debug/formatter" ; //$NON-NLS-1$
++	private static final String NEWINDEX_INDEXER_DEBUG = JavaCore.PLUGIN_ID + "/debug/newindex/indexer" ; //$NON-NLS-1$
++	private static final String NEWINDEX_LOCKS_DEBUG = JavaCore.PLUGIN_ID + "/debug/newindex/locks" ; //$NON-NLS-1$
++	private static final String NEWINDEX_INDEXER_SPACE = JavaCore.PLUGIN_ID + "/debug/newindex/space" ; //$NON-NLS-1$
++	private static final String NEWINDEX_INDEXER_TIMING = JavaCore.PLUGIN_ID + "/debug/newindex/timing" ; //$NON-NLS-1$
+ 
+ 	public static final String COMPLETION_PERF = JavaCore.PLUGIN_ID + "/perf/completion" ; //$NON-NLS-1$
+ 	public static final String SELECTION_PERF = JavaCore.PLUGIN_ID + "/perf/selection" ; //$NON-NLS-1$
+@@ -1777,6 +1782,10 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 				JavaModelManager.ZIP_ACCESS_VERBOSE = debug && options.getBooleanOption(ZIP_ACCESS_DEBUG, false);
+ 				SourceMapper.VERBOSE = debug && options.getBooleanOption(SOURCE_MAPPER_DEBUG_VERBOSE, false);
+ 				DefaultCodeFormatter.DEBUG = debug && options.getBooleanOption(FORMATTER_DEBUG, false);
++				Indexer.DEBUG = debug && options.getBooleanOption(NEWINDEX_INDEXER_DEBUG, false);
++				Indexer.DEBUG_ALLOCATIONS = debug && options.getBooleanOption(NEWINDEX_INDEXER_SPACE, false);
++				Indexer.DEBUG_TIMING = debug && options.getBooleanOption(NEWINDEX_INDEXER_TIMING, false);
++				Nd.sDEBUG_LOCKS = debug && options.getBooleanOption(NEWINDEX_LOCKS_DEBUG, false);
+ 		
+ 				// configure performance options
+ 				if(PerformanceStats.ENABLED) {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+index 00370a3..4d74bc6 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+@@ -34,7 +34,7 @@ public class Nd {
+ 	private static final int BLOCKED_WRITE_LOCK_OUTPUT_INTERVAL = 30000;
+ 	private static final int LONG_WRITE_LOCK_REPORT_THRESHOLD = 1000;
+ 	private static final int LONG_READ_LOCK_WAIT_REPORT_THRESHOLD = 1000;
+-	static boolean sDEBUG_LOCKS= false;
++	public static boolean sDEBUG_LOCKS= false;
+ 
+ 	private final int currentVersion;
+ 	private final int maxVersion;
+@@ -585,7 +585,7 @@ public class Nd {
+ 			factory1.destruct(this, address);
+ 
+ 			// Free up its memory
+-			getDB().free(address);
++			getDB().free(address, (short)(Database.POOL_FIRST_NODE_TYPE + nodeType));
+ 		}
+ 	}
+ 
+@@ -602,6 +602,10 @@ public class Nd {
+ 		factory1.destruct(this, address);
+ 
+ 		// Free up its memory
+-		getDB().free(address);
++		getDB().free(address, (short)(Database.POOL_FIRST_NODE_TYPE + nodeType));
++	}
++
++	public NdNodeTypeRegistry<NdNode> getTypeRegistry() {
++		return this.fNodeTypeRegistry;
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNode.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNode.java
+index 52609af..99b6d31 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNode.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNode.java
+@@ -93,7 +93,7 @@ public abstract class NdNode implements IDestructable {
+ 		short nodeType = nd.getNodeType(getClass());
+ 		ITypeFactory<? extends NdNode> factory1 = nd.getTypeFactory(nodeType);
+ 
+-		this.address = db.malloc(factory1.getRecordSize());
++		this.address = db.malloc(factory1.getRecordSize(), (short)(Database.POOL_FIRST_NODE_TYPE + nodeType));
+ 
+ 		NODE_TYPE.put(nd, this.address, nodeType);
+ 	}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNodeTypeRegistry.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNodeTypeRegistry.java
+index f89ecc7..ac308b7 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNodeTypeRegistry.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdNodeTypeRegistry.java
+@@ -66,7 +66,6 @@ public class NdNodeTypeRegistry<R> {
+ 		return this.types.get(type);
+ 	}
+ 
+-
+ 	public R createNode(Nd nd, long address, short nodeType) throws IndexException {
+ 		ITypeFactory<? extends R> typeFactory = this.types.get(nodeType);
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdRawLinkedList.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdRawLinkedList.java
+index 65cfcd7..83ddd8b 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdRawLinkedList.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/NdRawLinkedList.java
+@@ -167,7 +167,7 @@ public class NdRawLinkedList {
+ 				// further blocks. If this is the case, create a new block
+ 				if (isLastBlock(current, ptr)) {
+ 					current = db.malloc(
+-							recordSize(this.elementRecordSize, this.recordCount, this.metadataBitsPerRecord));
++							recordSize(this.elementRecordSize, this.recordCount, this.metadataBitsPerRecord), Database.POOL_LINKED_LIST);
+ 					db.putRecPtr(current + NEXT_MEMBER_BLOCK, current);
+ 				} else {
+ 					thisBlockRecordCount = this.recordCount;
+@@ -232,7 +232,7 @@ public class NdRawLinkedList {
+ 		long current = this.address;
+ 		while (true) {
+ 			long ptr = db.getRecPtr(current + NEXT_MEMBER_BLOCK);
+-			db.free(current);
++			db.free(current, Database.POOL_LINKED_LIST);
+ 
+ 			if (isLastBlock(current, ptr)) {
+ 				return;
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/RawGrowableArray.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/RawGrowableArray.java
+index 430d597..be7bb39 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/RawGrowableArray.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/RawGrowableArray.java
+@@ -224,7 +224,7 @@ public final class RawGrowableArray {
+ 				// Need to convert to using metablocks.
+ 				long firstGrowableBlockAddress = resizeBlock(nd, address, GrowableBlockHeader.MAX_GROWABLE_SIZE);
+ 
+-				metablockAddress = db.malloc(computeBlockBytes(GrowableBlockHeader.MAX_GROWABLE_SIZE));
++				metablockAddress = db.malloc(computeBlockBytes(GrowableBlockHeader.MAX_GROWABLE_SIZE), Database.POOL_GROWABLE_ARRAY);
+ 				GrowableBlockHeader.ARRAY_SIZE.put(nd, metablockAddress, currentSize);
+ 				GrowableBlockHeader.ALLOCATED_SIZE.put(nd, metablockAddress,
+ 						GrowableBlockHeader.MAX_GROWABLE_SIZE);
+@@ -244,7 +244,7 @@ public final class RawGrowableArray {
+ 			int currentBlockCount = currentAllocatedSize / GrowableBlockHeader.MAX_GROWABLE_SIZE;
+ 
+ 			for (int nextBlock = currentBlockCount; nextBlock < requiredBlockCount; nextBlock++) {
+-				long nextBlockAddress = db.malloc(computeBlockBytes(GrowableBlockHeader.MAX_GROWABLE_SIZE));
++				long nextBlockAddress = db.malloc(computeBlockBytes(GrowableBlockHeader.MAX_GROWABLE_SIZE), Database.POOL_GROWABLE_ARRAY);
+ 
+ 				db.putRecPtr(metablockAddress + GrowableBlockHeader.GROWABLE_BLOCK_HEADER_BYTES
+ 						+ nextBlock * Database.PTR_SIZE, nextBlockAddress);
+@@ -269,7 +269,7 @@ public final class RawGrowableArray {
+ 		// Check if the existing block is already exactly the right size
+ 		if (oldGrowableBlockAddress != 0) {
+ 			if (newBlockSize == 0) {
+-				db.free(oldGrowableBlockAddress);
++				db.free(oldGrowableBlockAddress, Database.POOL_GROWABLE_ARRAY);
+ 				return 0;
+ 			}
+ 
+@@ -281,11 +281,11 @@ public final class RawGrowableArray {
+ 
+ 		int arraySize = size(nd, address);
+ 		int numToCopySize = Math.min(Math.max(0, arraySize - this.inlineSize), newBlockSize);
+-		long newGrowableBlockAddress = db.malloc(computeBlockBytes(newBlockSize));
++		long newGrowableBlockAddress = db.malloc(computeBlockBytes(newBlockSize), Database.POOL_GROWABLE_ARRAY);
+ 
+ 		if (oldGrowableBlockAddress != 0) {
+ 			db.memcpy(newGrowableBlockAddress, oldGrowableBlockAddress, computeBlockBytes(numToCopySize));
+-			db.free(oldGrowableBlockAddress);
++			db.free(oldGrowableBlockAddress, Database.POOL_GROWABLE_ARRAY);
+ 		}
+ 
+ 		GrowableBlockHeader.ARRAY_SIZE.put(nd, newGrowableBlockAddress, arraySize);
+@@ -440,7 +440,7 @@ public final class RawGrowableArray {
+ 			while (--currentBlock >= desiredBlockCount) {
+ 				long nextAddress = metablockRecordsAddress + currentBlock * Database.PTR_SIZE;
+ 				long oldBlockAddress = db.getRecPtr(nextAddress);
+-				db.free(oldBlockAddress);
++				db.free(oldBlockAddress, Database.POOL_GROWABLE_ARRAY);
+ 				db.putRecPtr(nextAddress, 0);
+ 			}
+ 
+@@ -455,7 +455,7 @@ public final class RawGrowableArray {
+ 			// Dispose the metablock and replace it with the first growable block
+ 			long firstBlockAddress = db.getRecPtr(metablockRecordsAddress);
+ 			int oldSize = GrowableBlockHeader.ARRAY_SIZE.get(nd, growableBlockAddress);
+-			db.free(growableBlockAddress);
++			db.free(growableBlockAddress, Database.POOL_GROWABLE_ARRAY);
+ 
+ 			GROWABLE_BLOCK_ADDRESS.put(nd, address, firstBlockAddress);
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/BTree.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/BTree.java
+index feec3ab..f795b6e 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/BTree.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/BTree.java
+@@ -148,7 +148,7 @@ public class BTree {
+ 			children[idx] = getChild(chunk, record, idx);
+ 		}
+ 
+-		this.db.free(record);
++		this.db.free(record, Database.POOL_BTREE);
+ 
+ 		chunk = null;
+ 
+@@ -281,7 +281,7 @@ public class BTree {
+ 	}
+ 
+ 	private long allocateNode() throws IndexException {
+-		return this.db.malloc((2 * this.maxRecords + 1) * Database.INT_SIZE);
++		return this.db.malloc((2 * this.maxRecords + 1) * Database.INT_SIZE, Database.POOL_BTREE);
+ 	}
+ 
+ 	/**
+@@ -499,7 +499,7 @@ public class BTree {
+ 		long midKey = getRecord(keyProvider.chunk, keyProvider.node, kIndex);
+ 		putRecord(dst.chunk, dst.node, dst.keyCount, midKey);
+ 		long keySucc = kIndex + 1 == this.maxRecords ? 0 : getRecord(keyProvider.chunk, keyProvider.node, kIndex + 1);
+-		this.db.free(getChild(keyProvider.chunk, keyProvider.node,  kIndex + 1));
++		this.db.free(getChild(keyProvider.chunk, keyProvider.node,  kIndex + 1), Database.POOL_BTREE);
+ 		nodeContentDelete(keyProvider, kIndex + 1, 1);
+ 		putRecord(keyProvider.chunk, keyProvider.node, kIndex, keySucc);
+ 		if (kIndex == 0 && keySucc == 0) {
+@@ -511,7 +511,7 @@ public class BTree {
+ 			long rootNode = getRoot();
+ 			if (rootNode == keyProvider.node) {
+ 				this.db.putRecPtr(this.rootPointer, dst.node);
+-				this.db.free(rootNode);
++				this.db.free(rootNode, Database.POOL_BTREE);
+ 			}
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/DBProperties.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/DBProperties.java
+index 1e1a4d6..c6176d4 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/DBProperties.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/DBProperties.java
+@@ -33,7 +33,7 @@ public class DBProperties {
+ 	 */
+ 	public DBProperties(Nd nd) throws IndexException {
+ 		Database database = nd.getDB();
+-		this.record= database.malloc(RECORD_SIZE);
++		this.record= database.malloc(RECORD_SIZE, Database.POOL_DB_PROPERTIES);
+ 		this.index= new BTree(nd, this.record + PROP_INDEX, DBProperty.getComparator());
+ 		this.db= database;
+ 	}
+@@ -150,7 +150,7 @@ public class DBProperties {
+ 	 */
+ 	public void delete() throws IndexException {
+ 		clear();
+-		this.db.free(this.record);
++		this.db.free(this.record, Database.POOL_DB_PROPERTIES);
+ 	}
+ 
+ 	public long getRecord() {
+@@ -182,7 +182,7 @@ public class DBProperties {
+ 			assert value != null;
+ 			IString dbkey= db.newString(key);
+ 			IString dbvalue= db.newString(value);
+-			this.record= db.malloc(RECORD_SIZE);
++			this.record= db.malloc(RECORD_SIZE, Database.POOL_DB_PROPERTIES);
+ 			db.putRecPtr(this.record + KEY, dbkey.getRecord());
+ 			db.putRecPtr(this.record + VALUE, dbvalue.getRecord());
+ 			this.db= db;
+@@ -256,7 +256,7 @@ public class DBProperties {
+ 		public void delete() throws IndexException {
+ 			this.db.getString(this.db.getRecPtr(this.record + KEY)).delete();
+ 			this.db.getString(this.db.getRecPtr(this.record + VALUE)).delete();
+-			this.db.free(this.record);
++			this.db.free(this.record, Database.POOL_DB_PROPERTIES);
+ 		}
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+index a84d80f..a469308 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+@@ -50,6 +50,7 @@ import com.ibm.icu.text.MessageFormat;
+  * ..                   | ...
+  * INT_SIZE * (M + 1)   | pointer to head of linked list of blocks of size (M + MIN_BLOCK_DELTAS) * BLOCK_SIZE_DELTA
+  * WRITE_NUMBER_OFFSET  | long integer which is incremented on every write
++ * MALLOC_STATS_OFFSET  | memory usage statistics 
+  * DATA_AREA            | The database singletons are stored here and use the remainder of chunk 0
+  *
+  * M = CHUNK_SIZE / BLOCK_SIZE_DELTA - MIN_BLOCK_DELTAS
+@@ -103,7 +104,21 @@ public class Database {
+ 	private static final int MALLOC_TABLE_OFFSET = VERSION_OFFSET + INT_SIZE;
+ 	public static final int WRITE_NUMBER_OFFSET = MALLOC_TABLE_OFFSET
+ 			+ (CHUNK_SIZE / BLOCK_SIZE_DELTA - MIN_BLOCK_DELTAS + 1) * INT_SIZE;
+-	public static final int DATA_AREA_OFFSET = WRITE_NUMBER_OFFSET + LONG_SIZE;
++	public static final int MALLOC_STATS_OFFSET = WRITE_NUMBER_OFFSET + LONG_SIZE;
++	public static final int DATA_AREA_OFFSET = MALLOC_STATS_OFFSET + MemoryStats.SIZE;
++
++	// Malloc pool IDs (used for classifying memory allocations and recording statistics about them)
++	/** Misc pool -- may be used for any purpose that doesn't fit the IDs below. */
++	public static final short POOL_MISC 			= 0x0000;
++	public static final short POOL_BTREE 			= 0x0001;
++	public static final short POOL_DB_PROPERTIES 	= 0x0002;
++	public static final short POOL_STRING_LONG 		= 0x0003;
++	public static final short POOL_STRING_SHORT		= 0x0004;
++	public static final short POOL_LINKED_LIST		= 0x0005;
++	public static final short POOL_STRING_SET 		= 0x0006;
++	public static final short POOL_GROWABLE_ARRAY	= 0x0007;
++	/** Id for the first node type. All node types will record their stats in a pool whose ID is POOL_FIRST_NODE_TYPE + node_id*/
++	public static final short POOL_FIRST_NODE_TYPE	= 0x0100;
+ 
+ 	private final File fLocation;
+ 	private final boolean fReadOnly;
+@@ -124,6 +139,8 @@ public class Database {
+ 	private long cacheHits;
+ 	private long cacheMisses;
+ 
++	private MemoryStats memoryUsage;
++
+ 	/**
+ 	 * Construct a new Database object, creating a backing file if necessary.
+ 	 * @param location the local file path for the database
+@@ -155,6 +172,7 @@ public class Database {
+ 		} catch (IOException e) {
+ 			throw new IndexException(new DBStatus(e));
+ 		}
++		this.memoryUsage = new MemoryStats(this.fHeaderChunk, MALLOC_STATS_OFFSET);
+ 	}
+ 
+ 	private static int divideRoundingUp(int num, int den) {
+@@ -261,6 +279,7 @@ public class Database {
+ 			createNewChunks((int) setasideChunks);
+ 			flush();
+ 		}
++		this.memoryUsage.refresh();
+ 	}
+ 
+ 	private void removeChunksFromCache() {
+@@ -333,7 +352,7 @@ public class Database {
+ 	/**
+ 	 * Allocate a block out of the database.
+ 	 */
+-	public long malloc(final int datasize) throws IndexException {
++	public long malloc(final int datasize, final short poolId) throws IndexException {
+ 		assert this.fExclusiveLock;
+ 		assert datasize >= 0;
+ 		assert datasize <= MAX_MALLOC_SIZE;
+@@ -379,7 +398,9 @@ public class Database {
+ 		chunk.clear(freeblock + BLOCK_HEADER_SIZE, usedSize - BLOCK_HEADER_SIZE);
+ 
+ 		this.malloced += usedSize;
+-		return freeblock + BLOCK_HEADER_SIZE;
++		long result = freeblock + BLOCK_HEADER_SIZE;
++		this.memoryUsage.recordMalloc(poolId, datasize);
++		return result;
+ 	}
+ 
+ 	private long createNewChunk() throws IndexException {
+@@ -487,21 +508,23 @@ public class Database {
+ 	/**
+ 	 * Free an allocated block.
+ 	 *
+-	 * @param offset
++	 * @param address memory address to be freed
++	 * @param poolId the same ID that was previously passed into malloc when allocating this memory address
+ 	 */
+-	public void free(long offset) throws IndexException {
++	public void free(long address, short poolId) throws IndexException {
+ 		assert this.fExclusiveLock;
+ 		// TODO Look for opportunities to merge blocks
+-		long block = offset - BLOCK_HEADER_SIZE;
++		long block = address - BLOCK_HEADER_SIZE;
+ 		Chunk chunk = getChunk(block);
+ 		int blocksize = - chunk.getShort(block);
+ 		if (blocksize < 0) {
+ 			// Already freed.
+ 			throw new IndexException(new Status(IStatus.ERROR, Package.PLUGIN_ID, 0,
+-					"Already freed record " + offset, new Exception())); //$NON-NLS-1$
++					"Already freed record " + address, new Exception())); //$NON-NLS-1$
+ 		}
+ 		addBlock(chunk, blocksize, block);
+ 		this.freed += blocksize;
++		this.memoryUsage.recordFree(poolId, blocksize);
+ 	}
+ 
+ 	public void putByte(long offset, byte value) throws IndexException {
+@@ -676,6 +699,7 @@ public class Database {
+ 
+ 		// Chunks have been removed from the cache, so we are fine.
+ 		this.fHeaderChunk.clear(0, CHUNK_SIZE);
++		this.memoryUsage.refresh();
+ 		this.fHeaderChunk.fDirty= false;
+ 		this.fChunks= new Chunk[] { null };
+ 		this.fChunksUsed = this.fChunksAllocated = this.fChunks.length;
+@@ -869,4 +893,8 @@ public class Database {
+ 		long address = Chunk.expandToFreeRecPtr(value);
+ 		return address != 0 ? (address + BLOCK_HEADER_SIZE) : address;
+ 	}
++
++	public MemoryStats getMemoryStats() {
++		return this.memoryUsage;
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LongString.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LongString.java
+index 41108a1..a723d1f 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LongString.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/LongString.java
+@@ -48,7 +48,7 @@ public class LongString implements IString {
+ 		final int numCharsn = useBytes ? NUM_CHARSN * 2 : NUM_CHARSN;
+ 
+ 		this.db = db;
+-		this.record = db.malloc(Database.MAX_MALLOC_SIZE);
++		this.record = db.malloc(Database.MAX_MALLOC_SIZE, Database.POOL_STRING_LONG);
+ 
+ 		// Write the first record.
+ 		final int length = chars.length;
+@@ -65,7 +65,7 @@ public class LongString implements IString {
+ 		long lastNext = this.record + NEXT1;
+ 		int start = numChars1;
+ 		while (length - start > numCharsn) {
+-			long nextRecord = db.malloc(Database.MAX_MALLOC_SIZE);
++			long nextRecord = db.malloc(Database.MAX_MALLOC_SIZE, Database.POOL_STRING_LONG);
+ 			db.putRecPtr(lastNext, nextRecord);
+ 			chunk= db.getChunk(nextRecord);
+ 			if (useBytes) {
+@@ -79,7 +79,7 @@ public class LongString implements IString {
+ 
+ 		// Write the last record.
+ 		int remaining= length - start;
+-		long nextRecord = db.malloc(CHARSN + (useBytes ? remaining : remaining * 2));
++		long nextRecord = db.malloc(CHARSN + (useBytes ? remaining : remaining * 2), Database.POOL_STRING_LONG);
+ 		db.putRecPtr(lastNext, nextRecord);
+ 		chunk= db.getChunk(nextRecord);
+ 		if (useBytes) {
+@@ -148,19 +148,19 @@ public class LongString implements IString {
+ 			numCharsn *= 2;
+ 		}
+ 		long nextRecord = this.db.getRecPtr(this.record + NEXT1);
+-		this.db.free(this.record);
++		this.db.free(this.record, Database.POOL_STRING_LONG);
+ 		length -= numChars1;
+ 
+ 		// Middle records.
+ 		while (length > numCharsn) {
+ 			length -= numCharsn;
+ 			long nextnext = this.db.getRecPtr(nextRecord + NEXTN);
+-			this.db.free(nextRecord);
++			this.db.free(nextRecord, Database.POOL_STRING_LONG);
+ 			nextRecord = nextnext;
+ 		}
+ 
+ 		// Last record.
+-		this.db.free(nextRecord);
++		this.db.free(nextRecord, Database.POOL_STRING_LONG);
+ 	}
+ 
+ 	@Override
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/MemoryStats.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/MemoryStats.java
+new file mode 100644
+index 0000000..a0c968a
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/MemoryStats.java
+@@ -0,0 +1,220 @@
++package org.eclipse.jdt.internal.core.nd.db;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import org.eclipse.jdt.internal.core.nd.ITypeFactory;
++import org.eclipse.jdt.internal.core.nd.NdNodeTypeRegistry;
++
++public class MemoryStats {
++	public static final int TOTAL_MALLOC_POOLS = 64;
++	/** The size of the statistics for a single malloc pool */
++	public static final int SIZE = TOTAL_MALLOC_POOLS * PoolStats.RECORD_SIZE;
++
++	private Map<Integer, PoolStats> stats = new HashMap<>();
++
++	public final long address;
++	private Chunk db;
++
++	public static final class PoolStats {
++		public static int POOL_ID_OFFSET = 0;
++		public static int NUM_ALLOCATIONS_OFFSET = POOL_ID_OFFSET + Database.SHORT_SIZE;
++		public static int TOTAL_SIZE_OFFSET = NUM_ALLOCATIONS_OFFSET + Database.LONG_SIZE;
++
++		public static final int RECORD_SIZE = TOTAL_SIZE_OFFSET + Database.LONG_SIZE;
++
++		short poolId;
++		long numAllocations;
++		long totalSize;
++		long address;
++
++		public PoolStats(Chunk db, long address) {
++			this.address = address;
++			this.poolId = db.getShort(POOL_ID_OFFSET + address);
++			this.numAllocations = db.getLong(NUM_ALLOCATIONS_OFFSET + address);
++			this.totalSize = db.getLong(TOTAL_SIZE_OFFSET + address);
++		}
++
++		public void setAllocations(Chunk db, long numAllocations) {
++			this.numAllocations = numAllocations;
++			db.putLong(this.address + NUM_ALLOCATIONS_OFFSET, numAllocations);
++		}
++
++		public void setTotalSize(Chunk db, long totalSize) {
++			this.totalSize = totalSize;
++			db.putLong(this.address + TOTAL_SIZE_OFFSET, totalSize);
++		}
++
++		public void setPoolId(Chunk db, short poolId) {
++			this.poolId = poolId;
++			db.putShort(this.address + POOL_ID_OFFSET, poolId);
++		}
++
++		public long getNumAllocations() {
++			return this.numAllocations;
++		}
++
++		public short getPoolId() {
++			return this.poolId;
++		}
++
++		public long getTotalSize() {
++			return this.totalSize;
++		}
++	}
++
++	public MemoryStats(Chunk db, long address) {
++		this.db = db;
++		this.address = address;
++	}
++
++	public void printMemoryStats(NdNodeTypeRegistry nodeRegistry) {
++		StringBuilder builder = new StringBuilder();
++		for (PoolStats next : getSortedPools()) {
++			builder.append(getPoolName(nodeRegistry, next.poolId));
++			builder.append(" "); //$NON-NLS-1$
++			builder.append(next.numAllocations);
++			builder.append(" allocations, "); //$NON-NLS-1$
++			builder.append(next.totalSize);
++			builder.append(" bytes\n"); //$NON-NLS-1$
++		}
++		System.out.println(builder.toString());
++	}
++
++	private String getPoolName(NdNodeTypeRegistry registry, int poolId) {
++		switch (poolId) {
++			case Database.POOL_MISC: return "Miscellaneous"; //$NON-NLS-1$
++			case Database.POOL_BTREE: return "B-Trees"; //$NON-NLS-1$
++			case Database.POOL_DB_PROPERTIES: return "DB Properties"; //$NON-NLS-1$
++			case Database.POOL_STRING_LONG: return "Long Strings"; //$NON-NLS-1$
++			case Database.POOL_STRING_SHORT: return "Short Strings"; //$NON-NLS-1$
++			case Database.POOL_LINKED_LIST: return "Linked Lists"; //$NON-NLS-1$
++			case Database.POOL_STRING_SET: return "String Sets"; //$NON-NLS-1$
++			case Database.POOL_GROWABLE_ARRAY: return "Growable Arrays"; //$NON-NLS-1$
++			default:
++				if (poolId >= Database.POOL_FIRST_NODE_TYPE) {
++					ITypeFactory<?> type = registry.getClassForType((short)(poolId - Database.POOL_FIRST_NODE_TYPE));
++
++					if (type != null) {
++						return type.getElementClass().getSimpleName();
++					}
++				}
++				return "Unknown memory pool " + poolId; //$NON-NLS-1$
++		}
++	}
++
++	public Collection<PoolStats> getPools() {
++		return this.stats.values();
++	}
++
++	public List<PoolStats> getSortedPools() {
++		List<PoolStats> unsorted = new ArrayList<>();
++		unsorted.addAll(getPools());
++		Collections.sort(unsorted, new Comparator<PoolStats>() {
++			@Override
++			public int compare(PoolStats o1, PoolStats o2) {
++				return Long.signum(o2.totalSize - o1.totalSize);
++			}
++		});
++		return unsorted;
++	}
++
++	public void recordMalloc(short poolId, long size) {
++		PoolStats toRecord = getPoolStats(poolId);
++		toRecord.setAllocations(this.db, toRecord.numAllocations + 1);
++		toRecord.setTotalSize(this.db, toRecord.totalSize + size);
++	}
++
++	private PoolStats getPoolStats(short poolId) {
++		if (this.stats.isEmpty()) {
++			refresh();
++		}
++		PoolStats result = this.stats.get((int)poolId);
++		if (result == null) {
++			if (this.stats.size() >= TOTAL_MALLOC_POOLS) {
++				throw new IndexException("Too many malloc pools. Please increase the size of TOTAL_MALLOC_POOLS."); //$NON-NLS-1$
++			}
++			// Find the insertion position
++			int idx = 0;
++			for (;;idx++) {
++				PoolStats nextPool = readPool(idx);
++				if (idx > 0 && nextPool.poolId == 0) {
++					break;
++				}
++				if (nextPool.poolId == poolId) {
++					throw new IllegalStateException("The stats were out of sync with the database."); //$NON-NLS-1$
++				}
++				if (nextPool.poolId > poolId) {
++					break;
++				}
++			}
++
++			// Find the last pool position
++			int lastIdx = idx;
++			for (;;lastIdx++) {
++				PoolStats nextPool = readPool(lastIdx);
++				if (lastIdx > 0 && nextPool.poolId == 0) {
++					break;
++				}
++			}
++
++			// Shift all the pools to make room
++			for (int shiftIdx = lastIdx; shiftIdx > idx; shiftIdx--) {
++				PoolStats writeTo = readPool(shiftIdx);
++				PoolStats readFrom = readPool(shiftIdx - 1);
++
++				writeTo.setAllocations(this.db, readFrom.numAllocations);
++				writeTo.setTotalSize(this.db, readFrom.totalSize);
++				writeTo.setPoolId(this.db, readFrom.poolId);
++			}
++
++			result = readPool(idx);
++			result.setAllocations(this.db, 0);
++			result.setTotalSize(this.db, 0);
++			result.setPoolId(this.db, poolId);
++
++			refresh();
++		}
++		return result;
++	}
++
++	private List<PoolStats> loadStats() {
++		List<PoolStats> result = new ArrayList<>();
++		for (int idx = 0; idx < TOTAL_MALLOC_POOLS; idx++) {
++			PoolStats next = readPool(idx);
++
++			if (idx > 0 && next.poolId == 0) {
++				break;
++			}
++			
++			result.add(next);
++		}
++		return result;
++	}
++
++	public void refresh() {
++		this.stats.clear();
++
++		for (PoolStats next : loadStats()) {
++			this.stats.put((int)next.poolId, next);
++		}
++	}
++
++	public PoolStats readPool(int idx) {
++		return new PoolStats(this.db, this.address + idx * PoolStats.RECORD_SIZE);
++	}
++
++	public void recordFree(short poolId, long size) {
++		PoolStats toRecord = getPoolStats(poolId);
++		if (toRecord.numAllocations <= 0 || toRecord.totalSize < size) {
++			throw new IndexException("Attempted to free more memory from pool " + poolId + " than was ever allocated");  //$NON-NLS-1$//$NON-NLS-2$
++		}
++		toRecord.setAllocations(this.db, toRecord.numAllocations - 1);
++		toRecord.setTotalSize(this.db, toRecord.totalSize - size);
++	}
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/NdStringSet.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/NdStringSet.java
+index 41b238f..7fa0d1c 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/NdStringSet.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/NdStringSet.java
+@@ -92,7 +92,7 @@ public class NdStringSet {
+ 		IString string = this.db.newString(str);
+ 		record = string.getRecord();
+ 
+-		long new_node = this.db.malloc(NodeType.sizeof);
++		long new_node = this.db.malloc(NodeType.sizeof, Database.POOL_STRING_SET);
+ 		NodeType.Next.put(this.db, new_node, getHead());
+ 		NodeType.Item.put(this.db, new_node, record);
+ 
+@@ -178,7 +178,7 @@ public class NdStringSet {
+ 					this.head = next;
+ 				}
+ 
+-				this.db.free(curr);
++				this.db.free(curr, Database.POOL_STRING_SET);
+ 				return item;
+ 			}
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/ShortString.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/ShortString.java
+index b93e727..361a8d5 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/ShortString.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/ShortString.java
+@@ -38,7 +38,7 @@ public class ShortString implements IString {
+ 		final int n = chars.length;
+ 		this.db = db;
+ 
+-		this.record = db.malloc(CHARS + (useBytes ? n : 2 * n));
++		this.record = db.malloc(CHARS + (useBytes ? n : 2 * n), Database.POOL_STRING_SHORT);
+ 		Chunk chunk = db.getChunk(this.record);
+ 		chunk.putInt(this.record + LENGTH, useBytes ? -n : n);
+ 		long p = this.record + CHARS;
+@@ -56,7 +56,7 @@ public class ShortString implements IString {
+ 
+ 	@Override
+ 	public void delete() throws IndexException {
+-		this.db.free(this.record);
++		this.db.free(this.record, Database.POOL_STRING_SHORT);
+ 	}
+ 
+ 	@Override
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+index 07762c6..8e2cdb7 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+@@ -40,6 +40,7 @@ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.core.JavaElementDelta;
+ import org.eclipse.jdt.internal.core.JavaModel;
+ import org.eclipse.jdt.internal.core.JavaModelManager;
++import org.eclipse.jdt.internal.core.nd.IReader;
+ import org.eclipse.jdt.internal.core.nd.Nd;
+ import org.eclipse.jdt.internal.core.nd.java.FileFingerprint;
+ import org.eclipse.jdt.internal.core.nd.java.FileFingerprint.FingerprintTestResult;
+@@ -52,6 +53,9 @@ public final class Indexer {
+ 	private IWorkspaceRoot root;
+ 
+ 	private static Indexer indexer;
++	public static boolean DEBUG;
++	public static boolean DEBUG_ALLOCATIONS;
++	public static boolean DEBUG_TIMING;
+ 	private static final Object mutex = new Object();
+ 	private static final long MS_TO_NS = 1000000;
+ 
+@@ -85,7 +89,9 @@ public final class Indexer {
+ 		SubMonitor subMonitor = SubMonitor.convert(monitor, 100);
+ 
+ 		long startTimeNs = System.nanoTime();
+-		Package.logInfo("Indexer running rescan"); //$NON-NLS-1$
++		if (DEBUG) {
++			Package.logInfo("Indexer running rescan"); //$NON-NLS-1$
++		}
+ 
+ 		// Gather all the IPackageFragmentRoots in the workspace
+ 		List<IJavaElement> unfilteredRoots = getAllIndexableObjectsInWorkspace(subMonitor.split(3));
+@@ -147,12 +153,20 @@ public final class Indexer {
+ 		double averageFingerprintTimeMs = allRoots.size() == 0 ? 0 : (double)fingerprintTimeMs / (double)allRoots.size();
+ 		double averageResourceMappingMs = pathsToUpdate.size() == 0 ? 0 : (double)resourceMappingTimeMs / (double)pathsToUpdate.size();
+ 
+-		Package.logInfo(
+-				"Indexing done.\n" //$NON-NLS-1$
+-				+ "  Located " + totalRoots + " roots in " + locateRootsTimeMs + "ms\n" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+-				+ "  Tested " + allRoots.size() + " fingerprints in " + fingerprintTimeMs + "ms, average time = " + averageFingerprintTimeMs + "ms\n" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+-				+ "  Indexed " + classesIndexed + " classes in " + indexingTimeMs + "ms, average time = " + averageIndexTimeMs + "ms\n" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+-				+ "  Updated " + pathsToUpdate.size() + " paths in " + resourceMappingTimeMs + "ms, average time = " + averageResourceMappingMs + "ms\n"); //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$//$NON-NLS-4$
++		if (DEBUG_TIMING) {
++			Package.logInfo(
++					"Indexing done.\n" //$NON-NLS-1$
++					+ "  Located " + totalRoots + " roots in " + locateRootsTimeMs + "ms\n" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++					+ "  Tested " + allRoots.size() + " fingerprints in " + fingerprintTimeMs + "ms, average time = " + averageFingerprintTimeMs + "ms\n" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
++					+ "  Indexed " + classesIndexed + " classes in " + indexingTimeMs + "ms, average time = " + averageIndexTimeMs + "ms\n" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
++					+ "  Updated " + pathsToUpdate.size() + " paths in " + resourceMappingTimeMs + "ms, average time = " + averageResourceMappingMs + "ms\n"); //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$//$NON-NLS-4$
++		}
++
++		if (DEBUG_ALLOCATIONS) {
++			try (IReader readLock = this.nd.acquireReadLock()) {
++				this.nd.getDB().getMemoryStats().printMemoryStats(this.nd.getTypeRegistry());
++			}
++		}
+ 	}
+ 
+ 	private void fireDelta(Set<IPath> rootsWithChanges, IProgressMonitor monitor) {
+@@ -299,7 +313,9 @@ public final class Indexer {
+ 
+ 		File theFile = thePath.toFile();
+ 		if (!(theFile.exists() && theFile.isFile())) {
+-			Package.log("the file " + pathString + " does not exist", null); //$NON-NLS-1$ //$NON-NLS-2$
++			if (DEBUG) {
++				Package.log("the file " + pathString + " does not exist", null); //$NON-NLS-1$ //$NON-NLS-2$
++			}
+ 			return 0;
+ 		}
+ 
+@@ -320,7 +336,9 @@ public final class Indexer {
+ 			this.nd.releaseWriteLock();
+ 		}
+ 
+-		Package.logInfo("rescanning " + thePath.toString()); //$NON-NLS-1$
++		if (DEBUG) {
++			Package.logInfo("rescanning " + thePath.toString()); //$NON-NLS-1$
++		}
+ 		int result = addElement(resourceFile, element, subMonitor.split(90));
+ 
+ 		// Now update the timestamp and delete all older versions of this resource that exist in the index
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+index c4e74d9..e2a3342 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/JavaIndex.java
+@@ -36,9 +36,9 @@ import org.eclipse.jdt.internal.core.nd.util.CharArrayUtils;
+  */
+ public class JavaIndex {
+ 	// Version constants
+-	static final int CURRENT_VERSION = Nd.version(1, 26);
+-	static final int MAX_SUPPORTED_VERSION = Nd.version(1, 26);
+-	static final int MIN_SUPPORTED_VERSION = Nd.version(1, 26);
++	static final int CURRENT_VERSION = Nd.version(1, 29);
++	static final int MAX_SUPPORTED_VERSION = Nd.version(1, 29);
++	static final int MIN_SUPPORTED_VERSION = Nd.version(1, 29);
+ 
+ 	// Fields for the search header
+ 	public static final FieldSearchIndex<NdResourceFile> FILES;
+commit 26e13da07cd7f495466feb8512ee64964247de8e
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Thu Jun 16 11:55:44 2016 -0700
+
+    Bug 495557 - Record stats about index usage
+    
+    Add additional stats about memory allocation and free space.
+    
+    Change-Id: I20123065d0b3e107ff1d0e5284ea1438e7b9309a
+
+6	2	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+1	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+index a469308..97ba08b 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+@@ -665,14 +665,18 @@ public class Database {
+ 		return new ShortString(this, offset);
+ 	}
+ 
++	public long getDatabaseSize() {
++		return this.fChunksUsed * CHUNK_SIZE;
++	}
++
+ 	/**
+ 	 * For debugging purposes, only.
+ 	 */
+ 	public void reportFreeBlocks() throws IndexException {
+-		System.out.println("Allocated size: " + this.fChunksUsed * CHUNK_SIZE); //$NON-NLS-1$
++		System.out.println("Allocated size: " + getDatabaseSize() + " bytes"); //$NON-NLS-1$
+ 		System.out.println("malloc'ed: " + this.malloced); //$NON-NLS-1$
+ 		System.out.println("free'd: " + this.freed); //$NON-NLS-1$
+-		System.out.println("wasted: " + (this.fChunksUsed * CHUNK_SIZE - (this.malloced - this.freed))); //$NON-NLS-1$
++		System.out.println("wasted: " + (getDatabaseSize() - (this.malloced - this.freed))); //$NON-NLS-1$
+ 		System.out.println("Free blocks"); //$NON-NLS-1$
+ 		for (int bs = MIN_BLOCK_DELTAS*BLOCK_SIZE_DELTA; bs <= CHUNK_SIZE; bs += BLOCK_SIZE_DELTA) {
+ 			int count = 0;
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+index 47d6719..fc718e0 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+@@ -182,6 +182,7 @@ public final class Indexer {
+ 
+ 		if (DEBUG_ALLOCATIONS) {
+ 			try (IReader readLock = this.nd.acquireReadLock()) {
++				this.nd.getDB().reportFreeBlocks();
+ 				this.nd.getDB().getMemoryStats().printMemoryStats(this.nd.getTypeRegistry());
+ 			}
+ 		}

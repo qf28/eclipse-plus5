@@ -1,0 +1,1008 @@
+commit f9a551156100cf1c47e75136108bf92419ba4d63
+Author: Andrew Niefer <aniefer>
+Date:   Mon Mar 30 21:45:09 2009 +0000
+
+    bug 268884 - comparing manifests - ignore signatures
+
+73	21	bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/JarComparator.java
+17	9	bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/Utility.java
+0	1	bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/messages.properties
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/JarComparator.java b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/JarComparator.java
+index 8454fe2..4fa063f 100644
+--- a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/JarComparator.java
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/JarComparator.java
+@@ -11,8 +11,8 @@
+ package org.eclipse.equinox.p2.internal.repository.comparator;
+ 
+ import java.io.*;
+-import java.util.Arrays;
+-import java.util.Enumeration;
++import java.util.*;
++import java.util.jar.*;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipFile;
+ import org.eclipse.core.runtime.*;
+@@ -30,6 +30,11 @@ public class JarComparator implements IArtifactComparator {
+ 	private static final String SOURCE_ARTIFACT_PREFIX = "sourceartifact"; //$NON-NLS-1$
+ 	private static final String OSGI_BUNDLE_CLASSIFIER = "osgi.bundle"; //$NON-NLS-1$
+ 
++	private static final String META_INF = "meta-inf/"; //$NON-NLS-1$
++	private static final String DSA_EXT = ".dsa"; //$NON-NLS-1$
++	private static final String RSA_EXT = ".rsa"; //$NON-NLS-1$
++	private static final String SF_EXT = ".sf"; //$NON-NLS-1$
++
+ 	public IStatus compare(IArtifactRepository source, IArtifactDescriptor sourceDescriptor, IArtifactRepository destination, IArtifactDescriptor destinationDescriptor) {
+ 		String classifier = sourceDescriptor.getArtifactKey().getClassifier();
+ 		if (!OSGI_BUNDLE_CLASSIFIER.equals(classifier)) {
+@@ -97,10 +102,16 @@ public class JarComparator implements IArtifactComparator {
+ 		}
+ 	}
+ 
++	private boolean isSigningEntry(String entry) {
++		return (entry.startsWith(META_INF) && (entry.endsWith(SF_EXT) || entry.endsWith(RSA_EXT) || entry.endsWith(DSA_EXT)));
++	}
++
+ 	public IStatus compare(File sourceFile, File destinationFile) {
++		ZipFile firstFile = null;
++		ZipFile secondFile = null;
+ 		try {
+-			ZipFile firstFile = new ZipFile(sourceFile);
+-			ZipFile secondFile = new ZipFile(destinationFile);
++			firstFile = new ZipFile(sourceFile);
++			secondFile = new ZipFile(destinationFile);
+ 			final int firstFileSize = firstFile.size();
+ 			final int secondFileSize = secondFile.size();
+ 			if (firstFileSize != secondFileSize) {
+@@ -111,10 +122,14 @@ public class JarComparator implements IArtifactComparator {
+ 				String entryName = entry.getName();
+ 				final ZipEntry entry2 = secondFile.getEntry(entryName);
+ 				if (!entry.isDirectory() && entry2 != null) {
++					String lowerCase = entryName.toLowerCase();
++					if (isSigningEntry(lowerCase)) {
++						continue;
++					}
++
+ 					Disassembler disassembler = new Disassembler();
+ 					byte[] firstEntryClassFileBytes = Utility.getZipEntryByteContent(entry, firstFile);
+ 					byte[] secondEntryClassFileBytes = Utility.getZipEntryByteContent(entry2, secondFile);
+-					String lowerCase = entryName.toLowerCase();
+ 					if (lowerCase.endsWith(CLASS_EXTENSION)) {
+ 						String contentsFile1 = null;
+ 						String contentsFile2 = null;
+@@ -140,13 +155,7 @@ public class JarComparator implements IArtifactComparator {
+ 						} catch (IOException e) {
+ 							return newErrorStatus(NLS.bind(Messages.ioexceptioninentry, entryName, sourceFile.getAbsolutePath()), e);
+ 						} finally {
+-							try {
+-								if (stream != null) {
+-									stream.close();
+-								}
+-							} catch (IOException e) {
+-								// ignore
+-							}
++							Utility.close(stream);
+ 						}
+ 						File secondTempFile = null;
+ 						stream = null;
+@@ -160,13 +169,7 @@ public class JarComparator implements IArtifactComparator {
+ 						} catch (IOException e) {
+ 							return newErrorStatus(NLS.bind(Messages.ioexceptioninentry, entryName, sourceFile.getAbsolutePath()), e);
+ 						} finally {
+-							try {
+-								if (stream != null) {
+-									stream.close();
+-								}
+-							} catch (IOException e) {
+-								// ignore
+-							}
++							Utility.close(stream);
+ 						}
+ 
+ 						try {
+@@ -180,6 +183,11 @@ public class JarComparator implements IArtifactComparator {
+ 							}
+ 							secondTempFile.delete();
+ 						}
++					} else if (entryName.equalsIgnoreCase(JarFile.MANIFEST_NAME)) {
++						// MANIFEST.MF file
++						if (!compareManifest(firstEntryClassFileBytes, secondEntryClassFileBytes)) {
++							return newErrorStatus(NLS.bind(Messages.differentEntry, entryName, sourceFile.getAbsolutePath()));
++						}
+ 					} else if (!Arrays.equals(firstEntryClassFileBytes, secondEntryClassFileBytes)) {
+ 						// do a binary compare byte per byte
+ 						return newErrorStatus(NLS.bind(Messages.differentEntry, entryName, sourceFile.getAbsolutePath()));
+@@ -189,15 +197,59 @@ public class JarComparator implements IArtifactComparator {
+ 					return newErrorStatus(NLS.bind(Messages.missingEntry, entryName, sourceFile.getAbsolutePath()));
+ 				}
+ 			}
+-			firstFile.close();
+-			secondFile.close();
+ 		} catch (IOException e) {
+ 			// missing entry
+ 			return newErrorStatus(NLS.bind(Messages.ioexception, new String[] {sourceFile.getAbsolutePath(), destinationFile.getAbsolutePath()}), e);
++		} finally {
++			Utility.close(firstFile);
++			Utility.close(secondFile);
+ 		}
+ 		return Status.OK_STATUS;
+ 	}
+ 
++	private boolean compareManifest(byte[] firstEntryClassFileBytes, byte[] secondEntryClassFileBytes) {
++		ByteArrayInputStream inputStream = new ByteArrayInputStream(firstEntryClassFileBytes);
++		Manifest manifest = null;
++		try {
++			manifest = new Manifest(inputStream);
++		} catch (IOException e) {
++			// ignore
++		} finally {
++			Utility.close(inputStream);
++		}
++		if (manifest == null) {
++			return true;
++		}
++
++		inputStream = new ByteArrayInputStream(secondEntryClassFileBytes);
++		Manifest manifest2 = null;
++		try {
++			manifest2 = new Manifest(inputStream);
++		} catch (IOException e) {
++			// ignore
++		} finally {
++			Utility.close(inputStream);
++		}
++		if (manifest2 == null) {
++			return true;
++		}
++		Attributes attributes = manifest.getMainAttributes();
++		Attributes attributes2 = manifest2.getMainAttributes();
++		if (attributes.size() != attributes2.size())
++			return false;
++		for (Iterator iterator = attributes.entrySet().iterator(); iterator.hasNext();) {
++			Map.Entry entry = (Map.Entry) iterator.next();
++			Object value2 = attributes2.get(entry.getKey());
++			if (value2 == null) {
++				return false;
++			}
++			if (!value2.equals(entry.getValue())) {
++				return false;
++			}
++		}
++		return true;
++	}
++
+ 	private String normalize(String entryName) {
+ 		StringBuffer buffer = new StringBuffer();
+ 		char[] chars = entryName.toCharArray();
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/Utility.java b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/Utility.java
+index a0bc46d..888ce16 100644
+--- a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/Utility.java
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/Utility.java
+@@ -10,8 +10,7 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.internal.repository.comparator;
+ 
+-import java.io.IOException;
+-import java.io.InputStream;
++import java.io.*;
+ import java.util.Arrays;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipFile;
+@@ -44,13 +43,22 @@ public class Utility {
+ 				throw new IOException("Invalid zip entry name : " + ze.getName()); //$NON-NLS-1$
+ 			return getInputStreamAsByteArray(stream, (int) ze.getSize());
+ 		} finally {
+-			if (stream != null) {
+-				try {
+-					stream.close();
+-				} catch (IOException e) {
+-					// ignore
+-				}
+-			}
++			close(stream);
++		}
++	}
++
++	public static void close(Object object) {
++		if (object == null)
++			return;
++		try {
++			if (object instanceof InputStream)
++				((InputStream) object).close();
++			else if (object instanceof OutputStream)
++				((OutputStream) object).close();
++			else if (object instanceof ZipFile)
++				((ZipFile) object).close();
++		} catch (IOException e) {
++			//ignore
+ 		}
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/messages.properties b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/messages.properties
+index 25c9f6c..65fbf55 100644
+--- a/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.repository.tools/src/org/eclipse/equinox/p2/internal/repository/comparator/messages.properties
+@@ -38,7 +38,6 @@ disassembler_inner_name = inner name:
+ disassembler_inner_accessflags = accessflags:\ 
+ disassembler_signatureattributeheader = // Signature: {0}
+ disassembler_indentation = \  
+-disassembler_constantpoolindex =\ #
+ disassembler_space = \ 
+ disassembler_comma = ,
+ disassembler_openinnerclassentry = [
+commit 933772467cebe0464227beb42237870e5804efc9
+Author: Andrew Niefer <aniefer>
+Date:   Mon Mar 30 22:58:03 2009 +0000
+
+    bug 268884 - logging for compare
+
+125	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/FileMirrorLog.java
+26	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/IArtifactMirrorLog.java
+69	11	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/MirrorApplication.java
+17	2	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/Mirroring.java
+166	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/XMLMirrorLog.java
+5	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Messages.java
+5	1	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/messages.properties
+105	0	bundles/org.eclipse.equinox.p2.artifact.repository/src_ant/org/eclipse/equinox/internal/p2/artifact/repository/ant/AntMirrorLog.java
+28	2	bundles/org.eclipse.equinox.p2.artifact.repository/src_ant/org/eclipse/equinox/internal/p2/artifact/repository/ant/MirrorApplicationTask.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/FileMirrorLog.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/FileMirrorLog.java
+new file mode 100644
+index 0000000..a0602b4
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/FileMirrorLog.java
+@@ -0,0 +1,125 @@
++/*******************************************************************************
++ * Copyright (c) 2009 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.artifact.mirror;
++
++import java.io.*;
++import java.util.Date;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.equinox.internal.p2.artifact.repository.Messages;
++import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactDescriptor;
++
++public class FileMirrorLog implements IArtifactMirrorLog {
++
++	private static final String INDENT = "\t"; //$NON-NLS-1$
++	private static final String SEPARATOR = System.getProperty("line.separator"); //$NON-NLS-1$
++	private BufferedWriter out;
++	private boolean consoleMessage = false;
++	private int minSeverity = IStatus.OK;
++	private boolean hasRoot = false;
++
++	public FileMirrorLog(String location, int minSeverity, String root) {
++		this.minSeverity = minSeverity;
++		try {
++			File log = new File(location);
++			if (log.getParentFile().exists() || log.getParentFile().mkdirs()) {
++				out = new BufferedWriter(new FileWriter(log, true));
++				if (root != null) {
++					log(root + " - " + new Date()); //$NON-NLS-1$
++					hasRoot = true;
++				}
++			} else
++				throw new IOException(Messages.exception_unableToCreateParentDir);
++		} catch (IOException e) {
++			exceptionOccurred(null, e);
++		}
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.artifact.mirror.IArtifactMirrorLog#log(org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactDescriptor, org.eclipse.core.runtime.IStatus)
++	 */
++	public void log(IArtifactDescriptor descriptor, IStatus status) {
++		if (status.getSeverity() >= minSeverity) {
++			log(descriptor.toString());
++			log(status, INDENT);
++		}
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.artifact.mirror.IArtifactMirrorLog#log(org.eclipse.core.runtime.IStatus)
++	 */
++	public void log(IStatus status) {
++		log(status, ""); //$NON-NLS-1$
++	}
++
++	/*
++	 * Write a status to the log, indenting it based on status depth.
++	 * @param status the status to log
++	 * @param depth the depth of the status
++	 */
++	private void log(IStatus status, String prefix) {
++		if (status.getSeverity() >= minSeverity) {
++			// Write status to log
++			log(prefix + status.getMessage());
++
++			// Write exception to log if applicable
++			String exceptionMessage = status.getException() != null ? status.getException().getMessage() : null;
++			if (exceptionMessage != null)
++				log(prefix + exceptionMessage);
++
++			// Write the children of the status to the log
++			IStatus[] nestedStatus = status.getChildren();
++			if (nestedStatus != null)
++				for (int i = 0; i < nestedStatus.length; i++)
++					log(nestedStatus[i], prefix + INDENT);
++		}
++	}
++
++	/*
++	 * Write a message to the log
++	 * @param message the message to write
++	 */
++	private void log(String message) {
++		try {
++			out.write((hasRoot ? INDENT : "") + message + SEPARATOR); //$NON-NLS-1$
++		} catch (IOException e) {
++			exceptionOccurred((hasRoot ? INDENT : "") + message, e); //$NON-NLS-1$
++		}
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.artifact.mirror.IArtifactMirrorLog#close()
++	 */
++	public void close() {
++		try {
++			if (out != null)
++				out.close();
++		} catch (IOException e) {
++			exceptionOccurred(null, e);
++		}
++	}
++
++	/*
++	 * Show an error message if this the first time, and print status messages.
++	 */
++	private void exceptionOccurred(String message, Exception e) {
++		if (!consoleMessage) {
++			System.err.println(Messages.MirrorLog_Exception_Occurred);
++			e.printStackTrace(System.err);
++			System.err.println(Messages.MirrorLog_Console_Log);
++			consoleMessage = true;
++		}
++		if (message != null)
++			System.out.println(message);
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/IArtifactMirrorLog.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/IArtifactMirrorLog.java
+new file mode 100644
+index 0000000..959a7a3
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/IArtifactMirrorLog.java
+@@ -0,0 +1,26 @@
++/*******************************************************************************
++ * Copyright (c) 2009 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.artifact.mirror;
++
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactDescriptor;
++
++public interface IArtifactMirrorLog {
++
++	// Log a status associated with a descriptor 
++	public void log(IArtifactDescriptor descriptor, IStatus status);
++
++	// Log a status
++	public void log(IStatus status);
++
++	// Notify that logging is completed & cleanup resources 
++	public void close();
++}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/MirrorApplication.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/MirrorApplication.java
+index 498ff03..1fa8ec3 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/MirrorApplication.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/MirrorApplication.java
+@@ -42,6 +42,7 @@ public class MirrorApplication implements IApplication {
+ 	private boolean append = true;
+ 	private boolean raw = false;
+ 	private boolean failOnError = true;
++	private boolean validate = false;
+ 	private boolean verbose = false;
+ 	private IArtifactRepositoryManager cachedManager;
+ 	private boolean sourceLoaded = false;
+@@ -50,6 +51,8 @@ public class MirrorApplication implements IApplication {
+ 	private boolean compare = false;
+ 	private String comparatorID = MD5ArtifactComparator.MD5_COMPARATOR_ID; //use MD5 as default
+ 	private String destinationName;
++	private IArtifactMirrorLog mirrorLog;
++	private IArtifactMirrorLog comparatorLog;
+ 
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.app.IApplication#start(org.eclipse.equinox.app.IApplicationContext)
+@@ -63,6 +66,9 @@ public class MirrorApplication implements IApplication {
+ 		mirroring.setCompare(compare);
+ 		mirroring.setComparatorId(comparatorID);
+ 		mirroring.setBaseline(baseline);
++		mirroring.setValidate(validate);
++		if (comparatorLog != null)
++			mirroring.setComparatorLog(comparatorLog);
+ 
+ 		IStatus result = mirroring.run(failOnError, verbose);
+ 		if (!result.isOK()) {
+@@ -71,18 +77,10 @@ public class MirrorApplication implements IApplication {
+ 				System.err.println("Mirroring completed. Please check log file for more information."); //$NON-NLS-1$
+ 			else
+ 				System.err.println("Mirroring completed with warnings and/or errors. Please check log file for more information."); //$NON-NLS-1$
+-			FrameworkLog log = (FrameworkLog) ServiceHelper.getService(Activator.getContext(), FrameworkLog.class.getName());
+-			if (log != null)
+-				System.err.println("Log file location: " + log.getFile()); //$NON-NLS-1$
+-			LogHelper.log(result);
++			log(result);
+ 		}
+-		//if the repository was not already loaded before the mirror application started, close it.
+-		if (!sourceLoaded)
+-			getManager().removeRepository(sourceLocation);
+-		if (!destinationLoaded)
+-			getManager().removeRepository(destinationLocation);
+-		if (baselineLocation != null && !baselineLoaded)
+-			getManager().removeRepository(baselineLocation);
++
++		cleanup();
+ 
+ 		return IApplication.EXIT_OK;
+ 	}
+@@ -157,6 +155,10 @@ public class MirrorApplication implements IApplication {
+ 	public void initializeFromArguments(String[] args) throws Exception {
+ 		if (args == null)
+ 			return;
++
++		String comparatorLogLocation = null;
++		String mirrorLogLocation = null;
++
+ 		for (int i = 0; i < args.length; i++) {
+ 			// check for args without parameters (i.e., a flag arg)
+ 			if (args[i].equalsIgnoreCase("-raw")) //$NON-NLS-1$
+@@ -167,6 +169,8 @@ public class MirrorApplication implements IApplication {
+ 				verbose = true;
+ 			if (args[i].equalsIgnoreCase("-compare")) //$NON-NLS-1$
+ 				compare = true;
++			if (args[i].equalsIgnoreCase("-validate")) //$NON-NLS-1$
++				validate = true;
+ 
+ 			// check for args with parameters. If we are at the last argument or 
+ 			// if the next one has a '-' as the first character, then we can't have 
+@@ -177,11 +181,15 @@ public class MirrorApplication implements IApplication {
+ 
+ 			if (args[i - 1].equalsIgnoreCase("-comparator")) //$NON-NLS-1$
+ 				comparatorID = arg;
++			if (args[i - 1].equalsIgnoreCase("-comparatorLog")) //$NON-NLS-1$
++				comparatorLogLocation = arg;
+ 			if (args[i - 1].equalsIgnoreCase("-destinationName")) //$NON-NLS-1$
+ 				destinationName = arg;
+ 			if (args[i - 1].equalsIgnoreCase("-writeMode")) //$NON-NLS-1$
+ 				if (args[i].equalsIgnoreCase("clean")) //$NON-NLS-1$
+ 					append = false;
++			if (args[i - 1].equalsIgnoreCase("-log")) //$NON-NLS-1$
++				mirrorLogLocation = arg;
+ 
+ 			try {
+ 				if (args[i - 1].equalsIgnoreCase("-source")) //$NON-NLS-1$
+@@ -196,5 +204,55 @@ public class MirrorApplication implements IApplication {
+ 				throw new IllegalArgumentException(NLS.bind(Messages.exception_malformedRepoURI, arg));
+ 			}
+ 		}
++		// Create logs
++		if (mirrorLogLocation != null)
++			mirrorLog = getLog(mirrorLogLocation, "p2.artifact.mirror"); //$NON-NLS-1$
++		if (comparatorLogLocation != null && comparatorID != null)
++			comparatorLog = getLog(comparatorLogLocation, comparatorID);
++	}
++
++	public void setLog(IArtifactMirrorLog log) {
++		mirrorLog = log;
++	}
++
++	/*
++	 * Create a MirrorLog based on a filename
++	 */
++	private IArtifactMirrorLog getLog(String location, String root) {
++		if (location.toLowerCase().endsWith(".xml")) //$NON-NLS-1$
++			return new XMLMirrorLog(location, verbose ? IStatus.INFO : IStatus.ERROR, root);
++		return new FileMirrorLog(location, verbose ? IStatus.INFO : IStatus.ERROR, root);
++	}
++
++	/*
++	 * Log the result of mirroring
++	 */
++	private void log(IStatus status) {
++		if (mirrorLog == null) {
++			FrameworkLog log = (FrameworkLog) ServiceHelper.getService(Activator.getContext(), FrameworkLog.class.getName());
++			if (log != null)
++				System.err.println("Log file location: " + log.getFile()); //$NON-NLS-1$
++			LogHelper.log(status);
++		} else
++			mirrorLog.log(status);
++	}
++
++	/*
++	 * Cleanup
++	 */
++	private void cleanup() {
++		//if the repository was not already loaded before the mirror application started, close it.
++		if (!sourceLoaded)
++			getManager().removeRepository(sourceLocation);
++		if (!destinationLoaded)
++			getManager().removeRepository(destinationLocation);
++		if (baselineLocation != null && !baselineLoaded)
++			getManager().removeRepository(baselineLocation);
++
++		// Close logs
++		if (mirrorLog != null)
++			mirrorLog.close();
++		if (comparatorLog != null)
++			comparatorLog.close();
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/Mirroring.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/Mirroring.java
+index 8078cba..8fbbe1d 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/Mirroring.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/Mirroring.java
+@@ -32,6 +32,7 @@ public class Mirroring {
+ 	private IArtifactComparator comparator;
+ 	private String comparatorID;
+ 	private IArtifactKey[] keysToMirror;
++	private IArtifactMirrorLog comparatorLog;
+ 
+ 	private IArtifactComparator getComparator() {
+ 		if (comparator == null)
+@@ -53,6 +54,10 @@ public class Mirroring {
+ 		this.comparatorID = id;
+ 	}
+ 
++	public void setComparatorLog(IArtifactMirrorLog comparatorLog) {
++		this.comparatorLog = comparatorLog;
++	}
++
+ 	public void setBaseline(IArtifactRepository baseline) {
+ 		this.baseline = baseline;
+ 	}
+@@ -106,7 +111,10 @@ public class Mirroring {
+ 				if (baselineDescriptor != null) {
+ 					MultiStatus status = new MultiStatus(Activator.ID, IStatus.OK, NLS.bind(Messages.Mirroring_compareAndDownload, descriptor), null);
+ 					//Compare source against baseline
+-					status.add(getComparator().compare(baseline, baselineDescriptor, source, descriptor));
++					IStatus comparison = getComparator().compare(baseline, baselineDescriptor, source, descriptor);
++					if (comparatorLog != null)
++						comparatorLog.log(baselineDescriptor, comparison);
++					status.add(comparison);
+ 					if (destination.contains(baselineDescriptor))
+ 						return compareToDestination(baselineDescriptor);
+ 
+@@ -144,7 +152,14 @@ public class Mirroring {
+ 		}
+ 		if (destDescriptor == null)
+ 			return new Status(IStatus.INFO, Activator.ID, ProvisionException.ARTIFACT_EXISTS, Messages.Mirroring_NO_MATCHING_DESCRIPTOR, null);
+-		return getComparator().compare(source, descriptor, destination, destDescriptor);
++		return compare(source, descriptor, destination, destDescriptor);
++	}
++
++	private IStatus compare(IArtifactRepository sourceRepository, IArtifactDescriptor sourceDescriptor, IArtifactRepository destRepository, IArtifactDescriptor destDescriptor) {
++		IStatus comparison = getComparator().compare(sourceRepository, sourceDescriptor, destRepository, destDescriptor);
++		if (comparatorLog != null)
++			comparatorLog.log(sourceDescriptor, comparison);
++		return comparison;
+ 	}
+ 
+ 	/*
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/XMLMirrorLog.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/XMLMirrorLog.java
+new file mode 100644
+index 0000000..81e56d5
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/mirror/XMLMirrorLog.java
+@@ -0,0 +1,166 @@
++/*******************************************************************************
++ * Copyright (c) 2009 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.artifact.mirror;
++
++import java.io.*;
++import java.util.Date;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.equinox.internal.p2.artifact.repository.Messages;
++import org.eclipse.equinox.internal.p2.persistence.XMLWriter;
++import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactDescriptor;
++
++public class XMLMirrorLog implements IArtifactMirrorLog {
++	private static final String DEFAULT_FORMAT = "canonical"; //$NON-NLS-1$
++	// Constants used in XML tags
++	private static final String LOG = "log"; //$NON-NLS-1$
++	private static final String TIME_ATTRIBUTE = "time"; //$NON-NLS-1$
++	private static final String DESCRIPTOR_ELEMENT = "descriptor"; //$NON-NLS-1$
++	private static final String DESCRIPTOR_CLASSIFIER_ATTRIBUTE = "classifier"; //$NON-NLS-1$
++	private static final String DESCRIPTOR_FORMAT_ATTRIBUTE = "format"; //$NON-NLS-1$
++	private static final String DESCRIPTOR_ID_ATTRIBUTE = "id"; //$NON-NLS-1$
++	private static final String DESCRIPTOR_VERSION_ATTRIBUTE = "version"; //$NON-NLS-1$
++	private static final String STATUS_ELEMENT = "status"; //$NON-NLS-1$
++	private static final String STATUS_SEVERITY_ATTRIBUTE = "severity"; //$NON-NLS-1$
++	private static final String STATUS_MESSAGE_ATTRIBUTE = "message"; //$NON-NLS-1$
++
++	private int minStatus = IStatus.OK;
++	private XMLWriter writer;
++	private OutputStream outputStream;
++	private boolean consoleMessage = false;
++
++	public XMLMirrorLog(String location, int minStatus, String root) {
++		this.minStatus = minStatus;
++
++		try {
++			outputStream = new FileOutputStream(location);
++			writer = new XMLWriter(outputStream, null);
++			if (root != null)
++				writer.start(root.toLowerCase());
++			else
++				writer.start(LOG);
++			writer.attribute(TIME_ATTRIBUTE, new Date());
++		} catch (UnsupportedEncodingException e) {
++			exceptionOccurred(e);
++		} catch (FileNotFoundException e) {
++			exceptionOccurred(e);
++		}
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.artifact.mirror.IArtifactMirrorLog#log(org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactDescriptor, org.eclipse.core.runtime.IStatus)
++	 */
++	public void log(IArtifactDescriptor descriptor, IStatus status) {
++		if (status.getSeverity() < minStatus)
++			return;
++		// Start descriptor tag
++		if (writer != null) {
++			writer.start(DESCRIPTOR_ELEMENT);
++			writer.attribute(DESCRIPTOR_ID_ATTRIBUTE, descriptor.getArtifactKey().getId());
++			writer.attribute(DESCRIPTOR_CLASSIFIER_ATTRIBUTE, descriptor.getArtifactKey().getClassifier());
++			writer.attribute(DESCRIPTOR_VERSION_ATTRIBUTE, descriptor.getArtifactKey().getVersion());
++			if (descriptor.getProperties().get(IArtifactDescriptor.FORMAT) != null)
++				writer.attribute(DESCRIPTOR_FORMAT_ATTRIBUTE, descriptor.getProperties().get(IArtifactDescriptor.FORMAT));
++			else
++				writer.attribute(DESCRIPTOR_FORMAT_ATTRIBUTE, DEFAULT_FORMAT);
++		} else
++			// Creation of the XML writer failed, dump results to the console
++			System.out.println(descriptor);
++
++		log(status);
++
++		// Close descriptor tag
++		if (writer != null)
++			writer.end();
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.artifact.mirror.IArtifactMirrorLog#log(org.eclipse.core.runtime.IStatus)
++	 */
++	public void log(IStatus status) {
++		if (status.getSeverity() < minStatus)
++			return;
++
++		if (writer != null) {
++			// Start status tag
++			writer.start(STATUS_ELEMENT);
++			// Set severity attribute
++			switch (status.getSeverity()) {
++				case IStatus.OK :
++					writer.attribute(STATUS_SEVERITY_ATTRIBUTE, "OK"); //$NON-NLS-1$
++					break;
++				case IStatus.INFO :
++					writer.attribute(STATUS_SEVERITY_ATTRIBUTE, "INFO"); //$NON-NLS-1$
++					break;
++				case IStatus.WARNING :
++					writer.attribute(STATUS_SEVERITY_ATTRIBUTE, "WARNING"); //$NON-NLS-1$
++					break;
++				case IStatus.ERROR :
++					writer.attribute(STATUS_SEVERITY_ATTRIBUTE, "ERROR"); //$NON-NLS-1$
++					break;
++				case IStatus.CANCEL :
++					writer.attribute(STATUS_SEVERITY_ATTRIBUTE, "CANCEL"); //$NON-NLS-1$
++					break;
++				default :
++					writer.attribute(STATUS_SEVERITY_ATTRIBUTE, status.getSeverity());
++			}
++			// Set  message attribute
++			writer.attribute(STATUS_MESSAGE_ATTRIBUTE, status.getMessage());
++		} else
++			// Creation of the XML writer failed, dump results to the console
++			System.out.println(status);
++
++		// Log children statuses
++		IStatus[] nestedStatus = status.getChildren();
++		if (nestedStatus != null)
++			for (int i = 0; i < nestedStatus.length; i++)
++				log(nestedStatus[i]);
++
++		// Close status tag
++		if (writer != null)
++			writer.end();
++	}
++
++	/*
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.artifact.mirror.IArtifactMirrorLog#close()
++	 */
++	public void close() {
++		try {
++			if (writer != null) {
++				// Close opening tag & flush results
++				writer.end();
++				writer.flush();
++			}
++		} finally {
++			if (outputStream != null)
++				try {
++					// Close output stream
++					outputStream.close();
++				} catch (IOException e) {
++					exceptionOccurred(e);
++				}
++		}
++	}
++
++	/*
++	 * Show an error message if this the first time
++	 */
++	private void exceptionOccurred(Exception e) {
++		if (!consoleMessage) {
++			System.err.println(Messages.MirrorLog_Exception_Occurred);
++			e.printStackTrace(System.err);
++			System.err.println(Messages.MirrorLog_Console_Log);
++			consoleMessage = true;
++		}
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Messages.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Messages.java
+index 9843222..9040376 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Messages.java
+@@ -60,6 +60,11 @@ public class Messages extends NLS {
+ 	public static String Mirroring_ValidationError;
+ 	public static String Mirroring_compareAndDownload;
+ 
++	public static String MirrorLog_Console_Log;
++	public static String MirrorLog_Exception_Occurred;
++
++	public static String exception_unableToCreateParentDir;
++
+ 	static {
+ 		// initialize resource bundles
+ 		NLS.initializeMessages(BUNDLE_NAME, Messages.class);
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/messages.properties b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/messages.properties
+index f8e90a9..872a934 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/messages.properties
+@@ -51,7 +51,11 @@ Mirroring_MISSING_DESCRIPTOR=Missing descriptor: {0}.
+ Mirroring_DIFFERENT_DESCRIPTOR_PROPERTY=Descriptor {0} has different properties for {1}, source: {2}, destination: {3}. 
+ Mirroring_ValidationError=Error occurred while validating mirror.
+ Mirroring_compareAndDownload=Compare and download of {0} from baseline.
++MirrorLog_Console_Log=Logging to the console instead.
++MirrorLog_Exception_Occurred=An exception occurred while writing to the log:
+ 
+ exception_unsupportedAddToComposite = Cannot add descriptors to a composite repository.
+ exception_unsupportedGetOutputStream=Cannot write artifacts to a composite repository.
+-exception_unsupportedRemoveFromComposite = Cannot remove descriptors from a composite repository.
+\ No newline at end of file
++exception_unsupportedRemoveFromComposite = Cannot remove descriptors from a composite repository.
++
++exception_unableToCreateParentDir = Unable to create parent directory
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src_ant/org/eclipse/equinox/internal/p2/artifact/repository/ant/AntMirrorLog.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src_ant/org/eclipse/equinox/internal/p2/artifact/repository/ant/AntMirrorLog.java
+new file mode 100644
+index 0000000..9d30c11
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src_ant/org/eclipse/equinox/internal/p2/artifact/repository/ant/AntMirrorLog.java
+@@ -0,0 +1,105 @@
++/*******************************************************************************
++ * Copyright (c) 2009 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.artifact.repository.ant;
++
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.equinox.internal.p2.artifact.mirror.IArtifactMirrorLog;
++import org.eclipse.equinox.internal.p2.artifact.repository.Messages;
++import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactDescriptor;
++
++public class AntMirrorLog implements IArtifactMirrorLog {
++
++	private boolean consoleMessage = false;
++	private Method log;
++	private Object task;
++
++	public AntMirrorLog(Object task) throws NoSuchMethodException {
++		this.task = task;
++		try {
++			log = task.getClass().getMethod("log", new Class[] {String.class, int.class}); //$NON-NLS-1$
++		} catch (SecurityException e) {
++			exceptionOccurred(null, e);
++		}
++	}
++
++	public void log(IArtifactDescriptor descriptor, IStatus status) {
++		log(descriptor.toString(), status.getSeverity());
++		log(status);
++	}
++
++	public void log(IStatus status) {
++		int severity = status.getSeverity();
++		// Log the status message
++		log(status.getMessage(), severity);
++		// Log the exception if applicable
++		if (status.getException() != null)
++			log(status.getException().getMessage(), severity);
++
++		// Log any children of this status
++		IStatus[] nestedStatus = status.getChildren();
++		if (nestedStatus != null)
++			for (int i = 0; i < nestedStatus.length; i++)
++				log(nestedStatus[i]);
++	}
++
++	public void close() {
++		// nothing to do here
++	}
++
++	/*
++	 * Log a message to the Ant Task
++	 */
++	private void log(String message, int statusSeverity) {
++		try {
++			log.invoke(task, new Object[] {message, new Integer(mapLogLevels(statusSeverity))});
++		} catch (IllegalArgumentException e) {
++			exceptionOccurred(message, e);
++		} catch (IllegalAccessException e) {
++			exceptionOccurred(message, e);
++		} catch (InvocationTargetException e) {
++			exceptionOccurred(message, e);
++		}
++	}
++
++	/*
++	 * Show an error message if this the first time, and print status messages.
++	 */
++	private void exceptionOccurred(String message, Exception e) {
++		if (!consoleMessage) {
++			System.err.println(Messages.MirrorLog_Exception_Occurred);
++			e.printStackTrace(System.err);
++			System.err.println(Messages.MirrorLog_Console_Log);
++			consoleMessage = true;
++		}
++		if (message != null)
++			System.out.println(message);
++	}
++
++	/**
++	 * Copied from AntLogAdapter in pde build.
++	 */
++	private int mapLogLevels(int iStatusLevel) {
++		switch (iStatusLevel) {
++			case IStatus.ERROR :
++				return 0;
++			case IStatus.OK :
++				return 2;
++			case IStatus.INFO :
++				return 2;
++			case IStatus.WARNING :
++				return 1;
++			default :
++				return 1;
++		}
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src_ant/org/eclipse/equinox/internal/p2/artifact/repository/ant/MirrorApplicationTask.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src_ant/org/eclipse/equinox/internal/p2/artifact/repository/ant/MirrorApplicationTask.java
+index 7d3298f..c1a402f 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src_ant/org/eclipse/equinox/internal/p2/artifact/repository/ant/MirrorApplicationTask.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src_ant/org/eclipse/equinox/internal/p2/artifact/repository/ant/MirrorApplicationTask.java
+@@ -10,6 +10,7 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.artifact.repository.ant;
+ 
++import java.io.File;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.HashMap;
+@@ -29,8 +30,10 @@ public class MirrorApplicationTask extends Task {
+ 	private static final String ARG_COMPARATOR = "-comparator"; //$NON-NLS-1$
+ 	private static final String ARG_COMPARE = "-compare"; //$NON-NLS-1$
+ 	private static final String ARG_COMPARE_AGAINST = "-compareAgainst"; //$NON-NLS-1$
++	private static final String ARG_COMPARATOR_LOG = "-comparatorLog"; //$NON-NLS-1$
+ 	private static final String ARG_DESTINATION = "-destination"; //$NON-NLS-1$
+ 	private static final String ARG_IGNORE_ERRORS = "-ignoreErrors"; //$NON-NLS-1$
++	private static final String ARG_LOG = "-log"; //$NON-NLS-1$
+ 	private static final String ARG_RAW = "-raw"; //$NON-NLS-1$
+ 	private static final String ARG_SOURCE = "-source"; //$NON-NLS-1$
+ 	private static final String ARG_VERBOSE = "-verbose"; //$NON-NLS-1$
+@@ -39,6 +42,8 @@ public class MirrorApplicationTask extends Task {
+ 	URL source;
+ 	URL destination;
+ 	URL baseline; // location of known good repository for compare against (optional)
++	File mirrorLog; // file to log mirror output to (optional)
++	File comparatorLog; // file to comparator output to (optional)
+ 	String comparatorID; // specifies a comparator (optional)
+ 	String writeMode;
+ 	boolean compare = false;
+@@ -50,7 +55,10 @@ public class MirrorApplicationTask extends Task {
+ 	 * Runs the mirror application with the given arguments.
+ 	 */
+ 	private void runMirrorApplication(final String[] args) throws Exception {
+-		new MirrorApplication().start(new IApplicationContext() {
++		MirrorApplication app = new MirrorApplication();
++		if (mirrorLog == null)
++			app.setLog(new AntMirrorLog(this));
++		app.start(new IApplicationContext() {
+ 
+ 			public void applicationRunning() {
+ 				// nothing to do
+@@ -108,7 +116,11 @@ public class MirrorApplicationTask extends Task {
+ 				compareAgainst ? ARG_COMPARE_AGAINST : EMPTY_STRING, //
+ 				compareAgainst ? baseline.toExternalForm() : EMPTY_STRING, //
+ 				comparator ? ARG_COMPARATOR : EMPTY_STRING, //
+-				comparator ? comparatorID : EMPTY_STRING};
++				comparator ? comparatorID : EMPTY_STRING, //
++				mirrorLog != null ? ARG_LOG : EMPTY_STRING, //
++				mirrorLog != null ? mirrorLog.getAbsolutePath() : EMPTY_STRING, //
++				comparatorLog != null ? ARG_COMPARATOR_LOG : EMPTY_STRING, //
++				comparatorLog != null ? comparatorLog.getAbsolutePath() : EMPTY_STRING,};
+ 
+ 		try {
+ 			runMirrorApplication(args);
+@@ -148,6 +160,13 @@ public class MirrorApplicationTask extends Task {
+ 	}
+ 
+ 	/*
++	 * Set the location of the comparator log
++	 */
++	public void setComparatorLog(String value) {
++		comparatorLog = new File(value);
++	}
++
++	/*
+ 	 * Set the write mode. (e.g. clean or append)
+ 	 */
+ 	public void setWriteMode(String value) {
+@@ -155,6 +174,13 @@ public class MirrorApplicationTask extends Task {
+ 	}
+ 
+ 	/*
++	 * Set the log location if applicable
++	 */
++	public void setLog(String value) {
++		mirrorLog = new File(value);
++	}
++
++	/*
+ 	 * Set whether or not the application should be calling a comparator when mirroring.
+ 	 */
+ 	public void setCompare(boolean value) {

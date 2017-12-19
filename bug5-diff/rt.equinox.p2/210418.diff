@@ -1,0 +1,359 @@
+commit 924a139ce78993f24ef0cec6eaf2ea5739378c39
+Author: John Arthorne <johna>
+Date:   Tue Jan 8 20:05:34 2008 +0000
+
+    Bug 210418 [prov] Support for metadata compression
+
+13	3	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/p2/core/repository/IRepository.java
+8	0	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
+36	9	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
+29	1	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+14	3	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/URLMetadataRepository.java
+62	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/LocalMetadataRepositoryTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/p2/core/repository/IRepository.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/p2/core/repository/IRepository.java
+index 957aa8b..878d91d 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/p2/core/repository/IRepository.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/p2/core/repository/IRepository.java
+@@ -21,12 +21,22 @@ import org.eclipse.core.runtime.IAdaptable;
+  * This interface is not intended to be implemented by clients.
+  */
+ public interface IRepository extends IAdaptable {
+-	// The property key for a boolean property indicating that the repository
+-	// is an implementation detail, not subject to general access, hidden
+-	// from the typical user, etc.
++	/** 
++	 * The property key for a boolean property indicating that the repository
++	 * is an implementation detail, not subject to general access, hidden
++	 * from the typical user, etc.
++	 */
+ 	static public String IMPLEMENTATION_ONLY_KEY = "implementationOnly"; //$NON-NLS-1$
+ 
+ 	/**
++	 * The key for a boolean property indicating that repository metadata is
++	 * stored in compressed form.  A compressed repository will have lower
++	 * bandwidth cost to read when remote, but higher processing cost to
++	 * uncompress when reading.
++	 */
++	public static final String PROP_COMPRESSED = "p2.compressed"; //$NON-NLS-1$
++
++	/**
+ 	 * Returns the URL of the repository.
+ 	 * TODO: Should we use URL or URI? URL requires a protocol handler
+ 	 * to be installed in Java.  Can the URL have any protocol?
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
+index 5b111ab..dc7d854 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
+@@ -22,6 +22,7 @@ import org.eclipse.equinox.internal.p2.metadata.repository.MetadataRepositoryMan
+ import org.eclipse.equinox.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.p2.artifact.repository.IArtifactRepositoryManager;
+ import org.eclipse.equinox.p2.core.eventbus.ProvisioningEventBus;
++import org.eclipse.equinox.p2.core.repository.IRepository;
+ import org.eclipse.equinox.p2.metadata.generator.EclipseInstallGeneratorInfoProvider;
+ import org.eclipse.equinox.p2.metadata.generator.Generator;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+@@ -51,6 +52,8 @@ public class EclipseGeneratorApplication implements IApplication {
+ 	private String features;
+ 	private String bundles;
+ 	private String base;
++	//whether repository xml files should be compressed
++	private String compress = "false"; //$NON-NLS-1$
+ 
+ 	private File getExecutableName(String base, EclipseInstallGeneratorInfoProvider provider) {
+ 		File location = provider.getExecutableLocation();
+@@ -131,6 +134,7 @@ public class EclipseGeneratorApplication implements IApplication {
+ 		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(Activator.context, IMetadataRepositoryManager.class.getName());
+ 		IMetadataRepository repository = manager.loadRepository(location, null);
+ 		if (repository != null) {
++			repository.setProperty(IRepository.PROP_COMPRESSED, compress);
+ 			if (!repository.isModifiable())
+ 				throw new IllegalArgumentException("Metadata repository not writeable: " + location); //$NON-NLS-1$
+ 			provider.setMetadataRepository(repository);
+@@ -143,6 +147,7 @@ public class EclipseGeneratorApplication implements IApplication {
+ 		// TODO for now create a random repo by default.
+ 		String repositoryName = metadataLocation + " - metadata"; //$NON-NLS-1$
+ 		IMetadataRepository result = manager.createRepository(location, repositoryName, IMetadataRepositoryManager.TYPE_SIMPLE_REPOSITORY);
++		result.setProperty(IRepository.PROP_COMPRESSED, compress);
+ 		if (result != null)
+ 			provider.setMetadataRepository(result);
+ 	}
+@@ -170,6 +175,9 @@ public class EclipseGeneratorApplication implements IApplication {
+ 			if (args[i].equalsIgnoreCase("-noDefaultIUs"))
+ 				provider.setAddDefaultIUs(false);
+ 
++			if (args[i].equalsIgnoreCase("-compress"))
++				compress = "true"; //$NON-NLS-1$
++
+ 			// check for args with parameters. If we are at the last argument or if the next one
+ 			// has a '-' as the first character, then we can't have an arg with a parm so continue.
+ 			if (i == args.length - 1 || args[i + 1].startsWith("-")) //$NON-NLS-1$
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
+index 5c79f9d..9f24fd0 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
+@@ -14,6 +14,8 @@ package org.eclipse.equinox.internal.p2.metadata.repository;
+ import java.io.*;
+ import java.net.URL;
+ import java.util.*;
++import java.util.jar.JarEntry;
++import java.util.jar.JarOutputStream;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.query.Collector;
+@@ -29,18 +31,23 @@ public class LocalMetadataRepository extends AbstractMetadataRepository {
+ 	static final private String CONTENT_FILENAME = "content.xml"; //$NON-NLS-1$
+ 	static final private String REPOSITORY_TYPE = LocalMetadataRepository.class.getName();
+ 	static final private Integer REPOSITORY_VERSION = new Integer(1);
++	static final private String JAR_EXTENSION = ".jar"; //$NON-NLS-1$
+ 
+ 	protected HashSet units = new LinkedHashSet();
+ 
+-	public static File getActualLocation(URL location) {
++	private static File getActualLocation(URL location, String extension) {
+ 		String spec = location.getFile();
+-		if (spec.endsWith(CONTENT_FILENAME))
+-			return new File(spec);
++		if (spec.endsWith(CONTENT_FILENAME + extension))
++			return new File(spec + extension);
+ 		if (spec.endsWith("/")) //$NON-NLS-1$
+ 			spec += CONTENT_FILENAME;
+ 		else
+ 			spec += "/" + CONTENT_FILENAME; //$NON-NLS-1$
+-		return new File(spec);
++		return new File(spec + extension);
++	}
++
++	public static File getActualLocation(URL location) {
++		return getActualLocation(location, ""); //$NON-NLS-1$
+ 	}
+ 
+ 	/**
+@@ -119,13 +126,33 @@ public class LocalMetadataRepository extends AbstractMetadataRepository {
+ 
+ 	private void save() {
+ 		File file = getActualLocation(location);
++		boolean jar = "true".equalsIgnoreCase((String) properties.get(PROP_COMPRESSED)); //$NON-NLS-1$
+ 		try {
+-			if (!file.exists()) {
+-				if (!file.getParentFile().exists())
+-					file.getParentFile().mkdirs();
+-				file.createNewFile();
++			OutputStream output = null;
++			if (!jar) {
++				if (!file.exists()) {
++					if (!file.getParentFile().exists())
++						file.getParentFile().mkdirs();
++					file.createNewFile();
++				}
++				output = new FileOutputStream(file);
++			}
++			if (jar) {
++				if (file.exists()) {
++					file.delete();
++				}
++				File jarFile = getActualLocation(location, JAR_EXTENSION);
++				if (!jarFile.exists()) {
++					if (!jarFile.getParentFile().exists())
++						jarFile.getParentFile().mkdirs();
++					jarFile.createNewFile();
++				}
++				JarEntry jarEntry = new JarEntry(file.getPath());
++				JarOutputStream jOutput = new JarOutputStream(new FileOutputStream(jarFile));
++				jOutput.putNextEntry(jarEntry);
++				output = jOutput;
+ 			}
+-			new MetadataRepositoryIO().write(this, new FileOutputStream(file));
++			new MetadataRepositoryIO().write(this, output);
+ 		} catch (FileNotFoundException e) {
+ 			// TODO Auto-generated catch block
+ 			e.printStackTrace();
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+index 8ec5e2d..1c13212 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+@@ -12,6 +12,8 @@ package org.eclipse.equinox.internal.p2.metadata.repository;
+ 
+ import java.io.*;
+ import java.net.URL;
++import java.util.jar.JarEntry;
++import java.util.jar.JarInputStream;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.Status;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+@@ -23,6 +25,8 @@ import org.eclipse.equinox.spi.p2.metadata.repository.IMetadataRepositoryFactory
+ 
+ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFactory {
+ 
++	private static final String JAR_EXTENSION = ".jar"; //$NON-NLS-1$
++
+ 	public IMetadataRepository create(URL location, String name, String type) {
+ 		if (location.getProtocol().equals("file")) //$NON-NLS-1$
+ 			return new LocalMetadataRepository(location, name);
+@@ -30,6 +34,16 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 	}
+ 
+ 	public IMetadataRepository load(URL location) {
++		// load the jar
++		IMetadataRepository result = load(location, JAR_EXTENSION);
++		// compressed file is not available, load the xml
++		if (result == null) {
++			result = load(location, null);
++		}
++		return result;
++	}
++
++	private IMetadataRepository load(URL location, String type) {
+ 		if (location == null)
+ 			return null;
+ 		long time = 0;
+@@ -39,7 +53,21 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 			time = -System.currentTimeMillis();
+ 		}
+ 		try {
+-			InputStream descriptorStream = new BufferedInputStream(URLMetadataRepository.getActualLocation(location).openStream());
++			URL actualFile = URLMetadataRepository.getActualLocation(location);
++			InputStream inStream = URLMetadataRepository.getActualLocation(location, type).openStream();
++			if (JAR_EXTENSION.equalsIgnoreCase(type)) {
++				JarInputStream jInStream = new JarInputStream(inStream);
++				JarEntry jarEntry = jInStream.getNextJarEntry();
++				File f = new File(actualFile.getPath());
++				while (jarEntry != null && (f.compareTo(new File(jarEntry.getName()))) != 0) {
++					jarEntry = jInStream.getNextJarEntry();
++				}
++				if (jarEntry == null) {
++					throw new FileNotFoundException("Repository not found in " + actualFile.getPath() + type); //$NON-NLS-1$
++				}
++				inStream = jInStream;
++			}
++			InputStream descriptorStream = new BufferedInputStream(inStream);
+ 			try {
+ 				IMetadataRepository result = new MetadataRepositoryIO().read(descriptorStream);
+ 				if (result instanceof LocalMetadataRepository)
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/URLMetadataRepository.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/URLMetadataRepository.java
+index 63fbb09..95be57e 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/URLMetadataRepository.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/URLMetadataRepository.java
+@@ -33,15 +33,26 @@ public class URLMetadataRepository extends AbstractMetadataRepository {
+ 	protected HashSet units = new LinkedHashSet();
+ 
+ 	public static URL getActualLocation(URL base) {
++		return getActualLocation(base, null);
++	}
++
++	public static URL getActualLocation(URL base, String extension) {
++		if (extension == null) {
++			extension = ""; //$NON-NLS-1$
++		}
+ 		String spec = base.toExternalForm();
+-		if (spec.endsWith(CONTENT_FILENAME))
+-			return base;
++		if (spec.endsWith(CONTENT_FILENAME + extension))
++			try {
++				return new URL(spec + extension);
++			} catch (MalformedURLException e1) {
++				return null;
++			}
+ 		if (spec.endsWith("/")) //$NON-NLS-1$
+ 			spec += CONTENT_FILENAME;
+ 		else
+ 			spec += "/" + CONTENT_FILENAME; //$NON-NLS-1$
+ 		try {
+-			return new URL(spec);
++			return new URL(spec + extension);
+ 		} catch (MalformedURLException e) {
+ 			return null;
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/LocalMetadataRepositoryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/LocalMetadataRepositoryTest.java
+index 53190df..bdc7c39 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/LocalMetadataRepositoryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/LocalMetadataRepositoryTest.java
+@@ -14,6 +14,9 @@ import java.io.File;
+ import java.net.MalformedURLException;
+ import java.util.Map;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
++import org.eclipse.equinox.p2.core.repository.IRepository;
++import org.eclipse.equinox.p2.metadata.generator.EclipseInstallGeneratorInfoProvider;
++import org.eclipse.equinox.p2.metadata.generator.Generator;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepositoryManager;
+ import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+@@ -23,8 +26,8 @@ import org.eclipse.equinox.p2.tests.TestActivator;
+  * Test API of the local metadata repository implementation.
+  */
+ public class LocalMetadataRepositoryTest extends AbstractProvisioningTest {
+-	private static final String TEST_VALUE = "TestValue";
+ 	private static final String TEST_KEY = "TestKey";
++	private static final String TEST_VALUE = "TestValue";
+ 	protected File repoLocation;
+ 
+ 	private IMetadataRepositoryManager getMetadataRepositoryManager() {
+@@ -44,6 +47,38 @@ public class LocalMetadataRepositoryTest extends AbstractProvisioningTest {
+ 		super.tearDown();
+ 	}
+ 
++	public void testCompressedRepository() throws MalformedURLException {
++		IMetadataRepositoryManager manager = getMetadataRepositoryManager();
++		IMetadataRepository repo = manager.createRepository(repoLocation.toURL(), "TestRepo", IMetadataRepositoryManager.TYPE_SIMPLE_REPOSITORY);
++		repo.setProperty(IRepository.PROP_COMPRESSED, "true");
++		EclipseInstallGeneratorInfoProvider provider = new EclipseInstallGeneratorInfoProvider();
++		provider.setMetadataRepository(repo);
++		provider.initialize(repoLocation);
++		provider.setRootVersion("3.3");
++		provider.setRootId("sdk");
++		provider.setFlavor("tooling");
++		// Generate the repository
++		new Generator(provider).generate();
++		File[] files = repoLocation.listFiles();
++		boolean jarFilePresent = false;
++		boolean xmlFilePresent = false;
++		// one of the files in the repository should be the content.xml.jar
++		for (int i = 0; i < files.length; i++) {
++			if ("content.xml.jar".equalsIgnoreCase(files[i].getName())) {
++				jarFilePresent = true;
++			}
++			if ("content.xml".equalsIgnoreCase(files[i].getName())) {
++				xmlFilePresent = true;
++			}
++		}
++		if (!jarFilePresent) {
++			fail("Repository did not create JAR for content.xml");
++		}
++		if (xmlFilePresent) {
++			fail("Repository should not create content.xml");
++		}
++	}
++
+ 	public void testGetProperties() throws MalformedURLException {
+ 		IMetadataRepositoryManager manager = getMetadataRepositoryManager();
+ 		IMetadataRepository repo = manager.createRepository(repoLocation.toURL(), "TestRepo", IMetadataRepositoryManager.TYPE_SIMPLE_REPOSITORY);
+@@ -79,4 +114,30 @@ public class LocalMetadataRepositoryTest extends AbstractProvisioningTest {
+ 		properties = repo.getProperties();
+ 		assertTrue("1.4", !properties.containsKey(TEST_KEY));
+ 	}
++
++	public void testUncompressedRepository() throws MalformedURLException {
++		IMetadataRepositoryManager manager = getMetadataRepositoryManager();
++		IMetadataRepository repo = manager.createRepository(repoLocation.toURL(), "TestRepo", IMetadataRepositoryManager.TYPE_SIMPLE_REPOSITORY);
++		repo.setProperty(IRepository.PROP_COMPRESSED, "false");
++		EclipseInstallGeneratorInfoProvider provider = new EclipseInstallGeneratorInfoProvider();
++		provider.setMetadataRepository(repo);
++		provider.initialize(repoLocation);
++		provider.setRootVersion("3.3");
++		provider.setRootId("sdk");
++		provider.setFlavor("tooling");
++		// Generate the repository
++		new Generator(provider).generate();
++		File[] files = repoLocation.listFiles();
++		boolean jarFilePresent = false;
++		// none of the files in the repository should be the content.xml.jar
++		for (int i = 0; i < files.length; i++) {
++			if ("content.xml.jar".equalsIgnoreCase(files[i].getName())) {
++				jarFilePresent = true;
++			}
++		}
++		if (jarFilePresent) {
++			fail("Repository should not create JAR for content.xml");
++		}
++
++	}
+ }

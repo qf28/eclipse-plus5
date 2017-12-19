@@ -1,0 +1,781 @@
+commit e1ce38065823480549fe152214755fa58b2884e3
+Author: Jerome Lanneluc <jeromel>
+Date:   Wed Dec 7 11:27:15 2005 +0000
+
+    First part of EFS support (waiting on bug 119244 for zip/jar file support)
+
+1	0	org.eclipse.jdt.core/META-INF/MANIFEST.MF
+2	0	org.eclipse.jdt.core/buildnotes_jdt-core.html
+16	3	org.eclipse.jdt.core/model/org/eclipse/jdt/core/ToolFactory.java
+17	14	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+19	31	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+5	3	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/IncrementalImageBuilder.java
+12	4	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/HierarchyBuilder.java
+4	14	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/HierarchyResolver.java
+6	4	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/IndexBasedHierarchyBuilder.java
+41	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ResourceCompilationUnit.java
+52	37	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/Util.java
+8	5	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexAllProject.java
+9	6	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexBinaryFolder.java
+3	22	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
+2	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+diff --git a/org.eclipse.jdt.core/META-INF/MANIFEST.MF b/org.eclipse.jdt.core/META-INF/MANIFEST.MF
+index 1427222..0a46081 100644
+--- a/org.eclipse.jdt.core/META-INF/MANIFEST.MF
++++ b/org.eclipse.jdt.core/META-INF/MANIFEST.MF
+@@ -53,6 +53,7 @@ Export-Package: org.eclipse.jdt.core,
+  org.eclipse.jdt.internal.formatter.old;x-internal:=true
+ Require-Bundle: org.eclipse.core.resources;bundle-version="[3.2.0,4.0.0)",
+  org.eclipse.core.runtime;bundle-version="[3.1.0,4.0.0)",
++ org.eclipse.core.filesystem,
+  org.eclipse.text;bundle-version="[3.1.0,4.0.0)",
+  org.eclipse.team.core;bundle-version="[3.1.0,4.0.0)";resolution:=optional
+ Eclipse-LazyStart: true
+diff --git a/org.eclipse.jdt.core/buildnotes_jdt-core.html b/org.eclipse.jdt.core/buildnotes_jdt-core.html
+index d3fc429..ae10c90 100644
+--- a/org.eclipse.jdt.core/buildnotes_jdt-core.html
++++ b/org.eclipse.jdt.core/buildnotes_jdt-core.html
+@@ -51,6 +51,8 @@ Eclipse SDK 3.2M4 - ?th December 2005
+ <h2>
+ What's new in this drop</h2>
+ <ul>
++<li>Added support for EFS on non zip file. Support for zip and jar files is blocked by 
++     <a href="https://bugs.eclipse.org/bugs/show_bug.cgi?id=119244">bug 119244</a></li>
+ </ul>
+ 
+ <h3>Problem Reports Fixed</h3>
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/ToolFactory.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/ToolFactory.java
+index f30a2c4..d028255 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/ToolFactory.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/ToolFactory.java
+@@ -13,10 +13,12 @@ package org.eclipse.jdt.core;
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.net.URI;
+ import java.util.Map;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipFile;
+ 
++import org.eclipse.core.filesystem.EFS;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.jdt.core.compiler.IScanner;
+ import org.eclipse.jdt.core.formatter.CodeFormatter;
+@@ -155,9 +157,20 @@ public class ToolFactory {
+ 					String entryName = org.eclipse.jdt.internal.core.util.Util.concatWith(packageFragment.names, classFileName, '/');
+ 					return createDefaultClassFileReader(archiveName, entryName, decodingFlag);
+ 				} else {
+-					IPath location = classfile.getResource().getLocation();
+-					if (location == null) return null;
+-					return createDefaultClassFileReader(location.toOSString(), decodingFlag);
++					URI uri = classfile.getResource().getLocationURI();
++					if (uri == null) return null;
++					InputStream in = null;
++					try {
++						in = EFS.getStore(uri).openInputStream(EFS.NONE, null);
++						return createDefaultClassFileReader(in, decodingFlag);
++					} finally {
++						if (in != null)
++							try {
++								in.close();
++							} catch (IOException e) {
++								// ignore
++							}
++					}
+ 				}
+ 			} catch(CoreException e){
+ 				// unable to read
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+index eeff2b2..d3077d1 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+@@ -2217,20 +2217,23 @@ public class JavaProject
+ 			// when a project is imported, we get a first delta for the addition of the .project, but the .classpath is not accessible
+ 			// so default to using java.io.File
+ 			// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=96258
+-			File file  = rscFile.getLocation().toFile();
+-			if (file.exists()) {
+-				byte[] bytes;
+-				try {
+-					bytes = org.eclipse.jdt.internal.compiler.util.Util.getFileByteContent(file);
+-				} catch (IOException e) {
+-					return null;
+-				}
+-				try {
+-					property = new String(bytes, org.eclipse.jdt.internal.compiler.util.Util.UTF_8); // .classpath always encoded with UTF-8
+-				} catch (UnsupportedEncodingException e) {
+-					Util.log(e, "Could not read .classpath with UTF-8 encoding"); //$NON-NLS-1$
+-					// fallback to default
+-					property = new String(bytes);
++			IPath location = rscFile.getLocation();
++			if (location != null) {
++				File file = location.toFile();
++				if (file.exists()) {
++					byte[] bytes;
++					try {
++						bytes = org.eclipse.jdt.internal.compiler.util.Util.getFileByteContent(file);
++					} catch (IOException e) {
++						return null;
++					}
++					try {
++						property = new String(bytes, org.eclipse.jdt.internal.compiler.util.Util.UTF_8); // .classpath always encoded with UTF-8
++					} catch (UnsupportedEncodingException e) {
++						Util.log(e, "Could not read .classpath with UTF-8 encoding"); //$NON-NLS-1$
++						// fallback to default
++						property = new String(bytes);
++					}
+ 				}
+ 			}
+ 		}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+index 24d54a9..f338b0f 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+@@ -10,20 +10,23 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.builder;
+ 
++import java.io.IOException;
++
+ import org.eclipse.core.resources.*;
+ import org.eclipse.core.runtime.*;
+ 
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
++import org.eclipse.jdt.internal.core.util.Util;
+ 
+ public class ClasspathDirectory extends ClasspathLocation {
+ 
+ IContainer binaryFolder; // includes .class files for a single directory
+ boolean isOutputFolder;
+-String binaryLocation;
+ SimpleLookupTable directoryCache;
+ String[] missingPackageHolder = new String[1];
+ AccessRuleSet accessRuleSet;
+@@ -31,8 +34,6 @@ AccessRuleSet accessRuleSet;
+ ClasspathDirectory(IContainer binaryFolder, boolean isOutputFolder, AccessRuleSet accessRuleSet) {
+ 	this.binaryFolder = binaryFolder;
+ 	this.isOutputFolder = isOutputFolder;
+-	IPath location = binaryFolder.getLocation();
+-	this.binaryLocation = location != null ? location.addTrailingSeparator().toString() : ""; //$NON-NLS-1$
+ 	this.directoryCache = new SimpleLookupTable(5);
+ 	this.accessRuleSet = accessRuleSet;
+ }
+@@ -94,34 +95,21 @@ public boolean equals(Object o) {
+ public NameEnvironmentAnswer findClass(String binaryFileName, String qualifiedPackageName, String qualifiedBinaryFileName) {
+ 	if (!doesFileExist(binaryFileName, qualifiedPackageName, qualifiedBinaryFileName)) return null; // most common case
+ 
++	ClassFileReader reader = null;
+ 	try {
+-		ClassFileReader reader = ClassFileReader.read(binaryLocation + qualifiedBinaryFileName);
+-		if (reader != null) {
+-			if (this.accessRuleSet == null)
+-				return new NameEnvironmentAnswer(reader, null);
+-			String fileNameWithoutExtension = qualifiedBinaryFileName.substring(0, qualifiedBinaryFileName.length() - SuffixConstants.SUFFIX_CLASS.length);
+-			return new NameEnvironmentAnswer(reader, this.accessRuleSet.getViolatedRestriction(fileNameWithoutExtension.toCharArray()));
+-		}
+-	} catch (Exception e) {
+-		// handle the case when the project is the output folder and the top-level package is a linked folder
+-		if (binaryFolder instanceof IProject) {
+-			IResource file = binaryFolder.findMember(qualifiedBinaryFileName);
+-			if (file instanceof IFile) {
+-				IPath location = file.getLocation();
+-				if (location != null) {
+-					try {
+-						ClassFileReader reader = ClassFileReader.read(location.toString());
+-						if (reader != null) {
+-							if (this.accessRuleSet == null)
+-								return new NameEnvironmentAnswer(reader, null);
+-							String fileNameWithoutExtension = qualifiedBinaryFileName.substring(0, qualifiedBinaryFileName.length() - SuffixConstants.SUFFIX_CLASS.length);
+-							return new NameEnvironmentAnswer(reader, this.accessRuleSet.getViolatedRestriction(fileNameWithoutExtension.toCharArray()));
+-						}
+-					} catch (Exception ignored) { // treat as if class file is missing
+-					}
+-				}
+-			}
+-		}
++		reader = Util.newClassFileReader(this.binaryFolder.getFile(new Path(qualifiedBinaryFileName)));
++	} catch (CoreException e) {
++		return null;
++	} catch (ClassFormatException e) {
++		return null;
++	} catch (IOException e) {
++		return null;
++	}
++	if (reader != null) {
++		if (this.accessRuleSet == null)
++			return new NameEnvironmentAnswer(reader, null);
++		String fileNameWithoutExtension = qualifiedBinaryFileName.substring(0, qualifiedBinaryFileName.length() - SuffixConstants.SUFFIX_CLASS.length);
++		return new NameEnvironmentAnswer(reader, this.accessRuleSet.getViolatedRestriction(fileNameWithoutExtension.toCharArray()));
+ 	}
+ 	return null;
+ }
+@@ -154,7 +142,7 @@ public String toString() {
+ }
+ 
+ public String debugPathString() {
+-	return this.binaryLocation;
++	return this.binaryFolder.getFullPath().toString();
+ }
+ 
+ 
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/IncrementalImageBuilder.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/IncrementalImageBuilder.java
+index f035e49..df37e59 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/IncrementalImageBuilder.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/IncrementalImageBuilder.java
+@@ -23,6 +23,7 @@ import org.eclipse.jdt.internal.core.util.Messages;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+ import java.io.*;
++import java.net.URI;
+ import java.util.*;
+ 
+ /**
+@@ -674,9 +675,10 @@ protected boolean writeClassFileCheck(IFile file, String fileName, byte[] newByt
+ 				if (newBytes[i] != oldBytes[i]) break notEqual;
+ 			return false; // bytes are identical so skip them
+ 		}
+-		IPath location = file.getLocation();
+-		if (location == null) return false; // unable to determine location of this class file
+-		ClassFileReader reader = new ClassFileReader(oldBytes, location.toString().toCharArray());
++		URI uri = file.getLocationURI();
++		if (uri == null) return false; // unable to determine location of this class file
++		String filePath = uri.getPath();
++		ClassFileReader reader = new ClassFileReader(oldBytes, filePath.toCharArray());
+ 		// ignore local types since they're only visible inside a single method
+ 		if (!(reader.isLocal() || reader.isAnonymous()) && reader.hasStructuralChanges(newBytes)) {
+ 			if (JavaBuilder.DEBUG)
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/HierarchyBuilder.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/HierarchyBuilder.java
+index 0ca1ba0..df3d3cc 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/HierarchyBuilder.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/HierarchyBuilder.java
+@@ -13,6 +13,8 @@ package org.eclipse.jdt.internal.core.hierarchy;
+ import java.util.HashMap;
+ import java.util.Map;
+ 
++import org.eclipse.core.resources.IFile;
++import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.OperationCanceledException;
+@@ -25,6 +27,7 @@ import org.eclipse.jdt.internal.compiler.env.IGenericType;
+ import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+ import org.eclipse.jdt.internal.compiler.problem.DefaultProblemFactory;
+ import org.eclipse.jdt.internal.core.*;
++import org.eclipse.jdt.internal.core.util.ResourceCompilationUnit;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+ public abstract class HierarchyBuilder {
+@@ -247,9 +250,9 @@ public abstract class HierarchyBuilder {
+ /**
+  * Create an ICompilationUnit info from the given compilation unit on disk.
+  */
+-protected ICompilationUnit createCompilationUnitFromPath(Openable handle, String osPath) {
++protected ICompilationUnit createCompilationUnitFromPath(Openable handle, IFile file) {
+ 	final char[] elementName = handle.getElementName().toCharArray();
+-	return new BasicCompilationUnit(null/* no source*/, null/* no package */, osPath, handle) {
++	return new ResourceCompilationUnit(file) {
+ 		public char[] getFileName() {
+ 			return elementName;
+ 		}
+@@ -259,10 +262,10 @@ protected ICompilationUnit createCompilationUnitFromPath(Openable handle, String
+  * Creates the type info from the given class file on disk and
+  * adds it to the given list of infos.
+  */
+-protected IBinaryType createInfoFromClassFile(Openable handle, String osPath) {
++protected IBinaryType createInfoFromClassFile(Openable handle, IResource file) {
+ 	IBinaryType info = null;
+ 	try {
+-		info = org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader.read(osPath);
++		info = Util.newClassFileReader(file);
+ 	} catch (org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException e) {
+ 		if (TypeHierarchy.DEBUG) {
+ 			e.printStackTrace();
+@@ -273,6 +276,11 @@ protected IBinaryType createInfoFromClassFile(Openable handle, String osPath) {
+ 			e.printStackTrace();
+ 		}
+ 		return null;
++	} catch (CoreException e) {
++		if (TypeHierarchy.DEBUG) {
++			e.printStackTrace();
++		}
++		return null;
+ 	}						
+ 	this.infoToHandle.put(info, handle);
+ 	return info;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/HierarchyResolver.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/HierarchyResolver.java
+index 7df02b7..7a47dcf 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/HierarchyResolver.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/HierarchyResolver.java
+@@ -27,6 +27,7 @@ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Map;
+ 
++import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.IProgressMonitor;
+@@ -40,9 +41,6 @@ import org.eclipse.jdt.internal.compiler.DefaultErrorHandlingPolicies;
+ import org.eclipse.jdt.internal.compiler.IErrorHandlingPolicy;
+ import org.eclipse.jdt.internal.compiler.IProblemFactory;
+ import org.eclipse.jdt.internal.compiler.ast.*;
+-import org.eclipse.jdt.internal.compiler.ast.CompilationUnitDeclaration;
+-import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
+-import org.eclipse.jdt.internal.compiler.ast.TypeReference;
+ import org.eclipse.jdt.internal.compiler.env.AccessRestriction;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+@@ -52,18 +50,12 @@ import org.eclipse.jdt.internal.compiler.env.ISourceType;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.impl.ITypeRequestor;
+ import org.eclipse.jdt.internal.compiler.lookup.*;
+-import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding;
+-import org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment;
+-import org.eclipse.jdt.internal.compiler.lookup.PackageBinding;
+-import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+-import org.eclipse.jdt.internal.compiler.lookup.TypeIds;
+ import org.eclipse.jdt.internal.compiler.parser.Parser;
+ import org.eclipse.jdt.internal.compiler.parser.SourceTypeConverter;
+ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+ import org.eclipse.jdt.internal.compiler.problem.ProblemReporter;
+ import org.eclipse.jdt.internal.compiler.util.Messages;
+ import org.eclipse.jdt.internal.core.*;
+-import org.eclipse.jdt.internal.core.Member;
+ import org.eclipse.jdt.internal.core.util.ASTNodeFinder;
+ import org.eclipse.jdt.internal.core.util.HandleFactory;
+ 
+@@ -569,9 +561,8 @@ public void resolve(Openable[] openables, HashSet localTypes, IProgressMonitor m
+ 					if (containsLocalType) 	parsedUnit.bits |= ASTNode.HasAllMethodBodies;
+ 				} else {
+ 					// create parsed unit from file
+-					IResource file = cu.getResource();
+-					String osPath = file.getLocation().toOSString();
+-					ICompilationUnit sourceUnit = this.builder.createCompilationUnitFromPath(openable, osPath);
++					IFile file = (IFile) cu.getResource();
++					ICompilationUnit sourceUnit = this.builder.createCompilationUnitFromPath(openable, file);
+ 					
+ 					CompilationResult unitResult = new CompilationResult(sourceUnit, i, openablesLength, this.options.maxProblemsPerUnit); 
+ 					parsedUnit = parser.dietParse(sourceUnit, unitResult);
+@@ -608,8 +599,7 @@ public void resolve(Openable[] openables, HashSet localTypes, IProgressMonitor m
+ 						binaryType = this.builder.createInfoFromClassFileInJar(classFile);
+ 					} else {
+ 						IResource file = classFile.getResource();
+-						String osPath = file.getLocation().toOSString();
+-						binaryType = this.builder.createInfoFromClassFile(classFile, osPath);
++						binaryType = this.builder.createInfoFromClassFile(classFile, file);
+ 					}
+ 				}
+ 				if (binaryType != null) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/IndexBasedHierarchyBuilder.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/IndexBasedHierarchyBuilder.java
+index 33740f9..7ec2ed9 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/IndexBasedHierarchyBuilder.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/hierarchy/IndexBasedHierarchyBuilder.java
+@@ -12,6 +12,8 @@ package org.eclipse.jdt.internal.core.hierarchy;
+ 
+ import java.util.*;
+ 
++import org.eclipse.core.resources.IFile;
++import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.SubProgressMonitor;
+@@ -326,19 +328,19 @@ private void buildFromPotentialSubtypes(String[] allPotentialSubTypes, HashSet l
+ 		if (monitor != null) monitor.done();
+ 	}
+ }
+-protected ICompilationUnit createCompilationUnitFromPath(Openable handle, String osPath) {
+-	ICompilationUnit unit = super.createCompilationUnitFromPath(handle, osPath);
++protected ICompilationUnit createCompilationUnitFromPath(Openable handle, IFile file) {
++	ICompilationUnit unit = super.createCompilationUnitFromPath(handle, file);
+ 	this.cuToHandle.put(unit, handle);
+ 	return unit;
+ }
+-protected IBinaryType createInfoFromClassFile(Openable classFile, String osPath) {
++protected IBinaryType createInfoFromClassFile(Openable classFile, IResource file) {
+ 	String documentPath = classFile.getPath().toString();
+ 	IBinaryType binaryType = (IBinaryType)this.binariesFromIndexMatches.get(documentPath);
+ 	if (binaryType != null) {
+ 		this.infoToHandle.put(binaryType, classFile);
+ 		return binaryType;
+ 	} else {
+-		return super.createInfoFromClassFile(classFile, osPath);
++		return super.createInfoFromClassFile(classFile, file);
+ 	}
+ }
+ protected IBinaryType createInfoFromClassFileInJar(Openable classFile) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ResourceCompilationUnit.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ResourceCompilationUnit.java
+new file mode 100644
+index 0000000..81401ac
+--- /dev/null
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ResourceCompilationUnit.java
+@@ -0,0 +1,41 @@
++/*******************************************************************************
++ * Copyright (c) 2000, 2005 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core.util;
++
++import org.eclipse.core.resources.IFile;
++import org.eclipse.jdt.core.JavaModelException;
++import org.eclipse.jdt.core.compiler.CharOperation;
++import org.eclipse.jdt.internal.compiler.batch.CompilationUnit;
++
++/**
++ * An ICompilationUnit that retrieves its contents using an IFile
++ */
++public class ResourceCompilationUnit extends CompilationUnit {
++	
++	private IFile file;
++	
++	public ResourceCompilationUnit(IFile file) {
++		super(null/*no contents*/, file.getLocationURI() == null ? file.getFullPath().toString() : file.getLocationURI().getPath(), null/*encoding is used only when retrieving the contents*/);
++		this.file = file;
++	}
++
++	public char[] getContents() {
++		if (this.contents != null)
++			return this.contents;   // answer the cached source
++	
++		// otherwise retrieve it
++		try {
++			return Util.getResourceContentsAsCharArray(this.file);
++		} catch (JavaModelException e) {
++			return CharOperation.NO_CHAR;
++		}
++	}
++}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/Util.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/Util.java
+index e519063..de5c146 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/Util.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/Util.java
+@@ -11,10 +11,13 @@
+ package org.eclipse.jdt.internal.core.util;
+ 
+ import java.io.*;
++import java.net.URI;
+ import java.util.*;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipFile;
+ 
++import org.eclipse.core.filesystem.EFS;
++import org.eclipse.core.filesystem.IFileStore;
+ import org.eclipse.core.resources.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.core.runtime.content.IContentType;
+@@ -736,6 +739,7 @@ public class Util {
+ 		}
+ 		return null;
+ 	}
++	
+ 	/**
+ 	 * Returns the registered Java like extensions.
+ 	 */
+@@ -780,48 +784,45 @@ public class Util {
+ 	 */
+ 	public static long getJdkLevel(Object targetLibrary) {
+ 		try {
+-				ClassFileReader reader = null;
+-				if (targetLibrary instanceof IFolder) {
+-					IFile classFile = findFirstClassFile((IFolder) targetLibrary); // only internal classfolders are allowed
+-					if (classFile != null) {
+-						byte[] bytes = Util.getResourceContentsAsByteArray(classFile);
+-						IPath location = classFile.getLocation();
+-						reader = new ClassFileReader(bytes, location == null ? null : location.toString().toCharArray());
+-					}
+-				} else {
+-					// root is a jar file or a zip file
+-					ZipFile jar = null;
+-					try {
+-						IPath path = null;
+-						if (targetLibrary instanceof IResource) {
+-							path = ((IResource)targetLibrary).getLocation();
+-						} else if (targetLibrary instanceof File){
+-							File f = (File) targetLibrary;
+-							if (!f.isDirectory()) {
+-								path = new Path(((File)targetLibrary).getPath());
+-							}
++			ClassFileReader reader = null;
++			if (targetLibrary instanceof IFolder) {
++				IFile classFile = findFirstClassFile((IFolder) targetLibrary); // only internal classfolders are allowed
++				if (classFile != null)
++					reader = Util.newClassFileReader(classFile);
++			} else {
++				// root is a jar file or a zip file
++				ZipFile jar = null;
++				try {
++					IPath path = null;
++					if (targetLibrary instanceof IResource) {
++						path = ((IResource)targetLibrary).getLocation();
++					} else if (targetLibrary instanceof File){
++						File f = (File) targetLibrary;
++						if (!f.isDirectory()) {
++							path = new Path(((File)targetLibrary).getPath());
+ 						}
+-						if (path != null) {
+-							jar = JavaModelManager.getJavaModelManager().getZipFile(path);
+-							for (Enumeration e= jar.entries(); e.hasMoreElements();) {
+-								ZipEntry member= (ZipEntry) e.nextElement();
+-								String entryName= member.getName();
+-								if (org.eclipse.jdt.internal.compiler.util.Util.isClassFileName(entryName)) {
+-									reader = ClassFileReader.read(jar, entryName);
+-									break;
+-								}
++					}
++					if (path != null) {
++						jar = JavaModelManager.getJavaModelManager().getZipFile(path);
++						for (Enumeration e= jar.entries(); e.hasMoreElements();) {
++							ZipEntry member= (ZipEntry) e.nextElement();
++							String entryName= member.getName();
++							if (org.eclipse.jdt.internal.compiler.util.Util.isClassFileName(entryName)) {
++								reader = ClassFileReader.read(jar, entryName);
++								break;
+ 							}
+ 						}
+-					} catch (CoreException e) {
+-						// ignore
+-					} finally {
+-						JavaModelManager.getJavaModelManager().closeZipFile(jar);
+ 					}
++				} catch (CoreException e) {
++					// ignore
++				} finally {
++					JavaModelManager.getJavaModelManager().closeZipFile(jar);
+ 				}
+-				if (reader != null) {
+-					return reader.getVersion();
+-				}
+-		} catch(JavaModelException e) {
++			}
++			if (reader != null) {
++				return reader.getVersion();
++			}
++		} catch (CoreException e) {
+ 			// ignore
+ 		} catch(ClassFormatException e) {
+ 			// ignore
+@@ -1358,6 +1359,20 @@ public class Util {
+ 		JavaCore.getPlugin().getLog().log(status);
+ 	}	
+ 	
++	public static ClassFileReader newClassFileReader(IResource resource) throws CoreException, ClassFormatException, IOException {
++		InputStream in = null;
++		try {
++			URI uri = resource.getLocationURI();
++			if (uri == null) return null;
++			IFileStore store = EFS.getStore(uri);
++			in = store.openInputStream(EFS.NONE, null);
++			return ClassFileReader.read(in, uri.getPath());
++		} finally {
++			if (in != null)
++				in.close();
++		}
++	}
++
+ 	/**
+ 	 * Normalizes the cariage returns in the given text.
+ 	 * They are all changed  to use the given buffer's line separator.
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexAllProject.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexAllProject.java
+index e7b2fea..9024a8b 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexAllProject.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexAllProject.java
+@@ -11,8 +11,10 @@
+ package org.eclipse.jdt.internal.core.search.indexing;
+ 
+ import java.io.IOException;
++import java.net.URI;
+ import java.util.HashSet;
+ 
++import org.eclipse.core.filesystem.EFS;
+ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.resources.IProject;
+ import org.eclipse.core.resources.IResource;
+@@ -137,7 +139,7 @@ public class IndexAllProject extends IndexRequest {
+ 										case IResource.FILE :
+ 											if (org.eclipse.jdt.internal.core.util.Util.isJavaLikeFileName(proxy.getName())) {
+ 												IFile file = (IFile) proxy.requestResource();
+-												if (file.getLocation() == null) return false;
++												if (file.getLocationURI() == null) return false;
+ 												if (exclusionPatterns != null || inclusionPatterns != null)
+ 													if (Util.isExcluded(file, inclusionPatterns, exclusionPatterns))
+ 														return false;
+@@ -161,20 +163,21 @@ public class IndexAllProject extends IndexRequest {
+ 					} else {
+ 						sourceFolder.accept(
+ 							new IResourceProxyVisitor() {
+-								public boolean visit(IResourceProxy proxy) {
++								public boolean visit(IResourceProxy proxy) throws CoreException {
+ 									if (isCancelled) return false;
+ 									switch(proxy.getType()) {
+ 										case IResource.FILE :
+ 											if (org.eclipse.jdt.internal.core.util.Util.isJavaLikeFileName(proxy.getName())) {
+ 												IFile file = (IFile) proxy.requestResource();
+-												IPath location = file.getLocation();
+-												if (location == null) return false;
++												URI uri = file.getLocationURI();
++												if (uri == null) return false;
+ 												if (exclusionPatterns != null || inclusionPatterns != null)
+ 													if (Util.isExcluded(file, inclusionPatterns, exclusionPatterns))
+ 														return false;
+ 												String relativePathString = Util.relativePath(file.getFullPath(), 1/*remove project segment*/);
+ 												indexedFileNames.put(relativePathString,
+-													indexedFileNames.get(relativePathString) == null || indexLastModified < location.toFile().lastModified()
++													indexedFileNames.get(relativePathString) == null 
++															|| indexLastModified < EFS.getStore(uri).fetchInfo().getLastModified()
+ 														? (Object) file
+ 														: (Object) OK);
+ 											}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexBinaryFolder.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexBinaryFolder.java
+index c6d3057..d246b0c 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexBinaryFolder.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexBinaryFolder.java
+@@ -11,14 +11,15 @@
+ package org.eclipse.jdt.internal.core.search.indexing;
+ 
+ import java.io.IOException;
++import java.net.URI;
+ 
++import org.eclipse.core.filesystem.EFS;
+ import org.eclipse.core.resources.IContainer;
+ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.resources.IResourceProxy;
+ import org.eclipse.core.resources.IResourceProxyVisitor;
+ import org.eclipse.core.runtime.CoreException;
+-import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.core.index.Index;
+@@ -67,7 +68,7 @@ public class IndexBinaryFolder extends IndexRequest {
+ 						if (proxy.getType() == IResource.FILE) {
+ 							if (org.eclipse.jdt.internal.compiler.util.Util.isClassFileName(proxy.getName())) {
+ 								IFile file = (IFile) proxy.requestResource();
+-								if (file.getLocation() != null) {
++								if (file.getLocationURI() != null) {
+ 									String containerRelativePath = Util.relativePath(file.getFullPath(), containerPath.segmentCount());
+ 									indexedFileNames.put(containerRelativePath, file);
+ 								}
+@@ -84,16 +85,18 @@ public class IndexBinaryFolder extends IndexRequest {
+ 				final long indexLastModified = index.getIndexFile().lastModified();
+ 				this.folder.accept(
+ 					new IResourceProxyVisitor() {
+-						public boolean visit(IResourceProxy proxy) {
++						public boolean visit(IResourceProxy proxy) throws CoreException {
+ 							if (isCancelled) return false;
+ 							if (proxy.getType() == IResource.FILE) {
+ 								if (org.eclipse.jdt.internal.compiler.util.Util.isClassFileName(proxy.getName())) {
+ 									IFile file = (IFile) proxy.requestResource();
+-									IPath location = file.getLocation();
+-									if (location != null) {
++									URI uri = file.getLocationURI();
++									if (uri != null) {
+ 										String containerRelativePath = Util.relativePath(file.getFullPath(), containerPath.segmentCount());
+ 										indexedFileNames.put(containerRelativePath,
+-											indexedFileNames.get(containerRelativePath) == null || indexLastModified < location.toFile().lastModified()
++											indexedFileNames.get(containerRelativePath) == null 
++													|| indexLastModified < 
++													EFS.getStore(uri).fetchInfo().getLastModified()
+ 												? (Object) file
+ 												: (Object) OK);
+ 									}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
+index eeff45e..2bbbac7 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
+@@ -16,17 +16,15 @@ import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.Path;
+-import org.eclipse.jdt.internal.compiler.batch.CompilationUnit;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.core.builder.ClasspathLocation;
++import org.eclipse.jdt.internal.core.util.ResourceCompilationUnit;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+ public class ClasspathSourceDirectory extends ClasspathLocation {
+ 
+ 	IContainer sourceFolder;
+-	String sourceLocation; 
+-	String encoding;
+ 	SimpleLookupTable directoryCache;
+ 	String[] missingPackageHolder = new String[1];
+ 	char[][] fullExclusionPatternChars;
+@@ -34,15 +32,6 @@ public class ClasspathSourceDirectory extends ClasspathLocation {
+ 
+ ClasspathSourceDirectory(IContainer sourceFolder, char[][] fullExclusionPatternChars, char[][] fulInclusionPatternChars) {
+ 	this.sourceFolder = sourceFolder;
+-	IPath location = sourceFolder.getLocation();
+-	this.sourceLocation = location != null ? location.addTrailingSeparator().toString() : ""; //$NON-NLS-1$
+-	// Store default encoding
+-	try {
+-		this.encoding = this.sourceFolder.getDefaultCharset();
+-	}
+-	catch (CoreException ce) {
+-		// let use no encoding by default
+-	}
+ 	this.directoryCache = new SimpleLookupTable(5);
+ 	this.fullExclusionPatternChars = fullExclusionPatternChars;
+ 	this.fulInclusionPatternChars = fulInclusionPatternChars;
+@@ -108,19 +97,11 @@ public NameEnvironmentAnswer findClass(String sourceFileWithoutExtension, String
+ 		if (!doesFileExist(sourceFileName, qualifiedPackageName)) continue; // most common case
+ 	
+ 		String qualifiedSourceFileName = qualifiedSourceFileWithoutExtension + extension;
+-		String fullSourcePath = this.sourceLocation + qualifiedSourceFileName;
+ 		if (org.eclipse.jdt.internal.compiler.util.Util.isExcluded((sourceFolderPath + qualifiedSourceFileName).toCharArray(), this.fulInclusionPatternChars, this.fullExclusionPatternChars, false/*not a folder path*/))
+ 			continue;
+ 		IPath path = new Path(qualifiedSourceFileName);
+ 		IFile file = this.sourceFolder.getFile(path);
+-		String fileEncoding = this.encoding;
+-		try {
+-			fileEncoding = file.getCharset();
+-		}
+-		catch (CoreException ce) {
+-			// let use default encoding
+-		}
+-		return new NameEnvironmentAnswer(new CompilationUnit(null, fullSourcePath, fileEncoding), null /* no access restriction */);
++		return new NameEnvironmentAnswer(new ResourceCompilationUnit(file), null /* no access restriction */);
+ 	}
+ 	return null;
+ }
+@@ -142,7 +123,7 @@ public String toString() {
+ }
+ 
+ public String debugPathString() {
+-	return this.sourceLocation;
++	return this.sourceFolder.getFullPath().toString();
+ }
+ 
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+index 522ea73..52de729 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+@@ -256,7 +256,7 @@ public static ClassFileReader classFileReader(IType type) {
+ 	IPackageFragmentRoot root = (IPackageFragmentRoot) pkg.getParent();
+ 	try {
+ 		if (!root.isArchive())
+-			return ClassFileReader.read(type.getResource().getLocation().toOSString());
++			return Util.newClassFileReader(type.getResource());
+ 
+ 		IPath zipPath = root.isExternal() ? root.getPath() : root.getResource().getLocation();
+ 		if (zipPath == null) return null; // location is null
+@@ -735,8 +735,7 @@ protected IBinaryType getBinaryInfo(ClassFile classFile, IResource resource) thr
+ 			}
+ 		} else {
+ 			// class file in a directory
+-			String osPath = resource.getLocation().toOSString();
+-			info = ClassFileReader.read(osPath);
++			info = Util.newClassFileReader(resource);
+ 		}
+ 		if (info == null) throw binaryType.newNotPresentException();
+ 		return info;

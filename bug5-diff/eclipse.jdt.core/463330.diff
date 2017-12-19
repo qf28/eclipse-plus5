@@ -1,0 +1,260 @@
+commit a4e58088a1010e10b50ef0d8683567f65215eac1
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Mar 28 02:06:11 2015 +0100
+
+    Bug 463330 - [dom] DOMFinder doesn't find the VariableBinding
+    corresponding to a method argument
+    
+    Change-Id: Ia3edf29f0ec085e8c930013eb0c61e65a59a3822
+    Signed-off-by: Stephan Herrmann <stephan.herrmann@berlin.de>
+
+39	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTModelBridgeTests.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Binding.java
+9	2	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/CompilationUnitResolver.java
+13	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/LocalVariable.java
+62	8	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/BindingKeyResolver.java
+7	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/DOMFinder.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTModelBridgeTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTModelBridgeTests.java
+index 0fd7a86..835b711 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTModelBridgeTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTModelBridgeTests.java
+@@ -1222,6 +1222,45 @@ public class ASTModelBridgeTests extends AbstractASTTests {
+ 	}
+ 
+ 	/*
++	 * Ensures that the correct IBindings are created for a given set of IJavaElement
++	 * (method arguments)
++	 */
++	public void testCreateBindings25() throws JavaModelException {
++		this.workingCopy.getBuffer().setContents(
++				"public class X {\n" +
++				"  void foo(String str, int i) {}\n" +
++				"}");
++		this.workingCopy.makeConsistent(null);
++		IMethod method = this.workingCopy.getType("X").getMethod("foo", new String[]{"QString;", "I"});
++		ASTParser parser = ASTParser.newParser(AST.JLS8);
++		parser.setProject(getJavaProject("P"));
++		IBinding[] bindings = parser.createBindings(method.getParameters(), null);
++		assertBindingsEqual(
++			"LX;.foo(Ljava/lang/String;I)V#str\n" +
++			"LX;.foo(Ljava/lang/String;I)V#i",
++			bindings);
++	}
++
++	/*
++	 * Ensures that the correct IBindings are created for a given set of IJavaElement
++	 * (binary method arguments)
++	 */
++	public void testCreateBindings26() throws CoreException {
++		createClassFile("/P/lib", "A.class",
++				"public class A {\n" +
++				"  void foo(String str, int i) {}\n" +
++				"}");
++		IMethod method = getClassFile("/P/lib/A.class").getType().getMethod("foo", new String[] {"Ljava.lang.String;", "I"});
++		ASTParser parser = ASTParser.newParser(AST.JLS8);
++		parser.setProject(getJavaProject("P"));
++		IBinding[] bindings = parser.createBindings(method.getParameters(), null);
++		assertBindingsEqual(
++			"LA;.foo(Ljava/lang/String;I)V#str\n" +
++			"LA;.foo(Ljava/lang/String;I)V#i",
++			bindings);
++	}
++
++	/*
+ 	 * Ensures that the IJavaElement of an IBinding representing a field is correct.
+ 	 */
+ 	public void testField1() throws JavaModelException {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Binding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Binding.java
+index 46203de..e8b4820 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Binding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Binding.java
+@@ -112,14 +112,14 @@ public abstract class Binding {
+ 	public abstract int kind();
+ 	/*
+ 	 * Computes a key that uniquely identifies this binding.
+-	 * Returns null if binding is not a TypeBinding, a MethodBinding, a FieldBinding or a PackageBinding.
++	 * Returns null if binding is not a TypeBinding, a MethodBinding, a FieldBinding, a LocalVariableBinding or a PackageBinding (i.e. an ImportBinding).
+ 	 */
+ 	public char[] computeUniqueKey() {
+ 		return computeUniqueKey(true/*leaf*/);
+ 	}
+ 	/*
+ 	 * Computes a key that uniquely identifies this binding. Optionally include access flags.
+-	 * Returns null if binding is not a TypeBinding, a MethodBinding, a FieldBinding or a PackageBinding.
++	 * Returns null if binding is not a TypeBinding, a MethodBinding, a FieldBinding, a LocalVariableBinding or a PackageBinding (i.e. an ImportBinding)
+ 	 */
+ 	public char[] computeUniqueKey(boolean isLeaf) {
+ 		return null;
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/CompilationUnitResolver.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/CompilationUnitResolver.java
+index b6ebffa..c495557 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/CompilationUnitResolver.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/CompilationUnitResolver.java
+@@ -58,6 +58,7 @@ import org.eclipse.jdt.internal.core.CancelableNameEnvironment;
+ import org.eclipse.jdt.internal.core.CancelableProblemFactory;
+ import org.eclipse.jdt.internal.core.INameEnvironmentWithProgress;
+ import org.eclipse.jdt.internal.core.JavaProject;
++import org.eclipse.jdt.internal.core.LocalVariable;
+ import org.eclipse.jdt.internal.core.NameLookup;
+ import org.eclipse.jdt.internal.core.SourceRefElement;
+ import org.eclipse.jdt.internal.core.SourceTypeElementInfo;
+@@ -753,9 +754,15 @@ class CompilationUnitResolver extends Compiler {
+ 				}
+ 				intList.add(i);
+ 			} else {
+-				// binary member
++				// binary member or method argument
+ 				try {
+-					String key = ((BinaryMember) element).getKey(true/*open to get resolved info*/);
++					String key;
++					if (element instanceof BinaryMember)
++						key = ((BinaryMember) element).getKey(true/*open to get resolved info*/);
++					else if (element instanceof LocalVariable)
++						key = ((LocalVariable) element).getKey(true/*open to get resolved info*/);
++					else
++						throw new IllegalArgumentException(element + " has an unexpected type"); //$NON-NLS-1$
+ 					binaryElementPositions.put(key, i);
+ 				} catch (JavaModelException e) {
+ 					throw new IllegalArgumentException(element + " does not exist"); //$NON-NLS-1$
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/LocalVariable.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/LocalVariable.java
+index 1e5dedf..f05213b 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/LocalVariable.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/LocalVariable.java
+@@ -459,6 +459,19 @@ public class LocalVariable extends SourceRefElement implements ILocalVariable {
+ 		return true;
+ 	}
+ 
++	/**
++	 * @see org.eclipse.jdt.internal.compiler.lookup.Binding#computeUniqueKey()
++	 */
++	public String getKey(boolean forceOpen) throws JavaModelException {
++		if (this.parent.getElementType() == IJavaElement.METHOD) {
++			StringBuilder buf = new StringBuilder(((IMethod)this.parent).getKey());
++			buf.append('#');
++			buf.append(this.name);
++			return buf.toString();
++		}
++		return null;
++	}
++
+ 	protected void toStringInfo(int tab, StringBuffer buffer, Object info, boolean showResolvedInfo) {
+ 		buffer.append(tabString(tab));
+ 		if (info != NO_INFO) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/BindingKeyResolver.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/BindingKeyResolver.java
+index a46552b..cd63189 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/BindingKeyResolver.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/BindingKeyResolver.java
+@@ -18,6 +18,7 @@ import org.eclipse.jdt.core.Signature;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.ASTVisitor;
+ import org.eclipse.jdt.internal.compiler.Compiler;
++import org.eclipse.jdt.internal.compiler.ast.AbstractMethodDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.ArrayReference;
+ import org.eclipse.jdt.internal.compiler.ast.Assignment;
+ import org.eclipse.jdt.internal.compiler.ast.CastExpression;
+@@ -55,6 +56,44 @@ import org.eclipse.jdt.internal.compiler.util.HashtableOfObject;
+ 
+ @SuppressWarnings({"rawtypes", "unchecked"})
+ public class BindingKeyResolver extends BindingKeyParser {
++
++	/** Synthetic bindings for local variables (method arguments) restored from a binding key. */
++	private final class SyntheticLocalVariableBinding extends LocalVariableBinding {
++
++		private final MethodBinding enclosingMethod;
++		private char[] key;
++
++		SyntheticLocalVariableBinding(char[] name, TypeBinding type, MethodBinding enclosingMethod) {
++			super(name, type, 0, true);
++			this.enclosingMethod = enclosingMethod;
++		}
++
++		@Override
++		public char[] computeUniqueKey() {
++			if (this.key == null) {
++				// have no scope to find the enclosing method, so use the captured method:
++				StringBuilder buf = new StringBuilder().append(this.enclosingMethod.computeUniqueKey());
++				buf.append('#');
++				buf.append(this.name);
++				int length = buf.length();
++				this.key = new char[length];
++				buf.getChars(0, length, this.key, 0);
++			}
++			return this.key;
++		}
++		
++		@Override
++		public int hashCode() {
++			return CharOperation.hashCode(computeUniqueKey());
++		}
++
++		public boolean equals(Object obj) {
++			if (!(obj instanceof SyntheticLocalVariableBinding))
++				return false;
++			return CharOperation.equals(computeUniqueKey(), ((SyntheticLocalVariableBinding) obj).computeUniqueKey());
++		}
++	}
++
+ 	Compiler compiler;
+ 	Binding compilerBinding;
+ 
+@@ -290,15 +329,30 @@ public class BindingKeyResolver extends BindingKeyParser {
+ 		if (this.scope == null) {
+ 			if (this.methodBinding == null)
+ 				return;
+-			this.scope = this.methodBinding.sourceMethod().scope;
++			AbstractMethodDeclaration sourceMethod = this.methodBinding.sourceMethod();
++			if (sourceMethod != null) {
++				this.scope = sourceMethod.scope;
++			} else {
++				char[][] parameterNames = this.methodBinding.parameterNames;
++				for (int i = 0; i < parameterNames.length; i++) {
++					if (CharOperation.equals(parameterNames[i], varName)) {
++						// we don't have a compiler binding for this argument, but we can craft one:
++						this.compilerBinding = new SyntheticLocalVariableBinding(varName, this.methodBinding.parameters[i], this.methodBinding);
++						this.methodBinding = null;
++						return;
++					}
++				}
++			}
+ 		}
+-	 	for (int i = 0; i < this.scope.localIndex; i++) {
+-			LocalVariableBinding local = this.scope.locals[i];
+-			if (CharOperation.equals(local.name, varName)
+-					&& occurrenceCount-- == 0) {
+-				this.methodBinding = null;
+-				this.compilerBinding = local;
+-				return;
++		if (this.scope != null) {
++		 	for (int i = 0; i < this.scope.localIndex; i++) {
++				LocalVariableBinding local = this.scope.locals[i];
++				if (CharOperation.equals(local.name, varName)
++						&& occurrenceCount-- == 0) {
++					this.methodBinding = null;
++					this.compilerBinding = local;
++					return;
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/DOMFinder.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/DOMFinder.java
+index f56ce63..78a6990 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/DOMFinder.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/DOMFinder.java
+@@ -32,6 +32,7 @@ import org.eclipse.jdt.core.dom.NormalAnnotation;
+ import org.eclipse.jdt.core.dom.PackageDeclaration;
+ import org.eclipse.jdt.core.dom.ParameterizedType;
+ import org.eclipse.jdt.core.dom.SingleMemberAnnotation;
++import org.eclipse.jdt.core.dom.SingleVariableDeclaration;
+ import org.eclipse.jdt.core.dom.TypeDeclaration;
+ import org.eclipse.jdt.core.dom.TypeParameter;
+ import org.eclipse.jdt.core.dom.VariableDeclarationFragment;
+@@ -177,4 +178,10 @@ public class DOMFinder extends ASTVisitor {
+ 			this.foundBinding = node.resolveBinding();
+ 		return true;
+ 	}
++
++	public boolean visit(SingleVariableDeclaration node) {
++		if (found(node, node) && this.resolveBinding)
++			this.foundBinding = node.resolveBinding();
++		return true;		
++	}
+ }

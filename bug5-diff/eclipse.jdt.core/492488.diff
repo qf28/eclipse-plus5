@@ -1,0 +1,1060 @@
+commit 953d1c8a34c3bc4b5525319d237c9a12fe9f06cb
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Tue Apr 26 13:11:38 2016 -0700
+
+    Bug 492488 - Add change notifications to the new index
+    
+    Add a listener interface to Nd.
+    
+    Change-Id: I63799118d4d5c8a99564f816245eb9b35d5dd18a
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+62	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/LocalPath.java
+78	39	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+7	3	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+1	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+10	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/LocalPath.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/LocalPath.java
+new file mode 100644
+index 0000000..e0401e4
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/LocalPath.java
+@@ -0,0 +1,62 @@
++package org.eclipse.jdt.internal.core.nd;
++
++import org.eclipse.core.runtime.IPath;
++
++/**
++ * Stores a local path, either as a path on the local filesystem or a workspace-relative path.
++ * @since 3.12
++ */
++public final class LocalPath {
++	private final boolean isWorkspacePath;
++	private final IPath path;
++
++	private LocalPath(boolean isWorkspacePath, IPath path) {
++		super();
++		this.isWorkspacePath = isWorkspacePath;
++		this.path = path;
++	}
++
++	public static LocalPath createFileSystem(IPath path) {
++		return new LocalPath(false, path);
++	}
++
++	public static LocalPath createWorkspace(IPath path) {
++		return new LocalPath(true, path);
++	}
++
++	public boolean isWorkspacePath() {
++		return this.isWorkspacePath;
++	}
++
++	public IPath getPath() {
++		return this.path;
++	}
++
++	@Override
++	public int hashCode() {
++		final int prime = 31;
++		int result = 1;
++		result = prime * result + (this.isWorkspacePath ? 1231 : 1237);
++		result = prime * result + ((this.path == null) ? 0 : this.path.hashCode());
++		return result;
++	}
++
++	@Override
++	public boolean equals(Object obj) {
++		if (this == obj)
++			return true;
++		if (obj == null)
++			return false;
++		if (getClass() != obj.getClass())
++			return false;
++		LocalPath other = (LocalPath) obj;
++		if (this.isWorkspacePath != other.isWorkspacePath)
++			return false;
++		if (this.path == null) {
++			if (other.path != null)
++				return false;
++		} else if (!this.path.equals(other.path))
++			return false;
++		return true;
++	}
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+index 5a3b4c2..aa3e375 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+@@ -12,11 +12,13 @@ package org.eclipse.jdt.internal.core.nd;
+ 
+ import java.io.File;
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.WeakHashMap;
+ 
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.OperationCanceledException;
+@@ -69,53 +71,39 @@ public class Nd {
+ 		return "" + major + '.' + minor; //$NON-NLS-1$
+ 	}
+ 
+-	public static class ChangeEvent {
+-		public Set<IIndexFileLocation> fClearedFiles= new HashSet<>();
+-		public Set<IIndexFileLocation> fFilesWritten= new HashSet<>();
+-		private boolean fCleared;
+-		private boolean fReloaded;
+-		private boolean fNewFiles;
+-
+-//		private void setCleared() {
+-//			this.fCleared= true;
+-//			this.fReloaded= false;
+-//			this.fNewFiles= false;
+-//
+-//			this.fClearedFiles.clear();
+-//			this.fFilesWritten.clear();
+-//		}
+-
+-		public boolean isCleared() {
+-			return this.fCleared;
+-		}
+-
+-		public void setReloaded() {
+-			this.fReloaded= true;
+-		}
++	public interface Listener {
++		void consume(ChangeEvent event);
++	}
+ 
+-		public boolean isReloaded() {
+-			return this.fReloaded;
+-		}
++	public static class ChangeEvent {
++		private final Set<LocalPath> filesModified;
+ 
+-		public void setHasNewFiles() {
+-			this.fNewFiles = true;
++		public ChangeEvent(Set<LocalPath> changes) {
++			this.filesModified = changes;
+ 		}
+ 
+-		public boolean hasNewFiles() {
+-			return this.fNewFiles;
++		public Set<LocalPath> getFilesModified() {
++			return this.filesModified;
+ 		}
+ 
+ 		public boolean isTrivial() {
+-			return !this.fCleared && !this.fReloaded && !this.fNewFiles && this.fClearedFiles.isEmpty() &&
+-					this.fFilesWritten.isEmpty();
++			return this.filesModified.isEmpty();
+ 		}
+ 	}
+ 
+ 	// Local caches
+ 	protected Database db;
+ 	private File fPath;
+-	private final HashMap<Object, Object> fResultCache= new HashMap<>();
+-	protected ChangeEvent fEvent= new ChangeEvent();
++	private final HashMap<Object, Object> fResultCache = new HashMap<>();
++	/**
++	 * Holds the set of files which have been changed since the last index event was fired
++	 */
++	private Set<LocalPath> changes = new HashSet<>();
++	private Object listenersMutex = new Object();
++	/**
++	 * Listener list. Copy-on-write. Synchronize on "listenersMutex" before accessing.
++	 */
++	private Set<Listener> listeners = Collections.newSetFromMap(new WeakHashMap<Listener, Boolean>());
+ 	private final NdNodeTypeRegistry<NdNode> fNodeTypeRegistry;
+ 	private HashMap<Long, Throwable> pendingDeletions = new HashMap<>();
+ 
+@@ -323,7 +311,16 @@ public class Nd {
+ 		}
+ 	}
+ 
+-	final public void releaseWriteLock() {
++	/**
++	 * Should be called by the indexer to indicate a source file that has been
++	 * fully indexed.
++	 */
++	public final void markPathAsModified(LocalPath path) {
++		this.db.assertLocked();
++		this.changes.add(path);
++	}
++
++	public final void releaseWriteLock() {
+ 		releaseWriteLock(0, true);
+ 	}
+ 
+@@ -341,10 +338,14 @@ public class Nd {
+ 			Package.log(e);
+ 		}
+ 		assert this.lockCount == -1;
+-		if (!this.fEvent.isTrivial())
++		final ChangeEvent event;
++		if (this.changes.isEmpty()) {
++			event = null;
++		} else {
++			event = new ChangeEvent(this.changes);
+ 			this.lastWriteAccess= System.currentTimeMillis();
+-		//final ChangeEvent event= this.fEvent;
+-		this.fEvent= new ChangeEvent();
++			this.changes = new HashSet<>();
++		}
+ 		synchronized (this.mutex) {
+ 			if (sDEBUG_LOCKS) {
+ 				long timeHeld = this.lastWriteAccess - this.timeWriteLockAcquired;
+@@ -359,7 +360,45 @@ public class Nd {
+ 			this.mutex.notifyAll();
+ 			this.db.setLocked(this.lockCount != 0);
+ 		}
+-		//fireChange(event);
++		if (event != null) {
++			fireChange(event);
++		}
++	}
++
++	/**
++	 * Adds the given listener. It will be notified when Nd changes. No strong references
++	 * will be retained to the listener.
++	 */
++	public void addListener(Listener newListener) {
++		synchronized (this.listenersMutex) {
++			Set<Listener> oldListeners = this.listeners;
++			this.listeners = Collections.newSetFromMap(new WeakHashMap<Listener, Boolean>());
++			this.listeners.addAll(oldListeners);
++			this.listeners.add(newListener);
++		}
++	}
++
++	public void removeListener(Listener oldListener) {
++		synchronized (this.listenersMutex) {
++			if (!this.listeners.contains(oldListener)) {
++				return;
++			}
++			Set<Listener> oldListeners = this.listeners;
++			this.listeners = Collections.newSetFromMap(new WeakHashMap<Listener, Boolean>());
++			this.listeners.addAll(oldListeners);
++			this.listeners.remove(oldListener);
++		}
++	}
++
++	private void fireChange(ChangeEvent event) {
++		Set<Listener> localListeners;
++		synchronized (this.listenersMutex) {
++			localListeners = this.listeners;
++		}
++
++		for (Listener next : localListeners) {
++			next.consume(event);
++		}
+ 	}
+ 
+ 	public boolean hasWaitingReaders() {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+index a8c78e4..a84d80f 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/db/Database.java
+@@ -280,9 +280,7 @@ public class Database {
+ 	 * @throws IndexException
+ 	 */
+ 	public Chunk getChunk(long offset) throws IndexException {
+-		if (!this.fLocked) {
+-			throw new IllegalStateException("Database not locked!"); //$NON-NLS-1$
+-		}
++		assertLocked();
+ 		if (offset < CHUNK_SIZE) {
+ 			return this.fHeaderChunk;
+ 		}
+@@ -308,6 +306,12 @@ public class Database {
+ 		}
+ 	}
+ 
++	public void assertLocked() {
++		if (!this.fLocked) {
++			throw new IllegalStateException("Database not locked!"); //$NON-NLS-1$
++		}
++	}
++
+ 	private void databaseCorruptionDetected() throws IndexException {
+ 		String msg = MessageFormat.format("Corrupted database: {0}", //$NON-NLS-1$
+ 				new Object[] { this.fLocation.getName() });
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+index 1bf7398..28d6474 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+@@ -269,6 +269,7 @@ public final class Indexer {
+ 		try {
+ 			if (resourceFile.isInIndex()) {
+ 				resourceFile.setFingerprint(fingerprint);
++				this.nd.markPathAsModified(resourceFile.getLocalFile());
+ 				List<NdResourceFile> resourceFiles = javaIndex.getAllResourceFiles(pathString);
+ 
+ 				for (NdResourceFile next : resourceFiles) {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+index 6a247aa..3df3eb2 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+@@ -17,6 +17,7 @@ import org.eclipse.core.resources.IProject;
+ import org.eclipse.core.resources.IWorkspaceRoot;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.Path;
++import org.eclipse.jdt.internal.core.nd.LocalPath;
+ import org.eclipse.jdt.internal.core.nd.Nd;
+ import org.eclipse.jdt.internal.core.nd.db.Database;
+ import org.eclipse.jdt.internal.core.nd.db.IString;
+@@ -218,4 +219,13 @@ public class NdResourceFile extends NdTreeNode {
+ 		}
+ 		return javaRoot;
+ 	}
++
++	public LocalPath getLocalFile() {
++		if (WORKSPACE_MAPPINGS.isEmpty(getNd(), this.address)) {
++			NdWorkspaceLocation workspaceLocation = WORKSPACE_MAPPINGS.get(getNd(), this.address, 0);
++
++			return LocalPath.createWorkspace(new Path(workspaceLocation.getPath().getString()));
++		}
++		return LocalPath.createFileSystem(new Path(getLocation().getString()));
++	}
+ }
+commit 92eb0402b66c4940bc5f151646ce06eb95f0d27c
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Fri May 27 12:58:35 2016 -0400
+
+    Bug 492488 - Add change notifications to the new index
+    
+    Defer events indicating a change in external archives until after the
+    indexer is done indexing them.
+
+10	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessingState.java
+23	11	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+3	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+2	55	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+101	6	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+19	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/IndexerEvent.java
+4	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessingState.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessingState.java
+index d5a8569..469a1ba 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessingState.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessingState.java
+@@ -24,13 +24,15 @@ import org.eclipse.core.resources.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.jdt.core.*;
+ import org.eclipse.jdt.internal.core.JavaModelManager.PerProjectInfo;
++import org.eclipse.jdt.internal.core.nd.indexer.Indexer;
++import org.eclipse.jdt.internal.core.nd.indexer.IndexerEvent;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+ /**
+  * Keep the global states used during Java element delta processing.
+  */
+ @SuppressWarnings({ "rawtypes", "unchecked" })
+-public class DeltaProcessingState implements IResourceChangeListener {
++public class DeltaProcessingState implements IResourceChangeListener, Indexer.Listener {
+ 
+ 	/*
+ 	 * Collection of listeners for Java element deltas
+@@ -643,4 +645,11 @@ public class DeltaProcessingState implements IResourceChangeListener {
+ 		}
+ 	}
+ 
++	@Override
++	public void consume(IndexerEvent event) {
++		DeltaProcessor processor = getDeltaProcessor();
++		processor.notifyAndFire(event.getDelta());
++		this.deltaProcessors.set(null);
++	}
++
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+index 801723f..fe5483d 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+@@ -37,6 +37,7 @@ import org.eclipse.jdt.internal.compiler.SourceElementParser;
+ import org.eclipse.jdt.internal.core.JavaModelManager.PerProjectInfo;
+ import org.eclipse.jdt.internal.core.builder.JavaBuilder;
+ import org.eclipse.jdt.internal.core.hierarchy.TypeHierarchy;
++import org.eclipse.jdt.internal.core.nd.java.JavaIndex;
+ import org.eclipse.jdt.internal.core.search.AbstractSearchScope;
+ import org.eclipse.jdt.internal.core.search.JavaWorkspaceScope;
+ import org.eclipse.jdt.internal.core.search.indexing.IndexManager;
+@@ -1057,9 +1058,16 @@ public class DeltaProcessor {
+ 							if (VERBOSE){
+ 								System.out.println("- External JAR CHANGED, affecting root: "+root.getElementName()); //$NON-NLS-1$
+ 							}
+-							contentChanged(root);
+-							deltaContainsModifiedJar = true;
+-							hasDelta = true;
++							if (JavaIndex.isEnabled()) {
++								// Deltas for changes in external jars are fired after indexing, to reduce the chance of listeners trying to
++								// read the new state of the .JAR before it can be cached in the index.
++								close(root);
++								this.projectCachesToReset.add(javaProject);
++							} else {
++								contentChanged(root);
++								deltaContainsModifiedJar = true;
++								hasDelta = true;
++							}
+ 						} else if (status == EXTERNAL_JAR_REMOVED) {
+ 							PackageFragmentRoot root = (PackageFragmentRoot) javaProject.getPackageFragmentRoot(entryPath.toString());
+ 							if (VERBOSE){
+@@ -2101,14 +2109,7 @@ public class DeltaProcessor {
+ 							this.sourceElementParserCache = null; // don't hold onto parser longer than necessary
+ 							startDeltas();
+ 						}
+-						IElementChangedListener[] listeners;
+-						int listenerCount;
+-						synchronized (this.state) {
+-							listeners = this.state.elementChangedListeners;
+-							listenerCount = this.state.elementChangedListenerCount;
+-						}
+-						notifyTypeHierarchies(listeners, listenerCount);
+-						fire(null, ElementChangedEvent.POST_CHANGE);
++						notifyAndFire(null);
+ 					} finally {
+ 						// workaround for bug 15168 circular errors not reported
+ 						this.state.resetOldJavaProjectNames();
+@@ -2217,6 +2218,17 @@ public class DeltaProcessor {
+ 		}
+ 	}
+ 
++	public void notifyAndFire(IJavaElementDelta delta) {
++		IElementChangedListener[] listeners;
++		int listenerCount;
++		synchronized (this.state) {
++			listeners = this.state.elementChangedListeners;
++			listenerCount = this.state.elementChangedListenerCount;
++		}
++		notifyTypeHierarchies(listeners, listenerCount);
++		fire(delta, ElementChangedEvent.POST_CHANGE);
++	}
++
+ 	/*
+ 	 * Returns the root info for the given path. Look in the old roots table if kind is REMOVED.
+ 	 */
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+index 594699e..2ce053f 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+@@ -129,6 +129,7 @@ import org.eclipse.jdt.internal.core.builder.JavaBuilder;
+ import org.eclipse.jdt.internal.core.dom.SourceRangeVerifier;
+ import org.eclipse.jdt.internal.core.dom.rewrite.RewriteEventStore;
+ import org.eclipse.jdt.internal.core.hierarchy.TypeHierarchy;
++import org.eclipse.jdt.internal.core.nd.indexer.Indexer;
+ import org.eclipse.jdt.internal.core.search.AbstractSearchScope;
+ import org.eclipse.jdt.internal.core.search.BasicSearchEngine;
+ import org.eclipse.jdt.internal.core.search.IRestrictedAccessTypeRequestor;
+@@ -5149,6 +5150,8 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 					| IResourceChangeEvent.PRE_CLOSE
+ 					| IResourceChangeEvent.PRE_REFRESH);
+ 
++			Indexer.getInstance().addListener(this.deltaState);
++
+ 			// listen to resource changes affecting external annotations
+ 			ExternalAnnotationTracker.start(workspace);
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+index aa3e375..00370a3 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+@@ -12,13 +12,11 @@ package org.eclipse.jdt.internal.core.nd;
+ 
+ import java.io.File;
+ import java.util.ArrayList;
+-import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+-import java.util.WeakHashMap;
+ 
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.OperationCanceledException;
+@@ -99,11 +97,7 @@ public class Nd {
+ 	 * Holds the set of files which have been changed since the last index event was fired
+ 	 */
+ 	private Set<LocalPath> changes = new HashSet<>();
+-	private Object listenersMutex = new Object();
+-	/**
+-	 * Listener list. Copy-on-write. Synchronize on "listenersMutex" before accessing.
+-	 */
+-	private Set<Listener> listeners = Collections.newSetFromMap(new WeakHashMap<Listener, Boolean>());
++
+ 	private final NdNodeTypeRegistry<NdNode> fNodeTypeRegistry;
+ 	private HashMap<Long, Throwable> pendingDeletions = new HashMap<>();
+ 
+@@ -338,11 +332,7 @@ public class Nd {
+ 			Package.log(e);
+ 		}
+ 		assert this.lockCount == -1;
+-		final ChangeEvent event;
+-		if (this.changes.isEmpty()) {
+-			event = null;
+-		} else {
+-			event = new ChangeEvent(this.changes);
++		if (!this.changes.isEmpty()) {
+ 			this.lastWriteAccess= System.currentTimeMillis();
+ 			this.changes = new HashSet<>();
+ 		}
+@@ -360,45 +350,6 @@ public class Nd {
+ 			this.mutex.notifyAll();
+ 			this.db.setLocked(this.lockCount != 0);
+ 		}
+-		if (event != null) {
+-			fireChange(event);
+-		}
+-	}
+-
+-	/**
+-	 * Adds the given listener. It will be notified when Nd changes. No strong references
+-	 * will be retained to the listener.
+-	 */
+-	public void addListener(Listener newListener) {
+-		synchronized (this.listenersMutex) {
+-			Set<Listener> oldListeners = this.listeners;
+-			this.listeners = Collections.newSetFromMap(new WeakHashMap<Listener, Boolean>());
+-			this.listeners.addAll(oldListeners);
+-			this.listeners.add(newListener);
+-		}
+-	}
+-
+-	public void removeListener(Listener oldListener) {
+-		synchronized (this.listenersMutex) {
+-			if (!this.listeners.contains(oldListener)) {
+-				return;
+-			}
+-			Set<Listener> oldListeners = this.listeners;
+-			this.listeners = Collections.newSetFromMap(new WeakHashMap<Listener, Boolean>());
+-			this.listeners.addAll(oldListeners);
+-			this.listeners.remove(oldListener);
+-		}
+-	}
+-
+-	private void fireChange(ChangeEvent event) {
+-		Set<Listener> localListeners;
+-		synchronized (this.listenersMutex) {
+-			localListeners = this.listeners;
+-		}
+-
+-		for (Listener next : localListeners) {
+-			next.consume(event);
+-		}
+ 	}
+ 
+ 	public boolean hasWaitingReaders() {
+@@ -411,10 +362,6 @@ public class Nd {
+ 		return this.lastWriteAccess;
+ 	}
+ 
+-//	public long getLastReadAccess() {
+-//		return this.lastReadAccess;
+-//	}
+-
+ 	public boolean isSupportedVersion() throws IndexException {
+ 		final int version = this.db.getVersion();
+ 		return version >= this.minVersion && version <= this.maxVersion;
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+index e736ad9..07762c6 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+@@ -4,6 +4,7 @@ import java.io.File;
+ import java.util.ArrayDeque;
+ import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+@@ -11,6 +12,7 @@ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.WeakHashMap;
+ 
+ import org.eclipse.core.resources.IContainer;
+ import org.eclipse.core.resources.IFile;
+@@ -28,12 +30,16 @@ import org.eclipse.core.runtime.jobs.Job;
+ import org.eclipse.jdt.core.IClassFile;
+ import org.eclipse.jdt.core.IClasspathEntry;
+ import org.eclipse.jdt.core.IJavaElement;
++import org.eclipse.jdt.core.IJavaElementDelta;
+ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IPackageFragmentRoot;
+ import org.eclipse.jdt.core.IParent;
+ import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
++import org.eclipse.jdt.internal.core.JavaElementDelta;
++import org.eclipse.jdt.internal.core.JavaModel;
++import org.eclipse.jdt.internal.core.JavaModelManager;
+ import org.eclipse.jdt.internal.core.nd.Nd;
+ import org.eclipse.jdt.internal.core.nd.java.FileFingerprint;
+ import org.eclipse.jdt.internal.core.nd.java.FileFingerprint.FingerprintTestResult;
+@@ -49,6 +55,12 @@ public final class Indexer {
+ 	private static final Object mutex = new Object();
+ 	private static final long MS_TO_NS = 1000000;
+ 
++	private Object listenersMutex = new Object();
++	/**
++	 * Listener list. Copy-on-write. Synchronize on "listenersMutex" before accessing.
++	 */
++	private Set<Listener> listeners = Collections.newSetFromMap(new WeakHashMap<Listener, Boolean>());
++
+ 	private Job rescanJob = Job.create(Messages.Indexer_updating_index_job_name, new ICoreRunnable() {
+ 		@Override
+ 		public void run(IProgressMonitor monitor) throws CoreException {
+@@ -56,6 +68,10 @@ public final class Indexer {
+ 		}
+ 	});
+ 
++	public static interface Listener {
++		void consume(IndexerEvent event);
++	}
++
+ 	public static Indexer getInstance() {
+ 		synchronized (mutex) {
+ 			if (indexer == null) {
+@@ -111,13 +127,15 @@ public final class Indexer {
+ 		updateResourceMappings(pathsToUpdate, subMonitor.split(5));
+ 
+ 		// Flush the database to disk
+-		this.nd.acquireWriteLock(subMonitor.newChild(5));
++		this.nd.acquireWriteLock(subMonitor.split(4));
+ 		try {
+ 			this.nd.getDB().flush();
+ 		} finally {
+ 			this.nd.releaseWriteLock();
+ 		}
+ 
++		fireDelta(rootsWithChanges, subMonitor.split(1));
++
+ 		long endResourceMappingNs = System.nanoTime();
+ 
+ 		long fingerprintTimeMs = (startIndexingNs - startFingerprintTestNs) / MS_TO_NS;
+@@ -137,6 +155,47 @@ public final class Indexer {
+ 				+ "  Updated " + pathsToUpdate.size() + " paths in " + resourceMappingTimeMs + "ms, average time = " + averageResourceMappingMs + "ms\n"); //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$//$NON-NLS-4$
+ 	}
+ 
++	private void fireDelta(Set<IPath> rootsWithChanges, IProgressMonitor monitor) {
++		SubMonitor subMonitor = SubMonitor.convert(monitor, 1);
++		IProject[] projects = this.root.getProjects();
++
++		List<IProject> projectsToScan = new ArrayList<>();
++
++		for (IProject next : projects) {
++			if (next.isOpen()) {
++				projectsToScan.add(next);
++			}
++		}
++		JavaModel model = JavaModelManager.getJavaModelManager().getJavaModel();
++		JavaElementDelta delta = new JavaElementDelta(model);
++		SubMonitor projectLoopMonitor = subMonitor.split(1).setWorkRemaining(projectsToScan.size());
++		for (IProject project : projectsToScan) {
++			projectLoopMonitor.split(1);
++			try {
++				if (project.isOpen() && project.isNatureEnabled(JavaCore.NATURE_ID)) {
++					IJavaProject javaProject = JavaCore.create(project);
++
++					IPackageFragmentRoot[] roots = javaProject.getAllPackageFragmentRoots();
++
++					for (IPackageFragmentRoot next : roots) {
++						if (next.isArchive()) {
++							IPath location = JavaIndex.getLocationForElement(next);
++
++							if (rootsWithChanges.contains(location)) {
++								delta.changed(next,
++										IJavaElementDelta.F_CONTENT | IJavaElementDelta.F_ARCHIVE_CONTENT_CHANGED);
++							}
++						}
++					}
++				}
++			} catch (CoreException e) {
++				Package.log(e);
++			}
++		}
++
++		fireChange(IndexerEvent.createChange(delta));
++	}
++
+ 	private void updateResourceMappings(Map<IPath, List<IJavaElement>> pathsToUpdate, IProgressMonitor monitor) {
+ 		SubMonitor subMonitor = SubMonitor.convert(monitor, pathsToUpdate.keySet().size());
+ 
+@@ -216,7 +275,7 @@ public final class Indexer {
+ 		Map<IPath, FingerprintTestResult> result = new HashMap<>();
+ 
+ 		for (IPath next : allRoots) {
+-			result.put(next, testForChanges(next, subMonitor.newChild(1)));
++			result.put(next, testForChanges(next, subMonitor.split(1)));
+ 		}
+ 
+ 		return result;
+@@ -246,7 +305,7 @@ public final class Indexer {
+ 
+ 		NdResourceFile resourceFile;
+ 
+-		this.nd.acquireWriteLock(subMonitor.newChild(5));
++		this.nd.acquireWriteLock(subMonitor.split(5));
+ 		try {
+ 			resourceFile = new NdResourceFile(this.nd);
+ 			resourceFile.setLocation(pathString);
+@@ -262,10 +321,10 @@ public final class Indexer {
+ 		}
+ 
+ 		Package.logInfo("rescanning " + thePath.toString()); //$NON-NLS-1$
+-		int result = addElement(resourceFile, element, subMonitor.newChild(90));
++		int result = addElement(resourceFile, element, subMonitor.split(90));
+ 
+ 		// Now update the timestamp and delete all older versions of this resource that exist in the index
+-		this.nd.acquireWriteLock(subMonitor.newChild(5));
++		this.nd.acquireWriteLock(subMonitor.split(5));
+ 		try {
+ 			if (resourceFile.isInIndex()) {
+ 				resourceFile.setFingerprint(fingerprint);
+@@ -340,7 +399,7 @@ public final class Indexer {
+ 	private int addElement(NdResourceFile resourceFile, IJavaElement element, IProgressMonitor monitor)
+ 			throws JavaModelException {
+ 		SubMonitor subMonitor = SubMonitor.convert(monitor, 100);
+-		List<IJavaElement> bindableElements = getBindableElements(element, subMonitor.newChild(10));
++		List<IJavaElement> bindableElements = getBindableElements(element, subMonitor.split(10));
+ 		List<IClassFile> classFiles = getClassFiles(bindableElements);
+ 
+ 		subMonitor.setWorkRemaining(classFiles.size());
+@@ -563,4 +622,40 @@ public final class Indexer {
+ 	public void rescanAll() {
+ 		this.rescanJob.schedule();
+ 	}
++
++	/**
++	 * Adds the given listener. It will be notified when Nd changes. No strong references
++	 * will be retained to the listener.
++	 */
++	public void addListener(Listener newListener) {
++		synchronized (this.listenersMutex) {
++			Set<Listener> oldListeners = this.listeners;
++			this.listeners = Collections.newSetFromMap(new WeakHashMap<Listener, Boolean>());
++			this.listeners.addAll(oldListeners);
++			this.listeners.add(newListener);
++		}
++	}
++
++	public void removeListener(Listener oldListener) {
++		synchronized (this.listenersMutex) {
++			if (!this.listeners.contains(oldListener)) {
++				return;
++			}
++			Set<Listener> oldListeners = this.listeners;
++			this.listeners = Collections.newSetFromMap(new WeakHashMap<Listener, Boolean>());
++			this.listeners.addAll(oldListeners);
++			this.listeners.remove(oldListener);
++		}
++	}
++
++	private void fireChange(IndexerEvent event) {
++		Set<Listener> localListeners;
++		synchronized (this.listenersMutex) {
++			localListeners = this.listeners;
++		}
++
++		for (Listener next : localListeners) {
++			next.consume(event);
++		}
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/IndexerEvent.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/IndexerEvent.java
+new file mode 100644
+index 0000000..0409856
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/IndexerEvent.java
+@@ -0,0 +1,19 @@
++package org.eclipse.jdt.internal.core.nd.indexer;
++
++import org.eclipse.jdt.core.IJavaElementDelta;
++
++public class IndexerEvent {
++	final IJavaElementDelta delta;
++
++	private IndexerEvent(IJavaElementDelta delta) {
++		this.delta = delta;
++	}
++
++	public static IndexerEvent createChange(IJavaElementDelta delta) {
++		return new IndexerEvent(delta);
++	}
++
++	public IJavaElementDelta getDelta() {
++		return this.delta;
++	}
++}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+index 4c08f74..115de4f 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+@@ -67,6 +67,10 @@ public class NdResourceFile extends NdTreeNode {
+ 		super(nd, null);
+ 	}
+ 
++	public List<NdTreeNode> getChildren() {
++		return CHILDREN.asList(this.getNd(), this.address);
++	}
++
+ 	/**
+ 	 * Determines whether this file is still in the index. If a {@link NdResourceFile} instance is retained while the
+ 	 * database lock is released and reobtained, this method should be invoked to ensure that the {@link NdResourceFile}
+commit 09d77f1905e850fb1c43bdf748712ace23e06a1e
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Fri May 27 13:20:54 2016 -0400
+
+    Bug 492488 - Add change notifications to the new index
+    
+    Don't fire the new-style change events if the new index is disabled.
+    
+    Change-Id: I3e8ba8f8ffeb5f264eb7f4729c71285f514b0d6a
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+6	3	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessingState.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessingState.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessingState.java
+index 469a1ba..80eee64 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessingState.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessingState.java
+@@ -26,6 +26,7 @@ import org.eclipse.jdt.core.*;
+ import org.eclipse.jdt.internal.core.JavaModelManager.PerProjectInfo;
+ import org.eclipse.jdt.internal.core.nd.indexer.Indexer;
+ import org.eclipse.jdt.internal.core.nd.indexer.IndexerEvent;
++import org.eclipse.jdt.internal.core.nd.java.JavaIndex;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+ /**
+@@ -647,9 +648,11 @@ public class DeltaProcessingState implements IResourceChangeListener, Indexer.Li
+ 
+ 	@Override
+ 	public void consume(IndexerEvent event) {
+-		DeltaProcessor processor = getDeltaProcessor();
+-		processor.notifyAndFire(event.getDelta());
+-		this.deltaProcessors.set(null);
++		if (JavaIndex.isEnabled()) {
++			DeltaProcessor processor = getDeltaProcessor();
++			processor.notifyAndFire(event.getDelta());
++			this.deltaProcessors.set(null);
++		}
+ 	}
+ 
+ }
+commit e67642c5e787b794a595ed0e8789d64925482922
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Mon Jun 20 08:56:20 2016 -0700
+
+    Bug 492488 - Add change notifications to the new index
+    
+    Remove the remnants of eventing from the Nd object.
+    
+    Change-Id: Ie46a5e09881e020561eddb5f0a0ce3a794a527dd
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+1	39	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+0	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+index 1bd1e55..f8dc7da 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+@@ -13,10 +13,8 @@ package org.eclipse.jdt.internal.core.nd;
+ import java.io.File;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+-import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Set;
+ 
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.OperationCanceledException;
+@@ -70,34 +68,10 @@ public class Nd {
+ 		return "" + major + '.' + minor; //$NON-NLS-1$
+ 	}
+ 
+-	public interface Listener {
+-		void consume(ChangeEvent event);
+-	}
+-
+-	public static class ChangeEvent {
+-		private final Set<LocalPath> filesModified;
+-
+-		public ChangeEvent(Set<LocalPath> changes) {
+-			this.filesModified = changes;
+-		}
+-
+-		public Set<LocalPath> getFilesModified() {
+-			return this.filesModified;
+-		}
+-
+-		public boolean isTrivial() {
+-			return this.filesModified.isEmpty();
+-		}
+-	}
+-
+ 	// Local caches
+ 	protected Database db;
+ 	private File fPath;
+ 	private final HashMap<Object, Object> fResultCache = new HashMap<>();
+-	/**
+-	 * Holds the set of files which have been changed since the last index event was fired
+-	 */
+-	private Set<LocalPath> changes = new HashSet<>();
+ 
+ 	private final NdNodeTypeRegistry<NdNode> fNodeTypeRegistry;
+ 	private HashMap<Long, Object> pendingDeletions = new HashMap<>();
+@@ -321,15 +295,6 @@ public class Nd {
+ 		}
+ 	}
+ 
+-	/**
+-	 * Should be called by the indexer to indicate a source file that has been
+-	 * fully indexed.
+-	 */
+-	public final void markPathAsModified(LocalPath path) {
+-		this.db.assertLocked();
+-		this.changes.add(path);
+-	}
+-
+ 	public final void releaseWriteLock() {
+ 		releaseWriteLock(0, true);
+ 	}
+@@ -348,10 +313,7 @@ public class Nd {
+ 			Package.log(e);
+ 		}
+ 		assert this.lockCount == -1;
+-		if (!this.changes.isEmpty()) {
+-			this.lastWriteAccess= System.currentTimeMillis();
+-			this.changes = new HashSet<>();
+-		}
++		this.lastWriteAccess= System.currentTimeMillis();
+ 		synchronized (this.mutex) {
+ 			if (sDEBUG_LOCKS) {
+ 				long timeHeld = this.lastWriteAccess - this.timeWriteLockAcquired;
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+index fc718e0..1c53c55 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+@@ -476,7 +476,6 @@ public final class Indexer {
+ 		try {
+ 			if (resourceFile.isInIndex()) {
+ 				resourceFile.setFingerprint(fingerprint);
+-				this.nd.markPathAsModified(resourceFile.getLocalFile());
+ 				allResourcesWithThisPath = javaIndex.findResourcesWithPath(pathString);
+ 			}
+ 		} finally {
+commit 91bf5fd68abe1bc7744fee8a25c44ecb119eb715
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Tue Jun 21 07:19:34 2016 -0700
+
+    Bug 492488 - Add change notifications to the new index
+    
+    Remove unused LocalPath class.
+    
+    Change-Id: I90b1c6f5fccb67c9f253094d5bd822b935b68a91
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+0	62	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/LocalPath.java
+0	10	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/LocalPath.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/LocalPath.java
+deleted file mode 100644
+index e0401e4..0000000
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/LocalPath.java
++++ /dev/null
+@@ -1,62 +0,0 @@
+-package org.eclipse.jdt.internal.core.nd;
+-
+-import org.eclipse.core.runtime.IPath;
+-
+-/**
+- * Stores a local path, either as a path on the local filesystem or a workspace-relative path.
+- * @since 3.12
+- */
+-public final class LocalPath {
+-	private final boolean isWorkspacePath;
+-	private final IPath path;
+-
+-	private LocalPath(boolean isWorkspacePath, IPath path) {
+-		super();
+-		this.isWorkspacePath = isWorkspacePath;
+-		this.path = path;
+-	}
+-
+-	public static LocalPath createFileSystem(IPath path) {
+-		return new LocalPath(false, path);
+-	}
+-
+-	public static LocalPath createWorkspace(IPath path) {
+-		return new LocalPath(true, path);
+-	}
+-
+-	public boolean isWorkspacePath() {
+-		return this.isWorkspacePath;
+-	}
+-
+-	public IPath getPath() {
+-		return this.path;
+-	}
+-
+-	@Override
+-	public int hashCode() {
+-		final int prime = 31;
+-		int result = 1;
+-		result = prime * result + (this.isWorkspacePath ? 1231 : 1237);
+-		result = prime * result + ((this.path == null) ? 0 : this.path.hashCode());
+-		return result;
+-	}
+-
+-	@Override
+-	public boolean equals(Object obj) {
+-		if (this == obj)
+-			return true;
+-		if (obj == null)
+-			return false;
+-		if (getClass() != obj.getClass())
+-			return false;
+-		LocalPath other = (LocalPath) obj;
+-		if (this.isWorkspacePath != other.isWorkspacePath)
+-			return false;
+-		if (this.path == null) {
+-			if (other.path != null)
+-				return false;
+-		} else if (!this.path.equals(other.path))
+-			return false;
+-		return true;
+-	}
+-}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+index 7c745ea..fa0deaa 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+@@ -17,7 +17,6 @@ import org.eclipse.core.resources.IProject;
+ import org.eclipse.core.resources.IWorkspaceRoot;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.Path;
+-import org.eclipse.jdt.internal.core.nd.LocalPath;
+ import org.eclipse.jdt.internal.core.nd.Nd;
+ import org.eclipse.jdt.internal.core.nd.db.Database;
+ import org.eclipse.jdt.internal.core.nd.db.IString;
+@@ -234,15 +233,6 @@ public class NdResourceFile extends NdTreeNode {
+ 		return javaRoot;
+ 	}
+ 
+-	public LocalPath getLocalFile() {
+-		if (!WORKSPACE_MAPPINGS.isEmpty(getNd(), this.address)) {
+-			NdWorkspaceLocation workspaceLocation = WORKSPACE_MAPPINGS.get(getNd(), this.address, 0);
+-
+-			return LocalPath.createWorkspace(new Path(workspaceLocation.getPath().getString()));
+-		}
+-		return LocalPath.createFileSystem(new Path(getLocation().getString()));
+-	}
+-
+ 	public void markAsInvalid() {
+ 		TIME_LAST_SCANNED.put(getNd(), this.address, 0);
+ 	}

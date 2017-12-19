@@ -1,0 +1,443 @@
+commit a383b8a74cd6aa6df7e09b603786c84e4f93bb28
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Tue Nov 24 16:02:54 2015 +0100
+
+    Bug 482075: [compiler][null] Loosing @NonNull information when passing
+    implicit @NonNull fields to methods
+    
+    Change-Id: I366a9c555f9490a83767a93ced32d369faa0b616
+
+35	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+4	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayReference.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CastExpression.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+5	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+3	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldReference.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ForeachStatement.java
+3	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+5	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+15	11	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Reference.java
+4	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SwitchStatement.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ThisReference.java
+17	14	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+index 11c612a..66c9b0a 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+@@ -8625,4 +8625,39 @@ public void testBug477719() {
+ 		getCompilerOptions(),
+ 		"");
+ }
++public void testBug482075() {
++	Map options = getCompilerOptions();
++	options.put(JavaCore.COMPILER_PB_SYNTACTIC_NULL_ANALYSIS_FOR_FIELDS, JavaCore.ENABLED);
++	options.put(JavaCore.COMPILER_PB_NULL_UNCHECKED_CONVERSION, JavaCore.ERROR);
++	runConformTestWithLibs(
++		new String[] {
++			"TestIncidentImports2.java",
++			"public class TestIncidentImports2 {\n" + 
++			"\n" + 
++			"    private String arg0;\n" + 
++			"    private TestIncidentImports2 arg2;\n" + 
++			"\n" + 
++			"    public TestIncidentImports2(String arg0) {\n" + 
++			"        this.arg0 = arg0;\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    protected void apply(Object o) throws Exception {\n" + 
++			"        arg0.length();\n" + 
++			"        other(arg0);\n" + // arg0 is protected by dereference as MessageSend.receiver
++// still triggers an error: QualifiedNameReference doesn't have an ASTNode representing the receiver
++//			"        if (arg2.arg0 != null && other(arg2))\n" + // arg2 is protected by dereference from QualifiedNameReference
++//			"			System.out.println(7);\n" + 
++			"        if (this.arg2.arg0 != null && other(arg2))\n" + // arg2 is protected by dereference as FieldReference.receiver
++			"			System.out.println(9);\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    boolean other(@org.eclipse.jdt.annotation.NonNull Object o) {\n" + 
++			"		return true;\n" + 
++			"    }\n" + 
++			"}\n"
++		},
++		options,
++		""
++	);
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayReference.java
+index 0f13ed9..b816309 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -60,7 +60,7 @@ public FlowInfo analyseAssignment(BlockScope currentScope, FlowContext flowConte
+ }
+ 
+ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, FlowInfo flowInfo) {
+-	this.receiver.checkNPE(currentScope, flowContext, flowInfo);
++	this.receiver.checkNPE(currentScope, flowContext, flowInfo, 1);
+ 	flowInfo = this.receiver.analyseCode(currentScope, flowContext, flowInfo);
+ 	flowInfo = this.position.analyseCode(currentScope, flowContext, flowInfo);
+ 	this.position.checkNPEbyUnboxing(currentScope, flowContext, flowInfo);
+@@ -69,12 +69,12 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 	return flowInfo;
+ }
+ 
+-public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
++public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo, int ttlForFieldCheck) {
+ 	if ((this.resolvedType.tagBits & TagBits.AnnotationNullable) != 0) {
+ 		scope.problemReporter().arrayReferencePotentialNullReference(this);
+ 		return true;
+ 	} else {
+-		return super.checkNPE(scope, flowContext, flowInfo);
++		return super.checkNPE(scope, flowContext, flowInfo, ttlForFieldCheck);
+ 	}
+ }
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CastExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CastExpression.java
+index df99b84..00b8bea 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CastExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CastExpression.java
+@@ -266,9 +266,9 @@ public static void checkNeedForArgumentCasts(BlockScope scope, int operator, int
+ 	}
+ }
+ 
+-public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
++public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo, int ttlForFieldCheck) {
+ 	checkNPEbyUnboxing(scope, flowContext, flowInfo);
+-	return this.expression.checkNPE(scope, flowContext, flowInfo);
++	return this.expression.checkNPE(scope, flowContext, flowInfo, ttlForFieldCheck);
+ }
+ 
+ private static void checkAlternateBinding(BlockScope scope, Expression receiver, TypeBinding receiverType, MethodBinding binding, Expression[] arguments, TypeBinding[] originalArgumentTypes, TypeBinding[] alternateArgumentTypes, final InvocationSite invocationSite) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+index d285c6d..57665e9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+@@ -187,7 +187,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext,
+ 		return mergedInfo;
+ 	}
+ 
+-	public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
++	public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo, int ttlForFieldCheck) {
+ 		if ((this.nullStatus & FlowInfo.NULL) != 0)
+ 			scope.problemReporter().expressionNullReference(this);
+ 		else if ((this.nullStatus & FlowInfo.POTENTIALLY_NULL) != 0)
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+index ac87691..ed5c213 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+@@ -573,9 +573,10 @@ public final boolean checkCastTypesCompatibility(Scope scope, TypeBinding castTy
+  * @param scope the scope of the analysis
+  * @param flowContext the current flow context
+  * @param flowInfo the upstream flow info; caveat: may get modified
++ * @param ttlForFieldCheck if this is a reference to a field we will mark that field as nonnull for the specified timeToLive
+  * @return could this expression be checked by the current implementation?
+  */
+-public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
++public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo, int ttlForFieldCheck) {
+ 	boolean isNullable = false;
+ 	if (this.resolvedType != null) {
+ 		// 1. priority: @NonNull
+@@ -608,6 +609,9 @@ public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flow
+ 	}
+ 	return false; // not checked
+ }
++public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
++	return checkNPE(scope, flowContext, flowInfo, 0); // default: don't mark field references as checked for null
++}
+ 
+ /** If this expression requires unboxing check if that operation can throw NPE. */
+ protected void checkNPEbyUnboxing(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldReference.java
+index bf90d3a..da0db0e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FieldReference.java
+@@ -141,7 +141,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 	boolean nonStatic = !this.binding.isStatic();
+ 	this.receiver.analyseCode(currentScope, flowContext, flowInfo, nonStatic);
+ 	if (nonStatic) {
+-		this.receiver.checkNPE(currentScope, flowContext, flowInfo);
++		this.receiver.checkNPE(currentScope, flowContext, flowInfo, 1);
+ 	}
+ 
+ 	if (valueRequired || currentScope.compilerOptions().complianceLevel >= ClassFileConstants.JDK1_4) {
+@@ -150,11 +150,11 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 	return flowInfo;
+ }
+ 
+-public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
++public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo, int ttlForFieldCheck) {
+ 	if (flowContext.isNullcheckedFieldAccess(this)) {
+ 		return true; // enough seen
+ 	}
+-	return checkNullableFieldDereference(scope, this.binding, this.nameSourcePosition);
++	return checkNullableFieldDereference(scope, this.binding, this.nameSourcePosition, flowContext, ttlForFieldCheck);
+ }
+ 
+ /**
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ForeachStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ForeachStatement.java
+index 35b2042..72b47ee 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ForeachStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ForeachStatement.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -93,7 +93,7 @@ public class ForeachStatement extends Statement {
+ 		int initialComplaintLevel = (flowInfo.reachMode() & FlowInfo.UNREACHABLE) != 0 ? Statement.COMPLAINED_FAKE_REACHABLE : Statement.NOT_COMPLAINED;
+ 
+ 		// process the element variable and collection
+-		this.collection.checkNPE(currentScope, flowContext, flowInfo);
++		this.collection.checkNPE(currentScope, flowContext, flowInfo, 1);
+ 		flowInfo = this.elementVariable.analyseCode(this.scope, flowContext, flowInfo);		
+ 		FlowInfo condInfo = this.collection.analyseCode(this.scope, flowContext, flowInfo.copy());
+ 		LocalVariableBinding elementVarBinding = this.elementVariable.binding;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index d5a6b9c..ce2f82f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -165,7 +165,8 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 	}
+ 
+ 	if (nonStatic) {
+-		this.receiver.checkNPE(currentScope, flowContext, flowInfo);
++		int timeToLive = ((this.bits & ASTNode.InsideExpressionStatement) != 0) ? 3 : 2;
++		this.receiver.checkNPE(currentScope, flowContext, flowInfo, timeToLive);
+ 	}
+ 
+ 	if (this.arguments != null) {
+@@ -372,7 +373,7 @@ private FlowInfo analyseNullAssertion(BlockScope currentScope, Expression argume
+ 	return flowInfo;
+ }
+ 
+-public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
++public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo, int ttlForFieldCheck) {
+ 	// message send as a receiver
+ 	if ((nullStatus(flowInfo, flowContext) & FlowInfo.POTENTIALLY_NULL) != 0) // note that flowInfo is not used inside nullStatus(..)
+ 		scope.problemReporter().messageSendPotentialNullReference(this.binding, this);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+index 35b0563..8b77f46 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+@@ -253,18 +253,18 @@ private void checkInternalNPE(BlockScope scope, FlowContext flowContext, FlowInf
+ 	if (this.otherBindings != null) {
+ 		if ((this.bits & ASTNode.RestrictiveFlagMASK) == Binding.FIELD) {
+ 			// is the first field dereferenced annotated Nullable? If so, report immediately
+-			checkNullableFieldDereference(scope, (FieldBinding) this.binding, this.sourcePositions[this.indexOfFirstFieldBinding-1]);
++			checkNullableFieldDereference(scope, (FieldBinding) this.binding, this.sourcePositions[this.indexOfFirstFieldBinding-1], flowContext, 0);
+ 		}
+ 		// look for annotated fields, they do not depend on flow context -> check immediately:
+ 		int length = this.otherBindings.length - 1; // don't check the last binding
+ 		for (int i = 0; i < length; i++) {
+-			checkNullableFieldDereference(scope, this.otherBindings[i], this.sourcePositions[this.indexOfFirstFieldBinding+i]);
++			checkNullableFieldDereference(scope, this.otherBindings[i], this.sourcePositions[this.indexOfFirstFieldBinding+i], flowContext, 0);
+ 		}
+ 	}
+ }
+ 
+-public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
+-	if (super.checkNPE(scope, flowContext, flowInfo)) {
++public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo, int ttlForFieldCheck) {
++	if (super.checkNPE(scope, flowContext, flowInfo, ttlForFieldCheck)) {
+ 		return true;
+ 	}
+ 	FieldBinding fieldBinding = null;
+@@ -279,7 +279,7 @@ public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flow
+ 		position = this.sourcePositions[this.sourcePositions.length - 1];
+ 	}
+ 	if (fieldBinding != null) {
+-		return checkNullableFieldDereference(scope, fieldBinding, position);
++		return checkNullableFieldDereference(scope, fieldBinding, position, flowContext, ttlForFieldCheck);
+ 	}
+ 	return false;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Reference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Reference.java
+index 96ee371..bbd4cda 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Reference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Reference.java
+@@ -47,22 +47,26 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 	return flowInfo;
+ }
+ 
+-public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
++public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo, int ttlForFieldCheck) {
+ 	if (flowContext.isNullcheckedFieldAccess(this)) {
+ 		return true; // enough seen
+ 	}
+-	return super.checkNPE(scope, flowContext, flowInfo);
++	return super.checkNPE(scope, flowContext, flowInfo, ttlForFieldCheck);
+ }
+ 
+-protected boolean checkNullableFieldDereference(Scope scope, FieldBinding field, long sourcePosition) {
+-	// preference to type annotations if we have any
+-	if ((field.type.tagBits & TagBits.AnnotationNullable) != 0) {
+-		scope.problemReporter().dereferencingNullableExpression(sourcePosition, scope.environment());
+-		return true;
+-	}
+-	if ((field.tagBits & TagBits.AnnotationNullable) != 0) {
+-		scope.problemReporter().nullableFieldDereference(field, sourcePosition);
+-		return true;
++protected boolean checkNullableFieldDereference(Scope scope, FieldBinding field, long sourcePosition, FlowContext flowContext, int ttlForFieldCheck) {
++	if (field != null) {
++		if (ttlForFieldCheck > 0 && scope.compilerOptions().enableSyntacticNullAnalysisForFields)
++			flowContext.recordNullCheckedFieldReference(this, ttlForFieldCheck);
++		// preference to type annotations if we have any
++		if ((field.type.tagBits & TagBits.AnnotationNullable) != 0) {
++			scope.problemReporter().dereferencingNullableExpression(sourcePosition, scope.environment());
++			return true;
++		}
++		if ((field.tagBits & TagBits.AnnotationNullable) != 0) {
++			scope.problemReporter().nullableFieldDereference(field, sourcePosition);
++			return true;
++		}
+ 	}
+ 	return false;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+index 297e072..3c06e3e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+@@ -254,14 +254,12 @@ public TypeBinding checkFieldAccess(BlockScope scope) {
+ 
+ }
+ 
+-public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
+-	if (!super.checkNPE(scope, flowContext, flowInfo)) {
++public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo, int ttlForFieldCheck) {
++	if (!super.checkNPE(scope, flowContext, flowInfo, ttlForFieldCheck)) {
+ 		CompilerOptions compilerOptions = scope.compilerOptions();
+ 		if (compilerOptions.isAnnotationBasedNullAnalysisEnabled) {
+-			VariableBinding var = nullAnnotatedVariableBinding(compilerOptions.sourceLevel >= ClassFileConstants.JDK1_8);
+-			if (var instanceof FieldBinding) {
+-				checkNullableFieldDereference(scope, (FieldBinding) var, ((long)this.sourceStart<<32)+this.sourceEnd);
+-				return true;
++			if (this.binding instanceof FieldBinding) {
++				return checkNullableFieldDereference(scope, (FieldBinding) this.binding, ((long)this.sourceStart<<32)+this.sourceEnd, flowContext, ttlForFieldCheck);
+ 			}
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SwitchStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SwitchStatement.java
+index 5f6e111..bd51350 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SwitchStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SwitchStatement.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -79,7 +79,7 @@ public class SwitchStatement extends Statement {
+ 			if ((this.expression.implicitConversion & TypeIds.UNBOXING) != 0
+ 					|| (this.expression.resolvedType != null
+ 							&& (this.expression.resolvedType.id == T_JavaLangString || this.expression.resolvedType.isEnum()))) {
+-				this.expression.checkNPE(currentScope, flowContext, flowInfo);
++				this.expression.checkNPE(currentScope, flowContext, flowInfo, 1);
+ 			}
+ 			SwitchFlowContext switchContext =
+ 				new SwitchFlowContext(flowContext, this, (this.breakLabel = new BranchLabel()), true);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ThisReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ThisReference.java
+index e791c90..113c7aa 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ThisReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ThisReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -70,7 +70,7 @@ public class ThisReference extends Reference {
+ 		return true;
+ 	}
+ 
+-	public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo) {
++	public boolean checkNPE(BlockScope scope, FlowContext flowContext, FlowInfo flowInfo, int ttlForFieldCheck) {
+ 		return true; // never problematic
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
+index c6dcc0a..73862f3 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
+@@ -82,10 +82,10 @@ public class FlowContext implements TypeConstants {
+ 	public TypeBinding[][] providedExpectedTypes = null;
+ 
+ 	// record field references known to be non-null
+-	//   this array will never shrink, only grow. reset happens by nulling the first cell
+-	//   adding elements after reset ensures that the valid part of the array is always null-terminated
++	//   this array will never shrink, only grow. reset happens by nulling expired entries
++	//   this array grows in lock step with timesToLiveForNullCheckInfo, which controls expiration
+ 	private Reference[] nullCheckedFieldReferences = null;
+-	private int timeToLiveForNullCheckInfo = -1;
++	private int[] timesToLiveForNullCheckInfo = null;
+ 
+ 	public static final int DEFER_NULL_DIAGNOSTIC = 0x1;
+ 	public static final int PREEMPT_NULL_DIAGNOSTIC = 0x2;
+@@ -141,33 +141,35 @@ public FlowContext(FlowContext parent, ASTNode associatedNode) {
+  * @param timeToLive control how many expire events are needed to expire this information
+  */
+ public void recordNullCheckedFieldReference(Reference reference, int timeToLive) {
+-	this.timeToLiveForNullCheckInfo = timeToLive;
+ 	if (this.nullCheckedFieldReferences == null) {
+ 		// first entry:
+-		this.nullCheckedFieldReferences = new Reference[2];
+-		this.nullCheckedFieldReferences[0] = reference;
++		this.nullCheckedFieldReferences = new Reference[] { reference, null };
++		this.timesToLiveForNullCheckInfo = new int[] { timeToLive, -1 };
+ 	} else {
+ 		int len = this.nullCheckedFieldReferences.length;
+ 		// insert into first empty slot:
+ 		for (int i=0; i<len; i++) {
+ 			if (this.nullCheckedFieldReferences[i] == null) {
+ 				this.nullCheckedFieldReferences[i] = reference;
+-				if (i+1 < len) {
+-					this.nullCheckedFieldReferences[i+1] = null; // lazily mark next as empty
+-				}
++				this.timesToLiveForNullCheckInfo[i] = timeToLive;
+ 				return;
+ 			}
+ 		}
+-		// grow array:
++		// grow arrays:
+ 		System.arraycopy(this.nullCheckedFieldReferences, 0, this.nullCheckedFieldReferences=new Reference[len+2], 0, len);
++		System.arraycopy(this.timesToLiveForNullCheckInfo, 0, this.timesToLiveForNullCheckInfo=new int[len+2], 0, len);
+ 		this.nullCheckedFieldReferences[len] = reference;
++		this.timesToLiveForNullCheckInfo[len] = timeToLive;
+ 	}
+ }
+ 
+ /** If a null checked field has been recorded recently, increase its time to live. */
+ public void extendTimeToLiveForNullCheckedField(int t) {
+-	if (this.timeToLiveForNullCheckInfo > 0)
+-		this.timeToLiveForNullCheckInfo += t;
++	if (this.timesToLiveForNullCheckInfo != null) {
++		for (int i = 0; i < this.timesToLiveForNullCheckInfo.length; i++)
++			if (this.timesToLiveForNullCheckInfo[i] > 0)
++				this.timesToLiveForNullCheckInfo[i] += t;
++	}
+ }
+ 
+ /**
+@@ -178,8 +180,9 @@ public void extendTimeToLiveForNullCheckedField(int t) {
+  */	 
+ public void expireNullCheckedFieldInfo() {
+ 	if (this.nullCheckedFieldReferences != null) {
+-		if (--this.timeToLiveForNullCheckInfo == 0) {
+-			this.nullCheckedFieldReferences[0] = null; // lazily wipe
++		for (int i = 0; i < this.nullCheckedFieldReferences.length; i++) {
++			if (--this.timesToLiveForNullCheckInfo[i] == 0)
++				this.nullCheckedFieldReferences[i] = null;
+ 		}
+ 	}
+ }

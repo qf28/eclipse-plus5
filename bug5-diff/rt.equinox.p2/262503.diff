@@ -1,0 +1,3306 @@
+commit 101af48fe53dfac2854546a87c7cb22e88ad9abd
+Author: Pascal Rapicault <prapicau>
+Date:   Sat Apr 18 20:32:55 2009 +0000
+
+    Bug 262503 - [planner] Replace ResolutionHelper with SAT4J based solution
+
+64	15	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
+121	45	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+87	0	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
+index 616d604..5fabf3a 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
+@@ -56,6 +56,8 @@ public class Projector {
+ 
+ 	private Collection alreadyInstalledIUs;
+ 	private boolean considerMetaRequirements;
++	private IInstallableUnit entryPoint;
++	private Map fragments = new HashMap();
+ 
+ 	static class AbstractVariable {
+ 		public String toString() {
+@@ -126,8 +128,9 @@ public class Projector {
+ 		this.considerMetaRequirements = considerMetaRequirements;
+ 	}
+ 
+-	public void encode(IInstallableUnit metaIu, IInstallableUnit[] alreadyExistingRoots, IInstallableUnit[] newRoots, IProgressMonitor monitor) {
++	public void encode(IInstallableUnit entryPointIU, IInstallableUnit[] alreadyExistingRoots, IInstallableUnit[] newRoots, IProgressMonitor monitor) {
+ 		alreadyInstalledIUs = Arrays.asList(alreadyExistingRoots);
++		this.entryPoint = entryPointIU;
+ 		try {
+ 			long start = 0;
+ 			if (DEBUG) {
+@@ -159,15 +162,15 @@ public class Projector {
+ 					throw new OperationCanceledException();
+ 				}
+ 				IInstallableUnit iuToEncode = (IInstallableUnit) iusToEncode.next();
+-				if (iuToEncode != metaIu) {
++				if (iuToEncode != entryPointIU) {
+ 					processIU(iuToEncode, false);
+ 				}
+ 			}
+ 			createConstraintsForSingleton();
+ 
+-			createMustHave(metaIu, alreadyExistingRoots, newRoots);
++			createMustHave(entryPointIU, alreadyExistingRoots, newRoots);
+ 
+-			createOptimizationFunction(metaIu);
++			createOptimizationFunction(entryPointIU);
+ 			if (DEBUG) {
+ 				long stop = System.currentTimeMillis();
+ 				Tracing.debug("Projection complete: " + (stop - start)); //$NON-NLS-1$
+@@ -312,6 +315,9 @@ public class Projector {
+ 		if (!isApplicable(req))
+ 			return;
+ 		List matches = getApplicableMatches(req);
++		if (isHostRequirement(iu, req)) {
++			rememberHostMatches(iu, matches);
++		}
+ 		if (!req.isOptional()) {
+ 			if (matches.isEmpty()) {
+ 				missingRequirement(iu, req);
+@@ -380,7 +386,7 @@ public class Projector {
+ 
+ 	private void expandRequirementsWithPatches(IInstallableUnit iu, Collector applicablePatches, boolean isRootIu) throws ContradictionException {
+ 		//Unmodified dependencies
+-		Map unchangedRequirements = new HashMap(iu.getRequiredCapabilities().length);
++		Map unchangedRequirements = new HashMap(getRequiredCapabilities(iu).length);
+ 		for (Iterator iterator = applicablePatches.iterator(); iterator.hasNext();) {
+ 			IInstallableUnitPatch patch = (IInstallableUnitPatch) iterator.next();
+ 			IRequiredCapability[][] reqs = mergeRequirements(iu, patch);
+@@ -413,6 +419,9 @@ public class Projector {
+ 				if (isApplicable(reqs[i][1])) {
+ 					IRequiredCapability req = reqs[i][1];
+ 					List matches = getApplicableMatches(req);
++					if (isHostRequirement(iu, req)) {
++						rememberHostMatches(iu, matches);
++					}
+ 					if (!req.isOptional()) {
+ 						if (matches.isEmpty()) {
+ 							missingRequirement(patch, req);
+@@ -443,6 +452,9 @@ public class Projector {
+ 				if (isApplicable(reqs[i][0])) {
+ 					IRequiredCapability req = reqs[i][0];
+ 					List matches = getApplicableMatches(req);
++					if (isHostRequirement(iu, req)) {
++						rememberHostMatches(iu, matches);
++					}
+ 					if (!req.isOptional()) {
+ 						if (matches.isEmpty()) {
+ 							dependencyHelper.implication(new Object[] {iu}).implies(patch).named(new Explanation.HardRequirement(iu, null));
+@@ -487,6 +499,9 @@ public class Projector {
+ 			}
+ 			IRequiredCapability req = (IRequiredCapability) entry.getKey();
+ 			List matches = getApplicableMatches(req);
++			if (isHostRequirement(iu, req)) {
++				rememberHostMatches(iu, matches);
++			}
+ 			if (!req.isOptional()) {
+ 				if (matches.isEmpty()) {
+ 					if (requiredPatches.isEmpty()) {
+@@ -749,6 +764,8 @@ public class Projector {
+ 			Object var = i.next();
+ 			if (var instanceof IInstallableUnit) {
+ 				IInstallableUnit iu = (IInstallableUnit) var;
++				if (iu == entryPoint)
++					continue;
+ 				solution.add(iu);
+ 			}
+ 		}
+@@ -770,16 +787,6 @@ public class Projector {
+ 		return solution;
+ 	}
+ 
+-	public Set getExplanationFor(IInstallableUnit iu) {
+-		//TODO if the iu is resolved then return null.
+-		//TODO if the iu is in an unknown state, then return a special value in the set
+-		try {
+-			return dependencyHelper.whyNot(iu);
+-		} catch (TimeoutException e) {
+-			return Collections.EMPTY_SET;
+-		}
+-	}
+-
+ 	public Set getExplanation(IProgressMonitor monitor) {
+ 		ExplanationJob job = new ExplanationJob();
+ 		job.schedule();
+@@ -807,4 +814,46 @@ public class Projector {
+ 		}
+ 		return job.getExplanationResult();
+ 	}
++
++	public Map getFragmentAssociation() {
++		Map resolvedFragments = new HashMap(fragments.size());
++		for (Iterator iterator = fragments.entrySet().iterator(); iterator.hasNext();) {
++			Entry fragment = (Entry) iterator.next();
++			if (!dependencyHelper.getBooleanValueFor(fragment.getKey()))
++				continue;
++			Set potentialHosts = (Set) fragment.getValue();
++			List resolvedHost = new ArrayList(potentialHosts.size());
++			for (Iterator iterator2 = potentialHosts.iterator(); iterator2.hasNext();) {
++				Object host = iterator2.next();
++				if (dependencyHelper.getBooleanValueFor(host))
++					resolvedHost.add(host);
++			}
++			if (resolvedHost.size() != 0)
++				resolvedFragments.put(fragment.getKey(), resolvedHost);
++		}
++		return resolvedFragments;
++	}
++	
++		private void rememberHostMatches(IInstallableUnit fragment, List matches) {
++		Set existingMatches = (Set) fragments.get(fragment);
++		if (existingMatches == null) {
++			existingMatches = new HashSet();
++			fragments.put(fragment, existingMatches);
++			existingMatches.addAll(matches);
++		}
++		existingMatches.retainAll(matches);
++	}
++
++	private boolean isHostRequirement(IInstallableUnit iu, IRequiredCapability req) {
++		if (!(iu instanceof IInstallableUnitFragment))
++			return false;
++		IInstallableUnitFragment fragment = (IInstallableUnitFragment) iu;
++		IRequiredCapability[] reqs = fragment.getHost();
++		for (int i = 0; i < reqs.length; i++) {
++			if (req == reqs[i])
++				return true;
++		}
++		return true;
++	}
++	
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index b2b1814..8efd839 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -343,9 +343,7 @@ public class SimplePlanner implements IPlanner {
+ 				LogHelper.log(s);
+ 			s = Status.OK_STATUS;
+ 
+-			Collection newState = projector.extractSolution();
+-			newState.remove(updatedPlan[0]);
+-			return newState;
++			return projector;
+ 		} finally {
+ 			sub.done();
+ 		}
+@@ -355,22 +353,17 @@ public class SimplePlanner implements IPlanner {
+ 		SubMonitor sub = SubMonitor.convert(monitor, ExpandWork);
+ 		sub.setTaskName(Messages.Director_Task_Resolving_Dependencies);
+ 		try {
+-			//Get the solution of the initial request
++			//Get the solution for the initial request
+ 			Object resolutionResult = getSolutionFor(profileChangeRequest, context, sub.newChild(ExpandWork / 2));
+ 			if (resolutionResult instanceof ProvisioningPlan)
+ 				return (ProvisioningPlan) resolutionResult;
+ 
+-			//Compute the set of operands based on the solution obtained previously
+-			Collection newState = (Collection) resolutionResult;
++			Collection newState = ((Projector) resolutionResult).extractSolution();
+ 			Collection fullState = new ArrayList();
+ 			fullState.addAll(newState);
+-			ResolutionHelper newStateHelper = new ResolutionHelper(createSelectionContext(profileChangeRequest.getProfileProperties()), null);
+-			newState = newStateHelper.attachCUs(newState);
++			newState = ResolutionHelper.attachFragments(newState, ((Projector) resolutionResult).getFragmentAssociation());
+ 
+-			ResolutionHelper oldStateHelper = new ResolutionHelper(createSelectionContext(profileChangeRequest.getProfile().getProperties()), null);
+-			Collection oldState = oldStateHelper.attachCUs(profileChangeRequest.getProfile().query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+-
+-			ProvisioningPlan temporaryPlan = generateProvisioningPlan(oldState, newState, profileChangeRequest, null);
++			ProvisioningPlan temporaryPlan = generatePlan((Projector) resolutionResult, newState, profileChangeRequest);
+ 
+ 			//Create a plan for installing necessary pieces to complete the installation (e.g touchpoint actions)
+ 			return createInstallerPlan(profileChangeRequest.getProfile(), profileChangeRequest, fullState, newState, temporaryPlan, context, sub.newChild(ExpandWork / 2));
+@@ -472,14 +465,7 @@ public class SimplePlanner implements IPlanner {
+ 			return new ProvisioningPlan(externalInstallerStatus, initialRequest, new ProvisioningPlan(externalInstallerStatus, agentRequest, null));
+ 		}
+ 
+-		Collection newState = (Collection) externalInstallerPlan;
+-		ResolutionHelper newStateHelper = new ResolutionHelper(createSelectionContext(agentRequest.getProfileProperties()), null);
+-		newState = newStateHelper.attachCUs(newState);
+-
+-		ResolutionHelper oldStateHelper = new ResolutionHelper(createSelectionContext(agentProfile.getProperties()), null);
+-		Collection oldState = oldStateHelper.attachCUs(agentRequest.getProfile().query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+-
+-		initialPlan.setInstallerPlan(generateProvisioningPlan(oldState, newState, agentRequest, null));
++		initialPlan.setInstallerPlan(generatePlan((Projector) externalInstallerPlan, null, agentRequest));
+ 		return initialPlan;
+ 	}
+ 
+@@ -517,35 +503,57 @@ public class SimplePlanner implements IPlanner {
+ 			agentRequest.removeInstallableUnits(new IInstallableUnit[] {previousMetaRequirementIU});
+ 		agentRequest.addInstallableUnits(new IInstallableUnit[] {metaRequirementIU});
+ 
+-		ProvisioningContext agentCtx = initialContext; //TODO I believe that we are passing too much here
++		ProvisioningContext agentCtx = new ProvisioningContext(new URI[0]);
+ 		ArrayList extraIUs = new ArrayList(unattachedState);
+-		extraIUs.addAll(profile.available(InstallableUnitQuery.ANY, new Collector(), new NullProgressMonitor()).toCollection());
+ 		agentCtx.setExtraIUs(extraIUs);
+-		agentCtx.setProperty(INCLUDE_PROFILE_IUS, Boolean.FALSE.toString());
+ 		Object agentSolution = getSolutionFor(agentRequest, agentCtx, monitor.newChild(3));
+ 		if (agentSolution instanceof ProvisioningPlan && ((ProvisioningPlan) agentSolution).getStatus().getSeverity() == IStatus.ERROR) {
+ 			MultiStatus agentStatus = new MultiStatus(DirectorActivator.PI_DIRECTOR, 0, Messages.Planner_actions_and_software_incompatible, null);
+ 			agentStatus.add(((ProvisioningPlan) agentSolution).getStatus());
+ 			return new ProvisioningPlan(agentStatus, initialRequest, new ProvisioningPlan(agentStatus, agentRequest, null));
+ 		}
+-		Collection agentState = (Collection) agentSolution;
+-		agentState.remove(metaRequirementIU);
+-		ResolutionHelper agentStateHelper = new ResolutionHelper(createSelectionContext(initialRequest.getProfileProperties()), null);
+-		agentState = agentStateHelper.attachCUs(agentState);
+ 
+-		ResolutionHelper initialStateHelper = new ResolutionHelper(createSelectionContext(initialRequest.getProfile().getProperties()), null);
+-		Collection initialState = initialStateHelper.attachCUs(initialRequest.getProfile().query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+-		ProvisioningPlan agentPlan = generateProvisioningPlan(initialState, agentState, agentRequest, null);
++		//Compute the installer plan. It is the difference between what is currently in the profile and the solution we just computed
++		Collection agentState = ((Projector) agentSolution).extractSolution();
++		agentState.remove(metaRequirementIU); //Remove the fake IU
++		agentState = ResolutionHelper.attachFragments(agentState, ((Projector) agentSolution).getFragmentAssociation());
+ 
+-		ResolutionHelper newStateHelper = new ResolutionHelper(createSelectionContext(initialRequest.getProfileProperties()), null);
+-		expectedState = newStateHelper.attachCUs(expectedState);
++		ProvisioningContext NO_REPO_CONTEXT = new ProvisioningContext(new URI[0]);
++		NO_REPO_CONTEXT.setArtifactRepositories(new URI[0]);
++		//...This computes the attachment of what is currently in the profile 
++		Object initialSolution = getSolutionFor(new ProfileChangeRequest(new EverythingOptionalProfile(initialRequest.getProfile())), NO_REPO_CONTEXT, new NullProgressMonitor());
++		if (initialSolution instanceof ProvisioningPlan) {
++			LogHelper.log(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, "The resolution of the previous state contained in profile " + initialRequest.getProfile().getProfileId() + " version " + initialRequest.getProfile().getTimestamp() + " failed to resolve.")); //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$
++		}
++		Collection initialState = ((Projector) initialSolution).extractSolution();
++		initialState = ResolutionHelper.attachFragments(initialState, ((Projector) initialSolution).getFragmentAssociation());
+ 
+-		ResolutionHelper oldStateHelper = new ResolutionHelper(createSelectionContext(initialRequest.getProfileProperties()), null); //Here we purposefully use the new properties
+-		Set iusAfterActionInstall = new HashSet((Collection) agentSolution);
+-		iusAfterActionInstall.addAll(initialRequest.getProfile().query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+-		Collection oldState = oldStateHelper.attachCUs(iusAfterActionInstall);
++		ProvisioningPlan agentPlan = generateProvisioningPlan(initialState, agentState, initialRequest, null);
++
++		//Compute the installation plan. It is the difference between the state after the installer plan has run and the expectedState.
++		return generateProvisioningPlan(agentState, expectedState, initialRequest, agentPlan);
++	}
++
++	//Compute the set of operands based on the solution obtained previously
++	private ProvisioningPlan generatePlan(Projector newSolution, Collection newState, ProfileChangeRequest request) {
++		//Compute the attachment of the new state if not provided
++		if (newState == null) {
++			newState = newSolution.extractSolution();
++			newState = ResolutionHelper.attachFragments(newState, newSolution.getFragmentAssociation());
++		}
++		ProvisioningContext NO_REPO_CONTEXT = new ProvisioningContext(new URI[0]);
++		NO_REPO_CONTEXT.setArtifactRepositories(new URI[0]);
++
++		//Compute the attachment of the previous state
++		Object initialSolution = getSolutionFor(new ProfileChangeRequest(new EverythingOptionalProfile(request.getProfile())), NO_REPO_CONTEXT, new NullProgressMonitor());
++		if (initialSolution instanceof ProvisioningPlan) {
++			LogHelper.log(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, "The resolution of the previous state contained in profile " + request.getProfile().getProfileId() + " version " + request.getProfile().getTimestamp() + " failed to resolve.")); //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$
++		}
++		Collection initialState = ((Projector) initialSolution).extractSolution();
++		initialState = ResolutionHelper.attachFragments(initialState, ((Projector) initialSolution).getFragmentAssociation());
+ 
+-		return generateProvisioningPlan(oldState, expectedState, initialRequest, agentPlan);
++		//Generate the plan
++		return generateProvisioningPlan(initialState, newState, request, null);
+ 	}
+ 
+ 	private IInstallableUnit getPreviousIUForMetaRequirements(IProfile profile, String iuId, IProgressMonitor monitor) {
+@@ -601,17 +609,18 @@ public class SimplePlanner implements IPlanner {
+ 				profileChangeRequest.setInstallableUnitProfileProperty((IInstallableUnit) object.getKey(), INCLUSION_RULES, PlannerHelper.createStrictInclusionRule((IInstallableUnit) object.getKey()));
+ 		}
+ 		//Remove the iu properties associated to the ius removed and the iu properties being removed as well
+-		for (Iterator iterator = alreadyInstalled.iterator(); iterator.hasNext();) {
+-			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+-			for (int i = 0; i < removed.length; i++) {
+-				if (iu.equals(removed[i])) {
+-					profileChangeRequest.removeInstallableUnitProfileProperty(removed[i], INCLUSION_RULES);
+-					iterator.remove();
+-					break;
++		if (removed.length != 0) {
++			for (Iterator iterator = alreadyInstalled.iterator(); iterator.hasNext();) {
++				IInstallableUnit iu = (IInstallableUnit) iterator.next();
++				for (int i = 0; i < removed.length; i++) {
++					if (iu.equals(removed[i])) {
++						profileChangeRequest.removeInstallableUnitProfileProperty(removed[i], INCLUSION_RULES);
++						iterator.remove();
++						break;
++					}
+ 				}
+ 			}
+ 		}
+-
+ 		ArrayList gatheredRequirements = new ArrayList();
+ 
+ 		//Process all the IUs being added
+@@ -700,4 +709,71 @@ public class SimplePlanner implements IPlanner {
+ 		Collection results = resultsMap.values();
+ 		return (IInstallableUnit[]) results.toArray(new IInstallableUnit[results.size()]);
+ 	}
++
++	//helper class to trick the resolver to believe that everything is optional
++	private static class EverythingOptionalProfile implements IProfile {
++		private IProfile profile;
++
++		public EverythingOptionalProfile(IProfile p) {
++			profile = p;
++		}
++
++		public Collector available(Query query, Collector collector, IProgressMonitor monitor) {
++			return profile.available(query, collector, monitor);
++		}
++
++		public Map getInstallableUnitProperties(IInstallableUnit iu) {
++			return profile.getInstallableUnitProperties(iu);
++		}
++
++		public String getInstallableUnitProperty(IInstallableUnit iu, String key) {
++			if (INCLUSION_RULES.equals(key))
++				return PlannerHelper.createOptionalInclusionRule(iu);
++			return profile.getInstallableUnitProperty(iu, key);
++		}
++
++		public Map getLocalProperties() {
++			return profile.getLocalProperties();
++		}
++
++		public String getLocalProperty(String key) {
++			return profile.getLocalProperty(key);
++		}
++
++		public IProfile getParentProfile() {
++			return profile.getParentProfile();
++		}
++
++		public String getProfileId() {
++			return profile.getProfileId();
++		}
++
++		public Map getProperties() {
++			return profile.getProperties();
++		}
++
++		public String getProperty(String key) {
++			return profile.getProperty(key);
++		}
++
++		public String[] getSubProfileIds() {
++			return profile.getSubProfileIds();
++		}
++
++		public long getTimestamp() {
++			return profile.getTimestamp();
++		}
++
++		public boolean hasSubProfiles() {
++			return profile.hasSubProfiles();
++		}
++
++		public boolean isRootProfile() {
++			return profile.isRootProfile();
++		}
++
++		public Collector query(Query query, Collector collector, IProgressMonitor monitor) {
++			return profile.query(query, collector, monitor);
++		}
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
+index 04bca9d..ff706c6 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
+@@ -11,6 +11,7 @@
+ package org.eclipse.equinox.internal.p2.resolution;
+ 
+ import java.util.*;
++import java.util.Map.Entry;
+ import org.eclipse.equinox.internal.p2.director.DirectorActivator;
+ import org.eclipse.equinox.internal.p2.director.RecommendationDescriptor;
+ import org.eclipse.equinox.internal.provisional.p2.core.Version;
+@@ -186,6 +187,92 @@ public class ResolutionHelper {
+ 		return result;
+ 	}
+ 
++	public static Collection attachFragments(Collection toAttach, Map fragmentsToIUs) {
++		Map fragmentBindings = new HashMap();
++		//Build a map inverse of the one provided in input (host --> List of fragments)
++		Map iusToFragment = new HashMap(fragmentsToIUs.size());
++		for (Iterator iterator = fragmentsToIUs.entrySet().iterator(); iterator.hasNext();) {
++			Entry mapping = (Entry) iterator.next();
++			IInstallableUnitFragment fragment = (IInstallableUnitFragment) mapping.getKey();
++			List existingMatches = (List) mapping.getValue();
++
++			for (Iterator iterator2 = existingMatches.iterator(); iterator2.hasNext();) {
++				Object host = iterator2.next();
++				List potentialFragments = (List) iusToFragment.get(host);
++				if (potentialFragments == null) {
++					potentialFragments = new ArrayList();
++					iusToFragment.put(host, potentialFragments);
++				}
++				potentialFragments.add(fragment);
++			}
++		}
++
++		for (Iterator iterator = iusToFragment.entrySet().iterator(); iterator.hasNext();) {
++			Entry entry = (Entry) iterator.next();
++			IInstallableUnit hostIU = (IInstallableUnit) entry.getKey();
++			List potentialIUFragments = (List) entry.getValue();
++			ArrayList applicableFragments = new ArrayList();
++			for (Iterator iterator2 = potentialIUFragments.iterator(); iterator2.hasNext();) {
++				IInstallableUnit dependentIU = (IInstallableUnitFragment) iterator2.next();
++				if (hostIU.equals(dependentIU) || !dependentIU.isFragment())
++					continue;
++
++				IInstallableUnitFragment potentialFragment = (IInstallableUnitFragment) dependentIU;
++
++				// Check to make sure the host meets the requirements of the fragment
++				IRequiredCapability reqsFromFragment[] = potentialFragment.getHost();
++				boolean match = true;
++				boolean requirementMatched = false;
++				for (int l = 0; l < reqsFromFragment.length && match == true; l++) {
++					requirementMatched = false;
++					if (hostIU.satisfies(reqsFromFragment[l]))
++						requirementMatched = true;
++					if (requirementMatched == false) {
++						match = false;
++						break;
++					}
++
++				}
++				if (match) {
++					applicableFragments.add(potentialFragment);
++				}
++			}
++
++			IInstallableUnitFragment theFragment = null;
++			int specificityLevel = 0;
++			for (Iterator iterator4 = applicableFragments.iterator(); iterator4.hasNext();) {
++				IInstallableUnitFragment fragment = (IInstallableUnitFragment) iterator4.next();
++				if (fragment.getHost().length > specificityLevel) {
++					theFragment = fragment;
++					specificityLevel = fragment.getHost().length;
++				}
++			}
++			if (theFragment != null)
++				fragmentBindings.put(hostIU, theFragment);
++		}
++		//build the collection of resolved IUs
++		Collection result = new HashSet(toAttach.size());
++		for (Iterator iterator = toAttach.iterator(); iterator.hasNext();) {
++			IInstallableUnit iu = (IInstallableUnit) iterator.next();
++			if (iu == null)
++				continue;
++			//just return fragments as they are
++			if (iu.isFragment()) {
++				result.add(iu);
++				continue;
++			}
++			//return a new IU that combines the IU with its bound fragments
++			IInstallableUnitFragment fragment = (IInstallableUnitFragment) fragmentBindings.get(iu);
++			IInstallableUnitFragment[] fragments;
++			if (fragment == null)
++				fragments = NO_FRAGMENTS;
++			else
++				fragments = new IInstallableUnitFragment[] {fragment};
++			result.add(MetadataFactory.createResolvedInstallableUnit(iu, fragments));
++		}
++		return result;
++	}
++
+ 	public boolean isResolved(IInstallableUnit iu) {
+ 		return state.getBundle(iu.getId(), Version.toOSGiVersion(iu.getVersion())).isResolved();
+ 	}
+commit 3cc0f8c33b8f432c4418e878459f41ad5b75d17b
+Author: Pascal Rapicault <prapicau>
+Date:   Mon Apr 20 14:24:42 2009 +0000
+
+    Bug 262503 - [planner] Replace ResolutionHelper with SAT4J based solution
+
+0	1	bundles/org.eclipse.equinox.p2.director/META-INF/MANIFEST.MF
+96	0	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/AttachmentHelper.java
+0	647	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/NewDependencyExpander.java
+0	129	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Picker.java
+0	129	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Recommendation.java
+0	117	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/RecommendationDescriptor.java
+6	13	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+0	302	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
+0	34	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/StateMetadataMap.java
+0	145	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/Transformer.java
+0	82	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/UnsatisfiedCapability.java
+0	1	bundles/org.eclipse.equinox.p2.tests/META-INF/MANIFEST.MF
+0	3	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/AllTests.java
+0	39	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/OperationGenerationTest.java
+0	98	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/PickerTest.java
+0	172	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RecommendationTest.java
+0	269	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/ResolutionHelperTest.java
+4	4	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentMethodTest.java
+22	21	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentTest.java
+12	14	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/MultipleIUAndFragmentTest.java
+4	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/planner/AllTests.java
+diff --git a/bundles/org.eclipse.equinox.p2.director/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.director/META-INF/MANIFEST.MF
+index 1f297f9..c26b768 100644
+--- a/bundles/org.eclipse.equinox.p2.director/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.director/META-INF/MANIFEST.MF
+@@ -21,7 +21,6 @@ Import-Package: org.eclipse.equinox.internal.p2.core.helpers,
+  org.eclipse.osgi.util;version="1.0.0",
+  org.osgi.framework;version="1.3.0"
+ Export-Package: org.eclipse.equinox.internal.p2.director;x-friends:="org.eclipse.equinox.p2.exemplarysetup",
+- org.eclipse.equinox.internal.p2.resolution;x-internal:=true,
+  org.eclipse.equinox.internal.p2.rollback;x-friends:="org.eclipse.equinox.p2.ui",
+  org.eclipse.equinox.internal.provisional.p2.director;
+   x-friends:="org.eclipse.equinox.p2.console,
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/AttachmentHelper.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/AttachmentHelper.java
+new file mode 100644
+index 0000000..d10899f
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/AttachmentHelper.java
+@@ -0,0 +1,96 @@
++package org.eclipse.equinox.internal.p2.director;
++
++import java.util.*;
++import java.util.Map.Entry;
++import org.eclipse.equinox.internal.provisional.p2.metadata.*;
++
++public class AttachmentHelper {
++	private static final IInstallableUnitFragment[] NO_FRAGMENTS = new IInstallableUnitFragment[0];
++
++	public static Collection attachFragments(Collection toAttach, Map fragmentsToIUs) {
++		Map fragmentBindings = new HashMap();
++		//Build a map inverse of the one provided in input (host --> List of fragments)
++		Map iusToFragment = new HashMap(fragmentsToIUs.size());
++		for (Iterator iterator = fragmentsToIUs.entrySet().iterator(); iterator.hasNext();) {
++			Entry mapping = (Entry) iterator.next();
++			IInstallableUnitFragment fragment = (IInstallableUnitFragment) mapping.getKey();
++			List existingMatches = (List) mapping.getValue();
++
++			for (Iterator iterator2 = existingMatches.iterator(); iterator2.hasNext();) {
++				Object host = iterator2.next();
++				List potentialFragments = (List) iusToFragment.get(host);
++				if (potentialFragments == null) {
++					potentialFragments = new ArrayList();
++					iusToFragment.put(host, potentialFragments);
++				}
++				potentialFragments.add(fragment);
++			}
++		}
++
++		for (Iterator iterator = iusToFragment.entrySet().iterator(); iterator.hasNext();) {
++			Entry entry = (Entry) iterator.next();
++			IInstallableUnit hostIU = (IInstallableUnit) entry.getKey();
++			List potentialIUFragments = (List) entry.getValue();
++			ArrayList applicableFragments = new ArrayList();
++			for (Iterator iterator2 = potentialIUFragments.iterator(); iterator2.hasNext();) {
++				IInstallableUnit dependentIU = (IInstallableUnitFragment) iterator2.next();
++				if (hostIU.equals(dependentIU) || !dependentIU.isFragment())
++					continue;
++
++				IInstallableUnitFragment potentialFragment = (IInstallableUnitFragment) dependentIU;
++
++				// Check to make sure the host meets the requirements of the fragment
++				IRequiredCapability reqsFromFragment[] = potentialFragment.getHost();
++				boolean match = true;
++				boolean requirementMatched = false;
++				for (int l = 0; l < reqsFromFragment.length && match == true; l++) {
++					requirementMatched = false;
++					if (hostIU.satisfies(reqsFromFragment[l]))
++						requirementMatched = true;
++					if (requirementMatched == false) {
++						match = false;
++						break;
++					}
++
++				}
++				if (match) {
++					applicableFragments.add(potentialFragment);
++				}
++			}
++
++			IInstallableUnitFragment theFragment = null;
++			int specificityLevel = 0;
++			for (Iterator iterator4 = applicableFragments.iterator(); iterator4.hasNext();) {
++				IInstallableUnitFragment fragment = (IInstallableUnitFragment) iterator4.next();
++				if (fragment.getHost().length > specificityLevel) {
++					theFragment = fragment;
++					specificityLevel = fragment.getHost().length;
++				}
++			}
++			if (theFragment != null)
++				fragmentBindings.put(hostIU, theFragment);
++		}
++		//build the collection of resolved IUs
++		Collection result = new HashSet(toAttach.size());
++		for (Iterator iterator = toAttach.iterator(); iterator.hasNext();) {
++			IInstallableUnit iu = (IInstallableUnit) iterator.next();
++			if (iu == null)
++				continue;
++			//just return fragments as they are
++			if (iu.isFragment()) {
++				result.add(iu);
++				continue;
++			}
++			//return a new IU that combines the IU with its bound fragments
++			IInstallableUnitFragment fragment = (IInstallableUnitFragment) fragmentBindings.get(iu);
++			IInstallableUnitFragment[] fragments;
++			if (fragment == null)
++				fragments = NO_FRAGMENTS;
++			else
++				fragments = new IInstallableUnitFragment[] {fragment};
++			result.add(MetadataFactory.createResolvedInstallableUnit(iu, fragments));
++		}
++		return result;
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/NewDependencyExpander.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/NewDependencyExpander.java
+deleted file mode 100644
+index 7933d25..0000000
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/NewDependencyExpander.java
++++ /dev/null
+@@ -1,647 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others. All rights reserved. This
+- * program and the accompanying materials are made available under the terms of
+- * the Eclipse Public License v1.0 which accompanies this distribution, and is
+- * available at http://www.eclipse.org/legal/epl-v10.html
+- * 
+- * Contributors: 
+- * 	IBM Corporation - initial API and implementation
+- * 	Genuitec, LLC - added license support
+- ******************************************************************************/
+-package org.eclipse.equinox.internal.p2.director;
+-
+-import java.util.*;
+-import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.resolution.ResolutionHelper;
+-import org.eclipse.equinox.internal.p2.resolution.UnsatisfiedCapability;
+-import org.eclipse.equinox.internal.provisional.p2.core.Version;
+-import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+-import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.query.CapabilityQuery;
+-import org.eclipse.equinox.internal.provisional.p2.query.Collector;
+-import org.eclipse.osgi.util.NLS;
+-import org.osgi.framework.InvalidSyntaxException;
+-
+-/**
+- * This code is kept to report errors. The real resolution is done in classes {@link Slicer} and {@link Projector}. 
+- */
+-public class NewDependencyExpander {
+-
+-	private static class Match {
+-		/**
+-		 * The {@link IInstallableUnit}s satisfying this requirement.
+-		 */
+-		Set candidates;
+-		/**
+-		 * The environment against which capability filters are evaluated for this match.
+-		 */
+-		Dictionary env;
+-		IRequiredCapability req;
+-
+-		public Match(IRequiredCapability range, Dictionary environment) {
+-			this.req = range;
+-			this.env = environment;
+-			candidates = new HashSet(2);
+-		}
+-
+-		/**
+-		 * Prints out a human-readable representation of a Match object for use
+-		 * in error messages.
+-		 */
+-		public String toString() {
+-			if (req == null)
+-				return "[]"; //$NON-NLS-1$
+-			return req.toString();
+-		}
+-	}
+-
+-	/**
+-	 * Represents a requirement name in the map of required capabilities.
+-	 */
+-	private static class MatchKey {
+-		String name;
+-		String namespace;
+-
+-		MatchKey(IRequiredCapability capability) {
+-			this.namespace = capability.getNamespace();
+-			this.name = capability.getName();
+-		}
+-
+-		public boolean equals(Object object) {
+-			if (!(object instanceof MatchKey))
+-				return false;
+-			MatchKey that = (MatchKey) object;
+-			return this.namespace.equals(that.namespace) && this.name.equals(that.name);
+-		}
+-
+-		public int hashCode() {
+-			return 31 * namespace.hashCode() + name.hashCode();
+-		}
+-
+-		public String toString() {
+-			return "MatchKey(" + namespace + '/' + name + ')'; //$NON-NLS-1$
+-		}
+-	}
+-
+-	// Installable units that are optional have a dependency on themselves.
+-	private static class OptionalInstallableUnit implements IInstallableUnit {
+-		private boolean optionalReqs;
+-		private IInstallableUnit wrapped;
+-
+-		OptionalInstallableUnit(IInstallableUnit iu, boolean generateOptionalReqs) {
+-			wrapped = iu;
+-			optionalReqs = generateOptionalReqs;
+-		}
+-
+-		public String getFilter() {
+-			return wrapped.getFilter();
+-		}
+-
+-		public String getId() {
+-			return wrapped.getId();
+-		}
+-
+-		public Version getVersion() {
+-			return wrapped.getVersion();
+-		}
+-
+-		public String getProperty(String key) {
+-			return wrapped.getProperty(key);
+-		}
+-
+-		public boolean equals(Object obj) {
+-			if (this == obj)
+-				return true;
+-			if (!super.equals(obj))
+-				return false;
+-			if (getClass() != obj.getClass())
+-				return false;
+-			final OptionalInstallableUnit other = (OptionalInstallableUnit) obj;
+-			if (wrapped == null) {
+-				if (other.wrapped != null)
+-					return false;
+-			} else if (!wrapped.equals(other.wrapped))
+-				return false;
+-			return true;
+-		}
+-
+-		public IRequiredCapability[] getRequiredCapabilities() {
+-			ArrayList result = new ArrayList();
+-			IProvidedCapability[] caps = wrapped.getProvidedCapabilities();
+-			for (int i = 0; i < caps.length; i++) {
+-				result.add(MetadataFactory.createRequiredCapability(caps[i].getNamespace(), caps[i].getName(), new VersionRange(caps[i].getVersion(), true, caps[i].getVersion(), true), wrapped.getFilter(), optionalReqs, false));
+-			}
+-			result.addAll(Arrays.asList(wrapped.getRequiredCapabilities()));
+-			return (IRequiredCapability[]) result.toArray(new IRequiredCapability[result.size()]);
+-		}
+-
+-		public int hashCode() {
+-			final int prime = 31;
+-			int result = super.hashCode();
+-			result = prime * result + ((wrapped == null) ? 0 : wrapped.hashCode());
+-			return result;
+-		}
+-
+-		public String toString() {
+-			return wrapped.toString();
+-		}
+-
+-		public IArtifactKey[] getArtifacts() {
+-			return wrapped.getArtifacts();
+-		}
+-
+-		public Map getProperties() {
+-			return wrapped.getProperties();
+-		}
+-
+-		public IProvidedCapability[] getProvidedCapabilities() {
+-			return wrapped.getProvidedCapabilities();
+-		}
+-
+-		public ITouchpointData[] getTouchpointData() {
+-			return wrapped.getTouchpointData();
+-		}
+-
+-		public ITouchpointType getTouchpointType() {
+-			return wrapped.getTouchpointType();
+-		}
+-
+-		public boolean isFragment() {
+-			return wrapped.isFragment();
+-		}
+-
+-		public boolean isSingleton() {
+-			return wrapped.isSingleton();
+-		}
+-
+-		public int compareTo(Object arg) {
+-			return wrapped.compareTo(arg);
+-		}
+-
+-		public IInstallableUnitFragment[] getFragments() {
+-			return null;
+-		}
+-
+-		public boolean isResolved() {
+-			return false;
+-		}
+-
+-		public IInstallableUnit unresolved() {
+-			return this;
+-		}
+-
+-		public IUpdateDescriptor getUpdateDescriptor() {
+-			return wrapped.getUpdateDescriptor();
+-		}
+-
+-		public ILicense getLicense() {
+-			return wrapped.getLicense();
+-		}
+-
+-		public ICopyright getCopyright() {
+-			return wrapped.getCopyright();
+-		}
+-
+-		public boolean satisfies(IRequiredCapability candidate) {
+-			return wrapped.satisfies(candidate);
+-		}
+-
+-		public IRequiredCapability[] getMetaRequiredCapabilities() {
+-			return wrapped.getMetaRequiredCapabilities();
+-		}
+-	}
+-
+-	static final int OperationWork = 100;
+-
+-	private final Set alreadyInstalled = new HashSet();
+-
+-	private boolean includeOptional;
+-
+-	/**
+-	 * A map of all the requirements ever encountered in the system. The key is
+-	 * a MatchKey and the value is a List of Match objects.
+-	 */
+-	private Map must = new HashMap();
+-	private Picker picker;
+-
+-	private Dictionary selectionContext;
+-
+-	private RecommendationDescriptor recommendations;
+-
+-	private ResolutionHelper resolver;
+-
+-	private IInstallableUnit[] roots;
+-
+-	private Collection solution;
+-
+-	public NewDependencyExpander(IInstallableUnit[] r, IInstallableUnit[] alreadyInstalled, IInstallableUnit[] availableIUs, Dictionary selectionContext, boolean includeOptional) {
+-		this.roots = (r == null) ? new IInstallableUnit[0] : r;
+-		this.includeOptional = includeOptional;
+-		alreadyInstalled = alreadyInstalled == null ? new IInstallableUnit[0] : alreadyInstalled;
+-		this.alreadyInstalled.addAll(Arrays.asList(alreadyInstalled));
+-		this.selectionContext = selectionContext;
+-
+-		IInstallableUnit[] result = new IInstallableUnit[roots.length + alreadyInstalled.length + availableIUs.length];
+-		System.arraycopy(roots, 0, result, 0, roots.length);
+-		System.arraycopy(alreadyInstalled, 0, result, roots.length, alreadyInstalled.length);
+-		System.arraycopy(availableIUs, 0, result, roots.length + alreadyInstalled.length, availableIUs.length);
+-		picker = new Picker(result, new RecommendationDescriptor(new HashSet()));
+-		Collection filterForRoot = new ArrayList();
+-		if (r != null && r.length > 0) {
+-			filterForRoot.add(new BasicIUFilter(r));
+-			filterForRoot.add(new RequirementBasedFilter(r[0].getRequiredCapabilities()));
+-		}
+-		picker.prefer(filterForRoot);
+-	}
+-
+-	/**
+-	 * Creates a problem status for the given unsatisfied dependency.
+-	 */
+-	private void addUnsatisfied(IRequiredCapability req, Collection toAdd, MultiStatus problems) {
+-		for (Iterator it = toAdd.iterator(); it.hasNext();) {
+-			IInstallableUnit unit = (IInstallableUnit) it.next();
+-			IRequiredCapability[] required = unit.getRequiredCapabilities();
+-			for (int i = 0; i < required.length; i++) {
+-				if (required[i].equals(req)) {
+-					UnsatisfiedCapability unsatisfied = new UnsatisfiedCapability(req, unit);
+-					problems.add(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, unsatisfied.toString()));
+-				}
+-			}
+-		}
+-	}
+-
+-	private void algo(SubMonitor p, MultiStatus problems) {
+-		//First we create dependencies on the root themselves. The first iteration will mostly consist in rediscovering the roots.
+-		Collection toAdd = asOptionalIUs(Arrays.asList(roots), false);
+-		toAdd.addAll(alreadyInstalled);
+-		do {
+-			//reset work at each iteration, then use up a third. This results in an infinite series where remaining ticks gets steadily smaller
+-			if (p.isCanceled()) {
+-				problems.add(Status.CANCEL_STATUS);
+-				return;
+-			}
+-			p.setWorkRemaining(100);
+-			extractVisibilityData(toAdd);
+-			if (p.isCanceled()) {
+-				problems.add(Status.CANCEL_STATUS);
+-				return;
+-			}
+-			extractRequirements(toAdd);
+-			if (p.isCanceled()) {
+-				problems.add(Status.CANCEL_STATUS);
+-				return;
+-			}
+-			toAdd = collectMatches(toAdd, problems);
+-			p.worked(33);
+-		} while (toAdd.size() != 0);
+-
+-		//don't bother invoking the resolver if we already have problems
+-		//		if (!problems.isOK())
+-		//			return;
+-		invokeResolver(problems);
+-		//		if (problems.isOK())
+-		if (p.isCanceled()) {
+-			problems.add(Status.CANCEL_STATUS);
+-			return;
+-		}
+-		extractSolution();
+-	}
+-
+-	private void extractVisibilityData(Collection ius) {
+-		Collection filters = new ArrayList();
+-		for (Iterator iterator = ius.iterator(); iterator.hasNext();) {
+-			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+-			if ("true".equalsIgnoreCase(iu.getProperty("lineUp"))) { //$NON-NLS-1$//$NON-NLS-2$
+-				filters.add(new RequirementBasedFilter(iu.getRequiredCapabilities()));
+-			}
+-		}
+-		picker.prefer(filters);
+-	}
+-
+-	private Collection asOptionalIUs(Collection asList, boolean generateOptionalReqs) {
+-		ArrayList result = new ArrayList();
+-		for (Iterator iterator = asList.iterator(); iterator.hasNext();) {
+-			result.add(new OptionalInstallableUnit(((IInstallableUnit) iterator.next()), generateOptionalReqs));
+-		}
+-		return result;
+-	}
+-
+-	private Collection collectFlavorProviders(Collection toSearchFor) {
+-		String flavor = (String) selectionContext.get(IProfile.PROP_ENVIRONMENTS);
+-		if (flavor == null)
+-			return new HashSet();
+-		IInstallableUnit[][] picked = picker.findInstallableUnit(null, null, new IRequiredCapability[] {MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_FLAVOR, flavor, VersionRange.emptyRange, null, false, false)}, true /* fragmentsOnly */);
+-		IInstallableUnit[] ius;
+-		if (picked[0].length > 0)
+-			ius = picked[0];
+-		else
+-			ius = picked[1];
+-		Set results = new HashSet(ius.length);
+-		for (int i = 0; i < ius.length; i++) {
+-			IInstallableUnit tmp = match(toSearchFor, ius[i]);
+-			if (tmp != null)
+-				results.add(new OptionalInstallableUnit(tmp, false));
+-		}
+-		return results;
+-	}
+-
+-	private Collection collectInstallableUnitFragments(Collection ius) {
+-		Set picked = new HashSet();
+-		for (Iterator iterator = ius.iterator(); iterator.hasNext();) {
+-			IInstallableUnit current = (IInstallableUnit) iterator.next();
+-			IInstallableUnit[][] candidates = picker.findInstallableUnit(null, null, new IRequiredCapability[] {MetadataFactory.createRequiredCapability("fragment", current.getId(), VersionRange.emptyRange, null, true, false)}, false /* not fragmentsOnly */); //$NON-NLS-1$
+-			IInstallableUnit[] matches = candidates[0].length > 0 ? candidates[0] : candidates[1];
+-			if (matches.length > 0) { //TODO Here we need to check the filter of the found iu
+-				if (matches.length == 1) {
+-					picked.add(matches[0]);
+-					continue;
+-				}
+-				//verify that each IU requires the current iu
+-				IProvidedCapability capForCurrent = MetadataFactory.createProvidedCapability(IInstallableUnit.NAMESPACE_IU_ID, current.getId(), current.getVersion());
+-				Map toAdd = new HashMap();
+-				for (int i = 0; i < matches.length; i++) {
+-					IRequiredCapability[] reqs = matches[i].getRequiredCapabilities();
+-					boolean isReallyAFragment = false;
+-					for (int j = 0; j < reqs.length; j++) {
+-						isReallyAFragment = capForCurrent.satisfies(reqs[j]);
+-					}
+-					if (!isReallyAFragment)
+-						continue;
+-					IInstallableUnit match = (IInstallableUnit) toAdd.get(matches[i].getId());
+-					if (match == null || match.getVersion().compareTo(matches[i].getVersion()) < 0)
+-						toAdd.put(matches[i].getId(), matches[i]);
+-				}
+-				picked.addAll(toAdd.values());
+-				//in the reminder, check if more than one is good, then pick the highest one.
+-			}
+-		}
+-		return picked;
+-	}
+-
+-	// For each requirement, find the potential IUs
+-	private Collection collectMatches(Collection toAdd, MultiStatus problems) {
+-		Collection thingsAdded = new HashSet();
+-		for (Iterator iterator = must.values().iterator(); iterator.hasNext();) {
+-			List all = (List) iterator.next();
+-			for (Iterator matches = all.iterator(); matches.hasNext();) {
+-				Match current = (Match) matches.next();
+-				Collection[] picked = picker.findInstallableUnit(null, null, current.req);
+-				Collection found = picked[0].size() > 0 ? picked[0] : picked[1];
+-				if (current.candidates.addAll(found)) {
+-					thingsAdded.addAll(found);
+-					thingsAdded.addAll(collectOptionalInstallableUnits(found));
+-				}
+-				if (current.candidates.size() == 0 && requirementEnabled(current.req))
+-					addUnsatisfied(current.req, toAdd, problems);
+-			}
+-			if (all.size() > 2) {
+-				Match[] conflictingMatches = (Match[]) all.toArray(new Match[all.size()]);
+-				throw new IllegalStateException(NLS.bind(Messages.Old_Resolver_Several_Versions, conflictingMatches));
+-			}
+-			if (all.size() > 1) {
+-				//TODO This algorithm needs to be generalized to consider all the potential candidates.
+-				Set set1 = ((Match) all.get(0)).candidates;
+-				Set set2 = ((Match) all.get(1)).candidates;
+-				boolean potentialSolution = false;
+-				for (Iterator iteratorSet1 = set1.iterator(); iteratorSet1.hasNext() && !potentialSolution;) {
+-					IInstallableUnit itemSet1 = (IInstallableUnit) iteratorSet1.next();
+-					for (Iterator iteratorSet2 = set2.iterator(); iteratorSet2.hasNext() && !potentialSolution;) {
+-						IInstallableUnit itemSet2 = (IInstallableUnit) iteratorSet2.next();
+-						if (itemSet1.getId().equals(itemSet2.getId()) && ((itemSet1.isSingleton() == true && itemSet1.isSingleton() == itemSet2.isSingleton()) || itemSet1.isSingleton() != itemSet2.isSingleton())) {
+-							continue; //This combination would not work. Keep on searching
+-						}
+-						potentialSolution = true;
+-					}
+-				}
+-				if (potentialSolution == false) {
+-					String msg = NLS.bind(Messages.Old_Resolver_Incompatible_Versions, all.get(0), all.get(1));
+-					problems.add(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, msg));
+-				}
+-			}
+-
+-		}
+-		return thingsAdded;
+-	}
+-
+-	private Collection collectOptionalInstallableUnits(Collection optionalFor) {
+-		if (!includeOptional)
+-			return new ArrayList(0);
+-		Collection result = collectFlavorProviders(optionalFor);
+-		result.addAll(collectInstallableUnitFragments(optionalFor));
+-		//		if (result.size() != 0) {//Find the optional pieces of the optional pieces. TODO I think there can be cases where we would cycle infinitely
+-		//			result.addAll(collectOptionalInstallableUnits(result));
+-		//		}
+-		return result;
+-	}
+-
+-	/**
+-	 * Eliminate false positives from the set of unsatisfied capabilities returned
+-	 * by the resolver.  This includes optional dependencies, and dependencies for
+-	 * which we have an available installable unit.
+-	 */
+-	private UnsatisfiedCapability[] collectUnsatisfiedDependencies(UnsatisfiedCapability[] unresolved) {
+-		HashSet reallyUnsatisfied = new HashSet(unresolved.length);
+-		for (int i = 0; i < unresolved.length; i++) {
+-			List all = (List) must.get(new MatchKey(unresolved[i].getRequiredCapability()));
+-			if (all != null) {
+-				for (Iterator iterator = all.iterator(); iterator.hasNext();) {
+-					Match m = (Match) iterator.next();
+-					if (requirementEnabled(m.req) && !oneResolved(m.candidates))
+-						reallyUnsatisfied.add(unresolved[i]);
+-				}
+-			} else {
+-				must.get(new MatchKey(unresolved[i].getRequiredCapability()));
+-			}
+-		}
+-		return (UnsatisfiedCapability[]) reallyUnsatisfied.toArray(new UnsatisfiedCapability[reallyUnsatisfied.size()]);
+-	}
+-
+-	private List createList(Match m) {
+-		List result = new LinkedList();
+-		result.add(m);
+-		return result;
+-	}
+-
+-	public IStatus expand(IProgressMonitor p) {
+-		MultiStatus result = new MultiStatus(DirectorActivator.PI_DIRECTOR, 1, Messages.Director_Unsatisfied_Dependencies, null);
+-		try {
+-			algo(SubMonitor.convert(p, "Resolving", 10), result);
+-		} catch (IllegalStateException e) {
+-			return new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, 1, e.getMessage(), null);
+-		}
+-		if (result.isOK())
+-			return Status.OK_STATUS;
+-		return result;
+-	}
+-
+-	// return a map from a requirement to the set of installable units
+-	// 		  depending on that requirement
+-	private void extractRequirements(Collection ius) {
+-		//map of MatchKey->Match
+-		for (Iterator iterator = ius.iterator(); iterator.hasNext();) {
+-			IInstallableUnit currentUnit = (IInstallableUnit) iterator.next();
+-			IRequiredCapability[] toAdd = currentUnit.getRequiredCapabilities();
+-			outer: for (int i = 0; i < toAdd.length; i++) {
+-				IRequiredCapability current = toAdd[i];
+-				if (isApplicable(current) && !isMeta(current) && !current.isOptional()) {
+-					MatchKey key = new MatchKey(current);
+-					List match = (List) must.get(key);
+-					if (match == null) {
+-						//We've never seen a requirement like this. Make a new match
+-						must.put(key, createList(new Match(current, selectionContext)));
+-					} else {
+-						//look for an existing match whose version range is overlapping the new one
+-						for (Iterator matches = match.iterator(); matches.hasNext();) {
+-							Match currentMatch = (Match) matches.next();
+-							VersionRange newRange = intersect(currentMatch.req.getRange(), current.getRange());
+-							if (newRange != null) {
+-								//merge version range and environment with existing match
+-								currentMatch.req = MetadataFactory.createRequiredCapability(current.getNamespace(), current.getName(), newRange, current.getFilter(), currentMatch.req.isOptional() && current.isOptional(), false);
+-								currentMatch.env = mergeEnvironments(currentMatch.env, current);
+-								continue outer;
+-							}
+-						}
+-						//the new match is disjoint from existing ones, so add a new match to the list
+-						match.add(new Match(current, selectionContext));
+-					}
+-				}
+-			}
+-		}
+-	}
+-
+-	private void extractSolution() {
+-		solution = Collections.unmodifiableCollection(resolver.getAllResolved());
+-	}
+-
+-	public Collection getAllInstallableUnits() {
+-		if (solution == null)
+-			solution = new ArrayList(0);
+-		return solution;
+-	}
+-
+-	public Collection getNewInstallableUnits() {
+-		HashSet newIUs = new HashSet(getAllInstallableUnits());
+-		newIUs.removeAll(alreadyInstalled);
+-		return newIUs;
+-	}
+-
+-	public RecommendationDescriptor getRecommendations() {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-
+-	private VersionRange intersect(VersionRange r1, VersionRange r2) {
+-		Version resultMin = null;
+-		boolean resultMinIncluded = false;
+-		Version resultMax = null;
+-		boolean resultMaxIncluded = false;
+-
+-		int minCompare = r1.getMinimum().compareTo(r2.getMinimum());
+-		if (minCompare < 0) {
+-			resultMin = r2.getMinimum();
+-			resultMinIncluded = r2.getIncludeMinimum();
+-		} else if (minCompare > 0) {
+-			resultMin = r1.getMinimum();
+-			resultMinIncluded = r1.getIncludeMinimum();
+-		} else {//minCompare == 0
+-			resultMin = r1.getMinimum();
+-			resultMinIncluded = r1.getIncludeMinimum() && r2.getIncludeMinimum();
+-		}
+-
+-		int maxCompare = r1.getMaximum().compareTo(r2.getMaximum());
+-		if (maxCompare > 0) {
+-			resultMax = r2.getMaximum();
+-			resultMaxIncluded = r2.getIncludeMaximum();
+-		} else if (maxCompare < 0) {
+-			resultMax = r1.getMaximum();
+-			resultMaxIncluded = r1.getIncludeMaximum();
+-		} else {//maxCompare == 0
+-			resultMax = r1.getMaximum();
+-			resultMaxIncluded = r1.getIncludeMaximum() && r2.getIncludeMaximum();
+-		}
+-
+-		int resultRangeComparison = resultMin.compareTo(resultMax);
+-		if (resultRangeComparison < 0)
+-			return new VersionRange(resultMin, resultMinIncluded, resultMax, resultMaxIncluded);
+-		else if (resultRangeComparison == 0 && resultMinIncluded == resultMaxIncluded) {
+-			return new VersionRange(resultMin, resultMinIncluded, resultMax, resultMaxIncluded);
+-		} else
+-			return null;
+-	}
+-
+-	private void invokeResolver(MultiStatus problems) {
+-		resolver = new ResolutionHelper(selectionContext, recommendations);
+-		Set toInstall = new HashSet(must.size());
+-		for (Iterator iterator = must.values().iterator(); iterator.hasNext();) {
+-			List allMatches = (List) iterator.next();
+-			for (Iterator matches = allMatches.iterator(); matches.hasNext();) {
+-				Match current = (Match) matches.next();
+-				toInstall.addAll(current.candidates);
+-			}
+-		}
+-		toInstall.removeAll(alreadyInstalled);
+-		UnsatisfiedCapability[] unsatisfied = collectUnsatisfiedDependencies(resolver.install(toInstall, alreadyInstalled));
+-		for (int i = 0; i < unsatisfied.length; i++) {
+-			problems.add(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, unsatisfied[i].toString()));
+-		}
+-	}
+-
+-	// Check whether the requirement is applicable
+-	private boolean isApplicable(IRequiredCapability req) {
+-		String filter = req.getFilter();
+-		if (filter == null)
+-			return true;
+-		try {
+-			return DirectorActivator.context.createFilter(filter).match(selectionContext);
+-		} catch (InvalidSyntaxException e) {
+-			return false;
+-		}
+-	}
+-
+-	/**
+-	 * Because information to discover additional things to install is mixed with information 
+-	 * about inter-component dependencies, we end up having dependencies that cause
+-	 * the whole world to be selected. We are here filtering them out.
+-	 */
+-	private boolean isMeta(IRequiredCapability requiredCapability) {
+-		String namespace = requiredCapability.getNamespace();
+-		//TODO Should not reference OSGi touchpoint concepts here
+-		return namespace.equals("org.eclipse.equinox.p2.eclipse.type") || namespace.equals(IInstallableUnit.NAMESPACE_FLAVOR); //$NON-NLS-1$
+-	}
+-
+-	private IInstallableUnit match(Collection close, IInstallableUnit picked) {
+-		Collector result = new HasMatchCollector();
+-		new CapabilityQuery(picked.getRequiredCapabilities()).perform(close.iterator(), result);
+-		if (!result.isEmpty())
+-			return picked;
+-		return null;
+-	}
+-
+-	private Dictionary mergeEnvironments(Dictionary context, IRequiredCapability newCapability) {
+-		String[] newSelectors = newCapability.getSelectors();
+-		if (newSelectors == null || newSelectors.length == 0)
+-			return context;
+-		if (context == null)
+-			context = new Hashtable();
+-		String trueString = Boolean.TRUE.toString();
+-		for (int i = 0; i < newSelectors.length; i++) {
+-			context.put(newSelectors[i], trueString);
+-		}
+-		return context;
+-	}
+-
+-	private boolean oneResolved(Collection ius) {
+-		for (Iterator iterator = ius.iterator(); iterator.hasNext();) {
+-			if (resolver.isResolved((IInstallableUnit) iterator.next()))
+-				return true;
+-		}
+-		return false;
+-	}
+-
+-	private boolean requirementEnabled(IRequiredCapability req) {
+-		if (req.isOptional())
+-			return false;
+-		return isApplicable(req);
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Picker.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Picker.java
+deleted file mode 100644
+index e89b21c..0000000
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Picker.java
++++ /dev/null
+@@ -1,129 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.director;
+-
+-import java.util.*;
+-import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+-
+-//The pickers goal is to find an installable unit that satisfies a search criteria 
+-//TODO we may need additional variations of these method where version can be null, or where the search returns all the match, not just the first one
+-//TODO do we want a facility to limit the searching space, or do we assume that the unitsToPickFrom has already been scoped 
+-public class Picker {
+-	//TODO we'll likely need better indexing capabilities
+-	private IInstallableUnit[] preferredSet;
+-	private IInstallableUnit[] completeSet;
+-	private IInstallableUnit[] secondChoiceSet;
+-	private RecommendationDescriptor recommendations;
+-
+-	private List filters;
+-
+-	public Picker(IInstallableUnit[] unitsToPickFrom, RecommendationDescriptor recommendations) {
+-		if (unitsToPickFrom != null)
+-			completeSet = unitsToPickFrom;
+-		else
+-			completeSet = new IInstallableUnit[0];
+-		this.secondChoiceSet = completeSet;
+-		this.recommendations = recommendations;
+-		this.filters = new ArrayList(2);
+-	}
+-
+-	public Collection[] findInstallableUnit(String id, VersionRange range, IRequiredCapability searchedCapability) {
+-		IInstallableUnit[][] tmp = findInstallableUnit(id, range, new IRequiredCapability[] {searchedCapability}, false);
+-		return new Collection[] {Arrays.asList(tmp[0]), Arrays.asList(tmp[1])};
+-	}
+-
+-	public void prefer(Collection filtersToAdd) {
+-		if (!filters.addAll(filtersToAdd))
+-			return;
+-		if (filters.size() == 0)
+-			return;
+-		Set preferredIUs = new HashSet(completeSet.length);
+-		Set secondChoice = new HashSet(completeSet.length);
+-		for (int i = 0; i < completeSet.length; i++) {
+-			for (Iterator iterator = filters.iterator(); iterator.hasNext();) {
+-				if (((IUFilter) iterator.next()).accept(completeSet[i])) {
+-					preferredIUs.add(completeSet[i]);
+-					continue;
+-				} else {
+-					secondChoice.add(completeSet[i]);
+-				}
+-			}
+-		}
+-		preferredSet = (IInstallableUnit[]) preferredIUs.toArray(new IInstallableUnit[preferredIUs.size()]);
+-		secondChoiceSet = (IInstallableUnit[]) secondChoice.toArray(new IInstallableUnit[secondChoice.size()]);
+-	}
+-
+-	public IInstallableUnit[][] findInstallableUnit(String id, VersionRange range, IRequiredCapability[] searchedCapability, boolean fragmentsOnly) {
+-		return new IInstallableUnit[][] {findInstallableUnit(preferredSet, id, range, searchedCapability, fragmentsOnly), findInstallableUnit(secondChoiceSet, id, range, searchedCapability, fragmentsOnly)};
+-	}
+-
+-	//TODO what should be the return value when all the parameters are null. Is it even a valid call?
+-	//TODO A lot of improvement could be done on this algorithm, for example
+-	// - remove from the set of searchedCapability the one that are found
+-	private IInstallableUnit[] findInstallableUnit(IInstallableUnit[] pool, String id, VersionRange range, IRequiredCapability[] searchedCapability, boolean fragmentsOnly) {
+-		if (pool == null || pool.length == 0)
+-			return new IInstallableUnit[0];
+-		Set candidates = new HashSet();
+-
+-		//Filter on plugin id and range
+-		if (id != null && range != null) {
+-			for (int i = 0; i < pool.length; i++) {
+-				if (pool[i].getId().equals(id) && range.isIncluded(pool[i].getVersion()))
+-					candidates.add(pool[i]);
+-			}
+-			pool = (IInstallableUnit[]) candidates.toArray(new IInstallableUnit[candidates.size()]);
+-		}
+-
+-		//Filter on capabilities.
+-		if (searchedCapability != null) {
+-			searchedCapability = rewrite(searchedCapability);
+-			for (int i = 0; i < pool.length; i++) {
+-				IInstallableUnit candidate = pool[i];
+-				for (int k = 0; k < searchedCapability.length; k++) {
+-					boolean valid = false;
+-					IProvidedCapability[] capabilities = candidate.getProvidedCapabilities();
+-					if (capabilities.length == 0)
+-						valid = false;
+-					for (int j = 0; j < capabilities.length; j++) {
+-						if ((searchedCapability[k].getName().equals(capabilities[j].getName()) && searchedCapability[k].getNamespace().equals(capabilities[j].getNamespace()) && (searchedCapability[k].getRange() == null ? true : searchedCapability[k].getRange().isIncluded(capabilities[j].getVersion())))) { //TODO Need to deal with option
+-							valid = true;
+-							break;
+-						}
+-					}
+-					if (valid && (!fragmentsOnly || candidate.isFragment())) {
+-						candidates.add(candidate);
+-					}
+-				}
+-			}
+-			pool = (IInstallableUnit[]) candidates.toArray(new IInstallableUnit[candidates.size()]);
+-		}
+-
+-		return pool;
+-	}
+-
+-	private IRequiredCapability[] rewrite(IRequiredCapability[] requiredCapabilities) {
+-		if (recommendations == null)
+-			return requiredCapabilities;
+-		IRequiredCapability[] result = new IRequiredCapability[requiredCapabilities.length];
+-		for (int i = 0; i < requiredCapabilities.length; i++) {
+-			result[i] = getRecommendation(requiredCapabilities[i]);
+-			if (result[i] == null)
+-				result[i] = requiredCapabilities[i];
+-		}
+-		return result;
+-	}
+-
+-	private IRequiredCapability getRecommendation(IRequiredCapability match) {
+-		Recommendation foundRecommendation = recommendations.findRecommendation(match);
+-		return foundRecommendation != null ? foundRecommendation.newValue() : match;
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Recommendation.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Recommendation.java
+deleted file mode 100644
+index 6393620..0000000
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Recommendation.java
++++ /dev/null
+@@ -1,129 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others. All rights reserved. This
+- * program and the accompanying materials are made available under the terms of
+- * the Eclipse Public License v1.0 which accompanies this distribution, and is
+- * available at http://www.eclipse.org/legal/epl-v10.html
+- * 
+- * Contributors: IBM Corporation - initial API and implementation
+- ******************************************************************************/
+-package org.eclipse.equinox.internal.p2.director;
+-
+-import org.eclipse.equinox.internal.provisional.p2.core.Version;
+-import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IRequiredCapability;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory;
+-
+-public class Recommendation {
+-	private IRequiredCapability applyOn;
+-	private IRequiredCapability newValue;
+-
+-	public Recommendation(IRequiredCapability applyOn2, IRequiredCapability newValue2) {
+-		this.applyOn = applyOn2;
+-		this.newValue = newValue2;
+-	}
+-
+-	public IRequiredCapability applyOn() {
+-		return applyOn;
+-	}
+-
+-	public IRequiredCapability newValue() {
+-		return newValue;
+-	}
+-
+-	public boolean matches(IRequiredCapability toMatch) {
+-		if (!toMatch.getNamespace().equals(applyOn.getNamespace()))
+-			return false;
+-		if (!toMatch.getName().equals(applyOn.getName()))
+-			return false;
+-		if (toMatch.getRange().equals(applyOn.getRange()))
+-			return true;
+-
+-		//TODO Here, in the long run we want to be smarter .for example we could check that the range of the match is a subset of the range specified on applyOn.
+-		return false;
+-	}
+-
+-	boolean matches(Recommendation toMatch) {
+-		return matches(toMatch.applyOn());
+-	}
+-
+-	protected Recommendation merge(Recommendation r2) {
+-		VersionRange result = intersect(newValue().getRange(), r2.newValue().getRange());
+-		if (result == null)
+-			return null;
+-		return new Recommendation(applyOn, MetadataFactory.createRequiredCapability(applyOn.getNamespace(), applyOn.getName(), result, null, false, false));
+-	}
+-
+-	private VersionRange intersect(VersionRange r1, VersionRange r2) {
+-		Version resultMin = null;
+-		boolean resultMinIncluded = false;
+-		Version resultMax = null;
+-		boolean resultMaxIncluded = false;
+-
+-		int minCompare = r1.getMinimum().compareTo(r2.getMinimum());
+-		if (minCompare < 0) {
+-			resultMin = r2.getMinimum();
+-			resultMinIncluded = r2.getIncludeMinimum();
+-		} else if (minCompare > 0) {
+-			resultMin = r1.getMinimum();
+-			resultMinIncluded = r1.getIncludeMinimum();
+-		} else {
+-			// minCompare == 0
+-			resultMin = r1.getMinimum();
+-			resultMinIncluded = r1.getIncludeMinimum() && r2.getIncludeMinimum();
+-		}
+-
+-		int maxCompare = r1.getMaximum().compareTo(r2.getMaximum());
+-		if (maxCompare > 0) {
+-			resultMax = r2.getMaximum();
+-			resultMaxIncluded = r2.getIncludeMaximum();
+-		} else if (maxCompare < 0) {
+-			resultMax = r1.getMaximum();
+-			resultMaxIncluded = r1.getIncludeMaximum();
+-		} else {
+-			// maxCompare == 0
+-			resultMax = r1.getMaximum();
+-			resultMaxIncluded = r1.getIncludeMaximum() && r2.getIncludeMaximum();
+-		}
+-
+-		int resultRangeComparison = resultMin.compareTo(resultMax);
+-		if (resultRangeComparison < 0)
+-			return new VersionRange(resultMin, resultMinIncluded, resultMax, resultMaxIncluded);
+-		else if (resultRangeComparison == 0 && resultMinIncluded == resultMaxIncluded)
+-			return new VersionRange(resultMin, resultMinIncluded, resultMax, resultMaxIncluded);
+-		else
+-			return null;
+-	}
+-
+-	public boolean isCompatible(Recommendation other) {
+-		return intersect(newValue.getRange(), other.newValue.getRange()) != null;
+-	}
+-
+-	public int hashCode() {
+-		final int prime = 31;
+-		int result = 1;
+-		result = prime * result + ((applyOn == null) ? 0 : applyOn.hashCode());
+-		result = prime * result + ((newValue == null) ? 0 : newValue.hashCode());
+-		return result;
+-	}
+-
+-	public boolean equals(Object obj) {
+-		if (this == obj)
+-			return true;
+-		if (obj == null)
+-			return false;
+-		if (getClass() != obj.getClass())
+-			return false;
+-		final Recommendation other = (Recommendation) obj;
+-		if (applyOn == null) {
+-			if (other.applyOn != null)
+-				return false;
+-		} else if (!applyOn.equals(other.applyOn))
+-			return false;
+-		if (newValue == null) {
+-			if (other.newValue != null)
+-				return false;
+-		} else if (!newValue.equals(other.newValue))
+-			return false;
+-		return true;
+-	}
+-}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/RecommendationDescriptor.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/RecommendationDescriptor.java
+deleted file mode 100644
+index 9e1c4d0..0000000
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/RecommendationDescriptor.java
++++ /dev/null
+@@ -1,117 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others. All rights reserved. This
+- * program and the accompanying materials are made available under the terms of
+- * the Eclipse Public License v1.0 which accompanies this distribution, and is
+- * available at http://www.eclipse.org/legal/epl-v10.html
+- * 
+- * Contributors: IBM Corporation - initial API and implementation
+- ******************************************************************************/
+-package org.eclipse.equinox.internal.p2.director;
+-
+-import java.util.*;
+-import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IRequiredCapability;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory;
+-
+-public class RecommendationDescriptor {
+-	public static final String TOUCHPOINT_DATA_KEY = "recommendations";
+-	public static final String KIND = "recommendation";
+-
+-	private Set recommendations;
+-
+-	public RecommendationDescriptor(Set recommendations) {
+-		this.recommendations = recommendations;
+-	}
+-
+-	public Set getRecommendations() {
+-		return recommendations;
+-	}
+-
+-	public Recommendation findRecommendation(IRequiredCapability toMatch) {
+-		for (Iterator iterator = recommendations.iterator(); iterator.hasNext();) {
+-			Recommendation name = (Recommendation) iterator.next();
+-			if (name.matches(toMatch))
+-				return name;
+-		}
+-		return null;
+-	}
+-
+-	public Recommendation findRecommendation(Recommendation toMatch) {
+-		for (Iterator iterator = recommendations.iterator(); iterator.hasNext();) {
+-			Recommendation name = (Recommendation) iterator.next();
+-			if (name.matches(toMatch))
+-				return name;
+-		}
+-		return null;
+-	}
+-
+-	//Merge the other descriptor into this one. Return an OK Status is the merged succeeded, otherwise return an INFO Status
+-	public IStatus merge(RecommendationDescriptor other) {
+-		MultiStatus result = null;
+-		for (Iterator it = other.recommendations.iterator(); it.hasNext();) {
+-			Recommendation otherRecommendation = (Recommendation) it.next();
+-			Recommendation matchInThis = findRecommendation(otherRecommendation);
+-			if (matchInThis == null) {
+-				recommendations.add(otherRecommendation);
+-				continue;
+-			}
+-			Recommendation newRec = otherRecommendation.merge(matchInThis);
+-			if (newRec != null) {
+-				recommendations.remove(matchInThis);
+-				recommendations.add(newRec);
+-				continue;
+-			} else {
+-				if (result == null)
+-					result = new MultiStatus(DirectorActivator.PI_DIRECTOR, 0, "Conflict between recommendations", null);
+-				result.add(new Status(IStatus.INFO, DirectorActivator.PI_DIRECTOR, "can't merge " + otherRecommendation + " with " + matchInThis));
+-			}
+-		}
+-		if (result == null)
+-			return Status.OK_STATUS;
+-		return result;
+-
+-	}
+-
+-	public static RecommendationDescriptor parse(String descriptor) {
+-		StringTokenizer entries = new StringTokenizer(descriptor, "\n");
+-		Set recommendations = new HashSet(entries.countTokens());
+-		while (entries.hasMoreElements()) {
+-			StringTokenizer oneRec = new StringTokenizer((String) entries.nextElement(), "/");
+-			if (oneRec.countTokens() != 4) {
+-				//format error, ignore and continue
+-
+-				continue;
+-			}
+-			String ns = oneRec.nextToken().trim();
+-			String name = oneRec.nextToken().trim();
+-			String oldRange = oneRec.nextToken().trim();
+-			String newRange = oneRec.nextToken().trim();
+-			recommendations.add(new Recommendation(MetadataFactory.createRequiredCapability(ns, name, new VersionRange(oldRange), null, false, false), MetadataFactory.createRequiredCapability(ns, name, new VersionRange(newRange), null, false, false)));
+-		}
+-		return new RecommendationDescriptor(recommendations);
+-	}
+-
+-	public static String serialize(RecommendationDescriptor toSerialize) {
+-		StringBuffer result = new StringBuffer();
+-		for (Iterator iterator = toSerialize.recommendations.iterator(); iterator.hasNext();) {
+-			Recommendation entry = (Recommendation) iterator.next();
+-			result.append(entry.applyOn().getNamespace() + '/' + entry.applyOn().getName() + '/' + entry.applyOn().getRange().toString() + '/' + entry.newValue().getRange().toString() + '\n');
+-		}
+-		return result.toString();
+-	}
+-
+-	public boolean isCompatible(RecommendationDescriptor other) {
+-		for (Iterator it = other.recommendations.iterator(); it.hasNext();) {
+-			Recommendation otherRecommendation = (Recommendation) it.next();
+-			Recommendation matchInThis = findRecommendation(otherRecommendation);
+-			if (matchInThis == null) {
+-				continue;
+-			}
+-			if (!otherRecommendation.isCompatible(matchInThis))
+-				return false;
+-		}
+-		return true;
+-
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index a2994f4..7b44046 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -15,7 +15,6 @@ import java.util.*;
+ import java.util.Map.Entry;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.*;
+-import org.eclipse.equinox.internal.p2.resolution.ResolutionHelper;
+ import org.eclipse.equinox.internal.p2.rollback.FormerState;
+ import org.eclipse.equinox.internal.provisional.p2.core.*;
+ import org.eclipse.equinox.internal.provisional.p2.director.*;
+@@ -351,7 +350,7 @@ public class SimplePlanner implements IPlanner {
+ 			Collection newState = ((Projector) resolutionResult).extractSolution();
+ 			Collection fullState = new ArrayList();
+ 			fullState.addAll(newState);
+-			newState = ResolutionHelper.attachFragments(newState, ((Projector) resolutionResult).getFragmentAssociation());
++			newState = AttachmentHelper.attachFragments(newState, ((Projector) resolutionResult).getFragmentAssociation());
+ 
+ 			ProvisioningPlan temporaryPlan = generatePlan((Projector) resolutionResult, newState, profileChangeRequest);
+ 
+@@ -425,13 +424,7 @@ public class SimplePlanner implements IPlanner {
+ 	}
+ 
+ 	private ProvisioningPlan createInstallerPlanForCohostedCaseFromExternalInstaller(IProfile profile, ProfileChangeRequest initialRequest, ProvisioningPlan initialPlan, Collection newState, ProvisioningContext initialContext, IProfile agentProfile, SubMonitor sub) {
+-		ResolutionHelper newStateHelper = new ResolutionHelper(createSelectionContext(initialRequest.getProfileProperties()), null);
+-		newState = newStateHelper.attachCUs(newState);
+-
+-		ResolutionHelper oldStateHelper = new ResolutionHelper(createSelectionContext(profile.getProperties()), null);
+-		Collection oldState = oldStateHelper.attachCUs(initialRequest.getProfile().query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+-		ProvisioningPlan planForProfile = generateProvisioningPlan(oldState, newState, initialRequest, null);
+-
++		ProvisioningPlan planForProfile = generatePlan(null, newState, initialRequest);
+ 		return createInstallerPlanForExternalInstaller(profile, initialRequest, planForProfile, newState, initialContext, agentProfile, sub);
+ 	}
+ 
+@@ -506,7 +499,7 @@ public class SimplePlanner implements IPlanner {
+ 		//Compute the installer plan. It is the difference between what is currently in the profile and the solution we just computed
+ 		Collection agentState = ((Projector) agentSolution).extractSolution();
+ 		agentState.remove(metaRequirementIU); //Remove the fake IU
+-		agentState = ResolutionHelper.attachFragments(agentState, ((Projector) agentSolution).getFragmentAssociation());
++		agentState = AttachmentHelper.attachFragments(agentState, ((Projector) agentSolution).getFragmentAssociation());
+ 
+ 		ProvisioningContext NO_REPO_CONTEXT = new ProvisioningContext(new URI[0]);
+ 		NO_REPO_CONTEXT.setArtifactRepositories(new URI[0]);
+@@ -516,7 +509,7 @@ public class SimplePlanner implements IPlanner {
+ 			LogHelper.log(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, "The resolution of the previous state contained in profile " + initialRequest.getProfile().getProfileId() + " version " + initialRequest.getProfile().getTimestamp() + " failed to resolve.")); //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$
+ 		}
+ 		Collection initialState = ((Projector) initialSolution).extractSolution();
+-		initialState = ResolutionHelper.attachFragments(initialState, ((Projector) initialSolution).getFragmentAssociation());
++		initialState = AttachmentHelper.attachFragments(initialState, ((Projector) initialSolution).getFragmentAssociation());
+ 
+ 		ProvisioningPlan agentPlan = generateProvisioningPlan(initialState, agentState, initialRequest, null);
+ 
+@@ -529,7 +522,7 @@ public class SimplePlanner implements IPlanner {
+ 		//Compute the attachment of the new state if not provided
+ 		if (newState == null) {
+ 			newState = newSolution.extractSolution();
+-			newState = ResolutionHelper.attachFragments(newState, newSolution.getFragmentAssociation());
++			newState = AttachmentHelper.attachFragments(newState, newSolution.getFragmentAssociation());
+ 		}
+ 		ProvisioningContext NO_REPO_CONTEXT = new ProvisioningContext(new URI[0]);
+ 		NO_REPO_CONTEXT.setArtifactRepositories(new URI[0]);
+@@ -540,7 +533,7 @@ public class SimplePlanner implements IPlanner {
+ 			LogHelper.log(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, "The resolution of the previous state contained in profile " + request.getProfile().getProfileId() + " version " + request.getProfile().getTimestamp() + " failed to resolve.")); //$NON-NLS-1$//$NON-NLS-2$//$NON-NLS-3$
+ 		}
+ 		Collection initialState = ((Projector) initialSolution).extractSolution();
+-		initialState = ResolutionHelper.attachFragments(initialState, ((Projector) initialSolution).getFragmentAssociation());
++		initialState = AttachmentHelper.attachFragments(initialState, ((Projector) initialSolution).getFragmentAssociation());
+ 
+ 		//Generate the plan
+ 		return generateProvisioningPlan(initialState, newState, request, null);
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
+deleted file mode 100644
+index ff706c6..0000000
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
++++ /dev/null
+@@ -1,302 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.resolution;
+-
+-import java.util.*;
+-import java.util.Map.Entry;
+-import org.eclipse.equinox.internal.p2.director.DirectorActivator;
+-import org.eclipse.equinox.internal.p2.director.RecommendationDescriptor;
+-import org.eclipse.equinox.internal.provisional.p2.core.Version;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+-import org.eclipse.osgi.service.resolver.*;
+-import org.osgi.framework.ServiceReference;
+-
+-public class ResolutionHelper {
+-	private static final IInstallableUnitFragment[] NO_FRAGMENTS = new IInstallableUnitFragment[0];
+-
+-	private static boolean DEBUG = false;
+-
+-	private Transformer transformer;
+-	private State state;
+-	private Dictionary selectionContext;
+-	private RecommendationDescriptor recommendations;
+-	/**
+-	 * Map of IInstallableUnit->(IInstallableUnitFragment) representing the 
+-	 * mapping of IUs to the fragment they are bound to.
+-	 */
+-	private Map fragmentBindings;
+-
+-	public ResolutionHelper(Dictionary selectionContext, RecommendationDescriptor recommendations) {
+-		this.selectionContext = selectionContext;
+-		this.recommendations = recommendations;
+-	}
+-
+-	private void initialize() {
+-		ServiceReference sr = DirectorActivator.context.getServiceReference(PlatformAdmin.class.getName());
+-		PlatformAdmin pa = (PlatformAdmin) DirectorActivator.context.getService(sr);
+-		transformer = new Transformer(pa.getFactory(), selectionContext, recommendations);
+-		state = pa.getFactory().createState(true);
+-		fragmentBindings = new HashMap();
+-		if (selectionContext != null)
+-			state.setPlatformProperties(selectionContext);
+-	}
+-
+-	private void addToState(BundleDescription bd) {
+-		state.addBundle(bd);
+-	}
+-
+-	private BundleDescription addInResolution(IInstallableUnit toAdd) {
+-		transformer.visitInstallableUnit(toAdd);
+-		BundleDescription descriptionToAdd = transformer.getResult();
+-		//		bundleDescriptionToIU.put(descriptionToAdd, toAdd);
+-		addToState(descriptionToAdd);
+-		return descriptionToAdd;
+-	}
+-
+-	/** 
+-	 * Indicates if the installable unit to install will have all their constraints satisfied when installed with other installable units.
+-	 * @param toInstall the installable units to install
+-	 * @param existingState the other installable units to resolve against
+-	 * @return true if the installable unit to install resolves, return false otherwise. 
+-	 */
+-	public UnsatisfiedCapability[] install(Set toInstall, Set existingState) {
+-		initialize();
+-		BundleDescription[] addedBundle = new BundleDescription[toInstall.size()];
+-		int j = 0;
+-		for (Iterator iterator = toInstall.iterator(); iterator.hasNext();) {
+-			addedBundle[j++] = addInResolution((IInstallableUnit) iterator.next());
+-		}
+-
+-		for (Iterator iterator = existingState.iterator(); iterator.hasNext();) {
+-			addInResolution((IInstallableUnit) iterator.next());
+-		}
+-
+-		state.resolve(); //We may want to resolve in two times. first the existing state, then add the toInstall. This would allow to see what changes when dropping the new iu.
+-		//Also it could allow us to do an incremental resolution. however the results may differ
+-
+-		ArrayList results = new ArrayList();
+-		for (int i = 0; i < addedBundle.length; i++) {
+-			results.addAll(createUnsatisfiedCapabilities(state.getStateHelper().getUnsatisfiedConstraints(addedBundle[i]), addedBundle[i]));
+-		}
+-		return (UnsatisfiedCapability[]) results.toArray(new UnsatisfiedCapability[results.size()]);
+-
+-	}
+-
+-	private ArrayList createUnsatisfiedCapabilities(VersionConstraint[] unsatisfied, BundleDescription description) {
+-		ArrayList results = new ArrayList();
+-		for (int i = 0; i < unsatisfied.length; i++) {
+-			IRequiredCapability originalDependency = (IRequiredCapability) ((StateMetadataMap) description.getUserObject()).getGenericSpecifications().get(unsatisfied[i]);
+-			results.add(new UnsatisfiedCapability(originalDependency, ((StateMetadataMap) description.getUserObject()).getUnit()));
+-		}
+-		return results;
+-	}
+-
+-	/**
+-	 * Associates installable unit fragments to each IU being installed.
+-	 * 
+-	 * TODO: This method should probably be renamed to attachFragments
+-	 */
+-	public Collection attachCUs(Collection toAttach) {
+-		initialize();
+-		for (Iterator iterator = toAttach.iterator(); iterator.hasNext();) {
+-			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+-			if (iu != null)
+-				addInResolution(iu);
+-		}
+-		state.resolve();
+-		BundleDescription[] bds = state.getBundles();
+-		for (int i = 0; i < bds.length; i++) {
+-			if (DEBUG) {
+-				ResolverError[] re = state.getResolverErrors(bds[i]);
+-				for (int j = 0; j < re.length; j++) {
+-					System.out.println(re[j]);
+-				}
+-			}
+-			BundleDescription[] potentialIUFragments = state.getStateHelper().getDependentBundles(new BundleDescription[] {bds[i]});
+-			// TODO: We need to define a way to allow IUFragments to work together to do configuration work.
+-			// For now we will select just one fragment by preferring a fragment that matches the host
+-
+-			IInstallableUnit hostIU = ((StateMetadataMap) bds[i].getUserObject()).getUnit();
+-			ArrayList applicableFragments = new ArrayList();
+-			for (int k = 0; k < potentialIUFragments.length; k++) {
+-				IInstallableUnit dependentIU = ((StateMetadataMap) potentialIUFragments[k].getUserObject()).getUnit();
+-				if (hostIU.equals(dependentIU) || !dependentIU.isFragment())
+-					continue;
+-
+-				IInstallableUnitFragment potentialFragment = (IInstallableUnitFragment) dependentIU;
+-
+-				// Check to make sure the host meets the requirements of the fragment
+-				IRequiredCapability reqsFromFragment[] = potentialFragment.getHost();
+-				boolean match = true;
+-				boolean requirementMatched = false;
+-				for (int l = 0; l < reqsFromFragment.length && match == true; l++) {
+-					requirementMatched = false;
+-					if (hostIU.satisfies(reqsFromFragment[l]))
+-						requirementMatched = true;
+-					if (requirementMatched == false) {
+-						match = false;
+-						break;
+-					}
+-
+-				}
+-				if (match) {
+-					applicableFragments.add(potentialFragment);
+-				}
+-			}
+-
+-			IInstallableUnitFragment theFragment = null;
+-			int specificityLevel = 0;
+-			for (Iterator iterator = applicableFragments.iterator(); iterator.hasNext();) {
+-				IInstallableUnitFragment fragment = (IInstallableUnitFragment) iterator.next();
+-				if (fragment.getHost().length > specificityLevel) {
+-					theFragment = fragment;
+-					specificityLevel = fragment.getHost().length;
+-				}
+-			}
+-			if (theFragment != null)
+-				fragmentBindings.put(hostIU, theFragment);
+-		}
+-		//build the collection of resolved IUs
+-		Collection result = new HashSet(toAttach.size());
+-		for (Iterator iterator = toAttach.iterator(); iterator.hasNext();) {
+-			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+-			if (iu == null)
+-				continue;
+-			//just return fragments as they are
+-			if (iu.isFragment()) {
+-				result.add(iu);
+-				continue;
+-			}
+-			//return a new IU that combines the IU with its bound fragments
+-			IInstallableUnitFragment fragment = (IInstallableUnitFragment) fragmentBindings.get(iu);
+-			IInstallableUnitFragment[] fragments;
+-			if (fragment == null)
+-				fragments = NO_FRAGMENTS;
+-			else
+-				fragments = new IInstallableUnitFragment[] {fragment};
+-			result.add(MetadataFactory.createResolvedInstallableUnit(iu, fragments));
+-		}
+-		return result;
+-	}
+-
+-	public static Collection attachFragments(Collection toAttach, Map fragmentsToIUs) {
+-		Map fragmentBindings = new HashMap();
+-		//Build a map inverse of the one provided in input (host --> List of fragments)
+-		Map iusToFragment = new HashMap(fragmentsToIUs.size());
+-		for (Iterator iterator = fragmentsToIUs.entrySet().iterator(); iterator.hasNext();) {
+-			Entry mapping = (Entry) iterator.next();
+-			IInstallableUnitFragment fragment = (IInstallableUnitFragment) mapping.getKey();
+-			List existingMatches = (List) mapping.getValue();
+-
+-			for (Iterator iterator2 = existingMatches.iterator(); iterator2.hasNext();) {
+-				Object host = iterator2.next();
+-				List potentialFragments = (List) iusToFragment.get(host);
+-				if (potentialFragments == null) {
+-					potentialFragments = new ArrayList();
+-					iusToFragment.put(host, potentialFragments);
+-				}
+-				potentialFragments.add(fragment);
+-			}
+-		}
+-
+-		for (Iterator iterator = iusToFragment.entrySet().iterator(); iterator.hasNext();) {
+-			Entry entry = (Entry) iterator.next();
+-			IInstallableUnit hostIU = (IInstallableUnit) entry.getKey();
+-			List potentialIUFragments = (List) entry.getValue();
+-			ArrayList applicableFragments = new ArrayList();
+-			for (Iterator iterator2 = potentialIUFragments.iterator(); iterator2.hasNext();) {
+-				IInstallableUnit dependentIU = (IInstallableUnitFragment) iterator2.next();
+-				if (hostIU.equals(dependentIU) || !dependentIU.isFragment())
+-					continue;
+-
+-				IInstallableUnitFragment potentialFragment = (IInstallableUnitFragment) dependentIU;
+-
+-				// Check to make sure the host meets the requirements of the fragment
+-				IRequiredCapability reqsFromFragment[] = potentialFragment.getHost();
+-				boolean match = true;
+-				boolean requirementMatched = false;
+-				for (int l = 0; l < reqsFromFragment.length && match == true; l++) {
+-					requirementMatched = false;
+-					if (hostIU.satisfies(reqsFromFragment[l]))
+-						requirementMatched = true;
+-					if (requirementMatched == false) {
+-						match = false;
+-						break;
+-					}
+-
+-				}
+-				if (match) {
+-					applicableFragments.add(potentialFragment);
+-				}
+-			}
+-
+-			IInstallableUnitFragment theFragment = null;
+-			int specificityLevel = 0;
+-			for (Iterator iterator4 = applicableFragments.iterator(); iterator4.hasNext();) {
+-				IInstallableUnitFragment fragment = (IInstallableUnitFragment) iterator4.next();
+-				if (fragment.getHost().length > specificityLevel) {
+-					theFragment = fragment;
+-					specificityLevel = fragment.getHost().length;
+-				}
+-			}
+-			if (theFragment != null)
+-				fragmentBindings.put(hostIU, theFragment);
+-		}
+-		//build the collection of resolved IUs
+-		Collection result = new HashSet(toAttach.size());
+-		for (Iterator iterator = toAttach.iterator(); iterator.hasNext();) {
+-			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+-			if (iu == null)
+-				continue;
+-			//just return fragments as they are
+-			if (iu.isFragment()) {
+-				result.add(iu);
+-				continue;
+-			}
+-			//return a new IU that combines the IU with its bound fragments
+-			IInstallableUnitFragment fragment = (IInstallableUnitFragment) fragmentBindings.get(iu);
+-			IInstallableUnitFragment[] fragments;
+-			if (fragment == null)
+-				fragments = NO_FRAGMENTS;
+-			else
+-				fragments = new IInstallableUnitFragment[] {fragment};
+-			result.add(MetadataFactory.createResolvedInstallableUnit(iu, fragments));
+-		}
+-		return result;
+-	}
+-
+-	public boolean isResolved(IInstallableUnit iu) {
+-		return state.getBundle(iu.getId(), Version.toOSGiVersion(iu.getVersion())).isResolved();
+-	}
+-
+-	public ArrayList getAllResolved() {
+-		BundleDescription[] bd = state.getResolvedBundles();
+-		ArrayList result = new ArrayList(bd.length);
+-		for (int i = 0; i < bd.length; i++) {
+-			result.add(extractIU(bd[i]));
+-		}
+-		return result;
+-	}
+-
+-	private IInstallableUnit extractIU(BundleDescription bd) {
+-		return ((StateMetadataMap) bd.getUserObject()).getUnit();
+-	}
+-
+-	public List getSorted() {
+-		BundleDescription[] toSort = state.getResolvedBundles();
+-		state.getStateHelper().sortBundles(toSort);
+-		List result = new ArrayList(toSort.length);
+-		for (int i = 0; i < toSort.length; i++) {
+-			result.add(extractIU(toSort[i]));
+-		}
+-		return result;
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/StateMetadataMap.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/StateMetadataMap.java
+deleted file mode 100644
+index 0b294aa..0000000
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/StateMetadataMap.java
++++ /dev/null
+@@ -1,34 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.resolution;
+-
+-import java.util.Map;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+-
+-//Instances of this class are stored in the user object slot of bundlescriptions to ease navigation between the two models.
+-public class StateMetadataMap {
+-	private IInstallableUnit unit;
+-	private Map correspondingSpecifications; //indexes in this array maps to the ones in the dependencies array. This is gross. TODO
+-
+-	public StateMetadataMap(IInstallableUnit unit, Map correspondingSpecifications) {
+-		super();
+-		this.unit = unit;
+-		this.correspondingSpecifications = correspondingSpecifications;
+-	}
+-
+-	public IInstallableUnit getUnit() {
+-		return unit;
+-	}
+-
+-	public Map getGenericSpecifications() {
+-		return correspondingSpecifications;
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/Transformer.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/Transformer.java
+deleted file mode 100644
+index 68f0aa9..0000000
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/Transformer.java
++++ /dev/null
+@@ -1,145 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.resolution;
+-
+-import java.util.*;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Status;
+-import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+-import org.eclipse.equinox.internal.p2.director.*;
+-import org.eclipse.equinox.internal.provisional.p2.core.Version;
+-import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+-import org.eclipse.osgi.service.resolver.*;
+-import org.osgi.framework.InvalidSyntaxException;
+-
+-public class Transformer {
+-	private static final byte IU_KIND = 0;
+-	private static final String IU_NAMESPACE = "iu.namespace";
+-	static long iuInternalId = 0;
+-
+-	private Dictionary context = null;
+-	private StateObjectFactory factory = null;
+-	private ArrayList iuCapabilities;
+-	private Map iuDependencies;
+-	private byte kind = IU_KIND;
+-
+-	private BundleDescription result = null;
+-
+-	private RecommendationDescriptor recommendations = null;
+-
+-	public Transformer(StateObjectFactory factory) {
+-		this(factory, null, null);
+-	}
+-
+-	public Transformer(StateObjectFactory factory, Dictionary context, RecommendationDescriptor recommendations) {
+-		this.factory = factory;
+-		this.context = context;
+-		this.recommendations = recommendations;
+-	}
+-
+-	private String getNamespace() {
+-		switch (kind) {
+-			case IU_KIND :
+-				return IU_NAMESPACE;
+-			default :
+-				throw new IllegalStateException("unknown kind"); //This should not happen
+-		}
+-	}
+-
+-	public BundleDescription getResult() {
+-		return result;
+-	}
+-
+-	private boolean isEnabled(IRequiredCapability capability) {
+-		// If there is no context then be optimistic
+-		if (context == null)
+-			return true;
+-		String filter = capability.getFilter();
+-		if (filter == null)
+-			return true;
+-		try {
+-			return DirectorActivator.context.createFilter(filter).match(context);
+-		} catch (InvalidSyntaxException e) {
+-			// If we fail to parse the filter treat it as invalid and be optimistic
+-			return true;
+-		}
+-	}
+-
+-	private String toFilter(VersionRange range) {
+-		if (range == null)
+-			return null;
+-		StringBuffer buf = new StringBuffer();
+-		buf.append("(&"); //$NON-NLS-1$
+-		buf.append("(version>=").append(range.getMinimum().toString()).append(')'); //$NON-NLS-1$
+-		if (!range.getIncludeMinimum())
+-			buf.append("(!(version=").append(range.getMinimum().toString()).append("))");
+-		buf.append("(version<=").append(range.getMaximum().toString()).append(')'); //$NON-NLS-1$
+-		if (!range.getIncludeMaximum())
+-			buf.append("(!(version=").append(range.getMaximum().toString()).append("))");
+-		buf.append(')');
+-		return buf.toString();
+-	}
+-
+-	public void visitCapability(IProvidedCapability capability) {
+-		iuCapabilities.add(factory.createGenericDescription(capability.getName(), capability.getNamespace(), Version.toOSGiVersion(capability.getVersion()), null));
+-	}
+-
+-	public void visitInstallableUnit(IInstallableUnit toTransform) {
+-		kind = IU_KIND;
+-
+-		//Start with the dependencies
+-		IRequiredCapability[] requires = toTransform.getRequiredCapabilities();
+-		iuDependencies = new HashMap(requires.length);
+-		for (int i = 0; i < requires.length; i++) {
+-			visitRequiredCapability(requires[i]);
+-		}
+-
+-		//Do the capabilities
+-		IProvidedCapability[] capabilities = toTransform.getProvidedCapabilities();
+-		iuCapabilities = new ArrayList(requires.length + 1);
+-		for (int i = 0; i < capabilities.length; i++) {
+-			visitCapability(capabilities[i]);
+-		}
+-
+-		//Add a capability representing the IU itself
+-		iuCapabilities.add(factory.createGenericDescription(toTransform.getId(), getNamespace(), Version.toOSGiVersion(toTransform.getVersion()), null));
+-
+-		GenericSpecification[] genericSpecifications = new GenericSpecification[iuDependencies.size()];
+-		iuDependencies.keySet().toArray(genericSpecifications);
+-
+-		GenericDescription[] genericDescriptions = new GenericDescription[iuCapabilities.size()];
+-		iuCapabilities.toArray(genericDescriptions);
+-
+-		//Finally create the bundle description
+-		//TODO Need to create the filter for the IU itself
+-		result = factory.createBundleDescription(iuInternalId++, toTransform.getId(), Version.toOSGiVersion(toTransform.getVersion()), (String) null, (BundleSpecification[]) null, (HostSpecification) null, (ImportPackageSpecification[]) null, (ExportPackageDescription[]) null, toTransform.isSingleton(), true, true, toTransform.getFilter(), (String[]) null, genericSpecifications, genericDescriptions);
+-		result.setUserObject(new StateMetadataMap(toTransform, iuDependencies));
+-	}
+-
+-	public void visitRequiredCapability(IRequiredCapability capability) {
+-		try {
+-			if (isEnabled(capability)) {
+-				capability = rewrite(capability);
+-				iuDependencies.put(factory.createGenericSpecification(capability.getName(), capability.getNamespace(), toFilter(capability.getRange()), capability.isOptional(), capability.isMultiple()), capability);
+-			}
+-		} catch (InvalidSyntaxException e) {
+-			LogHelper.log(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, "Invalid filter: " + e.getFilter(), e)); //$NON-NLS-1$
+-		}
+-	}
+-
+-	private IRequiredCapability rewrite(IRequiredCapability match) {
+-		if (recommendations == null)
+-			return match;
+-		Recommendation foundRecommendation = recommendations.findRecommendation(match);
+-		return foundRecommendation != null ? foundRecommendation.newValue() : match;
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/UnsatisfiedCapability.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/UnsatisfiedCapability.java
+deleted file mode 100644
+index 16aa035..0000000
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/UnsatisfiedCapability.java
++++ /dev/null
+@@ -1,82 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.resolution;
+-
+-import org.eclipse.equinox.internal.p2.director.Messages;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IRequiredCapability;
+-import org.eclipse.osgi.util.NLS;
+-
+-/**
+- * Represents a provisioning dependency that was not satisfied during
+- * resolution.
+- */
+-public class UnsatisfiedCapability {
+-	private IInstallableUnit owner;
+-	private IRequiredCapability require;
+-
+-	/**
+-	 * Creates a new unresolved dependency
+-	 * @param required The dependency that was not satisfied.
+-	 * @param owner The installable unit whose dependency was not satisfied.
+-	 */
+-	public UnsatisfiedCapability(IRequiredCapability required, IInstallableUnit owner) {
+-		this.require = required;
+-		this.owner = owner;
+-	}
+-
+-	public IInstallableUnit getOwner() {
+-		return owner;
+-	}
+-
+-	/**
+-	 * Returns the specific dependency that was not satisfied.
+-	 */
+-	public IRequiredCapability getRequiredCapability() {
+-		return require;
+-	}
+-
+-	/**
+-	 * Returns the installable unit whose dependency was not satisfied.
+-	 */
+-	public IInstallableUnit getUnsatisfiedUnit() {
+-		return owner;
+-	}
+-
+-	/**
+-	 * Prints out a human-readable representation of an unsatisfied capability
+-	 */
+-	public String toString() {
+-		return NLS.bind(Messages.Director_Unsatisfied_Dependency, owner, require);
+-	}
+-
+-	/*
+-	 * (non-Javadoc)
+-	 * @see java.lang.Object#equals(java.lang.Object)
+-	 */
+-	public boolean equals(Object obj) {
+-		if (this == obj)
+-			return true;
+-		if (obj == null)
+-			return false;
+-		if (!(obj instanceof UnsatisfiedCapability))
+-			return false;
+-		if (owner == null || require == null)
+-			return false;
+-		return owner.equals(((UnsatisfiedCapability) obj).getOwner()) && require.equals(((UnsatisfiedCapability) obj).getRequiredCapability());
+-	}
+-
+-	public int hashCode() {
+-		if (owner == null || require == null)
+-			return 0;
+-		return 31 * owner.hashCode() + require.hashCode();
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.tests/META-INF/MANIFEST.MF
+index e6c5c16..d8d16c6 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.tests/META-INF/MANIFEST.MF
+@@ -25,7 +25,6 @@ Import-Package: javax.xml.parsers,
+  org.eclipse.equinox.internal.p2.metadata.repository.io,
+  org.eclipse.equinox.internal.p2.persistence,
+  org.eclipse.equinox.internal.p2.publisher.eclipse,
+- org.eclipse.equinox.internal.p2.resolution,
+  org.eclipse.equinox.internal.p2.touchpoint.eclipse,
+  org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions,
+  org.eclipse.equinox.internal.p2.touchpoint.natives,
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/AllTests.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/AllTests.java
+index 2a344cd..dec06ac 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/AllTests.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/AllTests.java
+@@ -24,10 +24,7 @@ public class AllTests extends TestCase {
+ 		suite.addTestSuite(OperationGenerationTest.class);
+ 		suite.addTestSuite(OracleTest.class);
+ 		suite.addTestSuite(OracleTest2.class);
+-		suite.addTestSuite(PickerTest.class);
+-		suite.addTestSuite(RecommendationTest.class);
+ 		suite.addTestSuite(ReplacePlanTest.class);
+-		suite.addTestSuite(ResolutionHelperTest.class);
+ 		suite.addTestSuite(RollbackTest.class);
+ 		suite.addTestSuite(SingletonTest.class);
+ 		suite.addTestSuite(UninstallTest.class);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/OperationGenerationTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/OperationGenerationTest.java
+index 68e068e..252a0a6 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/OperationGenerationTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/OperationGenerationTest.java
+@@ -14,7 +14,6 @@ import java.util.ArrayList;
+ import java.util.Collection;
+ import org.eclipse.equinox.internal.p2.director.OperationGenerator;
+ import org.eclipse.equinox.internal.p2.metadata.ResolvedInstallableUnit;
+-import org.eclipse.equinox.internal.p2.resolution.ResolutionHelper;
+ import org.eclipse.equinox.internal.provisional.p2.core.Version;
+ import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+ import org.eclipse.equinox.internal.provisional.p2.engine.InstallableUnitOperand;
+@@ -38,8 +37,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to.add(a1);
+ 		to.add(a3);
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		// 1 x install
+ 		// 1 x uninstall
+@@ -62,8 +59,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to.add(a3);
+ 		to.add(a2);
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		// 1 x install
+ 		assertEquals(1, operands.length);
+@@ -85,8 +80,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to.add(a1);
+ 		to.add(a3);
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		// 1 x uninstall
+ 		assertEquals(1, operands.length);
+@@ -108,8 +101,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to = new ArrayList();
+ 		to.add(MetadataFactory.createInstallableUnit(b));
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		// 1 x upgrade
+ 		assertEquals(1, operands.length);
+@@ -133,8 +124,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to = new ArrayList();
+ 		to.add(MetadataFactory.createInstallableUnit(b));
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		// 1 x install
+ 		// 2 x uninstall
+@@ -165,8 +154,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to.add(MetadataFactory.createInstallableUnit(b));
+ 		to.add(MetadataFactory.createInstallableUnit(c));
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		// 2 x update
+ 		assertEquals(2, operands.length);
+@@ -194,8 +181,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to.add(a2);
+ 		to.add(MetadataFactory.createInstallableUnit(b2));
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		// 1 x update
+ 		assertEquals(1, operands.length);
+@@ -222,8 +207,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to.add(a1);
+ 		to.add(MetadataFactory.createInstallableUnit(b2));
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		// 1 x update
+ 		// 1 x uninstall
+@@ -248,8 +231,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		Collection to = new ArrayList();
+ 		to.add(MetadataFactory.createResolvedInstallableUnit(three, new IInstallableUnitFragment[0]));
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		//We are uninstalling myBundle 1.0 and 2.0. 3.0 stays unchanged.
+ 		for (int i = 0; i < operands.length; i++) {
+@@ -280,9 +261,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to.add(MetadataFactory.createResolvedInstallableUnit(two, new IInstallableUnitFragment[0]));
+ 		to.add(MetadataFactory.createResolvedInstallableUnit(three, new IInstallableUnitFragment[0]));
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+-
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		//Two is already in the system therefore it will not be in the operands
+ 		for (int i = 0; i < operands.length; i++) {
+@@ -314,9 +292,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to.add(MetadataFactory.createResolvedInstallableUnit(two, new IInstallableUnitFragment[0]));
+ 		to.add(MetadataFactory.createResolvedInstallableUnit(three, new IInstallableUnitFragment[0]));
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+-
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		//Two is already in the system therefore it will not be in the operands
+ 		for (int i = 0; i < operands.length; i++) {
+@@ -345,8 +320,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		Collection to = new ArrayList();
+ 		to.add(MetadataFactory.createResolvedInstallableUnit(two, new IInstallableUnitFragment[0]));
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 		assertEquals("1.0", 1, operands.length);
+ 		assertEquals("1.1", one, operands[0].first());
+@@ -372,8 +345,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		to.add(toResolved);
+ 		to.add(MetadataFactory.createResolvedInstallableUnit(anotherIU2, new IInstallableUnitFragment[0]));
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 
+ 		assertEquals("1.0", 3, operands.length);
+@@ -403,8 +374,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		IInstallableUnit toResolved = MetadataFactory.createResolvedInstallableUnit(anIU, new IInstallableUnitFragment[] {cu2});
+ 		to.add(toResolved);
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 
+ 		assertEquals("1.0", 1, operands.length);
+@@ -425,8 +394,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		IInstallableUnit toResolved = MetadataFactory.createResolvedInstallableUnit(anIU, new IInstallableUnitFragment[0]);
+ 		to.add(toResolved);
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 
+ 		assertEquals("1.0", 1, operands.length);
+@@ -447,8 +414,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		IInstallableUnit toResolved = MetadataFactory.createResolvedInstallableUnit(anIU, new IInstallableUnitFragment[] {cu2});
+ 		to.add(toResolved);
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 
+ 		assertEquals("1.0", 0, operands.length);
+@@ -469,8 +434,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		IInstallableUnit toResolved = MetadataFactory.createResolvedInstallableUnit(anIU, new IInstallableUnitFragment[] {cu2, cu1});
+ 		to.add(toResolved);
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 
+ 		assertEquals("1.0", 0, operands.length);
+@@ -492,8 +455,6 @@ public class OperationGenerationTest extends AbstractProvisioningTest {
+ 		IInstallableUnit toResolved = MetadataFactory.createResolvedInstallableUnit(anIU, new IInstallableUnitFragment[] {cu1, cu3});
+ 		to.add(toResolved);
+ 
+-		from = new ResolutionHelper(null, null).attachCUs(from);
+-		to = new ResolutionHelper(null, null).attachCUs(to);
+ 		InstallableUnitOperand[] operands = new OperationGenerator().generateOperation(from, to);
+ 
+ 		assertEquals("1.0", 1, operands.length);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/PickerTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/PickerTest.java
+deleted file mode 100644
+index 4ffa42c..0000000
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/PickerTest.java
++++ /dev/null
+@@ -1,98 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.p2.tests.director;
+-
+-import org.eclipse.equinox.internal.p2.director.Picker;
+-import org.eclipse.equinox.internal.provisional.p2.core.Version;
+-import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+-import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+-
+-/**
+- * Testing of the {@link Picker} class.
+- */
+-public class PickerTest extends AbstractProvisioningTest {
+-	IInstallableUnit unitVersion5;
+-	private Picker picker;
+-
+-	public PickerTest() {
+-		super(""); //$NON-NLS-1$
+-	}
+-
+-	public PickerTest(String name) {
+-		super(name);
+-	}
+-
+-	protected void setUp() throws Exception {
+-		super.setUp();
+-		Version version = new Version(5, 0, 0);
+-
+-		//create some sample IUs to be available for the picker
+-		IProvidedCapability[] provides = new IProvidedCapability[] {MetadataFactory.createProvidedCapability("test.capability", "test", version)};
+-		unitVersion5 = createIU("required", version, provides);
+-
+-		IInstallableUnit[] units = new IInstallableUnit[] {unitVersion5};
+-		picker = new Picker(units, null);
+-
+-	}
+-
+-	/**
+-	 * Tests picking an IU that requires a capability, and the available
+-	 * provided capability is above the required capability's version range.
+-	 */
+-	public void testRequiredBelowVersionRange() {
+-
+-		//an IU whose required capability falls outside available range
+-		IRequiredCapability[] required = createRequiredCapabilities("test.capability", "test", new VersionRange("[2.0,5.0)"), null);
+-
+-		IInstallableUnit[][] result = picker.findInstallableUnit(null, null, required, false);
+-		assertEquals("1.0", 0, result[0].length + result[1].length);
+-	}
+-
+-	/**
+-	 * Tests picking an IU that requires a capability, and the available
+-	 * provided capability is above the required capability's version range.
+-	 */
+-	public void testRequiredWithinVersionRange() {
+-
+-		//in middle of range
+-		IRequiredCapability[] required = createRequiredCapabilities("test.capability", "test", new VersionRange("[2.0,6.0)"), null);
+-		IInstallableUnit[] result = picker.findInstallableUnit(null, null, required, false)[1];
+-		assertEquals("1.0", 1, result.length);
+-		assertEquals("1.1", unitVersion5, result[0]);
+-
+-		//on lower bound
+-		required = createRequiredCapabilities("test.capability", "test", new VersionRange("[5.0,6.0)"), null);
+-		result = picker.findInstallableUnit(null, null, required, false)[1];
+-		assertEquals("1.0", 1, result.length);
+-		assertEquals("1.1", unitVersion5, result[0]);
+-
+-		//on upper bound
+-		required = createRequiredCapabilities("test.capability", "test", new VersionRange("[1.0,5.0]"), null);
+-		result = picker.findInstallableUnit(null, null, required, false)[1];
+-		assertEquals("1.0", 1, result.length);
+-		assertEquals("1.1", unitVersion5, result[0]);
+-	}
+-
+-	/**
+-	 * Tests picking an IU that requires a capability, and the available
+-	 * provided capability is above the required capability's version range.
+-	 */
+-	public void testRequiredAboveVersionRange() {
+-
+-		//an IU whose required capability falls outside available range
+-		IRequiredCapability[] required = createRequiredCapabilities("test.capability", "test", new VersionRange("[5.1,6.0)"), null);
+-
+-		IInstallableUnit[][] result = picker.findInstallableUnit(null, null, required, false);
+-		assertEquals("1.0", 0, result[0].length + result[1].length);
+-	}
+-
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RecommendationTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RecommendationTest.java
+deleted file mode 100644
+index 16be1a9..0000000
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RecommendationTest.java
++++ /dev/null
+@@ -1,172 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.p2.tests.director;
+-
+-import java.lang.reflect.Method;
+-import java.util.HashSet;
+-import java.util.Set;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Status;
+-import org.eclipse.equinox.internal.p2.director.*;
+-import org.eclipse.equinox.internal.provisional.p2.core.Version;
+-import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+-import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+-
+-public class RecommendationTest extends AbstractProvisioningTest {
+-	//test name dependency over
+-	//test
+-	//check that the picker is returning something in the range
+-	public void testRecommendation() {
+-		IRequiredCapability applyOn, newValue;
+-		applyOn = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.0, 2.0)"), null, false, false);
+-		newValue = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.1, 2.0)"), null, false, false);
+-		Recommendation r1 = new Recommendation(applyOn, newValue);
+-
+-		IRequiredCapability goodMatch = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.0, 2.0)"), null, false, false);
+-		assertEquals(true, r1.matches(goodMatch));
+-
+-		IRequiredCapability badNamespace = MetadataFactory.createRequiredCapability("badNamespace", "name", new VersionRange("[1.0, 2.0)"), null, false, false);
+-		assertEquals(false, r1.matches(badNamespace));
+-
+-		IRequiredCapability badName = MetadataFactory.createRequiredCapability("namespace", "badName", new VersionRange("[1.0, 2.0)"), null, false, false);
+-		assertEquals(false, r1.matches(badName));
+-	}
+-
+-	public void testPicker() {
+-		//The IUs we will pick from
+-		IInstallableUnit iu1 = createIU("iu1", new Version(1, 0, 0));
+-		IInstallableUnit iu2 = createIU("iu2", new Version(4, 0, 0));
+-
+-		//The recommendations to be used
+-		IRequiredCapability applyOn, newValue;
+-		applyOn = MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu1", new VersionRange("[1.0, 2.0)"), null, false, false);
+-		newValue = MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu1", new VersionRange("[1.1, 2.0)"), null, false, false);
+-		Recommendation r1 = new Recommendation(applyOn, newValue);
+-
+-		IRequiredCapability applyOn2, newValue2;
+-		applyOn2 = MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu2", new VersionRange("[4.2, 5.0)"), null, false, false);
+-		newValue2 = MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu2", new VersionRange("[4.0, 5.0)"), null, false, false);
+-		Recommendation r2 = new Recommendation(applyOn2, newValue2);
+-		Set recommendations = new HashSet();
+-		recommendations.add(r1);
+-		recommendations.add(r2);
+-
+-		Picker p = new Picker(new IInstallableUnit[] {iu1, iu2}, null);
+-		IInstallableUnit[][] matches = p.findInstallableUnit(null, null, new IRequiredCapability[] {MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu1", null, null, false, false)}, false);
+-		assertEquals(matches[1][0], iu1);
+-
+-		Picker p1 = new Picker(new IInstallableUnit[] {iu1, iu2}, new RecommendationDescriptor(recommendations));
+-		matches = p1.findInstallableUnit(null, null, new IRequiredCapability[] {MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu1", new VersionRange("[1.0, 2.0)"), null, false, false)}, false);
+-		assertEquals(matches[0].length, 0);
+-		assertEquals(matches[1].length, 0);
+-
+-		matches = p1.findInstallableUnit(null, null, new IRequiredCapability[] {MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu1", new VersionRange("[4.2, 5.0)"), null, false, false)}, false);
+-		assertEquals(matches[0].length, 0);
+-		assertEquals(matches[1].length, 0);
+-	}
+-
+-	public void testWideningRanges() {
+-		//The IUs we will pick from
+-		IInstallableUnit iu1 = createIU("iu1", new Version(4, 0, 0));
+-
+-		//Here we add recommendation that widen the range of the bundle we are looking for
+-		IRequiredCapability applyOn2, newValue2;
+-		applyOn2 = MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu1", new VersionRange("[4.2, 5.0)"), null, false, false);
+-		newValue2 = MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu1", new VersionRange("[4.0, 5.0)"), null, false, false);
+-		Recommendation r2 = new Recommendation(applyOn2, newValue2);
+-		Set recommendations = new HashSet();
+-		recommendations.add(r2);
+-
+-		//Check without the recommendations
+-		Picker p2 = new Picker(new IInstallableUnit[] {iu1}, null);
+-		IInstallableUnit[][] matches = p2.findInstallableUnit(null, null, new IRequiredCapability[] {MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu1", new VersionRange("[4.0, 5.0)"), null, false, false)}, false);
+-		assertEquals(matches[1].length, 1);
+-
+-		//Check the widening works
+-		Picker p1 = new Picker(new IInstallableUnit[] {iu1}, new RecommendationDescriptor(recommendations));
+-		matches = p1.findInstallableUnit(null, null, new IRequiredCapability[] {MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, "iu1", new VersionRange("[4.2, 5.0)"), null, false, false)}, false);
+-		assertEquals(matches[1].length, 1);
+-
+-	}
+-
+-	public void testRecommendationDescriptorMerge() {
+-		IRequiredCapability applyOn1, newValue1;
+-		applyOn1 = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.0, 2.0)"), null, false, false);
+-		newValue1 = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.1, 2.0)"), null, false, false);
+-		Recommendation r1 = new Recommendation(applyOn1, newValue1);
+-		Set list1 = new HashSet();
+-		list1.add(r1);
+-		RecommendationDescriptor desc1 = new RecommendationDescriptor(list1);
+-
+-		IRequiredCapability applyOn2, newValue2;
+-		applyOn2 = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.0, 2.0)"), null, false, false);
+-		newValue2 = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.3, 2.0)"), null, false, false);
+-		Recommendation r2 = new Recommendation(applyOn2, newValue2);
+-		Set list2 = new HashSet();
+-		list2.add(r2);
+-		RecommendationDescriptor desc2 = new RecommendationDescriptor(list2);
+-
+-		//We test that the result of the merge worked.
+-		assertEquals(Status.OK_STATUS, desc1.merge(desc2));
+-		assertEquals(r2, desc1.findRecommendation(MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.0, 2.0)"), null, false, false)));
+-	}
+-
+-	public void testRecommendationDescriptorMergeConflict() {
+-		IRequiredCapability applyOn1, newValue1;
+-		applyOn1 = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.0, 2.0)"), null, false, false);
+-		newValue1 = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.1, 2.0)"), null, false, false);
+-		Recommendation r1 = new Recommendation(applyOn1, newValue1);
+-		Set list1 = new HashSet();
+-		list1.add(r1);
+-		RecommendationDescriptor desc1 = new RecommendationDescriptor(list1);
+-
+-		IRequiredCapability applyOn2, newValue2;
+-		applyOn2 = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[1.0, 2.0)"), null, false, false);
+-		newValue2 = MetadataFactory.createRequiredCapability("namespace", "name", new VersionRange("[2.1, 3.0)"), null, false, false);
+-		Recommendation r2 = new Recommendation(applyOn2, newValue2);
+-		Set list2 = new HashSet();
+-		list2.add(r2);
+-		RecommendationDescriptor desc2 = new RecommendationDescriptor(list2);
+-
+-		//We test that the result of the merge worked.
+-		assertEquals(IStatus.INFO, desc1.merge(desc2).getSeverity());
+-	}
+-
+-	public void testRangeIntersection() {
+-		Recommendation rec = new Recommendation(null, null);
+-		try {
+-			Method m = rec.getClass().getDeclaredMethod("intersect", new Class[] {VersionRange.class, VersionRange.class});
+-			m.setAccessible(true);
+-			assertEquals(new VersionRange("[1.0.0, 2.0.0)"), m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0)"), new VersionRange("[0.1.0, 3.0.0]")}));
+-
+-			assertEquals(new VersionRange("[1.1.0, 1.9.0]"), m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0)"), new VersionRange("[1.1.0, 1.9.0]")}));
+-			assertEquals(new VersionRange("[1.1.0, 2.0.0)"), m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0)"), new VersionRange("[1.1.0, 2.1.0]")}));
+-			assertEquals(new VersionRange("[1.0.0, 1.3.0]"), m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0)"), new VersionRange("[0.9.0, 1.3.0]")}));
+-			assertEquals(null, m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0)"), new VersionRange("[3.0.0, 4.0.0]")}));
+-
+-			assertEquals(new VersionRange("(1.0.0, 2.0.0]"), m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0]"), new VersionRange("(1.0.0, 2.1.0]")}));
+-			assertEquals(new VersionRange("(1.0.0, 2.0.0]"), m.invoke(rec, new Object[] {new VersionRange("(1.0.0, 2.0.0]"), new VersionRange("[1.0.0, 2.1.0]")}));
+-
+-			assertEquals(new VersionRange("[1.0.0, 2.0.0)"), m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0)"), new VersionRange("[1.0.0, 2.0.0]")}));
+-			assertEquals(new VersionRange("[1.0.0, 2.0.0)"), m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0]"), new VersionRange("[1.0.0, 2.0.0)")}));
+-
+-			assertEquals(new VersionRange("[1.0.0, 2.0.0]"), m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0]"), new VersionRange("[1.0.0, 2.0.0]")}));
+-			assertEquals(new VersionRange("(1.0.0, 2.0.0)"), m.invoke(rec, new Object[] {new VersionRange("(1.0.0, 2.0.0)"), new VersionRange("(1.0.0, 2.0.0)")}));
+-
+-			assertEquals(null, m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0)"), new VersionRange("[2.0.0, 3.0.0)")}));
+-			assertEquals(new VersionRange("[2.0.0, 2.0.0]"), m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0]"), new VersionRange("[2.0.0, 3.0.0)")}));
+-			assertEquals(null, m.invoke(rec, new Object[] {new VersionRange("[1.0.0, 2.0.0]"), new VersionRange("(2.0.0, 3.0.0)")}));
+-		} catch (Exception e) {
+-			fail("Usage of reflection failed");
+-		}
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/ResolutionHelperTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/ResolutionHelperTest.java
+deleted file mode 100644
+index 5acfabd..0000000
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/ResolutionHelperTest.java
++++ /dev/null
+@@ -1,269 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others. All rights reserved. This
+- * program and the accompanying materials are made available under the terms of
+- * the Eclipse Public License v1.0 which accompanies this distribution, and is
+- * available at http://www.eclipse.org/legal/epl-v10.html
+- * 
+- * Contributors: IBM Corporation - initial API and implementation
+- ******************************************************************************/
+-package org.eclipse.equinox.p2.tests.director;
+-
+-import java.util.*;
+-import junit.framework.Test;
+-import junit.framework.TestSuite;
+-import org.eclipse.equinox.internal.p2.resolution.ResolutionHelper;
+-import org.eclipse.equinox.internal.p2.resolution.UnsatisfiedCapability;
+-import org.eclipse.equinox.internal.provisional.p2.core.Version;
+-import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+-import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+-
+-/**
+- * Tests for {@link ResolutionHelper}.
+- */
+-public class ResolutionHelperTest extends AbstractProvisioningTest {
+-	private static final String FILTER_KEY = "osgi.os";
+-
+-	public static Test suite() {
+-		return new TestSuite(ResolutionHelperTest.class);
+-	}
+-
+-	public ResolutionHelperTest() {
+-		super("");
+-	}
+-
+-	public ResolutionHelperTest(String name) {
+-		super(name);
+-	}
+-
+-	/**
+-	 * Tests resolving an IU that requires a capability, and the available
+-	 * provided capability is above the required capability's version range.
+-	 */
+-	public void testDependencyAboveVersionRange() {
+-		Version version = new Version(5, 0, 0);
+-
+-		//The IU that exports the capability
+-		IProvidedCapability[] provides = new IProvidedCapability[] {MetadataFactory.createProvidedCapability("test.capability", "test", version)};
+-		IInstallableUnit required = createIU("required", version, provides);
+-
+-		//an IU whose required capability falls outside available range
+-		IRequiredCapability[] requires = createRequiredCapabilities("test.capability", "test", new VersionRange("[2.0,5.0)"), null);
+-		IInstallableUnit toInstall = createIU("match", version, requires);
+-
+-		ResolutionHelper rh = new ResolutionHelper(null, null);
+-		HashSet installSet = new HashSet();
+-		installSet.add(toInstall);
+-		HashSet available = new HashSet();
+-		available.add(required);
+-		UnsatisfiedCapability[] unsatisfied = rh.install(installSet, available);
+-
+-		assertEquals("1.0", 1, unsatisfied.length);
+-		assertEquals("1.1", "match", unsatisfied[0].getUnsatisfiedUnit().getId());
+-		IRequiredCapability capability = unsatisfied[0].getRequiredCapability();
+-		assertEquals("1.4", "test.capability", capability.getNamespace());
+-		assertEquals("1.5", "test", capability.getName());
+-	}
+-
+-	/**
+-	 * Tests resolving an IU that requires a capability, and the available
+-	 * provided capability is below the required capability's version range.
+-	 */
+-	public void testDependencyBelowVersionRange() {
+-		Version version = new Version(2, 0, 0);
+-
+-		//The IU that exports the capability
+-		IProvidedCapability[] provides = new IProvidedCapability[] {MetadataFactory.createProvidedCapability("test.capability", "test", version)};
+-		IInstallableUnit required = createIU("required", version, provides);
+-
+-		//an IU whose required capability falls outside available range
+-		IRequiredCapability[] requires = createRequiredCapabilities("test.capability", "test", new VersionRange("(2.0,3.0)"), null);
+-		IInstallableUnit toInstall = createIU("match", version, requires);
+-
+-		ResolutionHelper rh = new ResolutionHelper(null, null);
+-		HashSet installSet = new HashSet();
+-		installSet.add(toInstall);
+-		HashSet available = new HashSet();
+-		available.add(required);
+-		UnsatisfiedCapability[] unsatisfied = rh.install(installSet, available);
+-
+-		assertEquals("1.0", 1, unsatisfied.length);
+-		assertEquals("1.1", "match", unsatisfied[0].getUnsatisfiedUnit().getId());
+-		IRequiredCapability capability = unsatisfied[0].getRequiredCapability();
+-		assertEquals("1.4", "test.capability", capability.getNamespace());
+-		assertEquals("1.5", "test", capability.getName());
+-	}
+-
+-	public void testDependencyWithPlatformFilter() {
+-		Version version = new Version(1, 0, 0);
+-
+-		//The IU that exports the capability
+-		IProvidedCapability[] provides = new IProvidedCapability[] {MetadataFactory.createProvidedCapability("test.capability", "test", version)};
+-		IInstallableUnit required = createIU("required", version, createFilter(FILTER_KEY, "win32"), provides);
+-
+-		IRequiredCapability[] requires = createRequiredCapabilities("test.capability", "test", ANY_VERSION, null);
+-		IInstallableUnit toInstall = createIU("toInstall", version, requires);
+-
+-		//setup context so that platform filter will satisfy dependency
+-		Hashtable context = new Hashtable();
+-		context.put(FILTER_KEY, "win32");
+-		ResolutionHelper rh = new ResolutionHelper(context, null);
+-		HashSet installSet = new HashSet();
+-		installSet.add(toInstall);
+-		HashSet available = new HashSet();
+-		available.add(required);
+-		UnsatisfiedCapability[] unsatisfied = rh.install(installSet, available);
+-		assertEquals("1.0", 0, unsatisfied.length);
+-
+-		//now try with a null evaluation context
+-		rh = new ResolutionHelper(null, null);
+-		unsatisfied = rh.install(installSet, available);
+-		assertEquals("1.1", 1, unsatisfied.length);
+-		assertEquals("1.2", "toInstall", unsatisfied[0].getUnsatisfiedUnit().getId());
+-		IRequiredCapability capability = unsatisfied[0].getRequiredCapability();
+-		assertEquals("1.3", "test.capability", capability.getNamespace());
+-		assertEquals("1.4", "test", capability.getName());
+-
+-		//now use a context where platform filter will not be satisfied
+-		context.put(FILTER_KEY, "nomatch");
+-		rh = new ResolutionHelper(context, null);
+-		unsatisfied = rh.install(installSet, available);
+-		assertEquals("2.1", 1, unsatisfied.length);
+-		assertEquals("2.2", "toInstall", unsatisfied[0].getUnsatisfiedUnit().getId());
+-		capability = unsatisfied[0].getRequiredCapability();
+-		assertEquals("2.3", "test.capability", capability.getNamespace());
+-		assertEquals("2.4", "test", capability.getName());
+-
+-	}
+-
+-	/**
+-	 * Tests resolving an IU that has a filter on its required capability.
+-	 */
+-	public void testSatisfiedDependencyWithMatchingFilter() {
+-		//use the same version everywhere because it's not interesting for this test
+-		Version version = new Version(1, 0, 0);
+-
+-		//The IU that exports the capability
+-		IProvidedCapability[] provides = new IProvidedCapability[] {MetadataFactory.createProvidedCapability("test.capability", "test", version)};
+-		IInstallableUnit required = createIU("required", version, provides);
+-
+-		//an IU whose filter will match the environment
+-		IRequiredCapability[] requires = createRequiredCapabilities("test.capability", "test", createFilter(FILTER_KEY, "matchValue"));
+-		IInstallableUnit toInstall = createIU("match", version, requires);
+-
+-		Dictionary environment = new Hashtable();
+-		environment.put(FILTER_KEY, "matchValue");
+-		ResolutionHelper rh = new ResolutionHelper(environment, null);
+-		HashSet installSet = new HashSet();
+-		installSet.add(toInstall);
+-		HashSet available = new HashSet();
+-		available.add(required);
+-		UnsatisfiedCapability[] unsatisfied = rh.install(installSet, available);
+-
+-		assertEquals("1.0", 0, unsatisfied.length);
+-	}
+-
+-	/**
+-	 * In this test we try to resolve an IU that has a required capability that is
+-	 * available, but there is a filter on the required capability so it should not be considered.
+-	 */
+-	public void testSatisfiedDependencyWithUnmatchingFilter() {
+-		//use the same version everywhere because it's not interesting for this test
+-		Version version = new Version(1, 0, 0);
+-
+-		//The IU that exports the capability
+-		IProvidedCapability[] provides = new IProvidedCapability[] {MetadataFactory.createProvidedCapability("test.capability", "test", version)};
+-		IInstallableUnit required = createIU("required", version, provides);
+-
+-		//an IU whose filter will not match the environment
+-		IRequiredCapability[] requires = createRequiredCapabilities("test.capability", "test", createFilter(FILTER_KEY, "noMatchValue"));
+-		IInstallableUnit toInstall = createIU("noMatch", version, requires);
+-
+-		Dictionary environment = new Hashtable();
+-		environment.put(FILTER_KEY, "matchValue");
+-		ResolutionHelper rh = new ResolutionHelper(environment, null);
+-		HashSet installSet = new HashSet();
+-		installSet.add(toInstall);
+-		HashSet available = new HashSet();
+-		available.add(required);
+-		UnsatisfiedCapability[] unsatisfied = rh.install(installSet, available);
+-
+-		assertEquals("1.0", 0, unsatisfied.length);
+-	}
+-
+-	public void testSimpleDependency() {
+-		IRequiredCapability[] requires = new IRequiredCapability[] {MetadataFactory.createRequiredCapability("java.runtime", "JRE", null, null, false, false)};
+-		IInstallableUnit osgi = createIU("org.eclipse.osgi", new Version(3, 2, 0, null), requires, NO_PROPERTIES, false);
+-
+-		IProvidedCapability[] provides = new IProvidedCapability[] {MetadataFactory.createProvidedCapability("java.runtime", "JRE", new Version(1, 4, 2, "sr2"))};
+-		IInstallableUnit jre = createIU("com.ibm.jre", new Version(1, 4, 2, "sr2"), provides);
+-
+-		ResolutionHelper rh = new ResolutionHelper(null, null);
+-		HashSet osgiSet = new HashSet(1);
+-		osgiSet.add(osgi);
+-		HashSet jreSet = new HashSet(1);
+-		jreSet.add(jre);
+-		assertEquals("1.0", 0, rh.install(osgiSet, jreSet).length);
+-	}
+-
+-	/**
+-	 * Tests resolving an IU that has a filter on its required capability, and
+-	 * the required capability is not available.
+-	 */
+-	public void testUnsatisfiedDependencyWithMatchingFilter() {
+-		//use the same version everywhere because it's not interesting for this test
+-		Version version = new Version(1, 0, 0);
+-
+-		//The IU that exports the capability
+-		IProvidedCapability[] provides = new IProvidedCapability[] {MetadataFactory.createProvidedCapability("test.capability", "test", version)};
+-		IInstallableUnit required = createIU("required", version, provides);
+-
+-		//an IU whose filter will match the environment
+-		IRequiredCapability[] requires = createRequiredCapabilities("test.capability", "does.not.exist", createFilter(FILTER_KEY, "matchValue"));
+-		IInstallableUnit toInstall = createIU("match", version, requires);
+-
+-		Dictionary environment = new Hashtable();
+-		environment.put(FILTER_KEY, "matchValue");
+-		ResolutionHelper rh = new ResolutionHelper(environment, null);
+-		HashSet installSet = new HashSet();
+-		installSet.add(toInstall);
+-		HashSet available = new HashSet();
+-		available.add(required);
+-		UnsatisfiedCapability[] unsatisfied = rh.install(installSet, available);
+-
+-		assertEquals("1.0", 1, unsatisfied.length);
+-		assertEquals("1.1", "match", unsatisfied[0].getUnsatisfiedUnit().getId());
+-		IRequiredCapability capability = unsatisfied[0].getRequiredCapability();
+-		assertEquals("1.4", "test.capability", capability.getNamespace());
+-		assertEquals("1.5", "does.not.exist", capability.getName());
+-	}
+-
+-	/**
+-	 * In this test we try to resolve an IU that has an unsatisfied dependency.
+-	 * However, there is a filter on the unresolved dependency that does not
+-	 * match the environment, so it should not prevent the IU being resolved.
+-	 */
+-	public void testUnsatisfiedDependencyWithUnmatchingFilter() {
+-		//use the same version everywhere because it's not interesting for this test
+-		Version version = new Version(1, 0, 0);
+-
+-		//The IU that exports the capability
+-		IProvidedCapability[] provides = new IProvidedCapability[] {MetadataFactory.createProvidedCapability("test.capability", "test", version)};
+-		IInstallableUnit required = createIU("required", version, provides);
+-
+-		//an IU whose filter will not match the environment
+-		IRequiredCapability[] requires = createRequiredCapabilities("test.capability", "does.not.exist", createFilter(FILTER_KEY, "noMatchValue"));
+-		IInstallableUnit toInstall = createIU("noMatch", version, requires);
+-
+-		Dictionary environment = new Hashtable();
+-		environment.put(FILTER_KEY, "matchValue");
+-		ResolutionHelper rh = new ResolutionHelper(environment, null);
+-		HashSet installSet = new HashSet();
+-		installSet.add(toInstall);
+-		HashSet available = new HashSet();
+-		available.add(required);
+-		UnsatisfiedCapability[] unsatisfied = rh.install(installSet, available);
+-
+-		assertEquals("1.0", 0, unsatisfied.length);
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentMethodTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentMethodTest.java
+index ba69b59..f9c913a 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentMethodTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentMethodTest.java
+@@ -10,10 +10,10 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.metadata;
+ 
+-import java.util.*;
++import java.util.HashSet;
++import java.util.Iterator;
+ import junit.framework.AssertionFailedError;
+ import junit.framework.TestCase;
+-import org.eclipse.equinox.internal.p2.resolution.ResolutionHelper;
+ import org.eclipse.equinox.internal.provisional.p2.core.Version;
+ import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+@@ -43,8 +43,8 @@ public class FragmentMethodTest extends TestCase {
+ 		HashSet hash = new HashSet();
+ 		hash.add(iu1);
+ 		hash.add(iu3);
+-		Collection result = new ResolutionHelper(new Hashtable(), null).attachCUs(hash);
+-		for (Iterator iterator = result.iterator(); iterator.hasNext();) {
++		//		Collection result = new ResolutionHelper(new Hashtable(), null).attachCUs(hash);
++		for (Iterator iterator = hash.iterator(); iterator.hasNext();) {
+ 			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+ 			if (iu.getId().equals(iu1.getId()))
+ 				iu1 = iu;
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentTest.java
+index 748f582..f4cdfb1 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentTest.java
+@@ -10,10 +10,13 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.metadata;
+ 
+-import java.util.*;
++import java.util.HashMap;
++import java.util.Iterator;
+ import junit.framework.AssertionFailedError;
+-import org.eclipse.equinox.internal.p2.resolution.ResolutionHelper;
++import org.eclipse.equinox.internal.provisional.p2.director.ProfileChangeRequest;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.*;
++import org.eclipse.equinox.internal.provisional.p2.metadata.query.InstallableUnitQuery;
++import org.eclipse.equinox.internal.provisional.p2.query.Collector;
+ import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+ 
+ public class FragmentTest extends AbstractProvisioningTest {
+@@ -22,12 +25,15 @@ public class FragmentTest extends AbstractProvisioningTest {
+ 		String ID = "ui.test1";
+ 		IInstallableUnit iu1 = createEclipseIU(ID);
+ 		IInstallableUnit iu2 = createBundleFragment("iuFragment.test1");
+-		ResolutionHelper rh = new ResolutionHelper(new Hashtable(), null);
+-		HashSet set = new HashSet();
+-		set.add(iu1);
+-		set.add(iu2);
+-		Collection result = rh.attachCUs(set);
+-		for (Iterator iterator = result.iterator(); iterator.hasNext();) {
++		ProfileChangeRequest req = new ProfileChangeRequest(createProfile(getName()));
++		createTestMetdataRepository(new IInstallableUnit[] {iu1, iu2});
++		Iterator iterator = createPlanner().getProvisioningPlan(req, null, null).getAdditions().query(InstallableUnitQuery.ANY, new Collector(), null).iterator();
++		//		ResolutionHelper rh = new ResolutionHelper(new Hashtable(), null);
++		//		HashSet set = new HashSet();
++		//		set.add(iu1);
++		//		set.add(iu2);
++		//		Collection result = rh.attachCUs(set);
++		for (; iterator.hasNext();) {
+ 			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+ 			if (iu.getId().equals(ID)) {
+ 				assertEquals(iu.getFragments().length, 1);
+@@ -42,13 +48,10 @@ public class FragmentTest extends AbstractProvisioningTest {
+ 		IInstallableUnit iu1 = createEclipseIU(ID1);
+ 		IInstallableUnit iu3 = createEclipseIU(ID3);
+ 		IInstallableUnit iu2 = createBundleFragment("iuFragment.test1");
+-		ResolutionHelper rh = new ResolutionHelper(new Hashtable(), null);
+-		HashSet set = new HashSet();
+-		set.add(iu1);
+-		set.add(iu2);
+-		set.add(iu3);
+-		Collection result = rh.attachCUs(set);
+-		for (Iterator iterator = result.iterator(); iterator.hasNext();) {
++		ProfileChangeRequest req = new ProfileChangeRequest(createProfile(getName()));
++		createTestMetdataRepository(new IInstallableUnit[] {iu1, iu2, iu3});
++		Iterator iterator = createPlanner().getProvisioningPlan(req, null, null).getAdditions().query(InstallableUnitQuery.ANY, new Collector(), null).iterator();
++		for (; iterator.hasNext();) {
+ 			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+ 			if (iu.getId().equals(ID1)) {
+ 				assertEquals(iu.getFragments().length, 1);
+@@ -66,12 +69,10 @@ public class FragmentTest extends AbstractProvisioningTest {
+ 		assertEquals(createBundleFragment("iuFragment.test1").getTouchpointData().length, 1);
+ 		IInstallableUnit iu1 = createIUWithTouchpointData();
+ 		IInstallableUnit iu2 = createBundleFragment("iuFragment.test1");
+-		ResolutionHelper rh = new ResolutionHelper(new Hashtable(), null);
+-		HashSet set = new HashSet();
+-		set.add(iu1);
+-		set.add(iu2);
+-		Collection result = rh.attachCUs(set);
+-		for (Iterator iterator = result.iterator(); iterator.hasNext();) {
++		ProfileChangeRequest req = new ProfileChangeRequest(createProfile(getName()));
++		createTestMetdataRepository(new IInstallableUnit[] {iu1, iu2});
++		Iterator iterator = createPlanner().getProvisioningPlan(req, null, null).getAdditions().query(InstallableUnitQuery.ANY, new Collector(), null).iterator();
++		for (; iterator.hasNext();) {
+ 			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+ 			if (iu.getId().equals(iu1.getId()))
+ 				assertEquals(2, iu.getTouchpointData().length);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/MultipleIUAndFragmentTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/MultipleIUAndFragmentTest.java
+index 4b59380..8aed004 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/MultipleIUAndFragmentTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/MultipleIUAndFragmentTest.java
+@@ -10,10 +10,13 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.metadata;
+ 
+-import java.util.*;
+-import org.eclipse.equinox.internal.p2.resolution.ResolutionHelper;
++import java.util.Collection;
++import java.util.Iterator;
+ import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
++import org.eclipse.equinox.internal.provisional.p2.director.ProfileChangeRequest;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.*;
++import org.eclipse.equinox.internal.provisional.p2.metadata.query.InstallableUnitQuery;
++import org.eclipse.equinox.internal.provisional.p2.query.Collector;
+ import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+ 
+ public class MultipleIUAndFragmentTest extends AbstractProvisioningTest {
+@@ -23,17 +26,6 @@ public class MultipleIUAndFragmentTest extends AbstractProvisioningTest {
+ 	IInstallableUnit iu3;
+ 	Collection result;
+ 
+-	protected void setUp() throws Exception {
+-		iu1 = createEclipseIU("one");
+-		iu2 = createIUWithDependencyOn("two", "one");
+-		iu3 = createBundleFragment("fragment");
+-		HashSet set = new HashSet();
+-		set.add(iu1);
+-		set.add(iu2);
+-		set.add(iu3);
+-		result = new ResolutionHelper(new Hashtable(), null).attachCUs(set);
+-	}
+-
+ 	protected void tearDown() throws Exception {
+ 		super.tearDown();
+ 		iu1 = null;
+@@ -42,7 +34,13 @@ public class MultipleIUAndFragmentTest extends AbstractProvisioningTest {
+ 	}
+ 
+ 	public void testAttachment() {
+-		for (Iterator iterator = result.iterator(); iterator.hasNext();) {
++		iu1 = createEclipseIU("one");
++		iu2 = createIUWithDependencyOn("two", "one");
++		iu3 = createBundleFragment("fragment");
++		ProfileChangeRequest req = new ProfileChangeRequest(createProfile(getName()));
++		createTestMetdataRepository(new IInstallableUnit[] {iu1, iu2, iu3});
++		Iterator iterator = createPlanner().getProvisioningPlan(req, null, null).getAdditions().query(InstallableUnitQuery.ANY, new Collector(), null).iterator();
++		for (; iterator.hasNext();) {
+ 			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+ 			if (iu.getId().equals(iu1.getId())) {
+ 				assertEquals(1, iu.getFragments().length);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/planner/AllTests.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/planner/AllTests.java
+index 0c6ab00..ffd62c9 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/planner/AllTests.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/planner/AllTests.java
+@@ -31,20 +31,24 @@ public class AllTests extends TestCase {
+ 		suite.addTestSuite(AnotherSingleton.class);
+ 		suite.addTestSuite(Bug207319.class);
+ 		suite.addTestSuite(Bug249605.class);
++		suite.addTestSuite(Bug252638.class);
+ 		//		suite.addTestSuite(Bug252682.class);
+ 		suite.addTestSuite(Bug254481dataSet1.class);
+ 		suite.addTestSuite(Bug254481dataSet2.class);
+ 		suite.addTestSuite(Bug255984.class);
+ 		suite.addTestSuite(Bug262580.class);
+ 		suite.addTestSuite(Bug270656.class);
++		suite.addTestSuite(Bug270683.class);
+ 		suite.addTestSuite(Bug271067.class);
+ 		suite.addTestSuite(Bug271954.class);
++		//		suite.addTestSuite(Bug272251.class);
+ 		suite.addTestSuite(DependencyOnSelf.class);
+ 		suite.addTestSuite(DisabledExplanation.class);
+ 		suite.addTestSuite(DropinsScenario.class);
+ 		suite.addTestSuite(ExplanationDeepConflict.class);
+ 		suite.addTestSuite(ExplanationForOptionalDependencies.class);
+ 		suite.addTestSuite(ExplanationForPartialInstallation.class);
++		//		suite.addTestSuite(ExplanationLargeConflict.class);
+ 		suite.addTestSuite(ExplanationSeveralConflictingRoots.class);
+ 		suite.addTestSuite(GreedyRequirement.class);
+ 		suite.addTestSuite(InclusionRuleTest.class);

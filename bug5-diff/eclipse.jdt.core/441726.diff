@@ -1,0 +1,733 @@
+commit 3d73760dc9e0c52d27b28aa6b5ee7c1a07bc4ccf
+Author: Terry Parker <tparker@google.com>
+Date:   Thu Aug 14 11:16:06 2014 -0700
+
+    Bug 441726 - JDT performance regression due to bug 410207
+    
+    Add a cache in JavaModelManager that maps a jar's IPath to its Java
+    language level, and persist the cache across Eclipse sessions. This
+    cache makes JarPackageFragmentRoot creation much faster. Items in the
+    cache are invalidated whenever the DeltaProcessor sees that a jar's
+    timestamp has changed.
+    
+    FullSourceWorkspaceModelTests.testGetAllPackageFragmentRoots took 123ms
+    to execute before this patch, and only 29ms with this patch applied.
+    The same test took 30ms in Kepler with the patch for bug 411423 applied.
+    
+    Change-Id: Ic97dff022f9501a25315c35fae42df79b01486cc
+    Signed-off-by: Terry Parker <tparker@google.com>
+
+7	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+12	3	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+105	6	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+12	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+15	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+index 71f98ab..500339f 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+@@ -10,6 +10,7 @@
+  *     Terry Parker <tparker@google.com> - DeltaProcessor exhibits O(N^2) behavior, see https://bugs.eclipse.org/bugs/show_bug.cgi?id=354332
+  *     Terry Parker <tparker@google.com> - DeltaProcessor misses state changes in archive files, see https://bugs.eclipse.org/bugs/show_bug.cgi?id=357425
+  *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
++ *     Terry Parker <tparker@google.com> - Bug 441726 - JDT performance regression due to bug 410207
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -988,8 +989,9 @@ public class DeltaProcessor {
+ 							if (this.state.getExternalLibTimeStamps().remove(entryPath) != null /* file was known*/
+ 									&& this.state.roots.get(entryPath) != null /* and it was on the classpath*/) {
+ 								externalArchivesStatus.put(entryPath, EXTERNAL_JAR_REMOVED);
+-								// the jar was physically removed: remove the index
++								// the jar was physically removed: remove the index and from the language level cache
+ 								this.manager.indexManager.removeIndex(entryPath);
++								this.manager.removeFromLanguageLevelsCache(entryPath);
+ 							}
+ 
+ 						} else if (targetLibrary instanceof File){ // external JAR
+@@ -1004,12 +1006,15 @@ public class DeltaProcessor {
+ 								if (newTimeStamp == 0){ // file doesn't exist
+ 									externalArchivesStatus.put(entryPath, EXTERNAL_JAR_REMOVED);
+ 									this.state.getExternalLibTimeStamps().remove(entryPath);
+-									// remove the index
++									// remove the index and from the language level cache
+ 									this.manager.indexManager.removeIndex(entryPath);
++									this.manager.removeFromLanguageLevelsCache(entryPath);
+ 
+ 								} else if (oldTimestamp.longValue() != newTimeStamp){
+ 									externalArchivesStatus.put(entryPath, EXTERNAL_JAR_CHANGED);
+ 									this.state.getExternalLibTimeStamps().put(entryPath, new Long(newTimeStamp));
++									// remove from the language level cache so it can be recalculated
++									this.manager.removeFromLanguageLevelsCache(entryPath);
+ 									// first remove the index so that it is forced to be re-indexed
+ 									this.manager.indexManager.removeIndex(entryPath);
+ 									// then index the jar
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+index 09f3365..bff8544 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Terry Parker <tparker@google.com> - Bug 441726 - JDT performance regression due to bug 410207
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -59,12 +60,20 @@ public class JarPackageFragmentRoot extends PackageFragmentRoot {
+ 	 * does not have an associated <code>IResource</code>.
+ 	 */
+ 	protected JarPackageFragmentRoot(IPath externalJarPath, JavaProject project) {
++		this(null, project, Util.getJdkLevel(JavaModel.getTarget(externalJarPath, true)));
++	}
++
++	/**
++	 * Constructs a package fragment root which is the root of the Java package directory hierarchy
++	 * based on a JAR file that is not contained in a <code>IJavaProject</code> and
++	 * does not have an associated <code>IResource</code>.
++	 */
++	public JarPackageFragmentRoot(IPath externalJarPath, JavaProject project, long complianceLevel) {
+ 		super(null, project);
+ 		this.jarPath = externalJarPath;
+-		Object file = JavaModel.getTarget(getPath(), true);
+-		long level = Util.getJdkLevel(file);
+-		this.complianceLevel = CompilerOptions.versionFromJdkLevel(level);
++		this.complianceLevel = CompilerOptions.versionFromJdkLevel(complianceLevel);
+ 	}
++
+ 	/**
+ 	 * Constructs a package fragment root which is the root of the Java package directory hierarchy
+ 	 * based on a JAR file.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+index 30bc98a..1b161e7 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+@@ -14,6 +14,7 @@
+  *     Terry Parker <tparker@google.com> - DeltaProcessor misses state changes in archive files, see https://bugs.eclipse.org/bugs/show_bug.cgi?id=357425
+  *     Thirumala Reddy Mutchukota <thirumala@google.com> - Contribution to bug: https://bugs.eclipse.org/bugs/show_bug.cgi?id=411423
+  *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
++ *     Terry Parker <tparker@google.com> - Bug 441726 - JDT performance regression due to bug 410207
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -93,6 +94,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	private static final String INVALID_ARCHIVES_CACHE = "invalidArchivesCache";  //$NON-NLS-1$
+ 	private static final String EXTERNAL_FILES_CACHE = "externalFilesCache";  //$NON-NLS-1$
+ 	private static final String ASSUMED_EXTERNAL_FILES_CACHE = "assumedExternalFilesCache";  //$NON-NLS-1$
++	private static final String JAR_LANGUAGE_LEVEL_CACHE = "jarLanguageLevelCache";  //$NON-NLS-1$
+ 
+ 	/**
+ 	 * Define a zip cache object.
+@@ -1462,6 +1464,11 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	 */
+ 	private Set assumedExternalFiles;
+ 
++	/*
++	 * A map of jar IPaths to the language level of each jar.
++	 */
++	private Map<IPath, Long> jarLanguageLevels;
++
+ 	/**
+ 	 * Update the classpath variable cache
+ 	 */
+@@ -1598,6 +1605,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 			this.invalidArchives = loadClasspathListCache(INVALID_ARCHIVES_CACHE);
+ 			this.externalFiles = loadClasspathListCache(EXTERNAL_FILES_CACHE);
+ 			this.assumedExternalFiles = loadClasspathListCache(ASSUMED_EXTERNAL_FILES_CACHE);
++			this.jarLanguageLevels = loadJarLanguageLevelsCache();
+ 			String includeContainerReferencedLib = System.getProperty(RESOLVE_REFERENCED_LIBRARIES_FOR_CONTAINERS);
+ 			this.resolveReferencedLibrariesForContainers = TRUE.equalsIgnoreCase(includeContainerReferencedLib);
+ 		}
+@@ -1641,6 +1649,38 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	}
+ 
+ 	/**
++	 * Returns a language level for a jar or {@code null} if the jar's language level isn't cached.
++	 */
++	public Long getJarLanguageLevel(IPath path) {
++		if (this.jarLanguageLevels != null) {
++			return this.jarLanguageLevels.get(path);
++		}
++		return null;
++	}
++
++	/**
++	 * Adds a jar to the language levels cache.
++	 */
++	public void addToJarLanguageLevelsCache(IPath path, Long languageLevel) {
++		// unlikely to be null
++		if (this.jarLanguageLevels == null) {
++			this.jarLanguageLevels = Collections.synchronizedMap(new HashMap());
++		}
++		if (this.jarLanguageLevels != null) {
++			this.jarLanguageLevels.put(path, languageLevel);
++		}
++	}
++
++	/**
++	 * Removes a jar from the language levels cache.
++	 */
++	public void removeFromLanguageLevelsCache(IPath path) {
++		if (this.jarLanguageLevels != null) {
++			this.jarLanguageLevels.remove(path);
++		}
++	}
++
++	/**
+ 	 * Starts caching ZipFiles.
+ 	 * Ignores if there are already clients.
+ 	 */
+@@ -3186,7 +3226,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	
+ 	private Set loadClasspathListCache(String cacheName) {
+ 		Set pathCache = new HashSet();
+-		File cacheFile = getClasspathListFile(cacheName);
++		File cacheFile = getClasspathCacheFile(cacheName);
+ 		DataInputStream in = null;
+ 		try {
+ 			in = new DataInputStream(new BufferedInputStream(new FileInputStream(cacheFile)));
+@@ -3209,11 +3249,67 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 		}
+ 		return Collections.synchronizedSet(pathCache);
+ 	}
+-	
+-	private File getClasspathListFile(String fileName) {
+-		return JavaCore.getPlugin().getStateLocation().append(fileName).toFile(); 
++
++	private Map<IPath, Long> loadJarLanguageLevelsCache() {
++		Map<IPath, Long> pathCache = new HashMap<IPath, Long>();
++		File cacheFile = getClasspathCacheFile(JAR_LANGUAGE_LEVEL_CACHE);
++		DataInputStream in = null;
++		try {
++			in = new DataInputStream(new BufferedInputStream(new FileInputStream(cacheFile)));
++			int size = in.readInt();
++			while (size-- > 0) {
++				IPath path = Path.fromPortableString(in.readUTF());
++				long complianceLevel = in.readLong();
++				pathCache.put(path, complianceLevel);
++			}
++		} catch (IOException e) {
++			if (cacheFile.exists())
++				Util.log(e, "Unable to read JavaModelManager " + JAR_LANGUAGE_LEVEL_CACHE + " file"); //$NON-NLS-1$ //$NON-NLS-2$
++		} finally {
++			if (in != null) {
++				try {
++					in.close();
++				} catch (IOException e) {
++					// nothing we can do: ignore
++				}
++			}
++		}
++		return Collections.synchronizedMap(pathCache);
+ 	}
+-	
++
++	private void saveJarLanguageLevelsCache() throws CoreException {
++		File file = getClasspathCacheFile(JAR_LANGUAGE_LEVEL_CACHE);
++		DataOutputStream out = null;
++		try {
++			out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(file)));
++			synchronized (this.jarLanguageLevels) {
++				out.writeInt(this.jarLanguageLevels.size());
++				for (Map.Entry<IPath, Long> entry : this.jarLanguageLevels.entrySet()) {
++					IPath path = entry.getKey();
++					Long level = entry.getValue();
++					out.writeUTF(path.toPortableString());
++					out.writeLong(level);
++				}
++			}
++		} catch (IOException e) {
++			IStatus status = new Status(IStatus.ERROR, JavaCore.PLUGIN_ID, IStatus.ERROR, "Problems while saving non-chaining jar cache", e); //$NON-NLS-1$
++			throw new CoreException(status);
++		} finally {
++			if (out != null) {
++				try {
++					out.close();
++				} catch (IOException e) {
++					// Attempt to remove the invalid file.
++					file.delete();
++				}
++			}
++		}
++	}
++
++	private File getClasspathCacheFile(String fileName) {
++		return JavaCore.getPlugin().getStateLocation().append(fileName).toFile();
++	}
++
+ 	private Set getNonChainingJarsCache() throws CoreException {
+ 		// Even if there is one entry in the cache, just return it. It may not be 
+ 		// the complete cache, but avoid going through all the projects to populate the cache.
+@@ -3994,6 +4090,8 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 			this.externalFiles.clear();
+ 		if (this.assumedExternalFiles != null)
+ 			this.assumedExternalFiles.clear();
++		if (this.jarLanguageLevels != null)
++			this.jarLanguageLevels.clear();
+ 	}
+ 
+ 	/*
+@@ -4068,7 +4166,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	}
+ 
+ 	private void saveClasspathListCache(String cacheName) throws CoreException {
+-		File file = getClasspathListFile(cacheName);
++		File file = getClasspathCacheFile(cacheName);
+ 		DataOutputStream out = null;
+ 		try {
+ 			out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(file)));
+@@ -4344,6 +4442,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 				saveClasspathListCache(INVALID_ARCHIVES_CACHE);
+ 				saveClasspathListCache(EXTERNAL_FILES_CACHE);
+ 				saveClasspathListCache(ASSUMED_EXTERNAL_FILES_CACHE);
++				saveJarLanguageLevelsCache();
+ 	
+ 				// will need delta since this save (see https://bugs.eclipse.org/bugs/show_bug.cgi?id=38658)
+ 				context.needDelta();
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+index cf63fc8..d08573c 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+@@ -10,6 +10,7 @@
+  *     Stephan Herrmann <stephan@cs.tu-berlin.de> - Contributions for
+  *     						Bug 320618 - inconsistent initialization of classpath container backed by external class folder
+  *     						Bug 346010 - [model] strange initialization dependency in OptionTests
++ *     Terry Parker <tparker@google.com> - Bug 441726 - JDT performance regression due to bug 410207
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -616,7 +617,7 @@ public class JavaProject
+ 				} else if (target instanceof File) {
+ 					// external target
+ 					if (JavaModel.isFile(target)) {
+-						root = new JarPackageFragmentRoot(entryPath, this);
++						root = getJarPackageFragmentRoot(entryPath);
+ 					} else if (((File) target).isDirectory()) {
+ 						root = new ExternalPackageFragmentRoot(entryPath, this);
+ 					}
+@@ -1833,7 +1834,16 @@ public class JavaProject
+ 		IFolder linkedFolder = JavaModelManager.getExternalManager().getFolder(externalLibraryPath);
+ 		if (linkedFolder != null)
+ 			return new ExternalPackageFragmentRoot(linkedFolder, externalLibraryPath, this);
+-		return new JarPackageFragmentRoot(externalLibraryPath, this);
++		return getJarPackageFragmentRoot(externalLibraryPath);
++	}
++
++	private JarPackageFragmentRoot getJarPackageFragmentRoot(IPath externalLibraryPath) {
++		Long languageLevel = JavaModelManager.getJavaModelManager().getJarLanguageLevel(externalLibraryPath);
++		if (languageLevel == null) {
++			languageLevel = Util.getJdkLevel(JavaModel.getTarget(externalLibraryPath, true));
++			JavaModelManager.getJavaModelManager().addToJarLanguageLevelsCache(externalLibraryPath, languageLevel);
++		}
++		return new JarPackageFragmentRoot(externalLibraryPath, this, languageLevel);
+ 	}
+ 
+ 	/**
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
+index 334b810..30041e8 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Terry Parker <tparker@google.com> - Bug 441726 - JDT performance regression due to bug 410207
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.search.indexing;
+ 
+@@ -27,6 +28,8 @@ import org.eclipse.jdt.core.search.IJavaSearchScope;
+ import org.eclipse.jdt.core.search.SearchEngine;
+ import org.eclipse.jdt.core.search.SearchParticipant;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+ import org.eclipse.jdt.internal.compiler.parser.Scanner;
+ import org.eclipse.jdt.internal.compiler.parser.TerminalTokens;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+@@ -217,6 +220,7 @@ class AddJarFileToIndex extends IndexRequest {
+ 				if ((indexLocation = index.getIndexLocation()) != null) {
+ 					indexPath = new Path(indexLocation.getCanonicalFilePath());
+ 				}
++				Long languageLevel = JavaModelManager.getJavaModelManager().getJarLanguageLevel(zipFilePath);
+ 				for (Enumeration e = zip.entries(); e.hasMoreElements();) {
+ 					if (this.isCancelled) {
+ 						if (JobManager.VERBOSE)
+@@ -233,6 +237,17 @@ class AddJarFileToIndex extends IndexRequest {
+ 						final byte[] classFileBytes = org.eclipse.jdt.internal.compiler.util.Util.getZipEntryByteContent(ze, zip);
+ 						JavaSearchDocument entryDocument = new JavaSearchDocument(ze, zipFilePath, classFileBytes, participant);
+ 						this.manager.indexDocument(entryDocument, participant, index, indexPath);
++						// Update the language level cache value for this jar, since we've already done the expensive IO.
++						if (languageLevel == null) {
++							try {
++								languageLevel = new ClassFileReader(classFileBytes, null).getVersion();
++								JavaModelManager.getJavaModelManager().addToJarLanguageLevelsCache(zipFilePath, languageLevel);
++							} catch (ClassFormatException e1) {
++								// If we have trouble reading a class, stop trying to find this jar's language level.
++								// Set the local languageLevel variable to a dummy value but don't add it to the cache.
++								languageLevel = Long.MIN_VALUE;
++							}
++						}
+ 					}
+ 				}
+ 				if(this.forceIndexUpdate) {
+commit d1eee17b22e6a5c7fead90ad113c3a52618d279b
+Author: Markus Keller <markus_keller@ch.ibm.com>
+Date:   Mon Sep 1 00:27:35 2014 +0200
+
+    Revert "Bug 441726 - JDT performance regression due to bug 410207"
+    
+    This reverts commit 3d73760dc9e0c52d27b28aa6b5ee7c1a07bc4ccf.
+
+2	7	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+3	12	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+6	105	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+2	12	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+0	15	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+index 500339f..71f98ab 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+@@ -10,7 +10,6 @@
+  *     Terry Parker <tparker@google.com> - DeltaProcessor exhibits O(N^2) behavior, see https://bugs.eclipse.org/bugs/show_bug.cgi?id=354332
+  *     Terry Parker <tparker@google.com> - DeltaProcessor misses state changes in archive files, see https://bugs.eclipse.org/bugs/show_bug.cgi?id=357425
+  *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
+- *     Terry Parker <tparker@google.com> - Bug 441726 - JDT performance regression due to bug 410207
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -989,9 +988,8 @@ public class DeltaProcessor {
+ 							if (this.state.getExternalLibTimeStamps().remove(entryPath) != null /* file was known*/
+ 									&& this.state.roots.get(entryPath) != null /* and it was on the classpath*/) {
+ 								externalArchivesStatus.put(entryPath, EXTERNAL_JAR_REMOVED);
+-								// the jar was physically removed: remove the index and from the language level cache
++								// the jar was physically removed: remove the index
+ 								this.manager.indexManager.removeIndex(entryPath);
+-								this.manager.removeFromLanguageLevelsCache(entryPath);
+ 							}
+ 
+ 						} else if (targetLibrary instanceof File){ // external JAR
+@@ -1006,15 +1004,12 @@ public class DeltaProcessor {
+ 								if (newTimeStamp == 0){ // file doesn't exist
+ 									externalArchivesStatus.put(entryPath, EXTERNAL_JAR_REMOVED);
+ 									this.state.getExternalLibTimeStamps().remove(entryPath);
+-									// remove the index and from the language level cache
++									// remove the index
+ 									this.manager.indexManager.removeIndex(entryPath);
+-									this.manager.removeFromLanguageLevelsCache(entryPath);
+ 
+ 								} else if (oldTimestamp.longValue() != newTimeStamp){
+ 									externalArchivesStatus.put(entryPath, EXTERNAL_JAR_CHANGED);
+ 									this.state.getExternalLibTimeStamps().put(entryPath, new Long(newTimeStamp));
+-									// remove from the language level cache so it can be recalculated
+-									this.manager.removeFromLanguageLevelsCache(entryPath);
+ 									// first remove the index so that it is forced to be re-indexed
+ 									this.manager.indexManager.removeIndex(entryPath);
+ 									// then index the jar
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+index bff8544..09f3365 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+@@ -7,7 +7,6 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+- *     Terry Parker <tparker@google.com> - Bug 441726 - JDT performance regression due to bug 410207
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -60,20 +59,12 @@ public class JarPackageFragmentRoot extends PackageFragmentRoot {
+ 	 * does not have an associated <code>IResource</code>.
+ 	 */
+ 	protected JarPackageFragmentRoot(IPath externalJarPath, JavaProject project) {
+-		this(null, project, Util.getJdkLevel(JavaModel.getTarget(externalJarPath, true)));
+-	}
+-
+-	/**
+-	 * Constructs a package fragment root which is the root of the Java package directory hierarchy
+-	 * based on a JAR file that is not contained in a <code>IJavaProject</code> and
+-	 * does not have an associated <code>IResource</code>.
+-	 */
+-	public JarPackageFragmentRoot(IPath externalJarPath, JavaProject project, long complianceLevel) {
+ 		super(null, project);
+ 		this.jarPath = externalJarPath;
+-		this.complianceLevel = CompilerOptions.versionFromJdkLevel(complianceLevel);
++		Object file = JavaModel.getTarget(getPath(), true);
++		long level = Util.getJdkLevel(file);
++		this.complianceLevel = CompilerOptions.versionFromJdkLevel(level);
+ 	}
+-
+ 	/**
+ 	 * Constructs a package fragment root which is the root of the Java package directory hierarchy
+ 	 * based on a JAR file.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+index 1b161e7..30bc98a 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+@@ -14,7 +14,6 @@
+  *     Terry Parker <tparker@google.com> - DeltaProcessor misses state changes in archive files, see https://bugs.eclipse.org/bugs/show_bug.cgi?id=357425
+  *     Thirumala Reddy Mutchukota <thirumala@google.com> - Contribution to bug: https://bugs.eclipse.org/bugs/show_bug.cgi?id=411423
+  *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
+- *     Terry Parker <tparker@google.com> - Bug 441726 - JDT performance regression due to bug 410207
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -94,7 +93,6 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	private static final String INVALID_ARCHIVES_CACHE = "invalidArchivesCache";  //$NON-NLS-1$
+ 	private static final String EXTERNAL_FILES_CACHE = "externalFilesCache";  //$NON-NLS-1$
+ 	private static final String ASSUMED_EXTERNAL_FILES_CACHE = "assumedExternalFilesCache";  //$NON-NLS-1$
+-	private static final String JAR_LANGUAGE_LEVEL_CACHE = "jarLanguageLevelCache";  //$NON-NLS-1$
+ 
+ 	/**
+ 	 * Define a zip cache object.
+@@ -1464,11 +1462,6 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	 */
+ 	private Set assumedExternalFiles;
+ 
+-	/*
+-	 * A map of jar IPaths to the language level of each jar.
+-	 */
+-	private Map<IPath, Long> jarLanguageLevels;
+-
+ 	/**
+ 	 * Update the classpath variable cache
+ 	 */
+@@ -1605,7 +1598,6 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 			this.invalidArchives = loadClasspathListCache(INVALID_ARCHIVES_CACHE);
+ 			this.externalFiles = loadClasspathListCache(EXTERNAL_FILES_CACHE);
+ 			this.assumedExternalFiles = loadClasspathListCache(ASSUMED_EXTERNAL_FILES_CACHE);
+-			this.jarLanguageLevels = loadJarLanguageLevelsCache();
+ 			String includeContainerReferencedLib = System.getProperty(RESOLVE_REFERENCED_LIBRARIES_FOR_CONTAINERS);
+ 			this.resolveReferencedLibrariesForContainers = TRUE.equalsIgnoreCase(includeContainerReferencedLib);
+ 		}
+@@ -1649,38 +1641,6 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	}
+ 
+ 	/**
+-	 * Returns a language level for a jar or {@code null} if the jar's language level isn't cached.
+-	 */
+-	public Long getJarLanguageLevel(IPath path) {
+-		if (this.jarLanguageLevels != null) {
+-			return this.jarLanguageLevels.get(path);
+-		}
+-		return null;
+-	}
+-
+-	/**
+-	 * Adds a jar to the language levels cache.
+-	 */
+-	public void addToJarLanguageLevelsCache(IPath path, Long languageLevel) {
+-		// unlikely to be null
+-		if (this.jarLanguageLevels == null) {
+-			this.jarLanguageLevels = Collections.synchronizedMap(new HashMap());
+-		}
+-		if (this.jarLanguageLevels != null) {
+-			this.jarLanguageLevels.put(path, languageLevel);
+-		}
+-	}
+-
+-	/**
+-	 * Removes a jar from the language levels cache.
+-	 */
+-	public void removeFromLanguageLevelsCache(IPath path) {
+-		if (this.jarLanguageLevels != null) {
+-			this.jarLanguageLevels.remove(path);
+-		}
+-	}
+-
+-	/**
+ 	 * Starts caching ZipFiles.
+ 	 * Ignores if there are already clients.
+ 	 */
+@@ -3226,7 +3186,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	
+ 	private Set loadClasspathListCache(String cacheName) {
+ 		Set pathCache = new HashSet();
+-		File cacheFile = getClasspathCacheFile(cacheName);
++		File cacheFile = getClasspathListFile(cacheName);
+ 		DataInputStream in = null;
+ 		try {
+ 			in = new DataInputStream(new BufferedInputStream(new FileInputStream(cacheFile)));
+@@ -3249,67 +3209,11 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 		}
+ 		return Collections.synchronizedSet(pathCache);
+ 	}
+-
+-	private Map<IPath, Long> loadJarLanguageLevelsCache() {
+-		Map<IPath, Long> pathCache = new HashMap<IPath, Long>();
+-		File cacheFile = getClasspathCacheFile(JAR_LANGUAGE_LEVEL_CACHE);
+-		DataInputStream in = null;
+-		try {
+-			in = new DataInputStream(new BufferedInputStream(new FileInputStream(cacheFile)));
+-			int size = in.readInt();
+-			while (size-- > 0) {
+-				IPath path = Path.fromPortableString(in.readUTF());
+-				long complianceLevel = in.readLong();
+-				pathCache.put(path, complianceLevel);
+-			}
+-		} catch (IOException e) {
+-			if (cacheFile.exists())
+-				Util.log(e, "Unable to read JavaModelManager " + JAR_LANGUAGE_LEVEL_CACHE + " file"); //$NON-NLS-1$ //$NON-NLS-2$
+-		} finally {
+-			if (in != null) {
+-				try {
+-					in.close();
+-				} catch (IOException e) {
+-					// nothing we can do: ignore
+-				}
+-			}
+-		}
+-		return Collections.synchronizedMap(pathCache);
+-	}
+-
+-	private void saveJarLanguageLevelsCache() throws CoreException {
+-		File file = getClasspathCacheFile(JAR_LANGUAGE_LEVEL_CACHE);
+-		DataOutputStream out = null;
+-		try {
+-			out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(file)));
+-			synchronized (this.jarLanguageLevels) {
+-				out.writeInt(this.jarLanguageLevels.size());
+-				for (Map.Entry<IPath, Long> entry : this.jarLanguageLevels.entrySet()) {
+-					IPath path = entry.getKey();
+-					Long level = entry.getValue();
+-					out.writeUTF(path.toPortableString());
+-					out.writeLong(level);
+-				}
+-			}
+-		} catch (IOException e) {
+-			IStatus status = new Status(IStatus.ERROR, JavaCore.PLUGIN_ID, IStatus.ERROR, "Problems while saving non-chaining jar cache", e); //$NON-NLS-1$
+-			throw new CoreException(status);
+-		} finally {
+-			if (out != null) {
+-				try {
+-					out.close();
+-				} catch (IOException e) {
+-					// Attempt to remove the invalid file.
+-					file.delete();
+-				}
+-			}
+-		}
+-	}
+-
+-	private File getClasspathCacheFile(String fileName) {
+-		return JavaCore.getPlugin().getStateLocation().append(fileName).toFile();
++	
++	private File getClasspathListFile(String fileName) {
++		return JavaCore.getPlugin().getStateLocation().append(fileName).toFile(); 
+ 	}
+-
++	
+ 	private Set getNonChainingJarsCache() throws CoreException {
+ 		// Even if there is one entry in the cache, just return it. It may not be 
+ 		// the complete cache, but avoid going through all the projects to populate the cache.
+@@ -4090,8 +3994,6 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 			this.externalFiles.clear();
+ 		if (this.assumedExternalFiles != null)
+ 			this.assumedExternalFiles.clear();
+-		if (this.jarLanguageLevels != null)
+-			this.jarLanguageLevels.clear();
+ 	}
+ 
+ 	/*
+@@ -4166,7 +4068,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	}
+ 
+ 	private void saveClasspathListCache(String cacheName) throws CoreException {
+-		File file = getClasspathCacheFile(cacheName);
++		File file = getClasspathListFile(cacheName);
+ 		DataOutputStream out = null;
+ 		try {
+ 			out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(file)));
+@@ -4442,7 +4344,6 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 				saveClasspathListCache(INVALID_ARCHIVES_CACHE);
+ 				saveClasspathListCache(EXTERNAL_FILES_CACHE);
+ 				saveClasspathListCache(ASSUMED_EXTERNAL_FILES_CACHE);
+-				saveJarLanguageLevelsCache();
+ 	
+ 				// will need delta since this save (see https://bugs.eclipse.org/bugs/show_bug.cgi?id=38658)
+ 				context.needDelta();
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+index d08573c..cf63fc8 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+@@ -10,7 +10,6 @@
+  *     Stephan Herrmann <stephan@cs.tu-berlin.de> - Contributions for
+  *     						Bug 320618 - inconsistent initialization of classpath container backed by external class folder
+  *     						Bug 346010 - [model] strange initialization dependency in OptionTests
+- *     Terry Parker <tparker@google.com> - Bug 441726 - JDT performance regression due to bug 410207
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -617,7 +616,7 @@ public class JavaProject
+ 				} else if (target instanceof File) {
+ 					// external target
+ 					if (JavaModel.isFile(target)) {
+-						root = getJarPackageFragmentRoot(entryPath);
++						root = new JarPackageFragmentRoot(entryPath, this);
+ 					} else if (((File) target).isDirectory()) {
+ 						root = new ExternalPackageFragmentRoot(entryPath, this);
+ 					}
+@@ -1834,16 +1833,7 @@ public class JavaProject
+ 		IFolder linkedFolder = JavaModelManager.getExternalManager().getFolder(externalLibraryPath);
+ 		if (linkedFolder != null)
+ 			return new ExternalPackageFragmentRoot(linkedFolder, externalLibraryPath, this);
+-		return getJarPackageFragmentRoot(externalLibraryPath);
+-	}
+-
+-	private JarPackageFragmentRoot getJarPackageFragmentRoot(IPath externalLibraryPath) {
+-		Long languageLevel = JavaModelManager.getJavaModelManager().getJarLanguageLevel(externalLibraryPath);
+-		if (languageLevel == null) {
+-			languageLevel = Util.getJdkLevel(JavaModel.getTarget(externalLibraryPath, true));
+-			JavaModelManager.getJavaModelManager().addToJarLanguageLevelsCache(externalLibraryPath, languageLevel);
+-		}
+-		return new JarPackageFragmentRoot(externalLibraryPath, this, languageLevel);
++		return new JarPackageFragmentRoot(externalLibraryPath, this);
+ 	}
+ 
+ 	/**
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
+index 30041e8..334b810 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJarFileToIndex.java
+@@ -7,7 +7,6 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+- *     Terry Parker <tparker@google.com> - Bug 441726 - JDT performance regression due to bug 410207
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.search.indexing;
+ 
+@@ -28,8 +27,6 @@ import org.eclipse.jdt.core.search.IJavaSearchScope;
+ import org.eclipse.jdt.core.search.SearchEngine;
+ import org.eclipse.jdt.core.search.SearchParticipant;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+ import org.eclipse.jdt.internal.compiler.parser.Scanner;
+ import org.eclipse.jdt.internal.compiler.parser.TerminalTokens;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+@@ -220,7 +217,6 @@ class AddJarFileToIndex extends IndexRequest {
+ 				if ((indexLocation = index.getIndexLocation()) != null) {
+ 					indexPath = new Path(indexLocation.getCanonicalFilePath());
+ 				}
+-				Long languageLevel = JavaModelManager.getJavaModelManager().getJarLanguageLevel(zipFilePath);
+ 				for (Enumeration e = zip.entries(); e.hasMoreElements();) {
+ 					if (this.isCancelled) {
+ 						if (JobManager.VERBOSE)
+@@ -237,17 +233,6 @@ class AddJarFileToIndex extends IndexRequest {
+ 						final byte[] classFileBytes = org.eclipse.jdt.internal.compiler.util.Util.getZipEntryByteContent(ze, zip);
+ 						JavaSearchDocument entryDocument = new JavaSearchDocument(ze, zipFilePath, classFileBytes, participant);
+ 						this.manager.indexDocument(entryDocument, participant, index, indexPath);
+-						// Update the language level cache value for this jar, since we've already done the expensive IO.
+-						if (languageLevel == null) {
+-							try {
+-								languageLevel = new ClassFileReader(classFileBytes, null).getVersion();
+-								JavaModelManager.getJavaModelManager().addToJarLanguageLevelsCache(zipFilePath, languageLevel);
+-							} catch (ClassFormatException e1) {
+-								// If we have trouble reading a class, stop trying to find this jar's language level.
+-								// Set the local languageLevel variable to a dummy value but don't add it to the cache.
+-								languageLevel = Long.MIN_VALUE;
+-							}
+-						}
+ 					}
+ 				}
+ 				if(this.forceIndexUpdate) {

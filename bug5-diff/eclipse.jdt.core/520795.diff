@@ -1,0 +1,250 @@
+commit 1c0833e5c8df849044addcf4af12568a5ff4c906
+Author: Sasikanth Bharadwaj <sasikanth.bharadwaj@in.ibm.com>
+Date:   Mon Sep 11 15:43:09 2017 +0530
+
+    Fixed bug 520795: [9] CCE in
+    compiler.ast.MessageSend.manageSyntheticAccessIfNecessary
+    
+    Change-Id: I80a5cc3c10638b3559ebade5902d175fa962832e
+
+88	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest_9.java
+4	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+11	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SyntheticMethodBinding.java
+15	12	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest_9.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest_9.java
+index 0dfb948..0e82770 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest_9.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest_9.java
+@@ -308,4 +308,92 @@ public class InterfaceMethodsTest_9 extends AbstractComparableTest {
+ 			}, 
+ 			"");
+ 	}
++	public void testBug520795() {
++		runNegativeTest(
++			new String[] {
++				"I.java",
++				"public interface I {\n" +
++				"    private static void foo(){};\n" +
++				"	default void bar() {\n" + 
++				"		foo();\n" + 
++				"	}" +
++				"}\n",
++				"X.java",
++				"public class X {\n" +
++					"public static void main(String[] args) {\n" + 
++					"	I.foo();\n" + 
++					"}" +
++				"}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 3)\n" + 
++			"	I.foo();\n" + 
++			"	  ^^^\n" + 
++			"The method foo() from the type I is not visible\n" + 
++			"----------\n" );
++	}
++	public void testBug520795a() {
++		runConformTest(
++			new String[] {
++				"X.java",
++				"public class X {\n" +
++					"interface I {\n" +
++					"   private static void foo(){};\n" +
++					"	default void bar() {\n" + 
++					"		foo();\n" + 
++					"	}" +
++					"}\n" +
++					"public static void main(String[] args) {\n" + 
++					"	I.foo();\n" + 
++					"}" +
++				"}\n"
++		});
++	}
++	public void testBug520795b() {
++		runNegativeTest(
++			new String[] {
++				"X.java",
++				"public class X {\n" +
++					"public interface I {\n" +
++					"   private static void foo(){};\n" +
++					"	void bar();" +
++					"}\n" +
++					"public static void main(String[] args) {\n" +
++					"	I i = () -> {};\n" +
++					"	i.foo();\n" + 
++					"}" +
++				"}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 7)\n" + 
++			"	i.foo();\n" + 
++			"	  ^^^\n" + 
++			"This static method of interface X.I can only be accessed as X.I.foo\n" + 
++			"----------\n" );
++	}
++	public void testBug520795c() {
++		runNegativeTest(
++			new String[] {
++				"X.java",
++				"public class X {\n" +
++					"public interface I {\n" +
++					"   private static void foo(){};\n" +
++					"}\n" +
++					"public interface J extends I {\n" +
++					"   default void goo(){I.super.foo();};\n" +
++					"	void baz();" +
++					"}\n" +
++					"public static void main(String[] args) {\n" +
++					"	J j = () -> {};\n" +
++					"	j.goo();\n" + 
++					"}" +
++				"}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 6)\n" + 
++			"	default void goo(){I.super.foo();};\n" + 
++			"	                           ^^^\n" + 
++			"This static method of interface X.I can only be accessed as X.I.foo\n" + 
++			"----------\n" );
++	}
+ }
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index 9a54db6..e44943c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -862,8 +862,10 @@ public TypeBinding resolveType(BlockScope scope) {
+ 		}
+ 	} else {
+ 		// static message invoked through receiver? legal but unoptimal (optional warning).
+-		if (!(this.receiver.isImplicitThis() || this.receiver.isSuper() || this.receiverIsType)) {
+-			scope.problemReporter().nonStaticAccessToStaticMethod(this, this.binding);
++		if (this.binding.declaringClass.isInterface() && !((isTypeAccess() || this.receiver.isImplicitThis()) && TypeBinding.equalsEquals(this.binding.declaringClass, this.actualReceiverType))) {
++			scope.problemReporter().nonStaticOrAlienTypeReceiver(this, this.binding);
++		} else if (!(this.receiver.isImplicitThis() || this.receiver.isSuper() || this.receiverIsType)) {
++		 	scope.problemReporter().nonStaticAccessToStaticMethod(this, this.binding);
+ 		}
+ 		if (!this.receiver.isImplicitThis() && TypeBinding.notEquals(this.binding.declaringClass, this.actualReceiverType)) {
+ 			scope.problemReporter().indirectAccessToStaticMethod(this, this.binding);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
+index 4636fdd..c94251b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodBinding.java
+@@ -283,7 +283,7 @@ public final boolean canBeSeenBy(PackageBinding invocationPackage) {
+ public final boolean canBeSeenBy(TypeBinding receiverType, InvocationSite invocationSite, Scope scope) {
+ 
+ 	SourceTypeBinding invocationType = scope.enclosingSourceType();
+-	if (this.declaringClass.isInterface() && isStatic()) {
++	if (this.declaringClass.isInterface() && isStatic() && !isPrivate()) {
+ 		// Static interface methods can be explicitly invoked only through the type reference of the declaring interface or implicitly in the interface itself or via static import.
+ 		if (scope.compilerOptions().sourceLevel < ClassFileConstants.JDK1_8)
+ 			return false;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+index 61d195b..07f168f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+@@ -1986,7 +1986,7 @@ protected MethodBinding [] getInterfaceAbstractContracts(Scope scope, boolean re
+ 	LookupEnvironment environment = scope.environment();
+ 	for (int i = 0, length = methods == null ? 0 : methods.length; i < length; i++) {
+ 		final MethodBinding method = methods[i];
+-		if (method == null || method.isStatic() || method.redeclaresPublicObjectMethod(scope)) 
++		if (method == null || method.isStatic() || method.redeclaresPublicObjectMethod(scope) || method.isPrivate()) 
+ 			continue;
+ 		if (!method.isValidBinding()) 
+ 			throw new InvalidInputException("Not a functional interface"); //$NON-NLS-1$
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index 0b1aac3..8701d39 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -1790,7 +1790,7 @@ public abstract class Scope {
+ 				if (interfaceMethod != null) return interfaceMethod;
+ 				MethodBinding candidate = candidates[0];
+ 				int reason = ProblemReasons.NotVisible;
+-				if (candidate.isStatic() && candidate.declaringClass.isInterface()) {
++				if (candidate.isStatic() && candidate.declaringClass.isInterface() && !candidate.isPrivate()) {
+ 					if (soureLevel18)
+ 						reason = ProblemReasons.NonStaticOrAlienTypeReceiver;
+ 					else
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SyntheticMethodBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SyntheticMethodBinding.java
+index 6a7b43b..73a9ec7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SyntheticMethodBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SyntheticMethodBinding.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2016 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *		IBM Corporation - initial API and implementation
+  *		Stephan Herrmann - Contribution for
+@@ -515,8 +519,12 @@ public class SyntheticMethodBinding extends MethodBinding {
+ 		this.targetMethod = accessedMethod;
+ 		if (isSuperAccess && receiverType.isInterface() && !accessedMethod.isStatic())
+ 			this.modifiers = ClassFileConstants.AccPrivate | ClassFileConstants.AccSynthetic;
+-		else
+-			this.modifiers = ClassFileConstants.AccDefault | ClassFileConstants.AccStatic | ClassFileConstants.AccSynthetic;
++		else {
++			if (receiverType.isInterface()) // default is not allowed. TODO: do we need a target level check here?
++				this.modifiers = ClassFileConstants.AccPublic | ClassFileConstants.AccStatic | ClassFileConstants.AccSynthetic;
++			else
++				this.modifiers = ClassFileConstants.AccDefault | ClassFileConstants.AccStatic | ClassFileConstants.AccSynthetic;
++		}
+ 		this.tagBits |= (TagBits.AnnotationResolved | TagBits.DeprecatedAnnotationResolved);
+ 		SourceTypeBinding declaringSourceType = (SourceTypeBinding) receiverType;
+ 		SyntheticMethodBinding[] knownAccessMethods = declaringSourceType.syntheticMethods();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index 3f93a07..e5eac17 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -4195,6 +4195,20 @@ public void invalidFileNameForPackageAnnotations(Annotation annotation) {
+ 			annotation.sourceEnd);
+ }
+ 
++public void nonStaticOrAlienTypeReceiver(MessageSend messageSend, MethodBinding method) {
++	this.handle(
++			IProblem.NonStaticOrAlienTypeReceiver,
++			new String[] {
++					new String(method.declaringClass.readableName()),
++			        new String(method.selector),
++			},
++			new String[] {
++					new String(method.declaringClass.shortReadableName()),
++			        new String(method.selector),
++			},
++			(int) (messageSend.nameSourcePosition >>> 32),
++			(int) messageSend.nameSourcePosition);
++}
+ public void invalidMethod(MessageSend messageSend, MethodBinding method, Scope scope) {
+ 	if (isRecoveredName(messageSend.selector)) return;
+ 
+@@ -4276,18 +4290,7 @@ public void invalidMethod(MessageSend messageSend, MethodBinding method, Scope s
+ 			id = IProblem.StaticMethodRequested;
+ 			break;
+ 		case ProblemReasons.NonStaticOrAlienTypeReceiver:
+-			this.handle(
+-					IProblem.NonStaticOrAlienTypeReceiver,
+-					new String[] {
+-							new String(method.declaringClass.readableName()),
+-					        new String(method.selector),
+-					},
+-					new String[] {
+-							new String(method.declaringClass.shortReadableName()),
+-					        new String(method.selector),
+-					},
+-					(int) (messageSend.nameSourcePosition >>> 32),
+-					(int) messageSend.nameSourcePosition);
++			nonStaticOrAlienTypeReceiver(messageSend, method);
+ 			return;
+ 		case ProblemReasons.InterfaceMethodInvocationNotBelow18:
+ 			this.handle(

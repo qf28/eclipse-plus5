@@ -1,0 +1,455 @@
+commit 3798415d74984364974aa9ae67cf1df1d30d2356
+Author: Jay Arthanareeswaran <jarthana@in.ibm.com>
+Date:   Wed Apr 19 13:13:42 2017 +0530
+
+    Bug 515342 - [1.9] JavaCore.create(handleIdentifier) returns IType
+    instead of IModuleDescription for module's handle id
+    
+    Change-Id: I79eda545e28e3c650378ebb2a22aff1cafb4ee2c
+    Signed-off-by: Jay Arthanareeswaran <jarthana@in.ibm.com>
+
+57	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+6	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/PackageExportImpl.java
+114	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/AbstractModule.java
+2	47	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+5	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+6	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnit.java
+1	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaElement.java
+2	55	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceModule.java
+4	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/MementoTokenizer.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+index 6b5eba1..aae4ea3 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+@@ -901,4 +901,61 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 			deleteProject("Java9Elements");
+ 		}
+ 	}
++	public void test515342a() throws Exception {
++		try {
++			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL19_LIB"}, "bin", "1.9");
++			project.open(null);
++				String fileContent =  "module my.mod{}\n";
++				createFile(	"/Java9Elements/src/module-info.java",	fileContent);
++
++				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
++				IModuleDescription mod = unit.getModule();
++				String id = mod.getHandleIdentifier();
++				assertEquals("incorrect id", "=Java9Elements/src<{module-info.java`my.mod", id);
++				IJavaElement element = JavaCore.create(id);
++				assertEquals("incorrect element type", IJavaElement.JAVA_MODULE, element.getElementType());
++				assertEquals("incorrect module name", "my.mod", element.getElementName());
++		}
++		finally {
++			deleteProject("Java9Elements");
++		}
++	}
++	public void test515342b() throws Exception {
++		try {
++			IJavaProject project1 = createJava9Project("Java9Elements", new String[] {"src"});
++			project1.open(null);
++			IClasspathEntry[] rawClasspath = project1.getRawClasspath();
++			for (int i = 0; i < rawClasspath.length; i++) {
++				IPath path = rawClasspath[i].getPath();
++				if (path.lastSegment().equals("jrt-fs.jar")) {
++					path = path.removeLastSegments(2).append("jmods").append("java.base.jmod");
++					IClasspathEntry newEntry = JavaCore.newLibraryEntry(path, rawClasspath[i].getSourceAttachmentPath(), new Path("java.base"));
++					rawClasspath[i] = newEntry;
++				}
++			}
++			project1.setRawClasspath(rawClasspath, null);
++			String fileContent =
++					"module first {\n" +
++							"    requires java.base;\n" +
++							"    uses pack11.X11;\n" +
++							"}\n";
++			createFile("/Java9Elements/src/module-info.java", fileContent);
++
++			ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
++			String selection = "java.base";
++			int start = fileContent.lastIndexOf(selection);
++			IJavaElement[] elements = unit.codeSelect(start, selection.length());
++			assertEquals("Incorrect no of elements", 1, elements.length);
++			assertTrue("Invalid selection result", (elements[0] instanceof BinaryModule));
++			IModuleDescription mod = (IModuleDescription) elements[0];
++			String id = mod.getHandleIdentifier();
++			assertEquals("incorrect id", "=Java9Elements/C:\\/Java\\/jdk-9-ea+160\\/jmods\\/java.base.jmod<(module-info.class`java.base", id);
++			IJavaElement element = JavaCore.create(id);
++			assertEquals("incorrect element type", IJavaElement.JAVA_MODULE, element.getElementType());
++			assertEquals("incorrect module name", "java.base", element.getElementName());
++		}
++		finally {
++			deleteProject("Java9Elements");
++		}
++	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/PackageExportImpl.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/PackageExportImpl.java
+index d035933..06cc2a2 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/PackageExportImpl.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/PackageExportImpl.java
+@@ -29,8 +29,13 @@ public class PackageExportImpl implements IModule.IPackageExport {
+ 	public String toString() {
+ 		StringBuffer buffer = new StringBuffer();
+ 		buffer.append(this.pack);
++		buffer.append(" to "); //$NON-NLS-1$
+ 		if (this.exportedTo != null) {
+-			for (char[] cs : this.exportedTo) {
++			for (int i = 0; i < this.exportedTo.length; i++) {
++				if (i > 0) {
++					buffer.append(", "); //$NON-NLS-1$
++				}
++				char[] cs = this.exportedTo[i];
+ 				buffer.append(cs);
+ 			}
+ 		}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/AbstractModule.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/AbstractModule.java
+new file mode 100644
+index 0000000..378f7e6
+--- /dev/null
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/AbstractModule.java
+@@ -0,0 +1,114 @@
++/*******************************************************************************
++ * Copyright (c) 2017 IBM Corporation.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core;
++
++import java.util.ArrayList;
++
++import org.eclipse.jdt.core.IModuleDescription;
++import org.eclipse.jdt.core.JavaModelException;
++import org.eclipse.jdt.core.compiler.CharOperation;
++
++@SuppressWarnings({ "rawtypes", "unchecked" })
++public abstract class AbstractModule extends BinaryMember implements IModuleDescription {
++	protected AbstractModule(JavaElement parent, String name) {
++		super(parent, name);
++	}
++	@Override
++	public IModuleDescription.IModuleReference[] getRequiredModules() throws JavaModelException {
++		ArrayList list = getChildrenOfType(MODULE_REFERENCE);
++		IModuleDescription.IModuleReference[] array= new IModuleDescription.IModuleReference[list.size()];
++		list.toArray(array);
++		return array;
++	}
++	@Override
++	public IModuleDescription.IPackageExport[] getExportedPackages() throws JavaModelException {
++		ArrayList list = getChildrenOfType(PACKAGE_EXPORT);
++		IModuleDescription.IPackageExport[] array= new IModuleDescription.IPackageExport[list.size()];
++		list.toArray(array);
++		return array;
++	}
++	@Override
++	public IModuleDescription.IProvidedService[] getProvidedServices() throws JavaModelException {
++		ArrayList list = getChildrenOfType(SERVICE);
++		IModuleDescription.IProvidedService[] array= new IModuleDescription.IProvidedService[list.size()];
++		list.toArray(array);
++		return array;
++	}
++	@Override
++	public String[] getUsedServices() throws JavaModelException {
++		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
++		char[][] names= info.uses();
++		if (names == null || names.length == 0) {
++			return NO_STRINGS;
++		}
++		return CharOperation.toStrings(names);
++	}
++	@Override
++	public IOpenPackage[] getOpenedPackages() throws JavaModelException {
++		ArrayList list = getChildrenOfType(OPEN_PACKAGE);
++		IModuleDescription.IOpenPackage[] array= new IModuleDescription.IOpenPackage[list.size()];
++		list.toArray(array);
++		return array;
++	}
++	public String getKey(boolean forceOpen) throws JavaModelException {
++		return getKey(this, forceOpen);
++	}
++	public String toString(String lineDelimiter) {
++		StringBuffer buffer = new StringBuffer();
++		try {
++			toStringContent(buffer, lineDelimiter);
++		} catch (JavaModelException e) {
++			// TODO Auto-generated catch block
++			e.printStackTrace();
++		}
++		return buffer.toString();
++	}
++	protected void toStringContent(StringBuffer buffer, String lineDelimiter) throws JavaModelException {
++		IModuleDescription.IPackageExport[] exports = getExportedPackages();
++		IModuleDescription.IModuleReference[] requires = getRequiredModules();
++		buffer.append("module "); //$NON-NLS-1$
++		buffer.append(this.name).append(' ');
++		buffer.append('{').append(lineDelimiter);
++		if (exports != null) {
++			for(int i = 0; i < exports.length; i++) {
++				buffer.append("\texports "); //$NON-NLS-1$
++				buffer.append(exports[i].toString());
++				buffer.append(lineDelimiter);
++			}
++		}
++		buffer.append(lineDelimiter);
++		if (requires != null) {
++			for(int i = 0; i < requires.length; i++) {
++				buffer.append("\trequires "); //$NON-NLS-1$
++				if (requires[i].isPublic()) {
++					buffer.append(" public "); //$NON-NLS-1$
++				}
++				buffer.append(requires[i].getElementName());
++				buffer.append(';').append(lineDelimiter);
++			}
++		}
++		buffer.append(lineDelimiter).append('}').toString();
++	}
++	@Override
++	public int getElementType() {
++		return JAVA_MODULE;
++	}
++	/**
++	 * @see JavaElement#getHandleMemento()
++	 */
++	protected char getHandleMementoDelimiter() {
++		return JavaElement.JEM_MODULE;
++	}
++}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+index d4f1811..20ca4ac 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+@@ -14,55 +14,14 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+-import java.util.ArrayList;
+-
+ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.JavaModelException;
+-import org.eclipse.jdt.core.compiler.CharOperation;
+ 
+-@SuppressWarnings({ "rawtypes", "unchecked" })
+-public class BinaryModule extends BinaryMember implements IModuleDescription {
++public class BinaryModule extends AbstractModule {
+ 	public BinaryModule(JavaElement parent, String name) {
+ 		super(parent, name);
+ 	}
+-	@Override
+-	public IModuleDescription.IModuleReference[] getRequiredModules() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(MODULE_REFERENCE);
+-		IModuleDescription.IModuleReference[] array= new IModuleDescription.IModuleReference[list.size()];
+-		list.toArray(array);
+-		return array;
+-	}
+-	@Override
+-	public IModuleDescription.IPackageExport[] getExportedPackages() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(PACKAGE_EXPORT);
+-		IModuleDescription.IPackageExport[] array= new IModuleDescription.IPackageExport[list.size()];
+-		list.toArray(array);
+-		return array;
+-	}
+-	@Override
+-	public IModuleDescription.IProvidedService[] getProvidedServices() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(SERVICE);
+-		IModuleDescription.IProvidedService[] array= new IModuleDescription.IProvidedService[list.size()];
+-		list.toArray(array);
+-		return array;
+-	}
+-	@Override
+-	public String[] getUsedServices() throws JavaModelException {
+-		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
+-		char[][] names= info.uses();
+-		if (names == null || names.length == 0) {
+-			return NO_STRINGS;
+-		}
+-		return CharOperation.toStrings(names);
+-	}
+-	@Override
+-	public IOpenPackage[] getOpenedPackages() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(OPEN_PACKAGE);
+-		IModuleDescription.IOpenPackage[] array= new IModuleDescription.IOpenPackage[list.size()];
+-		list.toArray(array);
+-		return array;
+-	}
+ 	/*
+ 	 * @see IParent#getChildren()
+ 	 */
+@@ -115,8 +74,4 @@ public class BinaryModule extends BinaryMember implements IModuleDescription {
+ 		}
+ 		buffer.append(lineDelimiter).append('}').toString();
+ 	}
+-	@Override
+-	public int getElementType() {
+-		return JAVA_MODULE;
+-	}
+-}
+\ No newline at end of file
++}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+index d667518..a73205a 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+@@ -631,6 +631,11 @@ public IJavaElement getHandleFromMemento(String token, MementoTokenizer memento,
+ 			String typeName = memento.nextToken();
+ 			JavaElement type = new BinaryType(this, typeName);
+ 			return type.getHandleFromMemento(memento, owner);
++		case JEM_MODULE:
++			if (!memento.hasMoreTokens()) return this;
++			String modName = memento.nextToken();
++			JavaElement mod = new BinaryModule(this, modName);
++			return mod.getHandleFromMemento(memento, owner);
+ 	}
+ 	return null;
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnit.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnit.java
+index adf8807..9064454 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnit.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnit.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2016 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -747,6 +747,11 @@ public IJavaElement getHandleFromMemento(String token, MementoTokenizer memento,
+ 			String typeName = memento.nextToken();
+ 			JavaElement type = (JavaElement)getType(typeName);
+ 			return type.getHandleFromMemento(memento, workingCopyOwner);
++		case JEM_MODULE:
++			if (!memento.hasMoreTokens()) return this;
++			String modName = memento.nextToken();
++			JavaElement mod = new SourceModule(this, modName);
++			return mod.getHandleFromMemento(memento, workingCopyOwner);
+ 	}
+ 	return null;
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaElement.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaElement.java
+index 81bee4e..9630b03 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaElement.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaElement.java
+@@ -96,6 +96,7 @@ public abstract class JavaElement extends PlatformObject implements IJavaElement
+ 	public static final char JEM_LAMBDA_EXPRESSION = ')';
+ 	public static final char JEM_LAMBDA_METHOD = '&';
+ 	public static final char JEM_STRING = '"';
++	public static final char JEM_MODULE = '`';
+ 	
+ 	/**
+ 	 * Before ')', '&' and '"' became the newest additions as delimiters, the former two
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceModule.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceModule.java
+index 14e7b73..f4d5b05 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceModule.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceModule.java
+@@ -14,56 +14,13 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+-import java.util.ArrayList;
+-
+-import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.JavaModelException;
+-import org.eclipse.jdt.core.compiler.CharOperation;
+ 
+-@SuppressWarnings({ "rawtypes", "unchecked" })
+-public class SourceModule extends NamedMember implements IModuleDescription {
++public class SourceModule extends AbstractModule {
+ 	public SourceModule(JavaElement parent, String name) {
+ 		super(parent, name);
+ 	}
+ 	@Override
+-	public IModuleDescription.IModuleReference[] getRequiredModules() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(MODULE_REFERENCE);
+-		IModuleDescription.IModuleReference[] array= new IModuleDescription.IModuleReference[list.size()];
+-		list.toArray(array);
+-		return array;
+-	}
+-	@Override
+-	public IModuleDescription.IPackageExport[] getExportedPackages() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(PACKAGE_EXPORT);
+-		IModuleDescription.IPackageExport[] array= new IModuleDescription.IPackageExport[list.size()];
+-		list.toArray(array);
+-		return array;
+-	}
+-	@Override
+-	public IModuleDescription.IProvidedService[] getProvidedServices() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(SERVICE);
+-		IModuleDescription.IProvidedService[] array= new IModuleDescription.IProvidedService[list.size()];
+-		list.toArray(array);
+-		return array;
+-	}
+-	@Override
+-	public String[] getUsedServices() throws JavaModelException {
+-		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
+-		char[][] names= info.uses();
+-		if (names == null || names.length == 0) {
+-			return NO_STRINGS;
+-		}
+-		return CharOperation.toStrings(names);
+-	}
+-	@Override
+-	public IOpenPackage[] getOpenedPackages() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(OPEN_PACKAGE);
+-		IModuleDescription.IOpenPackage[] array= new IModuleDescription.IOpenPackage[list.size()];
+-		list.toArray(array);
+-		return array;
+-	}
+-	
+-	@Override
+ 	public int getFlags() throws JavaModelException {
+ 		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
+ 		return info.getModifiers();
+@@ -78,14 +35,4 @@ public class SourceModule extends NamedMember implements IModuleDescription {
+ 		}
+ 		return buffer.toString();
+ 	}
+-	protected void toStringContent(StringBuffer buffer, String lineDelimiter) throws JavaModelException {
+-		buffer.append("module "); //$NON-NLS-1$
+-		buffer.append(this.name).append(' ');
+-		buffer.append('{').append(lineDelimiter);
+-		buffer.append(lineDelimiter).append('}').toString();
+-	}
+-	@Override
+-	public int getElementType() {
+-		return JAVA_MODULE;
+-	}
+-}
+\ No newline at end of file
++}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/MementoTokenizer.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/MementoTokenizer.java
+index 06f26fb..eff8598 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/MementoTokenizer.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/MementoTokenizer.java
+@@ -23,6 +23,7 @@ public class MementoTokenizer {
+ 	public static final String COMPILATIONUNIT = Character.toString(JavaElement.JEM_COMPILATIONUNIT);
+ 	public static final String CLASSFILE = Character.toString(JavaElement.JEM_CLASSFILE);
+ 	public static final String TYPE = Character.toString(JavaElement.JEM_TYPE);
++	public static final String MODULE = Character.toString(JavaElement.JEM_MODULE);
+ 	public static final String PACKAGEDECLARATION = Character.toString(JavaElement.JEM_PACKAGEDECLARATION);
+ 	public static final String IMPORTDECLARATION = Character.toString(JavaElement.JEM_IMPORTDECLARATION);
+ 	public static final String LOCALVARIABLE = Character.toString(JavaElement.JEM_LOCALVARIABLE);
+@@ -92,6 +93,8 @@ public class MementoTokenizer {
+ 				return CLASSFILE;
+ 			case JavaElement.JEM_TYPE:
+ 				return TYPE;
++			case JavaElement.JEM_MODULE:
++				return MODULE;
+ 			case JavaElement.JEM_PACKAGEDECLARATION:
+ 				return PACKAGEDECLARATION;
+ 			case JavaElement.JEM_IMPORTDECLARATION:
+@@ -120,6 +123,7 @@ public class MementoTokenizer {
+ 				case JavaElement.JEM_COMPILATIONUNIT:
+ 				case JavaElement.JEM_CLASSFILE:
+ 				case JavaElement.JEM_TYPE:
++				case JavaElement.JEM_MODULE:
+ 				case JavaElement.JEM_PACKAGEDECLARATION:
+ 				case JavaElement.JEM_IMPORTDECLARATION:
+ 				case JavaElement.JEM_LOCALVARIABLE:

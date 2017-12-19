@@ -1,0 +1,242 @@
+commit 9d8b71081cd101218780093ff788c8cdcb494d20
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Mon Dec 16 14:15:25 2013 +0530
+
+    Fixed Bug 424080 - [1.8][completion] Workbench hanging on code
+    completion with lambda expression containing anonymous class
+
+44	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/parser/CompletionParserTest18.java
+1	1	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+6	3	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+4	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/CommitRollbackParser.java
+12	7	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/parser/CompletionParserTest18.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/parser/CompletionParserTest18.java
+index 836af64..4b10160 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/parser/CompletionParserTest18.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/parser/CompletionParserTest18.java
+@@ -817,4 +817,48 @@ public void testBrokenMethodCall() {  // verify that completion works when the c
+ 				expectedReplacedSource,
+ 				"diet ast");
+ }
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=424080, [1.8][completion] Workbench hanging on code completion with lambda expression containing anonymous class
++public void test424080() {
++	String string = 
++			"interface FI {\n" +
++			"	public static int val = 5;\n" +
++			"	default int run (String x) { return 1;};\n" +
++			"	public int run (int x);\n" +
++			"}\n" +
++			"public class X {\n" +
++			"	FI fi = x -> (new FI() { public int run (int x) {return 2;}}).run(\"\")val;\n" +
++			"}\n";
++
++			String completeBehind = "val";
++			int cursorLocation = string.lastIndexOf(completeBehind) + completeBehind.length() - 1;
++
++			String expectedCompletionNodeToString = "<CompleteOnName:val>";
++			String expectedParentNodeToString = "<NONE>";
++			String completionIdentifier = "val";
++			String expectedReplacedSource = "val";
++			String expectedUnitDisplayString =
++					"interface FI {\n" + 
++					"  public static int val;\n" + 
++					"  <clinit>() {\n" + 
++					"  }\n" + 
++					"  default int run(String x) {\n" + 
++					"  }\n" + 
++					"  public int run(int x);\n" + 
++					"}\n" + 
++					"public class X {\n" + 
++					"  FI fi = <CompleteOnName:val>;\n" + 
++					"  public X() {\n" + 
++					"  }\n" + 
++					"}\n";
++
++			checkMethodParse(
++				string.toCharArray(),
++				cursorLocation,
++				expectedCompletionNodeToString,
++				expectedParentNodeToString,
++				expectedUnitDisplayString,
++				completionIdentifier,
++				expectedReplacedSource,
++				"diet ast");
++}
+ }
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+index cd74fde..0ded12b 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+@@ -329,7 +329,7 @@ public RecoveredElement buildInitialRecoveryState(){
+ 			this.lastCheckPoint = importRef.declarationSourceEnd + 1;
+ 		}
+ 	}
+-	if (this.currentToken == TokenNameRBRACE) {
++	if (this.currentToken == TokenNameRBRACE && !isIndirectlyInsideLambdaExpression()) {
+ 		this.currentToken = 0; // closing brace has already been taken care of
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
+index a3eefdd..6fbb97c 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
+@@ -120,7 +120,8 @@ protected void attachOrphanCompletionNode(){
+ 				this.currentElement = this.currentElement.add(statement, 0);
+ 			}
+ 		}
+-		this.currentToken = 0; // given we are not on an eof, we do not want side effects caused by looked-ahead token
++		if (!isIndirectlyInsideLambdaExpression())
++			this.currentToken = 0; // given we are not on an eof, we do not want side effects caused by looked-ahead token
+ 	}
+ }
+ private void buildMoreCompletionContext(Expression expression) {
+@@ -552,7 +553,8 @@ protected void consumeEnterAnonymousClassBody(boolean qualified) {
+ 	if (!this.diet){
+ 		this.restartRecovery	= true;	// force to restart in recovery mode
+ 		this.lastIgnoredToken = -1;
+-		this.currentToken = 0; // opening brace already taken into account
++		if (!isIndirectlyInsideLambdaExpression())
++			this.currentToken = 0; // opening brace already taken into account
+ 		this.hasReportedError = true;
+ 	}
+ 
+@@ -562,7 +564,8 @@ protected void consumeEnterAnonymousClassBody(boolean qualified) {
+ 	if (this.currentElement != null){
+ 		this.lastCheckPoint = anonymousType.bodyStart;
+ 		this.currentElement = this.currentElement.add(anonymousType, 0);
+-		this.currentToken = 0; // opening brace already taken into account
++		if (!isIndirectlyInsideLambdaExpression())
++			this.currentToken = 0; // opening brace already taken into account
+ 		this.lastIgnoredToken = -1;
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+index fc81f8d..b0ff8d8 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+@@ -624,6 +624,8 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 			output.append("native "); //$NON-NLS-1$
+ 		if ((modifiers & ClassFileConstants.AccAbstract) != 0)
+ 			output.append("abstract "); //$NON-NLS-1$
++		if ((modifiers & ExtraCompilerModifiers.AccDefaultMethod) != 0)
++			output.append("default "); //$NON-NLS-1$
+ 		return output;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/CommitRollbackParser.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/CommitRollbackParser.java
+index 8927ec7..82bb239 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/CommitRollbackParser.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/CommitRollbackParser.java
+@@ -26,7 +26,6 @@ public abstract class CommitRollbackParser implements TerminalTokens, ParserBasi
+ 
+ 	public Scanner scanner;
+ 	public int currentToken;
+-	protected int kurrentToken; // copy of currentToken as it is trampled over all over the place :-(
+ 	
+ 	public CommitRollbackParser snapShot;
+ 	private static final int[] RECOVERY_TOKENS = new int [] { TokenNameSEMICOLON, TokenNameRPAREN,};
+@@ -65,20 +64,20 @@ public abstract class CommitRollbackParser implements TerminalTokens, ParserBasi
+ 		int automatonState = automatonState();
+ 				
+ 		// If triggered fake EOF at completion site, see if the real next token would have passed muster.
+-		if (this.kurrentToken == TokenNameEOF) {
++		if (this.currentToken == TokenNameEOF) {
+ 			if (this.scanner.eofPosition < this.scanner.source.length) {
+ 				atCompletionSite = true;
+ 				this.scanner.eofPosition = this.scanner.source.length;
+ 				nextToken = getNextToken();
+ 				if (automatonWillShift(nextToken, automatonState)) {
+-					this.currentToken = this.kurrentToken = nextToken;
++					this.currentToken = nextToken;
+ 					return RESUME;
+ 				}
+ 			} else {
+ 				nextToken = TokenNameEOF;
+ 			}
+ 		} else {
+-			nextToken = this.kurrentToken;
++			nextToken = this.currentToken;
+ 		}
+ 		if (nextToken == TokenNameEOF)
+ 			return HALT; // don't know how to proceed.
+@@ -86,7 +85,7 @@ public abstract class CommitRollbackParser implements TerminalTokens, ParserBasi
+ 		// OK, next token is no good to resume "in place", attempt some local repair. FIXME: need to make sure we don't get stuck keep reducing empty statements !!
+ 		for (int i = 0, length = RECOVERY_TOKENS.length; i < length; i++) {
+ 			if (automatonWillShift(RECOVERY_TOKENS[i], automatonState)) {
+-				this.currentToken = this.kurrentToken = RECOVERY_TOKENS[i];
++				this.currentToken = RECOVERY_TOKENS[i];
+ 				return RESUME;
+ 			}
+ 		}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+index 26b5e3f..ad28f10 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+@@ -1506,6 +1506,9 @@ protected void consumeAdditionalBoundList() {
+ protected void consumeAdditionalBoundList1() {
+ 	concatGenericsLists();
+ }
++protected boolean isIndirectlyInsideLambdaExpression() {
++	return false;
++}
+ protected void consumeAllocationHeader() {
+ 	// ClassInstanceCreationExpression ::= 'new' ClassType '(' ArgumentListopt ')' ClassBodyopt
+ 
+@@ -1530,7 +1533,8 @@ protected void consumeAllocationHeader() {
+ 		this.lastCheckPoint = anonymousType.bodyStart = this.scanner.currentPosition;
+ 		this.currentElement = this.currentElement.add(anonymousType, 0);
+ 		this.lastIgnoredToken = -1;
+-		this.currentToken = 0; // opening brace already taken into account
++		if (!isIndirectlyInsideLambdaExpression())
++			this.currentToken = 0; // opening brace already taken into account
+ 		return;
+ 	}
+ 	this.lastCheckPoint = this.scanner.startPosition; // force to restart at this exact position
+@@ -3463,7 +3467,8 @@ protected void consumeEnterAnonymousClassBody(boolean qualified) {
+ 		this.lastCheckPoint = anonymousType.bodyStart;
+ 		this.currentElement = this.currentElement.add(anonymousType, 0);
+ 		if (!(this.currentElement instanceof RecoveredAnnotation)) {
+-			this.currentToken = 0; // opening brace already taken into account
++			if (!isIndirectlyInsideLambdaExpression())
++				this.currentToken = 0; // opening brace already taken into account
+ 		} else {
+ 			this.ignoreNextOpeningBrace = true;
+ 			this.currentElement.bracketBalance++;
+@@ -3664,7 +3669,8 @@ protected void consumeEnumConstantHeader() {
+ 	  	this.currentElement = this.currentElement.add(anonymousType, 0);
+       	this.lastCheckPoint = anonymousType.bodyStart;
+         this.lastIgnoredToken = -1;
+-        this.currentToken = 0; // opening brace already taken into account
++        if (!isIndirectlyInsideLambdaExpression())
++        	this.currentToken = 0; // opening brace already taken into account
+ 	  } else {
+ 	  	  if(this.currentToken == TokenNameSEMICOLON) {
+ 		  	RecoveredType currentType = currentRecoveryType();
+@@ -10851,13 +10857,13 @@ try {
+ 			if (!this.hasReportedError) {
+ 				this.hasError = true;
+ 			}
+-			this.kurrentToken = this.currentToken;
++			int previousToken = this.currentToken;
+ 			switch (resumeOnSyntaxError()) {
+ 				case HALT:
+ 					act = ERROR_ACTION;
+ 					break ProcessTerminals;
+ 				case RESTART:
+-					if (act == ERROR_ACTION && this.kurrentToken != 0) this.lastErrorEndPosition = errorPos;
++					if (act == ERROR_ACTION && previousToken != 0) this.lastErrorEndPosition = errorPos;
+ 					act = START_STATE;
+ 					this.stateStackTop = -1;
+ 					this.currentToken = getFirstToken();
+@@ -10867,9 +10873,8 @@ try {
+ 						act = this.stack[this.stateStackTop--];
+ 						continue ProcessTerminals;
+ 					} else {
+-						this.currentToken = this.kurrentToken; // Gets trashed all over the place.
++						// FALL THROUGH.	
+ 					}
+-					// FALL THROUGH.
+ 			}
+ 		}
+ 		if (act <= NUM_RULES) {

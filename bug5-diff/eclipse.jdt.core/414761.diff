@@ -1,0 +1,266 @@
+commit 4338868bca17d013740bdd5f87257ce2620da83a
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Fri Apr 14 00:15:50 2017 +0200
+
+    Bug 414761: [null] Annotation-based nullnes inference fails for fields
+    in 'while' loop
+    
+    Change-Id: I313719ad6739e1dbc745d8870c2a0955a4e320e3
+    Signed-off-by: Stephan Herrmann <stephan.herrmann@berlin.de>
+
+47	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SwitchStatement.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/WhileStatement.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/ExceptionHandlingFlowContext.java
+13	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LabelFlowContext.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LoopingFlowContext.java
+3	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/SwitchFlowContext.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/TryFlowContext.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+index eee31ad..96bbce4 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+@@ -5372,6 +5372,53 @@ public void test_nullable_field_15() {
+ 		potNPE_nullable("The field nullable") + 
+ 		"----------\n");
+ }
++// access to a nullable field - dereference after check in while loop
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=414761
++public void test_nullable_field_16() {
++	// currently no flow analysis for fields is implemented,
++	// but the direct sequence of null-check + dereference is optionally supported as a special case
++	Map options = getCompilerOptions();
++	options.put(JavaCore.COMPILER_PB_SYNTACTIC_NULL_ANALYSIS_FOR_FIELDS, JavaCore.ENABLED);
++	runNegativeTestWithLibs(
++		new String[] {
++			"X.java",
++			"import org.eclipse.jdt.annotation.*;\n" +
++			"public class X {\n" +
++			"    @Nullable Object prop;\n" +
++			"    void testWhileAlone(){\n" + 
++			"        while(this.prop != null) {\n" + 
++			"          test(this.prop);\n" + 
++			"        }\n" + 
++			"    }\n" +
++			"	 @Nullable Object other;\n" +
++			"	 void testTwoFields() {\n" +
++			"		 boolean b = this.other != null;\n" + // we had funny interaction between analyses of other & prop
++			"        while(this.prop != null) {\n" + 
++			"          test(this.prop);\n" + 
++			"        }\n" + 
++			"    }\n" +
++			"	 void testWhileInIf() {\n" +
++			"		 if (this.prop != null) {\n" +
++			"       	 while(this.other != null) {\n" + 
++			"       	   test(this.prop);\n" + // no longer protected by outer if
++			"       	 }\n" + 
++			"		 }\n" +
++			"	 }\n" +
++			"    void test(@NonNull Object param){\n" + 
++			"        assert param != null;\n" + 
++			"    }" +
++			"}\n"
++		},
++		options /*customOptions*/,
++		"----------\n" + 
++		"1. ERROR in X.java (at line 19)\n" + 
++		"	test(this.prop);\n" + 
++		"	     ^^^^^^^^^\n" + 
++		(this.complianceLevel < ClassFileConstants.JDK1_8
++		? "Null type mismatch: required '@NonNull Object' but the provided value is specified as @Nullable\n"
++		: "Null type mismatch (type annotations): required \'@NonNull Object\' but this expression has type \'@Nullable Object\'\n") +
++		"----------\n");
++}
+ // an enum is declared within the scope of a null-default
+ // https://bugs.eclipse.org/331649#c61
+ public void test_enum_field_01() {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SwitchStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SwitchStatement.java
+index bd51350..48850af 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SwitchStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SwitchStatement.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2015 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -82,7 +82,7 @@ public class SwitchStatement extends Statement {
+ 				this.expression.checkNPE(currentScope, flowContext, flowInfo, 1);
+ 			}
+ 			SwitchFlowContext switchContext =
+-				new SwitchFlowContext(flowContext, this, (this.breakLabel = new BranchLabel()), true);
++				new SwitchFlowContext(flowContext, this, (this.breakLabel = new BranchLabel()), true, true);
+ 
+ 			// analyse the block by considering specially the case/default statements (need to bind them
+ 			// to the entry point)
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/WhileStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/WhileStatement.java
+index a215dda..e5eeaae 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/WhileStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/WhileStatement.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2015 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -103,6 +103,7 @@ public class WhileStatement extends Statement {
+ 					this.continueLabel,
+ 					currentScope,
+ 					true);
++			loopingContext.copyNullCheckedFieldsFrom(condLoopContext);
+ 			if (isConditionFalse) {
+ 				actionInfo = FlowInfo.DEAD_END;
+ 			} else {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/ExceptionHandlingFlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/ExceptionHandlingFlowContext.java
+index c12c044..893df8a 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/ExceptionHandlingFlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/ExceptionHandlingFlowContext.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2015 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -97,7 +97,7 @@ ExceptionHandlingFlowContext(
+ 		BlockScope scope,
+ 		UnconditionalFlowInfo flowInfo) {
+ 
+-	super(parent, associatedNode);
++	super(parent, associatedNode, true);
+ 	this.isMethodContext = scope == scope.methodScope();
+ 	this.handledExceptions = handledExceptions;
+ 	this.catchArguments = catchArguments;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
+index ce65992..d225440 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FlowContext.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2016 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -61,7 +61,7 @@ import org.eclipse.jdt.internal.compiler.lookup.VariableBinding;
+ public class FlowContext implements TypeConstants {
+ 
+ 	// preempt marks looping contexts
+-	public final static FlowContext NotContinuableContext = new FlowContext(null, null);
++	public final static FlowContext NotContinuableContext = new FlowContext(null, null, true);
+ 	public ASTNode associatedNode;
+ 	public FlowContext parent;
+ 	public FlowInfo initsOnFinally;
+@@ -121,7 +121,7 @@ public static final int IN_INSTANCEOF = 0x0400;
+ // check happened in an instanceof expression
+ public static final int CONTEXT_MASK = ~CHECK_MASK & ~HIDE_NULL_COMPARISON_WARNING_MASK;
+ 
+-public FlowContext(FlowContext parent, ASTNode associatedNode) {
++public FlowContext(FlowContext parent, ASTNode associatedNode, boolean inheritNullFieldChecks) {
+ 	this.parent = parent;
+ 	this.associatedNode = associatedNode;
+ 	if (parent != null) {
+@@ -130,8 +130,16 @@ public FlowContext(FlowContext parent, ASTNode associatedNode) {
+ 		}
+ 		this.initsOnFinally = parent.initsOnFinally;
+ 		this.conditionalLevel = parent.conditionalLevel;
+-		this.nullCheckedFieldReferences = parent.nullCheckedFieldReferences; // re-use list if there is one
+-		this.timesToLiveForNullCheckInfo = parent.timesToLiveForNullCheckInfo;
++		if (inheritNullFieldChecks)
++			copyNullCheckedFieldsFrom(parent); // re-use list if there is one
++	}
++}
++
++public void copyNullCheckedFieldsFrom(FlowContext other) {
++	Reference[] fieldReferences = other.nullCheckedFieldReferences;
++	if (fieldReferences != null && fieldReferences.length > 0 && fieldReferences[0] != null) {
++		this.nullCheckedFieldReferences = other.nullCheckedFieldReferences;
++		this.timesToLiveForNullCheckInfo = other.timesToLiveForNullCheckInfo;
+ 	}
+ }
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LabelFlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LabelFlowContext.java
+index 309eefc..b279d47 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LabelFlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LabelFlowContext.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -26,7 +26,7 @@ public class LabelFlowContext extends SwitchFlowContext {
+ 	public char[] labelName;
+ 
+ public LabelFlowContext(FlowContext parent, ASTNode associatedNode, char[] labelName, BranchLabel breakLabel, BlockScope scope) {
+-	super(parent, associatedNode, breakLabel, false);
++	super(parent, associatedNode, breakLabel, false, true);
+ 	this.labelName = labelName;
+ 	checkLabelValidity(scope);
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LoopingFlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LoopingFlowContext.java
+index ec758b4..1fd2613 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LoopingFlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/LoopingFlowContext.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2015 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -105,7 +105,7 @@ public class LoopingFlowContext extends SwitchFlowContext {
+ 		BranchLabel continueLabel,
+ 		Scope associatedScope,
+ 		boolean isPreTest) {
+-		super(parent, associatedNode, breakLabel, isPreTest);
++		super(parent, associatedNode, breakLabel, isPreTest, false);
+ 		this.tagBits |= FlowContext.PREEMPT_NULL_DIAGNOSTIC;
+ 			// children will defer to this, which may defer to its own parent
+ 		this.continueLabel = continueLabel;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/SwitchFlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/SwitchFlowContext.java
+index 279fff0..ce2ed9b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/SwitchFlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/SwitchFlowContext.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -24,8 +24,8 @@ public class SwitchFlowContext extends FlowContext {
+ 	public BranchLabel breakLabel;
+ 	public UnconditionalFlowInfo initsOnBreak = FlowInfo.DEAD_END;
+ 
+-public SwitchFlowContext(FlowContext parent, ASTNode associatedNode, BranchLabel breakLabel, boolean isPreTest) {
+-	super(parent, associatedNode);
++public SwitchFlowContext(FlowContext parent, ASTNode associatedNode, BranchLabel breakLabel, boolean isPreTest, boolean inheritNullFieldChecks) {
++	super(parent, associatedNode, inheritNullFieldChecks);
+ 	this.breakLabel = breakLabel;
+ 	if (isPreTest && parent.conditionalLevel > -1) {
+ 		this.conditionalLevel++;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/TryFlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/TryFlowContext.java
+index 1623e51..98f4fec 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/TryFlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/TryFlowContext.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2013 GK Software AG and others.
++ * Copyright (c) 2013, 2017 GK Software AG and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -25,7 +25,7 @@ public abstract class TryFlowContext extends FlowContext {
+ 	public FlowContext outerTryContext;
+ 
+ 	public TryFlowContext(FlowContext parent, ASTNode associatedNode) {
+-		super(parent, associatedNode);
++		super(parent, associatedNode, true);
+ 	}
+ 	
+ 	public void markFinallyNullStatus(LocalVariableBinding local, int nullStatus) {

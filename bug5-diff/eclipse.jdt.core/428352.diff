@@ -1,0 +1,550 @@
+commit dd10489904dda11a1b9c522a71a4705b9646605e
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Tue Feb 18 01:38:40 2014 +0100
+
+    Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+
+34	4	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+8	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+23	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+4	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+8	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+6	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+11	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Statement.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+13	9	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+4	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+index d572aaa..c0f8a96 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+@@ -2297,10 +2297,10 @@ public void testBug428275() {
+ 		});
+ }
+ // https://bugs.eclipse.org/bugs/show_bug.cgi?id=428352, [1.8][compiler] NPE in AllocationExpression.analyseCode when trying to pass Consumer as Function 
+-public void _test428352() {
+-	runConformTest(
++public void test428352() {
++	runNegativeTest(
+ 		new String[] {
+-			"X.java",
++			"OperationsPile.java",
+ 			"import java.util.Collection;\n" +
+ 			"import java.util.List;\n" +
+ 			"import java.util.function.Consumer;\n" +
+@@ -2317,6 +2317,36 @@ public void _test428352() {
+ 			"  }\n" +
+ 			"}\n"
+ 		},
+-		"");
++		"----------\n" + 
++		"1. ERROR in OperationsPile.java (at line 13)\n" + 
++		"	addAll3(combined, new OperationsPile<>(handler));\n" + 
++		"	                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
++		"Cannot infer type arguments for OperationsPile<>\n" + 
++		"----------\n");
++}
++public void test428352b() {
++	runConformTest(
++		new String[] {
++			"OperationsPile.java",
++			"import java.util.Collection;\n" +
++			"import java.util.List;\n" +
++			"import java.util.function.Consumer;\n" +
++			"import java.util.function.Function;\n" +
++			"\n" +
++			"public class OperationsPile<B> {\n" +
++			"  OperationsPile(Function<B, ?> handler) {}\n" +
++			"\n" +
++			"  private static <T> void addAll3(Collection<T> c, T t) {}\n" +
++			"\n" +
++			"  static <S> void adaad3(List<OperationsPile<?>> combined, Consumer<S> handler) {\n" +
++			"    addAll3(combined, new OperationsPile<>(null));\n" +
++			"  }\n" +
++			"	public static void main(String[] args) {\n" +
++			"		adaad3(null, null);\n" +
++			"		System.out.println(13);\n" +
++			"	}\n" +
++			"}\n"
++		},
++		"13");
+ }
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+index 3ad3a7f..da4f97b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+@@ -30,6 +30,7 @@
+  *								Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple candidate target types in outer overload context
+  *								Bug 427282 - [1.8][compiler] AIOOB (-1) at org.eclipse.jdt.internal.compiler.ClassFile.traverse(ClassFile.java:6209)
+  *								Bug 427483 - [Java 8] Variables in lambdas sometimes can't be resolved
++ *								Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+  *     Jesper S Moller - Contributions for
+  *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *								bug 412153 - [1.8][compiler] Check validity of annotations which may be repeatable
+@@ -651,8 +652,9 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 	 * @param methodBinding the method produced by lookup (possibly involving type inference).
+ 	 * @param argumentTypes the argument types as collected from first resolving the invocation arguments and as used for
+ 	 * 	the method lookup.
++	 * @param scope scope for error reporting
+ 	 */
+-	public static void resolvePolyExpressionArguments(Invocation invocation, MethodBinding methodBinding, TypeBinding[] argumentTypes) {
++	public static void resolvePolyExpressionArguments(Invocation invocation, MethodBinding methodBinding, TypeBinding[] argumentTypes, Scope scope) {
+ 		if (!invocation.innersNeedUpdate())
+ 			return;
+ 		int problemReason = 0;
+@@ -706,7 +708,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 
+ 				if (argument instanceof Invocation) {
+ 					Invocation innerInvocation = (Invocation)argument;
+-					MethodBinding binding = innerInvocation.binding(parameterType);
++					MethodBinding binding = innerInvocation.binding(parameterType, true, scope);
+ 					if (binding instanceof ParameterizedGenericMethodBinding) {
+ 						ParameterizedGenericMethodBinding parameterizedMethod = (ParameterizedGenericMethodBinding) binding;
+ 						InferenceContext18 innerContext = innerInvocation.getInferenceContext(parameterizedMethod);
+@@ -718,7 +720,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 									innerContext.reportInvalidInvocation(innerInvocation, improvedBinding);
+ 								}
+ 								if (innerInvocation.updateBindings(improvedBinding, parameterType)) {
+-									resolvePolyExpressionArguments(innerInvocation, improvedBinding);
++									resolvePolyExpressionArguments(innerInvocation, improvedBinding, scope);
+ 								}
+ 							} else if (innerContext.stepCompleted < InferenceContext18.BINDINGS_UPDATED) {
+ 								innerContext.rebindInnerPolies(parameterizedMethod, innerInvocation);
+@@ -733,7 +735,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 					if (infCtx != null && infCtx.stepCompleted == InferenceContext18.BINDINGS_UPDATED)
+ 						updatedArgumentType = argument.resolvedType; // in this case argument was already resolved via InferenceContext18.acceptPendingPolyArguments()
+ 					else
+-						updatedArgumentType = argument.checkAgainstFinalTargetType(parameterType);
++						updatedArgumentType = argument.checkAgainstFinalTargetType(parameterType, scope);
+ 
+ 					if (problemReason == ProblemReasons.NoError // preserve errors
+ 							&& updatedArgumentType != null					// do we have a relevant update? ...
+@@ -749,7 +751,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 		invocation.innerUpdateDone();
+ 	}
+ 
+-	public static void resolvePolyExpressionArguments(Invocation invocation, MethodBinding methodBinding) {
++	public static void resolvePolyExpressionArguments(Invocation invocation, MethodBinding methodBinding, Scope scope) {
+ 		TypeBinding[] argumentTypes = null;
+ 		Expression[] innerArguments = invocation.arguments();
+ 		if (innerArguments != null) {
+@@ -757,7 +759,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 			for (int i = 0; i < innerArguments.length; i++)
+ 				argumentTypes[i] = innerArguments[i].resolvedType;
+ 		}
+-		resolvePolyExpressionArguments(invocation, methodBinding, argumentTypes);
++		resolvePolyExpressionArguments(invocation, methodBinding, argumentTypes, scope);
+ 	}
+ 
+ 	public static void resolveAnnotations(BlockScope scope, Annotation[] sourceAnnotations, Binding recipient) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+index a150754..425924e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+@@ -37,6 +37,7 @@
+  *							Bug 427483 - [Java 8] Variables in lambdas sometimes can't be resolved
+  *							Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
+  *							Bug 426996 - [1.8][inference] try to avoid method Expression.unresolve()? 
++ *							Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+  *     Jesper S Moller <jesper@selskabet.org> - Contributions for
+  *							bug 378674 - "The method can be declared as static" is wrong
+  *     Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+@@ -88,6 +89,7 @@ public class AllocationExpression extends Expression implements Invocation {
+ 		boolean argsContainCast;
+ 		boolean cannotInferDiamond; // request the an error be reported in due time
+ 		TypeBinding[] argumentTypes;
++		boolean hasReportedError;
+ 
+ 		ResolutionState(BlockScope scope, boolean isDiamond, boolean diamonNeedsDeferring,
+ 				boolean argsContainCast, TypeBinding[] argumentTypes)
+@@ -497,6 +499,7 @@ boolean resolvePart2(ResolutionState state) {
+ 		if (inferredTypes == null) {
+ 			if (!state.diamondNeedsDeferring) {
+ 				state.scope.problemReporter().cannotInferElidedTypes(this);
++				state.hasReportedError = true;
+ 				this.resolvedType = null;
+ 			} else {
+ 				state.cannotInferDiamond = true; // defer reporting
+@@ -513,6 +516,8 @@ boolean resolvePart2(ResolutionState state) {
+ 
+ /** Final part of resolving (once): check and report various error conditions. */
+ TypeBinding resolvePart3(ResolutionState state) {
++	if (this.suspendedResolutionState != null && this.suspendedResolutionState.hasReportedError)
++		return this.resolvedType;
+ 	this.suspendedResolutionState = null;
+ 	if (state.cannotInferDiamond) {
+ 		state.scope.problemReporter().cannotInferElidedTypes(this);
+@@ -694,20 +699,34 @@ public boolean statementExpression() {
+ }
+ 
+ //-- interface Invocation: --
+-public MethodBinding binding(TypeBinding targetType) {
++public MethodBinding binding(TypeBinding targetType, boolean reportErrors, Scope scope) {
+ 	if (this.suspendedResolutionState != null && targetType != null) {
+ 		setExpectedType(targetType);
+-		if (!resolvePart2(this.suspendedResolutionState))
++		if (!resolvePart2(this.suspendedResolutionState)) {
++			if (reportErrors && !this.suspendedResolutionState.hasReportedError) {
++				if (this.suspendedResolutionState.cannotInferDiamond)
++					scope.problemReporter().cannotInferElidedTypes(this);
++				else
++					scope.problemReporter().genericInferenceError("constructor is unexpectedly unresolved", this); //$NON-NLS-1$
++				this.suspendedResolutionState.hasReportedError = true;
++			}
+ 			return null;
++		}
++	}
++	if (reportErrors && this.binding != null && !this.binding.isValidBinding()) {
++		if (this.binding.declaringClass == null)
++			this.binding.declaringClass = (ReferenceBinding) this.resolvedType;
++		scope.problemReporter().invalidConstructor(this, this.binding);
++		this.suspendedResolutionState.hasReportedError = true;
+ 	}
+ 	return this.binding;
+ }
+-public TypeBinding checkAgainstFinalTargetType(TypeBinding targetType) {
++public TypeBinding checkAgainstFinalTargetType(TypeBinding targetType, Scope scope) {
+ 	if (this.suspendedResolutionState != null) {
+ 		return resolvePart3(this.suspendedResolutionState);
+ 		// also: should this trigger any propagation to inners, too?
+ 	}
+-	return super.checkAgainstFinalTargetType(targetType);
++	return super.checkAgainstFinalTargetType(targetType, scope);
+ }
+ public Expression[] arguments() {
+ 	return this.arguments;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+index 5ac8a85..d457308 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+@@ -27,6 +27,7 @@
+  *							Bug 426078 - [1.8] VerifyError when conditional expression passed as an argument
+  *							Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
+  *							Bug 418537 - [1.8][null] Fix null type annotation analysis for poly conditional expressions
++ *							Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -717,12 +718,12 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext,
+ 		return this.expressionContext;
+ 	}
+ 	
+-	public TypeBinding checkAgainstFinalTargetType(TypeBinding targetType) {
++	public TypeBinding checkAgainstFinalTargetType(TypeBinding targetType, Scope scope) {
+ 		// in 1.8 if treated as a poly expression:
+ 		if (isPolyExpression()) {
+ 			targetType = targetType.uncapture(this.polyExpressionScope);
+-			this.originalValueIfTrueType = this.valueIfTrue.checkAgainstFinalTargetType(targetType);
+-			this.originalValueIfFalseType = this.valueIfFalse.checkAgainstFinalTargetType(targetType);
++			this.originalValueIfTrueType = this.valueIfTrue.checkAgainstFinalTargetType(targetType, scope);
++			this.originalValueIfFalseType = this.valueIfFalse.checkAgainstFinalTargetType(targetType, scope);
+ 			computeConversions(this.polyExpressionScope, targetType);
+ 			this.resolvedType = targetType;
+ 		}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+index d68ad67..8e686e6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+@@ -27,6 +27,7 @@
+  *								Bug 426290 - [1.8][compiler] Inference + overloading => wrong method resolution ?
+  *								Bug 427483 - [Java 8] Variables in lambdas sometimes can't be resolved
+  *								Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
++ *								Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 409245 - [1.8][compiler] Type annotations dropped when call is routed through a synthetic bridge method
+  *******************************************************************************/
+@@ -502,7 +503,13 @@ public class ExplicitConstructorCall extends Statement implements Invocation {
+ 	}
+ 
+ 	// -- interface Invocation: --
+-	public MethodBinding binding(TypeBinding targetType) {
++	public MethodBinding binding(TypeBinding targetType, boolean reportErrors, Scope scope) {
++		if (reportErrors) {
++			if (this.binding == null)
++				scope.problemReporter().genericInferenceError("constructor is unexpectedly unresolved", this); //$NON-NLS-1$
++			else if (!this.binding.isValidBinding())
++				scope.problemReporter().invalidConstructor(this, this.binding);
++		}
+ 		return this.binding;
+ 	}
+ 	public Expression[] arguments() {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+index 679befc..3425411 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+@@ -28,6 +28,7 @@
+  *								Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
+  *								Bug 426996 - [1.8][inference] try to avoid method Expression.unresolve()?
+  *								Bug 428274 - [1.8] [compiler] Cannot cast from Number to double
++ *								Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -1063,8 +1064,9 @@ public TypeBinding resolveTypeExpecting(BlockScope scope, TypeBinding expectedTy
+  * Once outer contexts have finalized the target type for this expression,
+  * perform any checks that might have been delayed previously.
+  * @param targetType the final target type (aka expectedType) for this expression.
++ * @param scope scope for error reporting
+  */
+-public TypeBinding checkAgainstFinalTargetType(TypeBinding targetType) {
++public TypeBinding checkAgainstFinalTargetType(TypeBinding targetType, Scope scope) {
+ 	return this.resolvedType; // subclasses may choose to do real stuff here
+ }
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+index 56aee47..7b393ab 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+@@ -22,6 +22,7 @@
+  *							Bug 425156 - [1.8] Lambda as an argument is flagged with incompatible error
+  *							Bug 424403 - [1.8][compiler] Generic method call with method reference argument fails to resolve properly.
+  *							Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
++ *							Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+  *     Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 405104 - [1.8][compiler][codegen] Implement support for serializeable lambdas
+  *******************************************************************************/
+@@ -180,7 +181,7 @@ public abstract class FunctionalExpression extends Expression {
+ 		return null;
+ 	}
+ 
+-	public TypeBinding checkAgainstFinalTargetType(TypeBinding targetType) {
++	public TypeBinding checkAgainstFinalTargetType(TypeBinding targetType, Scope scope) {
+ 		targetType = targetType.uncapture(this.enclosingScope);
+ 		return resolveTypeExpecting(this.enclosingScope, targetType);
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+index 02609f8..d3fce06 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+@@ -19,6 +19,7 @@ import org.eclipse.jdt.internal.compiler.lookup.InvocationSite;
+ import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.ParameterizedGenericMethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.ParameterizedMethodBinding;
++import org.eclipse.jdt.internal.compiler.lookup.Scope;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ 
+ /**
+@@ -35,8 +36,12 @@ public interface Invocation extends InvocationSite {
+ 	/**
+ 	 * Answer the resolved method binding of this invocation.
+ 	 * If a target type is given, the invocation gets a chance to do repeated method lookup.
++	 * @param targetType the target type of this invocation or null if not yet known
++	 * @param reportErrors if true then this is the last call, if no valid binding can be answered we should report an error
++	 * @param scope if reportErrors is true then this scope can be used for error reporting
++	 * 
+ 	 */
+-	MethodBinding binding(TypeBinding targetType);
++	MethodBinding binding(TypeBinding targetType, boolean reportErrors, Scope scope);
+ 
+ 	/**
+ 	 * Register the given inference context, which produced the given method as its intermediate result.
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index be495ec..c48f280 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -49,6 +49,7 @@
+  *								Bug 427483 - [Java 8] Variables in lambdas sometimes can't be resolved
+  *								Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
+  *								Bug 426996 - [1.8][inference] try to avoid method Expression.unresolve()? 
++ *								Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+  *     Jesper S Moller - Contributions for
+  *								Bug 378674 - "The method can be declared as static" is wrong
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+@@ -866,18 +867,18 @@ protected void findMethodBinding(BlockScope scope, TypeBinding[] argumentTypes)
+ 	this.binding = this.receiver.isImplicitThis()
+ 			? scope.getImplicitMethod(this.selector, argumentTypes, this)
+ 			: scope.getMethod(this.actualReceiverType, this.selector, argumentTypes, this);
+-	resolvePolyExpressionArguments(this, this.binding, argumentTypes);
++	resolvePolyExpressionArguments(this, this.binding, argumentTypes, scope);
+ }
+ 
+ @Override
+-public TypeBinding checkAgainstFinalTargetType(TypeBinding targetType) {
++public TypeBinding checkAgainstFinalTargetType(TypeBinding targetType, Scope scope) {
+ 	if (this.binding instanceof ParameterizedGenericMethodBinding) {
+ 		InferenceContext18 ctx = getInferenceContext((ParameterizedMethodBinding) this.binding);
+ 		if (ctx != null && ctx.stepCompleted < InferenceContext18.TYPE_INFERRED) {
+ 			this.expectedType = targetType;
+ 			MethodBinding updatedBinding = ctx.inferInvocationType(this, (ParameterizedGenericMethodBinding) this.binding);
+ 			if (updateBindings(updatedBinding, targetType)) {
+-				ASTNode.resolvePolyExpressionArguments(this, updatedBinding);
++				ASTNode.resolvePolyExpressionArguments(this, updatedBinding, scope);
+ 			}
+ 		}
+ 	}
+@@ -980,7 +981,13 @@ public boolean receiverIsImplicitThis() {
+ 	return this.receiver.isImplicitThis();
+ }
+ // -- interface Invocation: --
+-public MethodBinding binding(TypeBinding targetType) {
++public MethodBinding binding(TypeBinding targetType, boolean reportErrors, Scope scope) {
++	if (reportErrors) {
++		if (this.binding == null)
++			scope.problemReporter().genericInferenceError("method is unexpectedly unresolved", this); //$NON-NLS-1$
++		else if (!this.binding.isValidBinding())
++			scope.problemReporter().invalidMethod(this, this.binding);
++	}
+ 	return this.binding;
+ }
+ public Expression[] arguments() {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Statement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Statement.java
+index fe8ea2f..5a4aabf 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Statement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Statement.java
+@@ -31,6 +31,7 @@
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
+  *								Bug 424415 - [1.8][compiler] Eventual resolution of ReferenceExpression is not seen to be happening.
+  *								Bug 418537 - [1.8][null] Fix null type annotation analysis for poly conditional expressions
++ *								Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+  *        Andy Clement - Contributions for
+  *                          Bug 383624 - [1.8][compiler] Revive code generation support for type annotations (from Olivier's work)
+  *                          Bug 409250 - [1.8][compiler] Various loose ends in 308 code generation
+@@ -362,7 +363,7 @@ public ExpressionContext getExpressionContext() {
+  */
+ protected MethodBinding findConstructorBinding(BlockScope scope, Invocation site, ReferenceBinding receiverType, TypeBinding[] argumentTypes) {
+ 	MethodBinding ctorBinding = scope.getConstructor(receiverType, argumentTypes, site);
+-	resolvePolyExpressionArguments(site, ctorBinding, argumentTypes);
++	resolvePolyExpressionArguments(site, ctorBinding, argumentTypes, scope);
+ 	return ctorBinding;
+ }
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+index d0331cb..8247ed7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+@@ -80,7 +80,7 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 				return TRUE;
+ 			} else if (this.left instanceof AllocationExpression && this.left.isPolyExpression()) {
+ 				// half-resolved diamond has a resolvedType, but that may not be the final word, try one more step of resolution:
+-            	MethodBinding binding = ((AllocationExpression) this.left).binding(this.right);
++            	MethodBinding binding = ((AllocationExpression) this.left).binding(this.right, false, null);
+             	return (binding != null && binding.declaringClass.isCompatibleWith(this.right)) ? TRUE : FALSE;
+             }
+ 			return FALSE;
+@@ -95,7 +95,7 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 			// - parenthesized expression : these are transparent in our AST
+ 			if (this.left instanceof Invocation) {
+ 				Invocation invocation = (Invocation) this.left;
+-				MethodBinding previousMethod = invocation.binding(this.right);
++				MethodBinding previousMethod = invocation.binding(this.right, false, null);
+ 				if (previousMethod == null)  	// can happen, e.g., if inside a copied lambda with ignored errors
+ 					return null; 				// -> proceed with no new constraints
+ 				MethodBinding method = previousMethod;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index bca540a..0cd9f4d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -121,10 +121,10 @@ import org.eclipse.jdt.internal.compiler.ast.Wildcard;
+  *      18.5.2 finishes.</li>
+  *    <li>If the inner poly expression is a functional expression or a conditional expression no inference variables
+  *      exist representing the inner. In this case the final target type is pushed into the inner using
+- *      {@link Expression#checkAgainstFinalTargetType(TypeBinding)}, which, too, is called from 
++ *      {@link Expression#checkAgainstFinalTargetType(TypeBinding, Scope)}, which, too, is called from 
+  *      {@link #rebindInnerPolies(BoundSet, TypeBinding[])}.</li>
+  *    <li>For recursively pushing target types into arguments of an invocation
+- *    	method {@link ASTNode#resolvePolyExpressionArguments(Invocation, MethodBinding, TypeBinding[])} exists,
++ *    	method {@link ASTNode#resolvePolyExpressionArguments(Invocation, MethodBinding, TypeBinding[], Scope)} exists,
+  *    	which is called in two situations: (1) for non-generic outer invocations from MessageSend#findMethodBinding() and
+  *    	Statement#findConstructorBinding(); (2) for generic outer invocations from {@link #rebindInnerPolies(BoundSet, TypeBinding[])}.</li>
+  *    <li>In some situations invocation arguments that are poly invocations need to be resolved in the middle of overload resolution
+@@ -482,7 +482,7 @@ public class InferenceContext18 {
+ 			c.add(new ConstraintExceptionFormula((FunctionalExpression) expri, substF));
+ 		} else if (expri instanceof Invocation && expri.isPolyExpression()) {
+ 			Invocation invocation = (Invocation) expri;
+-			MethodBinding innerMethod = invocation.binding(null);
++			MethodBinding innerMethod = invocation.binding(null, false, null);
+ 			if (innerMethod instanceof ParameterizedGenericMethodBinding) {
+ 				InferenceContext18 innerCtx = invocation.getInferenceContext((ParameterizedMethodBinding) innerMethod);
+ 				if (innerCtx != null) { // otherwise innerMethod does not participate in inference
+@@ -1335,8 +1335,10 @@ public class InferenceContext18 {
+ 			Expression inner = (Expression) this.innerPolies.get(i);
+ 			if (inner instanceof Invocation) {
+ 				Invocation innerMessage = (Invocation) inner;
+-				TypeBinding innerTargetType = getParameter(parameterTypes, i, isVarargs);
+-				MethodBinding binding = innerMessage.binding(innerTargetType);
++				TypeBinding innerTargetType = inner.expectedType(); // may be set from acceptPendingPolyArguments
++				if (innerTargetType != null && !innerTargetType.isProperType(true))
++					innerTargetType = null;
++				MethodBinding binding = innerMessage.binding(innerTargetType, innerTargetType != null, this.scope);
+ 				if (binding == null)
+ 					continue;
+ 				MethodBinding original = binding.shallowOriginal();
+@@ -1363,7 +1365,7 @@ public class InferenceContext18 {
+ 				ParameterizedGenericMethodBinding innerBinding = this.environment.createParameterizedGenericMethod(original, solutions);
+ 				
+ 				if (innerMessage.updateBindings(innerBinding, innerTargetType)) { // only if we are actually improving anything
+-					ASTNode.resolvePolyExpressionArguments(innerMessage, innerBinding);
++					ASTNode.resolvePolyExpressionArguments(innerMessage, innerBinding, this.scope);
+ 				}
+ 			}
+ 		}
+@@ -1381,7 +1383,7 @@ public class InferenceContext18 {
+ 			if (expression instanceof Invocation) {
+ 				Invocation invocation = (Invocation) expression;
+ 				if (!this.innerPolies.contains(invocation)) {
+-					MethodBinding method = invocation.binding(targetType);
++					MethodBinding method = invocation.binding(targetType, true, this.scope);
+ 					if (method instanceof ParameterizedGenericMethodBinding) {
+ 						ParameterizedGenericMethodBinding previousBinding = (ParameterizedGenericMethodBinding) method;
+ 						InferenceContext18 innerCtx = invocation.getInferenceContext(previousBinding);
+@@ -1393,13 +1395,15 @@ public class InferenceContext18 {
+ 								innerCtx.reportInvalidInvocation(invocation, innerBinding);
+ 							}
+ 							if (invocation.updateBindings(innerBinding, targetType)) { // only if we are actually improving anything
+-								ASTNode.resolvePolyExpressionArguments(invocation, innerBinding);
++								ASTNode.resolvePolyExpressionArguments(invocation, innerBinding, this.scope);
+ 							}
+ 						}
+ 					}
++				} else {
++					expression.setExpectedType(targetType);
+ 				}
+ 			} else {
+-				expression.checkAgainstFinalTargetType(targetType);
++				expression.checkAgainstFinalTargetType(targetType, this.scope);
+ 			}
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index 50923dd..c4310b2 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -40,6 +40,7 @@
+  *								Bug 427218 - [1.8][compiler] Verify error varargs + inference
+  *								Bug 426836 - [1.8] special handling for return type in references to method getClass()?
+  *								Bug 427628 - [1.8] regression : The method * is ambiguous for the type *
++ *								Bug 428352 - [1.8][compiler] Resolution errors don't always surface
+  *     Jesper S Moller - Contributions for
+  *								Bug 378674 - "The method can be declared as static" is wrong
+  *  							Bug 405066 - [1.8][compiler][codegen] Implement code generation infrastructure for JSR335
+@@ -819,7 +820,7 @@ public abstract class Scope {
+ 			if (level != NOT_COMPATIBLE) {
+ 				return Math.max(compatible, level);
+ 			} else {
+-				MethodBinding innerBinding = innerPoly.binding(null); // 1. try without update
++				MethodBinding innerBinding = innerPoly.binding(null, false, null); // 1. try without update
+ 				if (innerBinding instanceof ParameterizedGenericMethodBinding) {
+ 					ParameterizedGenericMethodBinding innerParameterized = (ParameterizedGenericMethodBinding) innerBinding;
+ 					InferenceContext18 infCtx18 = innerPoly.getInferenceContext(innerParameterized);
+@@ -854,7 +855,7 @@ public abstract class Scope {
+ 						}
+ 					}
+ 				} else if (innerPoly instanceof AllocationExpression) {
+-					MethodBinding updatedMethod = innerPoly.binding(targetType); // 2. try with updating
++					MethodBinding updatedMethod = innerPoly.binding(targetType, false, null); // 2. try with updating
+ 					if (updatedMethod != innerBinding && updatedMethod != null) {
+ 						if (updatedMethod.isValidBinding()) {
+ 						if (updatedMethod.declaringClass.isCompatibleWith(targetType))
+@@ -5091,7 +5092,7 @@ public abstract class Scope {
+ 					return infCtx18.inferInvocationType(invocation, argumentTypes, parameterizedMethod);
+ 				}
+ 			} else {
+-				ASTNode.resolvePolyExpressionArguments(invocation, applicable, argumentTypes);
++				ASTNode.resolvePolyExpressionArguments(invocation, applicable, argumentTypes, this);
+ 			}
+ 		}
+ 		return applicable;

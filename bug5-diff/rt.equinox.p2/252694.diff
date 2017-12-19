@@ -1,0 +1,799 @@
+commit b1d0705787a62e9728136fd80f7ff8b5ccfccf46
+Author: Simon Kaegi <skaegi>
+Date:   Wed Jan 14 06:34:10 2009 +0000
+
+    Bug 252694 [engine] action validation step
+
+2	2	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ActionManager.java
+6	2	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/InstructionParser.java
+0	3	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+0	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+25	19	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+1	9	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
+1	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IEngine.java
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/InstallableUnitPhase.java
+2	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
+35	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/MissingAction.java
+39	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/MissingActionsException.java
+6	34	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
+79	9	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/PhaseSet.java
+2	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
+2	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/CheckTrust.java
+2	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Collect.java
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Install.java
+2	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Sizing.java
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Uninstall.java
+87	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
+8	4	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/InstructionParserTest.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseSetTest.java
+2	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ActionManager.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ActionManager.java
+index 0493259..434b7df 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ActionManager.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ActionManager.java
+@@ -43,7 +43,7 @@ public class ActionManager implements IRegistryChangeListener {
+ 		return touchpointManager.getTouchpoint(type);
+ 	}
+ 
+-	public ProvisioningAction getTouchpointQualifiedAction(String actionId, ITouchpointType type) {
++	public String getTouchpointQualifiedActionId(String actionId, ITouchpointType type) {
+ 		if (actionId.indexOf('.') == -1) {
+ 			if (type == null || type == ITouchpointType.NONE)
+ 				return null;
+@@ -53,7 +53,7 @@ public class ActionManager implements IRegistryChangeListener {
+ 				throw new IllegalArgumentException(NLS.bind(Messages.ActionManager_Required_Touchpoint_Not_Found, type.toString(), actionId));
+ 			actionId = touchpoint.qualifyAction(actionId);
+ 		}
+-		return getAction(actionId, null);
++		return actionId;
+ 	}
+ 
+ 	public ProvisioningAction getAction(String actionId, VersionRange versionRange) {
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/InstructionParser.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/InstructionParser.java
+index c0f8b5a..55b0b7d 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/InstructionParser.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/InstructionParser.java
+@@ -13,6 +13,7 @@ package org.eclipse.equinox.internal.p2.engine;
+ import java.util.*;
+ import org.eclipse.core.runtime.Assert;
+ import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
++import org.eclipse.equinox.internal.provisional.p2.engine.MissingAction;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.ITouchpointInstruction;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.ITouchpointType;
+@@ -80,6 +81,8 @@ public class InstructionParser {
+ 			throw new IllegalArgumentException(NLS.bind(Messages.action_syntax_error, statement));
+ 		String actionName = statement.substring(0, openBracket).trim();
+ 		ProvisioningAction action = lookupAction(actionName, qualifier, touchpointType);
++		if (action instanceof MissingAction)
++			return action;
+ 
+ 		String nameValuePairs = statement.substring(openBracket + 1, closeBracket);
+ 		if (nameValuePairs.length() == 0)
+@@ -107,9 +110,10 @@ public class InstructionParser {
+ 			versionRange = actionEntry.versionRange;
+ 		}
+ 
+-		ProvisioningAction action = (actionId.indexOf('.') != -1) ? actionManager.getAction(actionId, versionRange) : actionManager.getTouchpointQualifiedAction(actionId, touchpointType);
++		actionId = actionManager.getTouchpointQualifiedActionId(actionId, touchpointType);
++		ProvisioningAction action = actionManager.getAction(actionId, versionRange);
+ 		if (action == null)
+-			throw new IllegalArgumentException(NLS.bind(Messages.action_not_found, actionId));
++			action = new MissingAction(actionId, versionRange);
+ 
+ 		return action;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+index 6e29062..98d140b 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+@@ -17,9 +17,6 @@ class Messages extends NLS {
+ 
+ 	public static String ActionManager_Exception_Creating_Action_Extension;
+ 	public static String ActionManager_Required_Touchpoint_Not_Found;
+-
+-	public static String action_not_found;
+-
+ 	public static String download_artifact;
+ 	public static String download_no_repository;
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+index 6951f37..77e424e 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+@@ -11,7 +11,6 @@
+ 
+ ActionManager_Exception_Creating_Action_Extension=Error creating action with id: {0}.
+ ActionManager_Required_Touchpoint_Not_Found=The required {0} touchpoint for the {1} action is not included in the installation manager configuration.
+-action_not_found=No action found for: {0}.
+ action_syntax_error=Invalid action syntax: {0}.
+ download_artifact=Downloading artifacts
+ download_no_repository=No artifact repository available.
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+index ba1a7aa..8e66362 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
++ * Copyright (c) 2007-2009 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -27,22 +27,7 @@ public class Engine implements IEngine {
+ 	}
+ 
+ 	public IStatus perform(IProfile iprofile, PhaseSet phaseSet, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor) {
+-
+-		// TODO -- Messages
+-		if (iprofile == null)
+-			throw new IllegalArgumentException(Messages.null_profile);
+-
+-		if (phaseSet == null)
+-			throw new IllegalArgumentException(Messages.null_phaseset);
+-
+-		if (operands == null)
+-			throw new IllegalArgumentException(Messages.null_operands);
+-
+-		if (context == null)
+-			context = new ProvisioningContext();
+-
+-		if (monitor == null)
+-			monitor = new NullProgressMonitor();
++		checkArguments(iprofile, phaseSet, operands, context, monitor);
+ 
+ 		SimpleProfileRegistry profileRegistry = (SimpleProfileRegistry) ServiceHelper.getService(EngineActivator.getContext(), IProfileRegistry.class.getName());
+ 
+@@ -52,9 +37,9 @@ public class Engine implements IEngine {
+ 		try {
+ 			eventBus.publishEvent(new BeginOperationEvent(profile, phaseSet, operands, this));
+ 
+-			EngineSession session = new EngineSession(profile, context, actionManager);
++			EngineSession session = new EngineSession(profile, context);
+ 
+-			MultiStatus result = phaseSet.perform(session, profile, operands, context, monitor);
++			MultiStatus result = phaseSet.perform(actionManager, session, profile, operands, context, monitor);
+ 			if (result.matches(IStatus.ERROR | IStatus.CANCEL)) {
+ 				eventBus.publishEvent(new RollbackOperationEvent(profile, phaseSet, operands, this, result));
+ 				IStatus status = session.rollback();
+@@ -76,4 +61,25 @@ public class Engine implements IEngine {
+ 			profile.setChanged(false);
+ 		}
+ 	}
++
++	public IStatus validate(IProfile iprofile, PhaseSet phaseSet, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor) {
++		return phaseSet.validate(actionManager, iprofile, operands, context, monitor);
++	}
++
++	private void checkArguments(IProfile iprofile, PhaseSet phaseSet, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor) {
++		if (iprofile == null)
++			throw new IllegalArgumentException(Messages.null_profile);
++
++		if (phaseSet == null)
++			throw new IllegalArgumentException(Messages.null_phaseset);
++
++		if (operands == null)
++			throw new IllegalArgumentException(Messages.null_operands);
++
++		if (context == null)
++			context = new ProvisioningContext();
++
++		if (monitor == null)
++			monitor = new NullProgressMonitor();
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
+index a59fc11..118b1a9 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
+@@ -12,7 +12,6 @@ package org.eclipse.equinox.internal.provisional.p2.engine;
+ 
+ import java.util.*;
+ import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.engine.ActionManager;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+ import org.eclipse.osgi.util.NLS;
+ 
+@@ -41,16 +40,9 @@ public class EngineSession {
+ 
+ 	private Set touchpoints = new HashSet();
+ 
+-	private ActionManager actionManager;
+-
+-	public EngineSession(IProfile profile, ProvisioningContext context, ActionManager actionManager) {
++	public EngineSession(IProfile profile, ProvisioningContext context) {
+ 		this.profile = profile;
+ 		this.context = context;
+-		this.actionManager = actionManager;
+-	}
+-
+-	ActionManager getActionManager() {
+-		return actionManager;
+ 	}
+ 
+ 	IStatus commit() {
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IEngine.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IEngine.java
+index b0eb399..80023db 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IEngine.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IEngine.java
+@@ -18,4 +18,5 @@ public interface IEngine {
+ 
+ 	public IStatus perform(IProfile profile, PhaseSet phaseSet, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor);
+ 
++	public IStatus validate(IProfile iprofile, PhaseSet phaseSet, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/InstallableUnitPhase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/InstallableUnitPhase.java
+index f61465d..d76df1c 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/InstallableUnitPhase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/InstallableUnitPhase.java
+@@ -79,7 +79,7 @@ public abstract class InstallableUnitPhase extends Phase {
+ 			return null;
+ 
+ 		List actions = new ArrayList();
+-		InstructionParser instructionParser = new InstructionParser(actionManager);
++		InstructionParser instructionParser = new InstructionParser(getActionManager());
+ 		for (int i = 0; i < instructions.length; i++) {
+ 			actions.addAll(Arrays.asList(instructionParser.parseActions(instructions[i], unit.getTouchpointType())));
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
+index 96dbb1d..e1ce450 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
+@@ -45,6 +45,8 @@ public class Messages extends NLS {
+ 	public static String not_current_operand;
+ 	public static String null_action;
+ 	public static String session_context;
++	public static String action_not_found;
++	public static String actions_not_found;
+ 
+ 	static {
+ 		// initialize resource bundle
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/MissingAction.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/MissingAction.java
+new file mode 100644
+index 0000000..3c75e5b
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/MissingAction.java
+@@ -0,0 +1,35 @@
++package org.eclipse.equinox.internal.provisional.p2.engine;
++
++import java.util.Map;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.Status;
++import org.eclipse.equinox.internal.provisional.p2.core.VersionRange;
++import org.eclipse.osgi.util.NLS;
++
++public class MissingAction extends ProvisioningAction {
++
++	private String actionId;
++	private VersionRange versionRange;
++
++	public MissingAction(String actionId, VersionRange versionRange) {
++		this.actionId = actionId;
++		this.versionRange = versionRange;
++	}
++
++	public String getActionId() {
++		return actionId;
++	}
++
++	public VersionRange getVersionRange() {
++		return versionRange;
++	}
++
++	public IStatus execute(Map parameters) {
++		throw new IllegalArgumentException(NLS.bind(Messages.action_not_found, actionId + (versionRange == null ? "" : "/" + versionRange.toString()))); //$NON-NLS-1$ //$NON-NLS-2$
++	}
++
++	public IStatus undo(Map parameters) {
++		// do nothing as we want this action to undo successfully
++		return Status.OK_STATUS;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/MissingActionsException.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/MissingActionsException.java
+new file mode 100644
+index 0000000..6f0c88f
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/MissingActionsException.java
+@@ -0,0 +1,39 @@
++package org.eclipse.equinox.internal.provisional.p2.engine;
++
++import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.osgi.util.NLS;
++
++public class MissingActionsException extends ProvisionException {
++
++	private static final long serialVersionUID = 8617693596359747490L;
++	private final MissingAction[] missingActions;
++
++	public MissingActionsException(MissingAction[] missingActions) {
++		super(getMissingActionsMessage(missingActions));
++		this.missingActions = missingActions;
++	}
++
++	private static String getMissingActionsMessage(MissingAction[] missingActions) {
++
++		if (missingActions.length == 0)
++			throw new IllegalArgumentException("Bad exception: No missing actions"); //$NON-NLS-1$
++
++		StringBuffer buffer = new StringBuffer();
++		for (int i = 0; i < missingActions.length; i++) {
++			MissingAction missingAction = missingActions[i];
++			buffer.append(missingAction.getActionId());
++			if (missingAction.getVersionRange() != null) {
++				buffer.append("/"); //$NON-NLS-1$
++				buffer.append(missingAction.getVersionRange().toString());
++			}
++			if (i + 1 != missingActions.length)
++				buffer.append(", "); //$NON-NLS-1$
++		}
++
++		return NLS.bind(Messages.actions_not_found, buffer.toString());
++	}
++
++	public MissingAction[] getMissingActions() {
++		return missingActions;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
+index a264113..8bad6dd 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
+@@ -31,7 +31,7 @@ public abstract class Phase {
+ 	private Map phaseParameters = new HashMap();
+ 	private Map touchpointToTouchpointPhaseParameters = new HashMap();
+ 	private Map touchpointToTouchpointOperandParameters = new HashMap();
+-	protected ActionManager actionManager;
++	ActionManager actionManager; // injected from phaseset
+ 
+ 	protected Phase(String phaseId, int weight) {
+ 		if (phaseId == null || phaseId.length() == 0)
+@@ -42,43 +42,15 @@ public abstract class Phase {
+ 		this.phaseId = phaseId;
+ 	}
+ 
+-	public String toString() {
+-		return getClass().getName() + " - " + this.weight; //$NON-NLS-1$
++	final protected ActionManager getActionManager() {
++		return actionManager;
+ 	}
+ 
+-	public final MultiStatus perform(EngineSession session, IProfile profile, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor) {
+-		MultiStatus status = new MultiStatus(EngineActivator.ID, IStatus.OK, null, null);
+-		actionManager = session.getActionManager();
+-		try {
+-			perform(status, session, profile, operands, context, monitor);
+-		} catch (OperationCanceledException e) {
+-			// propagate operation cancellation
+-			status.add(new Status(IStatus.CANCEL, EngineActivator.ID, e.getMessage(), e));
+-		} catch (RuntimeException e) {
+-			// "perform" calls user code and might throw an unchecked exception
+-			// we catch the error here to gather information on where the problem occurred.
+-			status.add(new Status(IStatus.ERROR, EngineActivator.ID, e.getMessage(), e));
+-		} catch (LinkageError e) {
+-			// Catch linkage errors as these are generally recoverable but let other Errors propagate (see bug 222001)
+-			status.add(new Status(IStatus.ERROR, EngineActivator.ID, e.getMessage(), e));
+-		} finally {
+-			actionManager = null;
+-		}
+-
+-		if (status.matches(IStatus.CANCEL)) {
+-			MultiStatus result = new MultiStatus(EngineActivator.ID, IStatus.CANCEL, Messages.Engine_Operation_Canceled_By_User, null);
+-			result.merge(status);
+-			return result;
+-		} else if (status.matches(IStatus.ERROR)) {
+-			MultiStatus result = new MultiStatus(EngineActivator.ID, IStatus.ERROR, getProblemMessage(), null);
+-			result.add(new Status(IStatus.ERROR, EngineActivator.ID, session.getContextString(), null));
+-			result.merge(status);
+-			return result;
+-		}
+-		return status;
++	public String toString() {
++		return getClass().getName() + " - " + this.weight; //$NON-NLS-1$
+ 	}
+ 
+-	void perform(MultiStatus status, EngineSession session, IProfile profile, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor) {
++	public final void perform(MultiStatus status, EngineSession session, IProfile profile, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor) {
+ 		SubMonitor subMonitor = SubMonitor.convert(monitor, prePerformWork + mainPerformWork + postPerformWork);
+ 		prePerform(status, profile, context, subMonitor.newChild(prePerformWork));
+ 		if (status.matches(IStatus.ERROR | IStatus.CANCEL))
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/PhaseSet.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/PhaseSet.java
+index 5dfa5db..3be95c5 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/PhaseSet.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/PhaseSet.java
+@@ -10,8 +10,12 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.provisional.p2.engine;
+ 
++import java.util.HashSet;
++import java.util.Set;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.engine.ActionManager;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
++import org.eclipse.osgi.util.NLS;
+ 
+ public abstract class PhaseSet {
+ 	private final Phase[] phases;
+@@ -23,28 +27,94 @@ public abstract class PhaseSet {
+ 		this.phases = phases;
+ 	}
+ 
+-	public final MultiStatus perform(EngineSession session, IProfile profile, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor) {
+-		MultiStatus result = new MultiStatus(EngineActivator.ID, IStatus.OK, null, null);
++	public final MultiStatus perform(ActionManager actionManager, EngineSession session, IProfile profile, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor) {
++		MultiStatus status = new MultiStatus(EngineActivator.ID, IStatus.OK, null, null);
+ 		int[] weights = getProgressWeights(operands);
+ 		int totalWork = getTotalWork(weights);
+ 		SubMonitor pm = SubMonitor.convert(monitor, totalWork);
+ 		try {
+ 			for (int i = 0; i < phases.length; i++) {
+ 				if (pm.isCanceled()) {
+-					result.add(Status.CANCEL_STATUS);
+-					return result;
++					status.add(Status.CANCEL_STATUS);
++					return status;
+ 				}
+ 				Phase phase = phases[i];
+-				MultiStatus performResult = phase.perform(session, profile, operands, context, pm.newChild(weights[i]));
+-				if (!performResult.isOK())
+-					result.add(performResult);
+-				if (result.matches(IStatus.ERROR | IStatus.CANCEL))
++				phase.actionManager = actionManager;
++				try {
++					phase.perform(status, session, profile, operands, context, pm.newChild(weights[i]));
++				} catch (OperationCanceledException e) {
++					// propagate operation cancellation
++					status.add(new Status(IStatus.CANCEL, EngineActivator.ID, e.getMessage(), e));
++				} catch (RuntimeException e) {
++					// "perform" calls user code and might throw an unchecked exception
++					// we catch the error here to gather information on where the problem occurred.
++					status.add(new Status(IStatus.ERROR, EngineActivator.ID, e.getMessage(), e));
++				} catch (LinkageError e) {
++					// Catch linkage errors as these are generally recoverable but let other Errors propagate (see bug 222001)
++					status.add(new Status(IStatus.ERROR, EngineActivator.ID, e.getMessage(), e));
++				} finally {
++					phase.actionManager = null;
++				}
++				if (status.matches(IStatus.CANCEL)) {
++					MultiStatus result = new MultiStatus(EngineActivator.ID, IStatus.CANCEL, Messages.Engine_Operation_Canceled_By_User, null);
++					result.merge(status);
+ 					return result;
++				} else if (status.matches(IStatus.ERROR)) {
++					MultiStatus result = new MultiStatus(EngineActivator.ID, IStatus.ERROR, phase.getProblemMessage(), null);
++					result.add(new Status(IStatus.ERROR, EngineActivator.ID, session.getContextString(), null));
++					result.merge(status);
++					return result;
++				}
+ 			}
+ 		} finally {
+ 			pm.done();
+ 		}
+-		return result;
++		return status;
++	}
++
++	public final IStatus validate(ActionManager actionManager, IProfile profile, Operand[] operands, ProvisioningContext context, IProgressMonitor monitor) {
++		Set missingActions = new HashSet();
++		for (int i = 0; i < phases.length; i++) {
++			Phase phase = phases[i];
++			phase.actionManager = actionManager;
++			try {
++				for (int j = 0; j < operands.length; j++) {
++					Operand operand = operands[j];
++					try {
++						if (!phase.isApplicable(operand))
++							continue;
++
++						ProvisioningAction[] actions = phase.getActions(operand);
++						if (actions == null)
++							continue;
++						for (int k = 0; k < actions.length; k++) {
++							ProvisioningAction action = actions[k];
++							if (action instanceof MissingAction)
++								missingActions.add(action);
++						}
++					} catch (RuntimeException e) {
++						// "perform" calls user code and might throw an unchecked exception
++						// we catch the error here to gather information on where the problem occurred.
++						return new Status(IStatus.ERROR, EngineActivator.ID, e.getMessage() + " " + getContextString(profile, phase, operand), e); //$NON-NLS-1$
++					} catch (LinkageError e) {
++						// Catch linkage errors as these are generally recoverable but let other Errors propagate (see bug 222001)
++						return new Status(IStatus.ERROR, EngineActivator.ID, e.getMessage() + " " + getContextString(profile, phase, operand), e); //$NON-NLS-1$
++					}
++				}
++			} finally {
++				phase.actionManager = null;
++			}
++		}
++		if (!missingActions.isEmpty()) {
++			MissingAction[] missingActionsArray = (MissingAction[]) missingActions.toArray(new MissingAction[missingActions.size()]);
++			MissingActionsException exception = new MissingActionsException(missingActionsArray);
++			return (new Status(IStatus.ERROR, EngineActivator.ID, exception.getMessage(), exception));
++		}
++		return Status.OK_STATUS;
++	}
++
++	private String getContextString(IProfile profile, Phase phase, Operand operand) {
++		return NLS.bind(Messages.session_context, new Object[] {profile.getProfileId(), phase.getClass().getName(), operand.toString(), ""}); //$NON-NLS-1$
+ 	}
+ 
+ 	private int getTotalWork(int[] weights) {
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
+index 59597c3..dedaab1 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
+@@ -8,6 +8,8 @@
+ # Contributors:
+ #     IBM Corporation - initial API and implementation
+ ###############################################################################
++action_not_found=No action found for: {0}.
++actions_not_found=No actions found for: {0}.
+ not_current_phase=Current phase does not match argument.
+ null_operands=Operands must not be null.
+ null_phase=Phase must not be null.
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/CheckTrust.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/CheckTrust.java
+index 2386e5d..809c71f 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/CheckTrust.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/CheckTrust.java
+@@ -54,7 +54,8 @@ public class CheckTrust extends InstallableUnitPhase {
+ 		if (type == null || type == ITouchpointType.NONE)
+ 			return null;
+ 
+-		ProvisioningAction action = actionManager.getTouchpointQualifiedAction(phaseId, type);
++		String actionId = getActionManager().getTouchpointQualifiedActionId(phaseId, type);
++		ProvisioningAction action = getActionManager().getAction(actionId, null);
+ 		if (action == null) {
+ 			return null;
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Collect.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Collect.java
+index 93fc640..7ec973c 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Collect.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Collect.java
+@@ -48,7 +48,8 @@ public class Collect extends InstallableUnitPhase {
+ 		if (type == null || type == ITouchpointType.NONE)
+ 			return null;
+ 
+-		ProvisioningAction action = actionManager.getTouchpointQualifiedAction(phaseId, type);
++		String actionId = getActionManager().getTouchpointQualifiedActionId(phaseId, type);
++		ProvisioningAction action = getActionManager().getAction(actionId, null);
+ 		if (action == null) {
+ 			return null;
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Install.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Install.java
+index fee5157..1d92624 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Install.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Install.java
+@@ -82,7 +82,7 @@ public class Install extends InstallableUnitPhase {
+ 		ProvisioningAction afterAction = new AfterInstallEventAction();
+ 
+ 		IInstallableUnit unit = currentOperand.second();
+-		Touchpoint touchpoint = actionManager.getTouchpointPoint(unit.getTouchpointType());
++		Touchpoint touchpoint = getActionManager().getTouchpointPoint(unit.getTouchpointType());
+ 		if (touchpoint != null) {
+ 			beforeAction.setTouchpoint(touchpoint);
+ 			afterAction.setTouchpoint(touchpoint);
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Sizing.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Sizing.java
+index 2f74be7..5391f37 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Sizing.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Sizing.java
+@@ -55,7 +55,8 @@ public class Sizing extends InstallableUnitPhase {
+ 		if (type == null || type == ITouchpointType.NONE)
+ 			return null;
+ 
+-		ProvisioningAction action = actionManager.getTouchpointQualifiedAction(COLLECT_PHASE_ID, type);
++		String actionId = getActionManager().getTouchpointQualifiedActionId(COLLECT_PHASE_ID, type);
++		ProvisioningAction action = getActionManager().getAction(actionId, null);
+ 		if (action == null) {
+ 			return null;
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Uninstall.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Uninstall.java
+index 3e5307c..89469a2 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Uninstall.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/phases/Uninstall.java
+@@ -79,7 +79,7 @@ public class Uninstall extends InstallableUnitPhase {
+ 		ProvisioningAction afterAction = new AfterUninstallEventAction();
+ 
+ 		IInstallableUnit unit = currentOperand.first();
+-		Touchpoint touchpoint = actionManager.getTouchpointPoint(unit.getTouchpointType());
++		Touchpoint touchpoint = getActionManager().getTouchpointPoint(unit.getTouchpointType());
+ 		if (touchpoint != null) {
+ 			beforeAction.setTouchpoint(touchpoint);
+ 			afterAction.setTouchpoint(touchpoint);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
+index 8bd7ab7..823d0f9 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/EngineTest.java
+@@ -40,9 +40,13 @@ public class EngineTest extends AbstractProvisioningTest {
+ 			super("NPE", 1);
+ 		}
+ 
+-		protected ProvisioningAction[] getActions(Operand operand) {
++		protected IStatus completePhase(IProgressMonitor monitor, IProfile profile, Map parameters) {
+ 			throw new NullPointerException();
+ 		}
++
++		protected ProvisioningAction[] getActions(Operand operand) {
++			return null;
++		}
+ 	}
+ 
+ 	private static class NPEPhaseSet extends PhaseSet {
+@@ -208,6 +212,24 @@ public class EngineTest extends AbstractProvisioningTest {
+ 		assertTrue(sizingPhase.getDlSize() == 0);
+ 	}
+ 
++	public void testValidateInstallOSGiFramework() {
++		Map properties = new HashMap();
++		properties.put(IProfile.PROP_INSTALL_FOLDER, testProvisioning.getAbsolutePath());
++
++		IProfile profile = createProfile("testPerformInstallOSGiFramework", null, properties);
++		for (Iterator it = getInstallableUnits(profile); it.hasNext();) {
++			PhaseSet phaseSet = new DefaultPhaseSet();
++			IInstallableUnit doomed = (IInstallableUnit) it.next();
++			InstallableUnitOperand[] operands = new InstallableUnitOperand[] {new InstallableUnitOperand(createResolvedIU(doomed), null)};
++			engine.perform(profile, phaseSet, operands, null, new NullProgressMonitor());
++		}
++		PhaseSet phaseSet = new DefaultPhaseSet();
++
++		InstallableUnitOperand[] operands = new InstallableUnitOperand[] {new InstallableUnitOperand(null, createOSGiIU())};
++		IStatus result = engine.validate(profile, phaseSet, operands, null, new NullProgressMonitor());
++		assertTrue(result.isOK());
++	}
++
+ 	public void testPerformInstallOSGiFramework() {
+ 		Map properties = new HashMap();
+ 		properties.put(IProfile.PROP_INSTALL_FOLDER, testProvisioning.getAbsolutePath());
+@@ -276,6 +298,44 @@ public class EngineTest extends AbstractProvisioningTest {
+ 		InstallableUnitOperand[] operands = new InstallableUnitOperand[] {new InstallableUnitOperand(null, createOSGiIU()), new InstallableUnitOperand(null, createBadIU())};
+ 		IStatus result = engine.perform(profile, phaseSet, operands, null, new NullProgressMonitor());
+ 		assertFalse(result.isOK());
++
++		ius = getInstallableUnits(profile);
++		assertFalse(ius.hasNext());
++	}
++
++	public void testValidateMissingAction() {
++
++		Map properties = new HashMap();
++		properties.put(IProfile.PROP_INSTALL_FOLDER, testProvisioning.getAbsolutePath());
++		IProfile profile = createProfile("testPerformRollback", null, properties);
++		PhaseSet phaseSet = new DefaultPhaseSet();
++
++		Iterator ius = getInstallableUnits(profile);
++		assertFalse(ius.hasNext());
++
++		InstallableUnitOperand[] operands = new InstallableUnitOperand[] {new InstallableUnitOperand(null, createOSGiIU()), new InstallableUnitOperand(null, createMissingActionIU())};
++		IStatus result = engine.validate(profile, phaseSet, operands, null, new NullProgressMonitor());
++		assertFalse(result.isOK());
++
++		Throwable t = result.getException();
++		assertTrue(t instanceof MissingActionsException);
++		MissingActionsException e = (MissingActionsException) t;
++		assertEquals("org.eclipse.equinox.p2.touchpoint.eclipse.thisactionismissing", e.getMissingActions()[0].getActionId());
++	}
++
++	public void testPerformMissingAction() {
++
++		Map properties = new HashMap();
++		properties.put(IProfile.PROP_INSTALL_FOLDER, testProvisioning.getAbsolutePath());
++		IProfile profile = createProfile("testPerformMissingAction", null, properties);
++		PhaseSet phaseSet = new DefaultPhaseSet();
++
++		Iterator ius = getInstallableUnits(profile);
++		assertFalse(ius.hasNext());
++
++		InstallableUnitOperand[] operands = new InstallableUnitOperand[] {new InstallableUnitOperand(null, createOSGiIU()), new InstallableUnitOperand(null, createMissingActionIU())};
++		IStatus result = engine.perform(profile, phaseSet, operands, null, new NullProgressMonitor());
++		assertFalse(result.isOK());
+ 		ius = getInstallableUnits(profile);
+ 		assertFalse(ius.hasNext());
+ 	}
+@@ -371,6 +431,32 @@ public class EngineTest extends AbstractProvisioningTest {
+ 		return MetadataFactory.createResolvedInstallableUnit(iu, cus);
+ 	}
+ 
++	private IInstallableUnit createMissingActionIU() {
++		InstallableUnitDescription description = new MetadataFactory.InstallableUnitDescription();
++		description.setId("org.eclipse.osgi.bad");
++		description.setVersion(new Version("3.3.1.R33x_v20070828"));
++		description.setTouchpointType(AbstractProvisioningTest.TOUCHPOINT_OSGI);
++		Map touchpointData = new HashMap();
++		String manifest = "Manifest-Version: 1.0\r\n" + "Bundle-Activator: org.eclipse.osgi.framework.internal.core.SystemBundl\r\n" + " eActivator\r\n" + "Bundle-RequiredExecutionEnvironment: J2SE-1.4,OSGi/Minimum-1.0\r\n" + "Export-Package: org.eclipse.osgi.event;version=\"1.0\",org.eclipse.osgi.\r\n" + " framework.console;version=\"1.0\",org.eclipse.osgi.framework.eventmgr;v\r\n" + " ersion=\"1.0\",org.eclipse.osgi.framework.log;version=\"1.0\",org.eclipse\r\n" + " .osgi.service.datalocation;version=\"1.0\",org.eclipse.osgi.service.deb\r\n" + " ug;version=\"1.0\",org.eclipse.osgi.service.environment;version=\"1.0\",o\r\n" + " rg.eclipse.osgi.service.localization;version=\"1.0\",org.eclipse.osgi.s\r\n" + " ervice.pluginconversion;version=\"1.0\",org.eclipse.osgi.service.resolv\r\n"
++				+ " er;version=\"1.1\",org.eclipse.osgi.service.runnable;version=\"1.0\",org.\r\n" + " eclipse.osgi.service.urlconversion;version=\"1.0\",org.eclipse.osgi.sto\r\n" + " ragemanager;version=\"1.0\",org.eclipse.osgi.util;version=\"1.0\",org.osg\r\n" + " i.framework;version=\"1.3\",org.osgi.service.condpermadmin;version=\"1.0\r\n" + " \",org.osgi.service.packageadmin;version=\"1.2\",org.osgi.service.permis\r\n" + " sionadmin;version=\"1.2\",org.osgi.service.startlevel;version=\"1.0\",org\r\n" + " .osgi.service.url;version=\"1.0\",org.osgi.util.tracker;version=\"1.3.2\"\r\n" + " ,org.eclipse.core.runtime.adaptor;x-friends:=\"org.eclipse.core.runtim\r\n" + " e\",org.eclipse.core.runtime.internal.adaptor;x-internal:=true,org.ecl\r\n"
++				+ " ipse.core.runtime.internal.stats;x-friends:=\"org.eclipse.core.runtime\r\n" + " \",org.eclipse.osgi.baseadaptor;x-internal:=true,org.eclipse.osgi.base\r\n" + " adaptor.bundlefile;x-internal:=true,org.eclipse.osgi.baseadaptor.hook\r\n" + " s;x-internal:=true,org.eclipse.osgi.baseadaptor.loader;x-internal:=tr\r\n" + " ue,org.eclipse.osgi.framework.adaptor;x-internal:=true,org.eclipse.os\r\n" + " gi.framework.debug;x-internal:=true,org.eclipse.osgi.framework.intern\r\n" + " al.core;x-internal:=true,org.eclipse.osgi.framework.internal.protocol\r\n" + " ;x-internal:=true,org.eclipse.osgi.framework.internal.protocol.bundle\r\n" + " entry;x-internal:=true,org.eclipse.osgi.framework.internal.protocol.b\r\n"
++				+ " undleresource;x-internal:=true,org.eclipse.osgi.framework.internal.pr\r\n" + " otocol.reference;x-internal:=true,org.eclipse.osgi.framework.internal\r\n" + " .reliablefile;x-internal:=true,org.eclipse.osgi.framework.launcher;x-\r\n" + " internal:=true,org.eclipse.osgi.framework.util;x-internal:=true,org.e\r\n" + " clipse.osgi.internal.baseadaptor;x-internal:=true,org.eclipse.osgi.in\r\n" + " ternal.module;x-internal:=true,org.eclipse.osgi.internal.profile;x-in\r\n" + " ternal:=true,org.eclipse.osgi.internal.resolver;x-internal:=true,org.\r\n" + " eclipse.osgi.internal.verifier;x-internal:=true,org.eclipse.osgi.inte\r\n" + " rnal.provisional.verifier;x-friends:=\"org.eclipse.update.core,org.ecl\r\n" + " ipse.ui.workbench\"\r\n" + "Bundle-Version: 3.3.0.v20060925\r\n"
++				+ "Eclipse-SystemBundle: true\r\n" + "Bundle-Copyright: %copyright\r\n" + "Bundle-Name: %systemBundle\r\n" + "Bundle-Description: %systemBundle\r\n" + "Bundle-DocUrl: http://www.eclipse.org\r\n" + "Bundle-ManifestVersion: 2\r\n" + "Export-Service: org.osgi.service.packageadmin.PackageAdmin,org.osgi.se\r\n" + " rvice.permissionadmin.PermissionAdmin,org.osgi.service.startlevel.Sta\r\n" + " rtLevel,org.eclipse.osgi.service.debug.DebugOptions\r\n" + "Bundle-Vendor: %eclipse.org\r\n" + "Main-Class: org.eclipse.core.runtime.adaptor.EclipseStarter\r\n" + "Bundle-SymbolicName: org.eclipse.osgi; singleton:=true\r\n" + "Bundle-Localization: systembundle\r\n" + "Eclipse-ExtensibleAPI: true\r\n" + "\r\n" + "";
++		touchpointData.put("manifest", manifest);
++		touchpointData.put("install", "thisactionismissing()");
++
++		IInstallableUnitFragment[] cus = new IInstallableUnitFragment[1];
++		InstallableUnitFragmentDescription desc = new InstallableUnitFragmentDescription();
++		desc.addTouchpointData(MetadataFactory.createTouchpointData(touchpointData));
++		cus[0] = MetadataFactory.createInstallableUnitFragment(desc);
++
++		//IArtifactKey key = new ArtifactKey("eclipse", "plugin", "org.eclipse.osgi", new Version("3.3.1.R33x_v20070828"));
++		//iu.setArtifacts(new IArtifactKey[] {key});
++
++		IInstallableUnit iu = MetadataFactory.createInstallableUnit(description);
++		return MetadataFactory.createResolvedInstallableUnit(iu, cus);
++	}
++
+ 	public void testIncompatibleProfile() {
+ 
+ 		IProfile profile = new IProfile() {
+@@ -439,5 +525,4 @@ public class EngineTest extends AbstractProvisioningTest {
+ 		}
+ 		fail();
+ 	}
+-
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/InstructionParserTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/InstructionParserTest.java
+index 89d869f..aec0ac8 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/InstructionParserTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/InstructionParserTest.java
+@@ -67,7 +67,8 @@ public class InstructionParserTest extends AbstractProvisioningTest {
+ 	public void testBadActionFullyQualified() {
+ 		InstructionParser parser = new InstructionParser(new ActionManager());
+ 		try {
+-			parser.parseActions(MetadataFactory.createTouchpointInstruction("instructionparsertest.badAction()", null), null);
++			ProvisioningAction[] actions = parser.parseActions(MetadataFactory.createTouchpointInstruction("instructionparsertest.badAction()", null), null);
++			actions[0].execute(null);
+ 		} catch (IllegalArgumentException e) {
+ 			return;
+ 		}
+@@ -89,7 +90,8 @@ public class InstructionParserTest extends AbstractProvisioningTest {
+ 	public void testBadActionFromImport() {
+ 		InstructionParser parser = new InstructionParser(new ActionManager());
+ 		try {
+-			parser.parseActions(MetadataFactory.createTouchpointInstruction("badAction()", "instructionparsertest.badAction"), null);
++			ProvisioningAction[] actions = parser.parseActions(MetadataFactory.createTouchpointInstruction("badAction()", "instructionparsertest.badAction"), null);
++			actions[0].execute(null);
+ 		} catch (IllegalArgumentException e) {
+ 			return;
+ 		}
+@@ -147,7 +149,8 @@ public class InstructionParserTest extends AbstractProvisioningTest {
+ 	public void testGoodActionBadAction() {
+ 		InstructionParser parser = new InstructionParser(new ActionManager());
+ 		try {
+-			parser.parseActions(MetadataFactory.createTouchpointInstruction("goodAction(); badAction()", null), TOUCHPOINT_TYPE);
++			ProvisioningAction[] actions = parser.parseActions(MetadataFactory.createTouchpointInstruction("goodAction(); badAction()", null), TOUCHPOINT_TYPE);
++			actions[1].execute(null);
+ 		} catch (IllegalArgumentException e) {
+ 			return;
+ 		}
+@@ -157,7 +160,8 @@ public class InstructionParserTest extends AbstractProvisioningTest {
+ 	public void testNoActionFound() {
+ 		InstructionParser parser = new InstructionParser(new ActionManager());
+ 		try {
+-			parser.parseActions(MetadataFactory.createTouchpointInstruction("notfoundaction()", null), TOUCHPOINT_TYPE);
++			ProvisioningAction[] actions = parser.parseActions(MetadataFactory.createTouchpointInstruction("notfoundaction()", null), TOUCHPOINT_TYPE);
++			actions[0].execute(null);
+ 		} catch (IllegalArgumentException e) {
+ 			return;
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseSetTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseSetTest.java
+index b3a40c6..1f3220a 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseSetTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseSetTest.java
+@@ -53,7 +53,7 @@ public class PhaseSetTest extends AbstractProvisioningTest {
+ 		InstallableUnitOperand[] operands = new InstallableUnitOperand[] {op};
+ 
+ 		ProvisioningContext context = new ProvisioningContext();
+-		IStatus result = phaseSet.perform(new EngineSession(profile, context, null), profile, operands, context, new NullProgressMonitor());
++		IStatus result = phaseSet.perform(null, new EngineSession(profile, context), profile, operands, context, new NullProgressMonitor());
+ 		assertTrue(result.isOK());
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
+index a667ef9..1278d2e 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/PhaseTest.java
+@@ -86,7 +86,8 @@ public class PhaseTest extends AbstractProvisioningTest {
+ 			if (type == null || type == ITouchpointType.NONE)
+ 				return null;
+ 
+-			ProvisioningAction action = actionManager.getTouchpointQualifiedAction(phaseId, type);
++			String actionId = getActionManager().getTouchpointQualifiedActionId(phaseId, type);
++			ProvisioningAction action = getActionManager().getAction(actionId, null);
+ 			if (action == null) {
+ 				throw new IllegalArgumentException("action not found: " + phaseId);
+ 			}

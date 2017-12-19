@@ -1,0 +1,532 @@
+commit 128a99659b73df0d65c1b7965233f291b8bbcedc
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Mon Mar 4 08:12:17 2013 +0530
+
+    Fixed Bug 402233 - [1.8][compiler][infrastructure] Implement
+    Expression.isMoreSpecific(TypeBinding t, TypeBinding s)
+
+3	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+6	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+14	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+84	20	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+4	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+59	14	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+4	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/IntersectionCastTypeBinding.java
+4	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+4	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/RawTypeBinding.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+index f13f940..2e81bd0 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+@@ -553,6 +553,9 @@ public boolean isPolyExpression() {
+ 			this.type != null && (this.type.bits & ASTNode.IsDiamond) != 0;
+ }
+ 
++public boolean tIsMoreSpecific(TypeBinding t, TypeBinding s) {
++	return isPolyExpression() ? !t.isBaseType() && s.isBaseType() : super.tIsMoreSpecific(t, s);
++}
+ /**
+  * @see org.eclipse.jdt.internal.compiler.lookup.InvocationSite#expectedType()
+  */
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+index 67baa5a..224ae40 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ConditionalExpression.java
+@@ -646,6 +646,12 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext,
+ 		return this.valueIfTrue.isCompatibleWith(left, scope) && this.valueIfFalse.isCompatibleWith(left, scope);
+ 	}
+ 	
++	public boolean tIsMoreSpecific(TypeBinding t, TypeBinding s) {
++		return isPolyExpression() ?
++				this.valueIfTrue.tIsMoreSpecific(t, s) && this.valueIfFalse.tIsMoreSpecific(t, s):
++				super.tIsMoreSpecific(t, s);
++	}
++	
+ 	public void tagAsEllipsisArgument() {
+ 		this.valueIfTrue.tagAsEllipsisArgument();
+ 		this.valueIfFalse.tagAsEllipsisArgument();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+index 0d50344..c875856 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+@@ -1121,6 +1121,20 @@ public boolean isCompatibleWith(TypeBinding left, Scope scope) {
+ 	throw new UnsupportedOperationException("Unexpected control flow, should not have reached Expression.isCompatibleWith"); //$NON-NLS-1$
+ }
+ 
++public boolean tIsMoreSpecific(TypeBinding t, TypeBinding s) {
++	TypeBinding expressionType = this.resolvedType;
++	if (expressionType == null || !expressionType.isValidBinding()) // Shouldn't get here, just to play it safe
++		return false; // trigger ambiguity.
++	
++	if (t.findSuperTypeOriginatingFrom(s) == s)
++		return true;
++	
++	final boolean tIsBaseType = t.isBaseType();
++	final boolean sIsBaseType = s.isBaseType();
++	
++	return expressionType.isBaseType() ? tIsBaseType && !sIsBaseType : !tIsBaseType && sIsBaseType;
++}
++
+ public void tagAsEllipsisArgument() {
+ 	// don't care. Subclasses that are poly expressions in specific contexts should listen in and make note.
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+index 39311ec..f6de18a 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+@@ -40,6 +40,7 @@ import org.eclipse.jdt.internal.compiler.problem.AbortCompilationUnit;
+ import org.eclipse.jdt.internal.compiler.problem.AbortMethod;
+ import org.eclipse.jdt.internal.compiler.problem.AbortType;
+ import org.eclipse.jdt.internal.compiler.problem.ProblemSeverities;
++import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ 
+ public abstract class FunctionalExpression extends Expression implements ProblemSeverities, ReferenceContext {
+ 	
+@@ -48,6 +49,7 @@ public abstract class FunctionalExpression extends Expression implements Problem
+ 	public MethodBinding binding;
+ 	boolean ignoreFurtherInvestigation;
+ 	protected ExpressionContext expressionContext = VANILLA_CONTEXT;
++	protected SimpleLookupTable resultExpressions;
+ 	protected CompilationResult compilationResult;
+ 	protected BlockScope enclosingScope;
+ 	protected boolean ellipsisArgument;
+@@ -242,8 +244,6 @@ public abstract class FunctionalExpression extends Expression implements Problem
+ 			}
+ 		}
+ 	}
+-
+-	
+ }
+ 
+ class IncongruentLambdaException extends RuntimeException {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 96af0e2..e2d03d9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -43,15 +43,17 @@ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeIds;
+ import org.eclipse.jdt.internal.compiler.parser.Parser;
++import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ 
+ public class LambdaExpression extends FunctionalExpression {
+ 	public Argument [] arguments;
+ 	public Statement body;
+ 	public boolean hasParentheses;
+-	MethodScope scope;
++	protected MethodScope scope;
+ 	protected boolean voidCompatible = true;
+ 	protected boolean valueCompatible = false;
+ 	protected boolean shapeAnalysisComplete = false;
++	protected int returnExpressionsTally = 0;
+ 	
+ 	public LambdaExpression(CompilationResult compilationResult, Argument [] arguments, Statement body) {
+ 		super(compilationResult);
+@@ -97,6 +99,7 @@ public class LambdaExpression extends FunctionalExpression {
+ 					private boolean throwSeen = false;
+ 					public boolean visit(ReturnStatement returnStatement, BlockScope dontCare) {
+ 						if (returnStatement.expression != null) {
++							LambdaExpression.this.returnExpressionsTally++;
+ 							this.valueReturnSeen = true;
+ 							LambdaExpression.this.voidCompatible = false;
+ 							LambdaExpression.this.valueCompatible = !this.voidReturnSeen;
+@@ -105,7 +108,7 @@ public class LambdaExpression extends FunctionalExpression {
+ 							LambdaExpression.this.valueCompatible = false;
+ 							LambdaExpression.this.voidCompatible = !this.valueReturnSeen;
+ 						}
+-						return false;
++						return false; // should not analyze any lambda returns.
+ 					}
+ 					public boolean visit(ThrowStatement throwStatement, BlockScope dontCare) {
+ 						this.throwSeen  = true;
+@@ -129,6 +132,7 @@ public class LambdaExpression extends FunctionalExpression {
+ 				Expression expression = (Expression) this.body;
+ 				this.voidCompatible = expression.statementExpression();
+ 				this.valueCompatible = true;
++				this.returnExpressionsTally = 1;
+ 				this.shapeAnalysisComplete = true;
+ 			}	
+ 			return new PolyTypeBinding(this);
+@@ -426,7 +430,7 @@ public class LambdaExpression extends FunctionalExpression {
+ 		return this.shapeAnalysisComplete;
+ 	}
+ 	
+-	public boolean isCompatibleWith(TypeBinding left, Scope someScope) {
++	public boolean isCompatibleWith(final TypeBinding left, final Scope someScope) {
+ 		
+ 		final MethodBinding sam = left.getSingleAbstractMethod(this.enclosingScope);
+ 		
+@@ -452,7 +456,7 @@ public class LambdaExpression extends FunctionalExpression {
+ 					return false;
+ 			}
+ 		
+-			LambdaExpression copy = copy();
++			final LambdaExpression copy = copy();
+ 			copy.setExpressionContext(this.expressionContext);
+ 			copy.setExpectedType(left);
+ 			copy.resolveType(this.enclosingScope);
+@@ -465,23 +469,34 @@ public class LambdaExpression extends FunctionalExpression {
+ 				}
+ 			}
+ 
+-			final TypeBinding returnType = sam.returnType;
+-			if (this.body instanceof Block) {
+-				ASTVisitor visitor = new ASTVisitor() {
+-					public boolean visit(ReturnStatement returnStatement, BlockScope blockScope) {
+-						Expression expression = returnStatement.expression;
+-						if (expression != null && !expression.isAssignmentCompatible(returnType, blockScope))
+-							throw new IncongruentLambdaException();
+-						return false;
+-					}
+-				};
+-				copy.body.traverse(visitor, copy.scope);
+-			} else {
+-				Expression expression = (Expression) copy.body;
+-				if (!expression.isAssignmentCompatible(returnType, copy.scope))
+-					throw new IncongruentLambdaException();
++			if (this.returnExpressionsTally > 0) {
++				final TypeBinding returnType = sam.returnType;
++				if (this.resultExpressions == null)
++					this.resultExpressions = new SimpleLookupTable(); // gather for more specific analysis later.
++				if (this.body instanceof Block) {
++					ASTVisitor visitor = new ASTVisitor() {
++						Expression [] returnExpressions = new Expression[LambdaExpression.this.returnExpressionsTally];
++						int returnExpressionsCount = 0;
++						public boolean visit(ReturnStatement returnStatement, BlockScope blockScope) {
++							Expression expression = returnStatement.expression;
++							if (expression != null && !expression.isAssignmentCompatible(returnType, blockScope))
++								throw new IncongruentLambdaException();
++							this.returnExpressions[this.returnExpressionsCount++] = expression;
++							return false; // should not analyze any lambda returns.m
++						}
++						public void endVisit(Block block, BlockScope blockScope) {
++							if (block == copy.body)
++								LambdaExpression.this.resultExpressions.put(left, this.returnExpressions);
++						}
++					};
++					copy.body.traverse(visitor, copy.scope);
++				} else if (this.body instanceof Expression){
++					Expression expression = (Expression) copy.body;
++					if (!expression.isAssignmentCompatible(returnType, copy.scope))
++						throw new IncongruentLambdaException();
++					this.resultExpressions.put(left, new Expression [] { expression });
++				}
+ 			}
+-			 
+ 		} catch (IncongruentLambdaException e) {
+ 			return false;
+ 		} finally {
+@@ -489,6 +504,55 @@ public class LambdaExpression extends FunctionalExpression {
+ 		}
+ 		return true;
+ 	}
++	
++	public boolean tIsMoreSpecific(TypeBinding t, TypeBinding s) {
++		/* 15.12.2.5 t is more specific than s iff ... Some of the checks here are redundant by the very fact of control reaching here, 
++		   but have been left in for completeness/documentation sakes. These should be cheap anyways. 
++		*/
++		
++		// Both t and s are functional interface types ... 
++		MethodBinding tSam = t.getSingleAbstractMethod(this.enclosingScope);
++		if (tSam == null || !tSam.isValidBinding())
++			return false;
++		MethodBinding sSam = s.getSingleAbstractMethod(this.enclosingScope);
++		if (sSam == null || !sSam.isValidBinding())
++			return false;
++		
++		// t should neither be a subinterface nor a superinterface of s
++		if (t.findSuperTypeOriginatingFrom(s) != null || s.findSuperTypeOriginatingFrom(t) != null)
++			return false;
++
++		// If the lambda expression's parameters have inferred types, then the descriptor parameter types of t are the same as the descriptor parameter types of s.
++		if (argumentsTypeElided()) {
++			if (tSam.parameters.length != sSam.parameters.length)
++				return false;
++			for (int i = 0, length = tSam.parameters.length; i < length; i++) {
++				if (tSam.parameters[i] != sSam.parameters[i])
++					return false;
++			}
++		}
++		
++		// either the descriptor return type of s is void or ...
++		if (sSam.returnType.id == TypeIds.T_void)
++			return true;
++		
++		/* ... or for all result expressions in the lambda body (or for the body itself if the body is an expression), 
++           the descriptor return type of the capture of T is more specific than the descriptor return type of S.
++		*/
++		Expression [] returnExpressions = (Expression[]) this.resultExpressions.get(t); // should be same as for s
++		int returnExpressionsLength = returnExpressions == null ? 0 : returnExpressions.length;
++		if (returnExpressionsLength == 0)
++			return true; // as good as or as bad as false.
++		
++		t = t.capture(this.enclosingScope, this.sourceEnd);
++		tSam = t.getSingleAbstractMethod(this.enclosingScope);
++		for (int i = 0; i < returnExpressionsLength; i++) {
++			Expression resultExpression = returnExpressions[i];
++			if (!resultExpression.tIsMoreSpecific(tSam.returnType, sSam.returnType))
++				return false;
++		}
++		return true;
++	}
+ 
+ 	private boolean squarePegInRoundHole(final MethodBinding sam) {
+ 		if (sam.returnType.id == TypeIds.T_void) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index 2b57966..f3b4d63 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -745,6 +745,10 @@ public boolean isPolyExpression() {
+ 	return false;
+ }
+ 
++public boolean tIsMoreSpecific(TypeBinding t, TypeBinding s) {
++	return isPolyExpression() ? !t.isBaseType() && s.isBaseType() : super.tIsMoreSpecific(t, s);
++}
++
+ public void setFieldIndex(int depth) {
+ 	// ignore for here
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+index 129107c..9bee359 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+@@ -41,6 +41,7 @@ import org.eclipse.jdt.internal.compiler.lookup.TagBits;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeIds;
+ import org.eclipse.jdt.internal.compiler.problem.ProblemSeverities;
++import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ 
+ public class ReferenceExpression extends FunctionalExpression implements InvocationSite {
+ 	
+@@ -96,11 +97,11 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+     				}
+     			}
+     			if (this.typeArgumentsHaveErrors)
+-    				return this.resolvedType;
++    				return this.resolvedType = null;
+     		}
+     	} else {
+     		if (this.typeArgumentsHaveErrors)
+-				return this.resolvedType;
++				return this.resolvedType = null;
+     		lhsType = this.lhs.resolvedType;
+     	}
+ 
+@@ -110,18 +111,18 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+ 		super.resolveType(scope);
+ 		
+     	if (lhsType == null || !lhsType.isValidBinding()) 
+-			return null;
++			return this.resolvedType = null;
+ 		
+ 		final TypeBinding[] descriptorParameters = this.descriptor != null ? this.descriptor.parameters : Binding.NO_PARAMETERS;
+ 		final char[] selector = this.method.token;
+ 		if (lhsType.isBaseType()) {
+ 			scope.problemReporter().errorNoMethodFor(this.lhs, lhsType, selector, descriptorParameters);
+-			return null;
++			return this.resolvedType = null;
+ 		}
+ 		
+ 		if (isConstructorReference() && !lhsType.canBeInstantiated()) {
+ 			scope.problemReporter().cannotInstantiate(this.lhs, lhsType);
+-			return null;
++			return this.resolvedType = null;
+ 		}
+ 		
+ 		/* 15.28: "It is a compile-time error if a method reference of the form super :: NonWildTypeArgumentsopt Identifier or of the form 
+@@ -140,15 +141,15 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         	final TypeBinding leafComponentType = lhsType.leafComponentType();
+ 			if (leafComponentType.isParameterizedType()) {
+         		scope.problemReporter().illegalGenericArray(leafComponentType, this);
+-        		return null;
++        		return this.resolvedType = null;
+         	}
+         	if (parametersLength != 1 || scope.parameterCompatibilityLevel(descriptorParameters[0], TypeBinding.INT) == Scope.NOT_COMPATIBLE) {
+         		scope.problemReporter().invalidArrayConstructorReference(this, lhsType, descriptorParameters);
+-        		return null;
++        		return this.resolvedType = null;
+         	}
+         	if (!lhsType.isCompatibleWith(this.descriptor.returnType)) {
+         		scope.problemReporter().constructedArrayIncompatible(this, lhsType, this.descriptor.returnType);
+-        		return null;
++        		return this.resolvedType = null;
+         	}
+         	return this.resolvedType; // No binding construction possible. Code generator will have to conjure up a rabbit.
+         }
+@@ -168,7 +169,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+ 		   LHS's resolved type == actual receiver type. All code below only when a valid descriptor is available.
+ 		 */
+         if (this.descriptor == null || !this.descriptor.isValidBinding())
+-        	return null;
++        	return this.resolvedType =  null;
+         
+         // 15.28.1
+         final boolean isMethodReference = isMethodReference();
+@@ -179,12 +180,12 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         	final boolean isStatic = someMethod.isStatic();
+         	if (isStatic && (this.haveReceiver || this.receiverType.isParameterizedType())) {
+     			scope.problemReporter().methodMustBeAccessedStatically(this, someMethod);
+-    			return null;
++    			return this.resolvedType = null;
+     		}
+         	if (!this.haveReceiver) {
+         		if (!isStatic && !someMethod.isConstructor()) {
+         			scope.problemReporter().methodMustBeAccessedWithInstance(this, someMethod);
+-        			return null;
++        			return this.resolvedType = null;
+         		}
+         	} 
+         } else {
+@@ -214,13 +215,13 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         	}
+         	if (anotherMethod != null && anotherMethod.isValidBinding() && anotherMethod.isStatic()) {
+         		scope.problemReporter().methodMustBeAccessedStatically(this, anotherMethod);
+-        		return null;
++        		return this.resolvedType = null;
+         	}
+         }
+         
+         if (someMethod != null && someMethod.isValidBinding() && anotherMethod != null && anotherMethod.isValidBinding()) {
+         	scope.problemReporter().methodReferenceSwingsBothWays(this, anotherMethod, someMethod);
+-        	return null;
++        	return this.resolvedType = null;
+         }
+ 
+         this.method.binding = this.binding = someMethod != null && someMethod.isValidBinding() ? someMethod : 
+@@ -229,7 +230,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         if (this.binding == null) {
+         	char [] visibleName = isConstructorReference() ? this.receiverType.sourceName() : selector;
+         	scope.problemReporter().danglingReference(this, this.receiverType, visibleName, descriptorParameters);
+-			return null;
++			return this.resolvedType = null;
+         }
+         
+         // See https://bugs.eclipse.org/bugs/show_bug.cgi?id=382350#c2, I.super::abstractMethod will be handled there.
+@@ -314,6 +315,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+     		if (!returnType.isCompatibleWith(this.descriptor.returnType, scope) && !isBoxingCompatible(returnType, this.descriptor.returnType, this, scope)) {
+     			scope.problemReporter().incompatibleReturnType(this, this.binding, this.descriptor.returnType);
+     			this.method.binding = this.binding = null;
++    			this.resolvedType = null;
+     		}
+     	}
+ 
+@@ -405,8 +407,51 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+ 		} finally {
+ 			this.enclosingScope.problemReporter().switchErrorHandlingPolicy(oldPolicy);
+ 			isCompatible = this.binding != null && this.binding.isValidBinding();
++			if (isCompatible) {
++				if (this.resultExpressions == null)
++					this.resultExpressions = new SimpleLookupTable(); // gather for more specific analysis later.
++				this.resultExpressions.put(left, this.binding.returnType);
++			}
+ 			this.method.binding = this.binding = null;
+ 		}
+ 		return isCompatible;
+ 	}
++	public boolean tIsMoreSpecific(TypeBinding t, TypeBinding s) {
++		/* 15.12.2.5 t is more specific than s iff ... Some of the checks here are redundant by the very fact of control reaching here, 
++		   but have been left in for completeness/documentation sakes. These should be cheap anyways. 
++		*/
++		
++		// Both t and s are functional interface types ... 
++		MethodBinding tSam = t.getSingleAbstractMethod(this.enclosingScope);
++		if (tSam == null || !tSam.isValidBinding())
++			return false;
++		MethodBinding sSam = s.getSingleAbstractMethod(this.enclosingScope);
++		if (sSam == null || !sSam.isValidBinding())
++			return false;
++		
++		// t should neither be a subinterface nor a superinterface of s
++		if (t.findSuperTypeOriginatingFrom(s) != null || s.findSuperTypeOriginatingFrom(t) != null)
++			return false;
++
++		// The descriptor parameter types of t are the same as the descriptor parameter types of s.
++		if (tSam.parameters.length != sSam.parameters.length)
++			return false;
++		for (int i = 0, length = tSam.parameters.length; i < length; i++) {
++			if (tSam.parameters[i] != sSam.parameters[i])
++				return false;
++		}
++		
++		// Either the descriptor return type of s is void or ...
++		if (sSam.returnType.id == TypeIds.T_void)
++			return true;
++		
++		/* ... or the descriptor return type of the capture of T is more specific than the descriptor return type of S for 
++		   an invocation expression of the same form as the method reference..
++		*/
++		Expression resultExpression = (Expression) this.resultExpressions.get(t); // should be same as for s
++		
++		t = t.capture(this.enclosingScope, this.sourceEnd);
++		tSam = t.getSingleAbstractMethod(this.enclosingScope);
++		return resultExpression.tIsMoreSpecific(tSam.returnType, sSam.returnType);
++	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/IntersectionCastTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/IntersectionCastTypeBinding.java
+index 623ae83..a2eb60d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/IntersectionCastTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/IntersectionCastTypeBinding.java
+@@ -33,19 +33,21 @@ public class IntersectionCastTypeBinding extends ReferenceBinding {
+ 	}
+ 	
+ 	public MethodBinding getSingleAbstractMethod(Scope scope) {
++		if (this.singleAbstractMethod != null)
++			return this.singleAbstractMethod;
+ 		MethodBinding sam = samProblemBinding;  // guilty unless proven innocent !
+ 		for (int i = 0; i < this.length; i++) {
+ 			MethodBinding method = this.intersectingTypes[i].getSingleAbstractMethod(scope);
+ 			if (method != null) {
+ 				if (method.isValidBinding()) {
+ 					if (sam.isValidBinding())
+-						return new ProblemMethodBinding(TypeConstants.ANONYMOUS_METHOD, null, ProblemReasons.IntersectionHasMultipleFunctionalInterfaces);
++						return this.singleAbstractMethod = new ProblemMethodBinding(TypeConstants.ANONYMOUS_METHOD, null, ProblemReasons.IntersectionHasMultipleFunctionalInterfaces);
+ 					else
+ 						sam = method;
+ 				}
+ 			}
+ 		}
+-		return sam; // I don't see a value in building the notional interface described in 9.8 - it appears just pedantic/normative - perhaps it plays a role in wildcard parameterized types ?
++		return this.singleAbstractMethod = sam; // I don't see a value in building the notional interface described in 9.8 - it appears just pedantic/normative - perhaps it plays a role in wildcard parameterized types ?
+ 	}
+ 
+ 	public boolean hasTypeBit(int bit) { // Stephan ??
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+index b4140f0..9b234d5 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+@@ -1149,10 +1149,13 @@ public class ParameterizedTypeBinding extends ReferenceBinding implements Substi
+ 		return this.fields;
+ 	}
+ 	public MethodBinding getSingleAbstractMethod(final Scope scope) {
++		if (this.singleAbstractMethod != null) {
++			return this.singleAbstractMethod;
++		}
+ 		final ReferenceBinding genericType = genericType();
+ 		MethodBinding theAbstractMethod = genericType.getSingleAbstractMethod(scope);
+ 		if (theAbstractMethod == null || !theAbstractMethod.isValidBinding())
+-			return theAbstractMethod;
++			return this.singleAbstractMethod = theAbstractMethod;
+ 		
+ 		TypeBinding [] typeArguments = this.arguments; // A1 ... An 
+ 		TypeVariableBinding [] typeParameters = genericType.typeVariables(); // P1 ... Pn
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/RawTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/RawTypeBinding.java
+index d2fe051..f2b086b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/RawTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/RawTypeBinding.java
+@@ -175,10 +175,13 @@ public class RawTypeBinding extends ParameterizedTypeBinding {
+ 	}
+ 	
+ 	public MethodBinding getSingleAbstractMethod(Scope scope) {
++		if (this.singleAbstractMethod != null) {
++			return this.singleAbstractMethod;
++		}
+ 		final ReferenceBinding genericType = genericType();
+ 		MethodBinding theAbstractMethod = genericType.getSingleAbstractMethod(scope);
+ 		if (theAbstractMethod == null || !theAbstractMethod.isValidBinding())
+-			return theAbstractMethod;
++			return this.singleAbstractMethod = theAbstractMethod;
+ 		
+ 		ReferenceBinding rawType = (ReferenceBinding) scope.environment().convertToRawType(genericType, true);
+ 		MethodBinding [] choices = rawType.getMethods(theAbstractMethod.selector);

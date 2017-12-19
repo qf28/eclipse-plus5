@@ -1,0 +1,477 @@
+commit 450038a1b6ffb1bbec25cb693dbc54c7ff6507e2
+Author: Simon Kaegi <skaegi>
+Date:   Thu Feb 21 20:03:32 2008 +0000
+
+    Bug 212334 [prov] Support checking of profile lastmodified before Engine.perform
+    Bug 212335 [prov] parent profiles, engine locking, and removal
+
+14	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Profile.java
+14	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileParser.java
+1	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileWriter.java
+2	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileXMLConstants.java
+132	15	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+4	26	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+2	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Profile.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Profile.java
+index 25ca9b9..7086a93 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Profile.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Profile.java
+@@ -39,6 +39,8 @@ public class Profile implements IQueryable, IProfile {
+ 	private Map iuProperties = new HashMap();
+ 	private boolean changed = false;
+ 
++	private long timestamp;
++
+ 	public Profile(String profileId, Profile parent, Map properties) {
+ 		if (profileId == null || profileId.length() == 0) {
+ 			throw new IllegalArgumentException(NLS.bind(Messages.Profile_Null_Profile_Id, null));
+@@ -260,6 +262,10 @@ public class Profile implements IQueryable, IProfile {
+ 		return changed;
+ 	}
+ 
++	public void setChanged(boolean isChanged) {
++		changed = isChanged;
++	}
++
+ 	public void clearInstallableUnits() {
+ 		ius.clear();
+ 		iuProperties.clear();
+@@ -272,6 +278,7 @@ public class Profile implements IQueryable, IProfile {
+ 			parentSnapshot = parentProfile.snapshot();
+ 
+ 		Profile snapshot = new Profile(profileId, parentSnapshot, storage);
++		snapshot.setTimestamp(timestamp);
+ 
+ 		if (subProfileIds != null) {
+ 			for (Iterator it = subProfileIds.iterator(); it.hasNext();) {
+@@ -304,4 +311,11 @@ public class Profile implements IQueryable, IProfile {
+ 		changed = true;
+ 	}
+ 
++	public long getTimestamp() {
++		return timestamp;
++	}
++
++	public void setTimestamp(long millis) {
++		timestamp = millis;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileParser.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileParser.java
+index 3d4ffeb..d4507fd 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileParser.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileParser.java
+@@ -33,6 +33,7 @@ public abstract class ProfileParser extends MetadataParser implements ProfileXML
+ 
+ 		private String profileId;
+ 		private String parentId;
++		private String timestamp;
+ 		private PropertiesHandler propertiesHandler;
+ 		private InstallableUnitsHandler unitsHandler;
+ 		private IUsPropertiesHandler iusPropertiesHandler;
+@@ -44,6 +45,8 @@ public abstract class ProfileParser extends MetadataParser implements ProfileXML
+ 		protected void handleRootAttributes(Attributes attributes) {
+ 			profileId = parseRequiredAttributes(attributes, required)[0];
+ 			parentId = parseOptionalAttribute(attributes, PARENT_ID_ATTRIBUTE);
++			timestamp = parseOptionalAttribute(attributes, TIMESTAMP_ATTRIBUTE);
++
+ 		}
+ 
+ 		public void startElement(String name, Attributes attributes) {
+@@ -78,6 +81,17 @@ public abstract class ProfileParser extends MetadataParser implements ProfileXML
+ 			return parentId;
+ 		}
+ 
++		public long getTimestamp() {
++			if (timestamp != null) {
++				try {
++					return Long.parseLong(timestamp);
++				} catch (NumberFormatException e) {
++					// TODO: log
++				}
++			}
++			return 0;
++		}
++
+ 		public Map getProperties() {
+ 			if (propertiesHandler == null)
+ 				return null;
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileWriter.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileWriter.java
+index c96f7bf..510738a 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileWriter.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileWriter.java
+@@ -29,6 +29,7 @@ public class ProfileWriter extends MetadataWriter implements ProfileXMLConstants
+ 	public void writeProfile(IProfile profile) {
+ 		start(PROFILE_ELEMENT);
+ 		attribute(ID_ATTRIBUTE, profile.getProfileId());
++		attribute(TIMESTAMP_ATTRIBUTE, Long.toString(profile.getTimestamp()));
+ 		IProfile parentProfile = profile.getParentProfile();
+ 		if (parentProfile != null)
+ 			attribute(PARENT_ID_ATTRIBUTE, parentProfile.getProfileId());
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileXMLConstants.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileXMLConstants.java
+index ca45bbe..6f61026 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileXMLConstants.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfileXMLConstants.java
+@@ -27,7 +27,8 @@ public interface ProfileXMLConstants extends XMLConstants {
+ 	// Constants for profile elements
+ 
+ 	public static final String PROFILE_ELEMENT = "profile"; //$NON-NLS-1$
++	public static final String TIMESTAMP_ATTRIBUTE = "timestamp"; //$NON-NLS-1$
+ 	public static final String IUS_PROPERTIES_ELEMENT = "iusProperties"; //$NON-NLS-1$
+ 	public static final String IU_PROPERTIES_ELEMENT = "iuProperties"; //$NON-NLS-1$
+-	public static final String PROFILE_TARGET = "profile";
++	public static final String PROFILE_TARGET = "profile"; //$NON-NLS-1$
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index 67b781f..383a08e 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -32,6 +32,54 @@ import org.xml.sax.InputSource;
+ import org.xml.sax.SAXException;
+ 
+ public class SimpleProfileRegistry implements IProfileRegistry {
++
++	static class Lock {
++
++		private Thread lockHolder;
++		private int lockedCount;
++
++		protected void lock(Object monitor) {
++			Thread current = Thread.currentThread();
++			if (lockHolder != current) {
++				boolean interrupted = false;
++				try {
++					while (lockedCount != 0)
++						try {
++							monitor.wait();
++						} catch (InterruptedException e) {
++							// although we don't handle an interrupt we should still 
++							// save and restore the interrupt for others further up the stack
++							interrupted = true;
++						}
++				} finally {
++					if (interrupted)
++						current.interrupt(); // restore interrupted status
++				}
++			}
++			lockedCount++;
++			lockHolder = current;
++		}
++
++		protected void unlock(Object monitor) {
++			Thread current = Thread.currentThread();
++			if (lockHolder != current)
++				throw new IllegalStateException("Thread not lock owner"); //$NON-NLS-1$
++
++			lockedCount--;
++			if (lockedCount == 0) {
++				lockHolder = null;
++				monitor.notifyAll();
++			}
++		}
++
++		protected synchronized void checkLocked() {
++			Thread current = Thread.currentThread();
++			if (lockHolder != current)
++				throw new IllegalStateException("Thread not lock owner"); //$NON-NLS-1$
++		}
++
++	}
++
+ 	private static final String STORAGE_DIR = "profileRegistry"; //$NON-NLS-1$
+ 
+ 	private static final String PROFILE_EXT = ".profile"; //$NON-NLS-1$
+@@ -40,6 +88,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	 * Reference to Map of String(Profile id)->Profile. 
+ 	 */
+ 	private SoftReference profiles;
++	private Map profileLocks = new HashMap();
+ 
+ 	private String self;
+ 
+@@ -85,14 +134,19 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	}
+ 
+ 	public synchronized IProfile getProfile(String id) {
+-		if (SELF.equals(id))
+-			id = self;
+-		Profile profile = (Profile) getProfileMap().get(id);
++		Profile profile = internalGetProfile(id);
+ 		if (profile == null)
+ 			return null;
+ 		return profile.snapshot();
+ 	}
+ 
++	private Profile internalGetProfile(String id) {
++		if (SELF.equals(id))
++			id = self;
++		Profile profile = (Profile) getProfileMap().get(id);
++		return profile;
++	}
++
+ 	public synchronized IProfile[] getProfiles() {
+ 		Map profileMap = getProfileMap();
+ 		Profile[] result = new Profile[profileMap.size()];
+@@ -127,12 +181,13 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 
+ 	public synchronized void updateProfile(Profile profile) {
+ 		String id = profile.getProfileId();
+-		if (SELF.equals(id))
+-			id = self;
+-		Profile current = (Profile) getProfileMap().get(id);
++		Profile current = internalGetProfile(id);
+ 		if (current == null)
+ 			throw new IllegalArgumentException("Profile to be updated does not exist:" + id); //$NON-NLS-1$
+ 
++		Lock lock = (Lock) profileLocks.get(id);
++		lock.checkLocked();
++
+ 		current.clearLocalProperties();
+ 		current.clearInstallableUnits();
+ 
+@@ -145,7 +200,8 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 			if (iuProperties != null)
+ 				current.addInstallableUnitProperties(iu, iuProperties);
+ 		}
+-		saveProfile(profile);
++		saveProfile(current);
++		profile.setTimestamp(current.getTimestamp());
+ 		broadcastChangeEvent(id, ProfileEvent.CHANGED);
+ 	}
+ 
+@@ -193,9 +249,14 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		for (int i = 0; i < subProfileIds.length; i++) {
+ 			removeProfile(subProfileIds[i]);
+ 		}
+-
+-		profile.setParent(null);
++		internalLockProfile(profile);
++		try {
++			profile.setParent(null);
++		} finally {
++			internalUnlockProfile(profile);
++		}
+ 		profileMap.remove(profileId);
++		profileLocks.remove(profileId);
+ 		deleteProfile(profileId);
+ 		broadcastChangeEvent(profileId, ProfileEvent.REMOVED);
+ 	}
+@@ -227,7 +288,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 
+ 		File store = getRegistryDirectory();
+ 		if (store == null || !store.isDirectory())
+-			throw new IllegalStateException("Registry Directory not available");
++			throw new IllegalStateException("Registry Directory not available"); //$NON-NLS-1$
+ 
+ 		Parser parser = new Parser(EngineActivator.getContext(), EngineActivator.ID);
+ 		File[] profileDirectories = store.listFiles();
+@@ -267,14 +328,20 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 
+ 		File profileDirectory = new File(registryDirectory, escape(profile.getProfileId()) + PROFILE_EXT);
+ 		profileDirectory.mkdir();
+-		long timestamp = new Date().getTime();
+-		File profileFile = new File(profileDirectory, Long.toString(timestamp) + PROFILE_EXT);
++
++		long previousTimestamp = profile.getTimestamp();
++		long currentTimestamp = System.currentTimeMillis();
++		File profileFile = new File(profileDirectory, Long.toString(currentTimestamp) + PROFILE_EXT);
++
++		profile.setTimestamp(currentTimestamp);
+ 		OutputStream os = null;
+ 		try {
+ 			os = new BufferedOutputStream(new FileOutputStream(profileFile));
+ 			Writer writer = new Writer(os);
+ 			writer.writeProfile(profile);
+ 		} catch (IOException e) {
++			profile.setTimestamp(previousTimestamp);
++			profileFile.delete();
+ 			LogHelper.log(new Status(IStatus.ERROR, EngineActivator.ID, "Error persisting profile", e)); //$NON-NLS-1$
+ 		} finally {
+ 			try {
+@@ -316,7 +383,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		return buffer.toString();
+ 	}
+ 
+-	private class Writer extends ProfileWriter {
++	static class Writer extends ProfileWriter {
+ 
+ 		public Writer(OutputStream output) throws IOException {
+ 			super(output, new ProcessingInstruction[] {ProcessingInstruction.makeClassVersionInstruction(PROFILE_TARGET, Profile.class, ProfileXMLConstants.CURRENT_VERSION)});
+@@ -327,7 +394,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	 * 	Parser for the contents of a SimpleProfileRegistry,
+ 	 * 	as written by the Writer class.
+ 	 */
+-	private class Parser extends ProfileParser {
++	static class Parser extends ProfileParser {
+ 		private final Map profileHandlers = new HashMap();
+ 
+ 		public Parser(BundleContext context, String bundleId) {
+@@ -358,7 +425,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		}
+ 
+ 		protected Object getRootObject() {
+-			return SimpleProfileRegistry.this;
++			return this;
+ 		}
+ 
+ 		public Map getProfileMap() {
+@@ -384,6 +451,8 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 			}
+ 
+ 			Profile profile = new Profile(profileId, parentProfile, profileHandler.getProperties());
++			profile.setTimestamp(profileHandler.getTimestamp());
++
+ 			IInstallableUnit[] ius = profileHandler.getInstallableUnits();
+ 			if (ius != null) {
+ 				for (int i = 0; i < ius.length; i++) {
+@@ -429,4 +498,52 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		}
+ 
+ 	}
++
++	public synchronized void lockProfile(IProfile profile) {
++		Profile internalProfile = internalGetProfile(profile.getProfileId());
++		if (internalProfile == null)
++			throw new IllegalArgumentException("Profile not registered."); //$NON-NLS-1$
++
++		if (!checkTimestamps(profile, internalProfile))
++			throw new IllegalArgumentException("Profile not current."); //$NON-NLS-1$
++
++		internalLockProfile(internalProfile);
++	}
++
++	private void internalLockProfile(IProfile profile) {
++		Lock lock = (Lock) profileLocks.get(profile.getProfileId());
++		if (lock == null) {
++			lock = new Lock();
++			profileLocks.put(profile.getProfileId(), lock);
++		}
++		lock.lock(this);
++		if (profile.getParentProfile() != null)
++			internalLockProfile(profile.getParentProfile());
++	}
++
++	private boolean checkTimestamps(IProfile profile, IProfile internalProfile) {
++		if (profile.getTimestamp() == internalProfile.getTimestamp()) {
++			if (profile.getParentProfile() == null)
++				return true;
++
++			return checkTimestamps(profile.getParentProfile(), internalProfile.getParentProfile());
++		}
++		return false;
++	}
++
++	public synchronized void unlockProfile(IProfile profile) {
++		Profile internalProfile = internalGetProfile(profile.getProfileId());
++		if (internalProfile == null)
++			throw new IllegalArgumentException("Profile not registered."); //$NON-NLS-1$
++		internalUnlockProfile(internalProfile);
++	}
++
++	private void internalUnlockProfile(IProfile profile) {
++		if (profile.getParentProfile() != null)
++			internalUnlockProfile(profile.getParentProfile());
++
++		Lock lock = (Lock) profileLocks.get(profile.getProfileId());
++		lock.unlock(this);
++	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+index adde93d..abf8fe4 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+@@ -10,8 +10,6 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.provisional.p2.engine;
+ 
+-import java.util.ArrayList;
+-import java.util.List;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.engine.*;
+@@ -20,7 +18,6 @@ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEv
+ public class Engine implements IEngine {
+ 
+ 	private final IProvisioningEventBus eventBus;
+-	private List lockedProfiles = new ArrayList();
+ 
+ 	public Engine(IProvisioningEventBus eventBus) {
+ 		this.eventBus = eventBus;
+@@ -45,11 +42,9 @@ public class Engine implements IEngine {
+ 			monitor = new NullProgressMonitor();
+ 
+ 		Profile profile = (Profile) iprofile;
+-		lockProfile(profile);
+-		// TODO we should check that the profile that the profile is up to date
+ 		SimpleProfileRegistry profileRegistry = (SimpleProfileRegistry) ServiceHelper.getService(EngineActivator.getContext(), IProfileRegistry.class.getName());
+-		if (profileRegistry.getProfile(profile.getProfileId()) == null)
+-			throw new IllegalArgumentException("Profile is not registered."); //$NON-NLS-1$
++
++		profileRegistry.lockProfile(profile);
+ 		try {
+ 			eventBus.publishEvent(new BeginOperationEvent(profile, phaseSet, operands, this));
+ 
+@@ -65,30 +60,13 @@ public class Engine implements IEngine {
+ 			} else if (result.matches(IStatus.ERROR | IStatus.CANCEL)) {
+ 				eventBus.publishEvent(new RollbackOperationEvent(profile, phaseSet, operands, this, result));
+ 				session.rollback();
++				profile.setChanged(false);
+ 			}
+ 			//if there is only one child status, return that status instead because it will have more context
+ 			IStatus[] children = result.getChildren();
+ 			return children.length == 1 ? children[0] : result;
+ 		} finally {
+-			unlockProfile(profile);
+-		}
+-	}
+-
+-	private synchronized void unlockProfile(IProfile profile) {
+-		lockedProfiles.remove(profile.getProfileId());
+-		notify();
+-	}
+-
+-	private synchronized void lockProfile(IProfile profile) {
+-		String profileId = profile.getProfileId();
+-		while (lockedProfiles.contains(profileId)) {
+-			try {
+-				wait();
+-			} catch (InterruptedException e) {
+-				// TODO We should think about how we want to handle blocked engine requests
+-				Thread.currentThread().interrupt();
+-			}
++			profileRegistry.unlockProfile(profile);
+ 		}
+-		lockedProfiles.add(profileId);
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
+index e643a27..b1a95f0 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
+@@ -109,4 +109,6 @@ public interface IProfile extends IQueryable {
+ 
+ 	public Map getInstallableUnitProperties(IInstallableUnit iu);
+ 
++	public long getTimestamp();
++
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileTest.java
+index accab2f..a09a825 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileTest.java
+@@ -369,6 +369,7 @@ public class ProfileTest extends AbstractProvisioningTest {
+ 				}
+ 
+ 				Profile profile = new Profile(profileId, parentProfile, profileHandler.getProperties());
++				profile.setTimestamp(profileHandler.getTimestamp());
+ 				IInstallableUnit[] ius = profileHandler.getInstallableUnits();
+ 				if (ius != null) {
+ 					for (int i = 0; i < ius.length; i++) {
+@@ -457,5 +458,4 @@ public class ProfileTest extends AbstractProvisioningTest {
+ 		output1.close();
+ 		assertTrue("Profile write after read after write produced different XML", profileText1.equals(profileText0));
+ 	}
+-
+ }

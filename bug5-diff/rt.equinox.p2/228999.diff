@@ -1,0 +1,520 @@
+commit 6cd9c82c6897055a9e23221eecceb2793067690b
+Author: Simon Kaegi <skaegi>
+Date:   Mon Apr 28 21:47:59 2008 +0000
+
+    Bug 228999 Shared install with a read-only base
+
+1	1	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+4	0	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/rollback/FormerState.java
+14	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Profile.java
+53	23	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+127	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
+19	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
+16	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/ISurrogateProfileHandler.java
+2	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/LazyManipulator.java
+16	2	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index 608814d..3990114 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -231,7 +231,7 @@ public class SimplePlanner implements IPlanner {
+ 
+ 			List extraIUs = new ArrayList(Arrays.asList(profileChangeRequest.getAddedInstallableUnits()));
+ 			extraIUs.addAll(Arrays.asList(profileChangeRequest.getRemovedInstallableUnits()));
+-			extraIUs.addAll(profileChangeRequest.getProfile().query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
++			extraIUs.addAll(profile.available(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+ 
+ 			IInstallableUnit[] availableIUs = gatherAvailableInstallableUnits((IInstallableUnit[]) extraIUs.toArray(new IInstallableUnit[extraIUs.size()]), metadataRepositories, context, sub.newChild(ExpandWork / 4));
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/rollback/FormerState.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/rollback/FormerState.java
+index b3abb08..b9dfa80 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/rollback/FormerState.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/rollback/FormerState.java
+@@ -357,5 +357,9 @@ public class FormerState {
+ 		public Collector query(Query query, Collector collector, IProgressMonitor monitor) {
+ 			return query.perform(ius.iterator(), collector);
+ 		}
++
++		public Collector available(Query query, Collector collector, IProgressMonitor monitor) {
++			return query(query, collector, monitor);
++		}
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Profile.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Profile.java
+index e5869f8..047c6e5 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Profile.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Profile.java
+@@ -13,6 +13,7 @@ import java.util.Map.Entry;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.internal.p2.core.helpers.OrderedProperties;
+ import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
++import org.eclipse.equinox.internal.provisional.p2.engine.ISurrogateProfileHandler;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.query.*;
+ import org.eclipse.osgi.util.NLS;
+@@ -40,6 +41,7 @@ public class Profile implements IQueryable, IProfile {
+ 	private boolean changed = false;
+ 
+ 	private long timestamp;
++	private ISurrogateProfileHandler surrogateProfileHandler;
+ 
+ 	public Profile(String profileId, Profile parent, Map properties) {
+ 		if (profileId == null || profileId.length() == 0) {
+@@ -160,6 +162,12 @@ public class Profile implements IQueryable, IProfile {
+ 		return query.perform(ius.iterator(), collector);
+ 	}
+ 
++	public Collector available(Query query, Collector collector, IProgressMonitor monitor) {
++		if (surrogateProfileHandler != null)
++			return surrogateProfileHandler.queryProfile(this, query, collector, monitor);
++		return query.perform(ius.iterator(), collector);
++	}
++
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.provisional.p2.engine.IProfile#getInstallableUnitProperty(org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit, java.lang.String)
+ 	 */
+@@ -278,6 +286,8 @@ public class Profile implements IQueryable, IProfile {
+ 			parentSnapshot = parentProfile.snapshot();
+ 
+ 		Profile snapshot = new Profile(profileId, parentSnapshot, storage);
++		if (surrogateProfileHandler != null)
++			snapshot.setSurrogateProfileHandler(surrogateProfileHandler);
+ 		snapshot.setTimestamp(timestamp);
+ 
+ 		if (subProfileIds != null) {
+@@ -319,4 +329,8 @@ public class Profile implements IQueryable, IProfile {
+ 	public void setTimestamp(long millis) {
+ 		timestamp = millis;
+ 	}
++
++	public void setSurrogateProfileHandler(ISurrogateProfileHandler surrogateProfileHandler) {
++		this.surrogateProfileHandler = surrogateProfileHandler;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index 3005072..4a70eb1 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -80,10 +80,8 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 
+ 	}
+ 
+-	private static final String STORAGE_DIR = "profileRegistry"; //$NON-NLS-1$
+-
+ 	private static final String PROFILE_EXT = ".profile"; //$NON-NLS-1$
+-
++	public static final String DEFAULT_STORAGE_DIR = "profileRegistry"; //$NON-NLS-1$
+ 	/**
+ 	 * Reference to Map of String(Profile id)->Profile. 
+ 	 */
+@@ -95,12 +93,36 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	//Whether the registry has been loaded at all in this session
+ 	private boolean hasBeenRestored = false;
+ 
+-	private File registryDirectory;
++	private File store;
++
++	ISurrogateProfileHandler surrogateProfileHandler;
++
++	public SimpleProfileRegistry(File registryDirectory, ISurrogateProfileHandler handler) {
++		store = (registryDirectory != null) ? registryDirectory : getDefaultRegistryDirectory();
++		surrogateProfileHandler = handler;
++		self = EngineActivator.getContext().getProperty("eclipse.p2.profile"); //$NON-NLS-1$
++	}
+ 
+ 	public SimpleProfileRegistry() {
++		store = getDefaultRegistryDirectory();
++		surrogateProfileHandler = new SurrogateProfileHandler();
+ 		self = EngineActivator.getContext().getProperty("eclipse.p2.profile"); //$NON-NLS-1$
+ 	}
+ 
++	private static File getDefaultRegistryDirectory() {
++		File registryDirectory = null;
++		AgentLocation agent = (AgentLocation) ServiceHelper.getService(EngineActivator.getContext(), AgentLocation.class.getName());
++		try {
++			URL registryURL = new URL(agent.getDataArea(EngineActivator.ID), DEFAULT_STORAGE_DIR);
++			registryDirectory = new File(registryURL.getPath());
++			registryDirectory.mkdirs();
++
++		} catch (MalformedURLException e) {
++			//this is not possible because we know the above URL is valid
++		}
++		return registryDirectory;
++	}
++
+ 	/**
+ 	 * If the current profile for self is marked as a roaming profile, we need
+ 	 * to update its install and bundle pool locations.
+@@ -144,9 +166,28 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		if (SELF.equals(id))
+ 			id = self;
+ 		Profile profile = (Profile) getProfileMap().get(id);
++		if (profile == null && (self.equals(id)))
++			profile = createSurrogateProfile(id);
++
+ 		return profile;
+ 	}
+ 
++	private Profile createSurrogateProfile(String id) {
++		if (surrogateProfileHandler == null)
++			return null;
++
++		Profile profile = surrogateProfileHandler.createProfile(id);
++		if (profile == null)
++			return null;
++
++		saveProfile(profile);
++
++		// reset profile cache
++		profiles = null;
++		hasBeenRestored = false;
++		return (Profile) getProfileMap().get(id);
++	}
++
+ 	public synchronized IProfile[] getProfiles() {
+ 		Map profileMap = getProfileMap();
+ 		Profile[] result = new Profile[profileMap.size()];
+@@ -230,6 +271,8 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		}
+ 
+ 		Profile profile = new Profile(id, parent, profileProperties);
++		if (surrogateProfileHandler != null && surrogateProfileHandler.isSurrogate(profile))
++			profile.setSurrogateProfileHandler(surrogateProfileHandler);
+ 		profileMap.put(id, profile);
+ 		saveProfile(profile);
+ 		broadcastChangeEvent(id, ProfileEvent.ADDED);
+@@ -265,28 +308,12 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		((IProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), IProvisioningEventBus.class.getName())).publishEvent(new ProfileEvent(profileId, reason));
+ 	}
+ 
+-	private File getRegistryDirectory() {
+-		if (registryDirectory == null) {
+-			AgentLocation agent = (AgentLocation) ServiceHelper.getService(EngineActivator.getContext(), AgentLocation.class.getName());
+-			try {
+-				URL registryURL = new URL(agent.getDataArea(EngineActivator.ID), STORAGE_DIR);
+-				registryDirectory = new File(registryURL.getPath());
+-				registryDirectory.mkdirs();
+-
+-			} catch (MalformedURLException e) {
+-				//this is not possible because we know the above URL is valid
+-			}
+-		}
+-		return registryDirectory;
+-	}
+-
+ 	/**
+ 	 * Restores the profile registry from disk, and returns the loaded profile map.
+ 	 * Returns <code>null</code> if unable to read the registry.
+ 	 */
+ 	private Map restore() {
+ 
+-		File store = getRegistryDirectory();
+ 		if (store == null || !store.isDirectory())
+ 			throw new IllegalStateException(Messages.reg_dir_not_available);
+ 
+@@ -326,7 +353,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 
+ 	private void saveProfile(Profile profile) {
+ 
+-		File profileDirectory = new File(registryDirectory, escape(profile.getProfileId()) + PROFILE_EXT);
++		File profileDirectory = new File(store, escape(profile.getProfileId()) + PROFILE_EXT);
+ 		profileDirectory.mkdir();
+ 
+ 		long previousTimestamp = profile.getTimestamp();
+@@ -355,7 +382,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	}
+ 
+ 	private void deleteProfile(String profileId) {
+-		File profileDirectory = new File(registryDirectory, escape(profileId) + PROFILE_EXT);
++		File profileDirectory = new File(store, escape(profileId) + PROFILE_EXT);
+ 		FileUtils.deleteAll(profileDirectory);
+ 	}
+ 
+@@ -395,7 +422,7 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	 * 	Parser for the contents of a SimpleProfileRegistry,
+ 	 * 	as written by the Writer class.
+ 	 */
+-	static class Parser extends ProfileParser {
++	class Parser extends ProfileParser {
+ 		private final Map profileHandlers = new HashMap();
+ 
+ 		public Parser(BundleContext context, String bundleId) {
+@@ -452,6 +479,9 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 			}
+ 
+ 			Profile profile = new Profile(profileId, parentProfile, profileHandler.getProperties());
++			if (surrogateProfileHandler != null && surrogateProfileHandler.isSurrogate(profile))
++				profile.setSurrogateProfileHandler(surrogateProfileHandler);
++
+ 			profile.setTimestamp(profileHandler.getTimestamp());
+ 
+ 			IInstallableUnit[] ius = profileHandler.getInstallableUnits();
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
+new file mode 100644
+index 0000000..8a05a7f
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
+@@ -0,0 +1,127 @@
++/*******************************************************************************
++ * Copyright (c) 2007, 2008 IBM Corporation and others. All rights reserved. This
++ * program and the accompanying materials are made available under the terms of
++ * the Eclipse Public License v1.0 which accompanies this distribution, and is
++ * available at http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors: IBM Corporation - initial API and implementation
++ ******************************************************************************/
++package org.eclipse.equinox.internal.p2.engine;
++
++import java.io.File;
++import java.net.MalformedURLException;
++import java.net.URL;
++import java.util.Iterator;
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
++import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
++import org.eclipse.equinox.internal.provisional.p2.engine.ISurrogateProfileHandler;
++import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
++import org.eclipse.equinox.internal.provisional.p2.query.Collector;
++import org.eclipse.equinox.internal.provisional.p2.query.Query;
++import org.eclipse.osgi.service.datalocation.Location;
++
++public class SurrogateProfileHandler implements ISurrogateProfileHandler {
++
++	private static final String ORG_ECLIPSE_EQUINOX_P2_NATIVE = "org.eclipse.equinox.p2.native"; //$NON-NLS-1$
++	private static final String ORG_ECLIPSE_EQUINOX_P2_TYPE_ROOT = "org.eclipse.equinox.p2.type.root"; //$NON-NLS-1$
++	private static final String P2_ENGINE_DIR = "p2/" + EngineActivator.ID + "/"; //$NON-NLS-1$//$NON-NLS-2$
++	private static final String OSGI_INSTALL_AREA = "osgi.install.area"; //$NON-NLS-1$
++	private static final String ECLIPSE_INI_IGNORED = "eclipse.ini.ignored"; //$NON-NLS-1$
++
++	/**
++	 * Profile property constant indicating the bundle pool cache location.
++	 */
++	public static final String PROP_SURROGATE = "org.eclipse.equinox.p2.surrogate"; //$NON-NLS-1$
++
++	private SimpleProfileRegistry profileRegistry;
++
++	private synchronized SimpleProfileRegistry getProfileRegistry() {
++		if (profileRegistry == null) {
++			String installArea = EngineActivator.getContext().getProperty(OSGI_INSTALL_AREA);
++			try {
++				URL registryURL = new URL(installArea + P2_ENGINE_DIR + SimpleProfileRegistry.DEFAULT_STORAGE_DIR);
++				File sharedRegistryDirectory = new File(registryURL.getPath());
++				profileRegistry = new SimpleProfileRegistry(sharedRegistryDirectory, null);
++			} catch (MalformedURLException e) {
++				//this is not possible because we know the above URL is valid
++			}
++		}
++		return profileRegistry;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.engine.ISurrogateProfileHandler#createProfile(java.lang.String)
++	 */
++	public Profile createProfile(String id) {
++		final IProfile sharedProfile = getProfileRegistry().getProfile(id);
++		if (sharedProfile == null)
++			return null;
++
++		Query rootIUQuery = new Query() {
++			public boolean isMatch(Object candidate) {
++				if (candidate instanceof IInstallableUnit) {
++					IInstallableUnit iu = (IInstallableUnit) candidate;
++					if (Boolean.valueOf(sharedProfile.getInstallableUnitProperty(iu, ORG_ECLIPSE_EQUINOX_P2_TYPE_ROOT)).booleanValue())
++						return true;
++					if (iu.getTouchpointType().getId().equals(ORG_ECLIPSE_EQUINOX_P2_NATIVE))
++						return true;
++				}
++				return false;
++			}
++		};
++
++		Collector rootIUs = sharedProfile.query(rootIUQuery, new Collector(), null);
++
++		Profile userProfile = new Profile(id, null, sharedProfile.getProperties());
++		userProfile.setSurrogateProfileHandler(this);
++		for (Iterator iterator = rootIUs.iterator(); iterator.hasNext();) {
++			IInstallableUnit iu = (IInstallableUnit) iterator.next();
++			userProfile.addInstallableUnit(iu);
++			userProfile.addInstallableUnitProperties(iu, sharedProfile.getInstallableUnitProperties(iu));
++		}
++
++		//update properties
++		userProfile.setProperty(PROP_SURROGATE, Boolean.TRUE.toString());
++		Location installLocation = (Location) ServiceHelper.getService(EngineActivator.getContext(), Location.class.getName(), Location.INSTALL_FILTER);
++		File installFolder = new File(installLocation.getURL().getPath());
++
++		if (Boolean.valueOf(userProfile.getProperty(IProfile.PROP_ROAMING)).booleanValue()) {
++			userProfile.setProperty(IProfile.PROP_INSTALL_FOLDER, installFolder.getAbsolutePath());
++			userProfile.setProperty(IProfile.PROP_SHARED_CACHE, installFolder.getAbsolutePath());
++			userProfile.setProperty(IProfile.PROP_ROAMING, Boolean.FALSE.toString());
++		} else {
++			String cache = userProfile.getProperty(IProfile.PROP_CACHE);
++			if (cache != null)
++				userProfile.setProperty(IProfile.PROP_SHARED_CACHE, cache);
++		}
++
++		Location configurationLocation = (Location) ServiceHelper.getService(EngineActivator.getContext(), Location.class.getName(), Location.CONFIGURATION_FILTER);
++		File configurationFolder = new File(configurationLocation.getURL().getPath());
++
++		userProfile.setProperty(IProfile.PROP_CACHE, configurationFolder.getParentFile().getAbsolutePath());
++		userProfile.setProperty(IProfile.PROP_CONFIGURATION_FOLDER, configurationFolder.getAbsolutePath());
++
++		File launcherConfigFile = new File(configurationFolder, ECLIPSE_INI_IGNORED);
++		userProfile.setProperty(IProfile.PROP_LAUNCHER_CONFIGURATION, launcherConfigFile.getAbsolutePath());
++		return userProfile;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.engine.ISurrogateProfileHandler#isSurrogate(org.eclipse.equinox.internal.provisional.p2.engine.IProfile)
++	 */
++	public boolean isSurrogate(IProfile profile) {
++		return Boolean.valueOf(profile.getProperty(PROP_SURROGATE)).booleanValue();
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.engine.ISurrogateProfileHandler#queryProfile(org.eclipse.equinox.internal.provisional.p2.engine.IProfile, org.eclipse.equinox.internal.provisional.p2.query.Query, org.eclipse.equinox.internal.provisional.p2.query.Collector, org.eclipse.core.runtime.IProgressMonitor)
++	 */
++	public Collector queryProfile(IProfile profile, Query query, Collector collector, IProgressMonitor monitor) {
++		IProfile sharedProfile = getProfileRegistry().getProfile(profile.getProfileId());
++		if (sharedProfile != null)
++			sharedProfile.query(query, collector, monitor);
++
++		return profile.query(query, collector, monitor);
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
+index 3036c74..c509ca0 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
+@@ -11,8 +11,9 @@
+ package org.eclipse.equinox.internal.provisional.p2.engine;
+ 
+ import java.util.Map;
++import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+-import org.eclipse.equinox.internal.provisional.p2.query.IQueryable;
++import org.eclipse.equinox.internal.provisional.p2.query.*;
+ 
+ public interface IProfile extends IQueryable {
+ 
+@@ -25,6 +26,15 @@ public interface IProfile extends IQueryable {
+ 	 */
+ 	public static final String PROP_INSTALL_FOLDER = "org.eclipse.equinox.p2.installFolder"; //$NON-NLS-1$
+ 	/**
++	 * Profile property constant indicating the configuration folder for the profile.
++	 */
++	public static final String PROP_CONFIGURATION_FOLDER = "org.eclipse.equinox.p2.configurationFolder"; //$NON-NLS-1$
++	/**
++	 * Profile property constant indicating the location of the launcher configuration file for the profile.
++	 */
++	public static final String PROP_LAUNCHER_CONFIGURATION = "org.eclipse.equinox.p2.launcherConfiguration"; //$NON-NLS-1$
++
++	/**
+ 	 * Profile property constant indicating the installed language(s) for the profile.
+ 	 */
+ 	public static final String PROP_NL = "org.eclipse.equinox.p2.nl"; //$NON-NLS-1$
+@@ -56,6 +66,12 @@ public interface IProfile extends IQueryable {
+ 	 * Profile property constant indicating the bundle pool cache location.
+ 	 */
+ 	public static final String PROP_CACHE = "org.eclipse.equinox.p2.cache"; //$NON-NLS-1$
++
++	/**
++	 * Profile property constant indicating a shared read-only bundle pool cache location.
++	 */
++	public static final String PROP_SHARED_CACHE = "org.eclipse.equinox.p2.cache.shared"; //$NON-NLS-1$
++
+ 	/**
+ 	 * Profile property constant for a boolean property indicating if update features should
+ 	 * be installed in this profile
+@@ -112,4 +128,6 @@ public interface IProfile extends IQueryable {
+ 
+ 	public long getTimestamp();
+ 
++	public Collector available(Query query, Collector collector, IProgressMonitor monitor);
++
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/ISurrogateProfileHandler.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/ISurrogateProfileHandler.java
+new file mode 100644
+index 0000000..5c01dc4
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/ISurrogateProfileHandler.java
+@@ -0,0 +1,16 @@
++package org.eclipse.equinox.internal.provisional.p2.engine;
++
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.equinox.internal.p2.engine.Profile;
++import org.eclipse.equinox.internal.provisional.p2.query.Collector;
++import org.eclipse.equinox.internal.provisional.p2.query.Query;
++
++public interface ISurrogateProfileHandler {
++
++	public abstract Profile createProfile(String id);
++
++	public abstract boolean isSurrogate(IProfile profile);
++
++	public abstract Collector queryProfile(IProfile profile, Query query, Collector collector, IProgressMonitor monitor);
++
++}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/LazyManipulator.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/LazyManipulator.java
+index 0599ce5..6f62a40 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/LazyManipulator.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/LazyManipulator.java
+@@ -42,6 +42,8 @@ public class LazyManipulator implements Manipulator {
+ 		LauncherData launcherData = manipulator.getLauncherData();
+ 		launcherData.setFwConfigLocation(Util.getConfigurationFolder(profile));
+ 		launcherData.setLauncher(Util.getLauncherPath(profile));
++		launcherData.setLauncherConfigLocation(Util.getLauncherConfigLocation(profile));
++
+ 		try {
+ 			manipulator.load();
+ 		} catch (IllegalStateException e) {
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+index a195a1f..ad26cd2 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+@@ -37,7 +37,6 @@ public class Util {
+ 	/**
+ 	 * TODO "cache" is probably not the right term for this location
+ 	 */
+-	private final static String CONFIG_FOLDER = "eclipse.configurationFolder"; //$NON-NLS-1$
+ 	private static final String REPOSITORY_TYPE = IArtifactRepositoryManager.TYPE_SIMPLE_REPOSITORY;
+ 	private static final String CACHE_EXTENSIONS = "org.eclipse.equinox.p2.cache.extensions"; //$NON-NLS-1$
+ 	private static final String PIPE = "|"; //$NON-NLS-1$
+@@ -94,6 +93,16 @@ public class Util {
+ 
+ 		IArtifactRepositoryManager manager = getArtifactRepositoryManager();
+ 		List extensions = getListProfileProperty(profile, CACHE_EXTENSIONS);
++		String sharedCache = profile.getProperty(IProfile.PROP_SHARED_CACHE);
++		if (sharedCache != null) {
++			try {
++				extensions.add(new File(sharedCache).toURL().toExternalForm());
++			} catch (MalformedURLException e) {
++				// unexpected, URLs should be pre-checked
++				LogHelper.log(new Status(IStatus.ERROR, Activator.ID, e.getMessage(), e));
++			}
++		}
++
+ 		for (Iterator iterator = extensions.iterator(); iterator.hasNext();) {
+ 			try {
+ 				String extension = (String) iterator.next();
+@@ -159,7 +168,7 @@ public class Util {
+ 	}
+ 
+ 	public static File getConfigurationFolder(IProfile profile) {
+-		String config = profile.getProperty(CONFIG_FOLDER);
++		String config = profile.getProperty(IProfile.PROP_CONFIGURATION_FOLDER);
+ 		if (config != null)
+ 			return new File(config);
+ 		return new File(getInstallFolder(profile), "configuration"); //$NON-NLS-1$
+@@ -272,4 +281,9 @@ public class Util {
+ 			throw new CoreException(createError(NLS.bind(Messages.artifact_file_not_found, artifactKey)));
+ 		return fileLocation.getAbsolutePath();
+ 	}
++
++	public static File getLauncherConfigLocation(IProfile profile) {
++		String launcherConfig = profile.getProperty(IProfile.PROP_LAUNCHER_CONFIGURATION);
++		return launcherConfig == null ? null : new File(launcherConfig);
++	}
+ }

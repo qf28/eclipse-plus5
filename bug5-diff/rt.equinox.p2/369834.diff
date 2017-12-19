@@ -1,0 +1,525 @@
+commit 91027ecca979ba174a9617241ff3999250490ae9
+Author: Mengxin Zhu <kane.zhu@windriver.com>
+Date:   Thu Feb 9 18:54:44 2012 +0800
+
+    Bug 369834.
+    
+    Rework the download progress event reports in the scenario of multiple agents.
+    
+    Signed-off-by: Mengxin Zhu <kane.zhu@windriver.com>
+
+2	4	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+11	15	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/ProgressStatistics.java
+90	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProvisioningEventTest2.java
+3	7	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/JarURLMetadataRepositoryTest.java
+2	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/repository/AllTestServerTests.java
+2	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/repository/FileReaderTest.java
+29	0	bundles/org.eclipse.equinox.p2.testserver/webfiles/emptyJarRepo/content.xml
+2	2	bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/ECFTransportComponent.java
+36	8	bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/FileReader.java
+18	10	bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/RepositoryTransport.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+index 0c4c1dd..4c0777d 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepository.java
+@@ -25,13 +25,13 @@ import org.eclipse.core.runtime.*;
+ import org.eclipse.core.runtime.jobs.Job;
+ import org.eclipse.equinox.internal.p2.artifact.processors.md5.MD5Verifier;
+ import org.eclipse.equinox.internal.p2.artifact.repository.*;
+-import org.eclipse.equinox.internal.p2.artifact.repository.Activator;
+ import org.eclipse.equinox.internal.p2.artifact.repository.Messages;
+ import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
+ import org.eclipse.equinox.internal.p2.metadata.ArtifactKey;
+ import org.eclipse.equinox.internal.p2.metadata.expression.CompoundIterator;
+ import org.eclipse.equinox.internal.p2.metadata.index.IndexProvider;
+-import org.eclipse.equinox.internal.p2.repository.*;
++import org.eclipse.equinox.internal.p2.repository.DownloadStatus;
++import org.eclipse.equinox.internal.p2.repository.Transport;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.processing.*;
+ import org.eclipse.equinox.internal.provisional.p2.repository.IStateful;
+ import org.eclipse.equinox.p2.core.IProvisioningAgent;
+@@ -748,8 +748,6 @@ public class SimpleArtifactRepository extends AbstractArtifactRepository impleme
+ 		if (monitor.isCanceled())
+ 			return Status.CANCEL_STATUS;
+ 
+-		ProgressStatistics.setProvisioningAgent(getProvisioningAgent());
+-
+ 		final MultiStatus overallStatus = new MultiStatus(Activator.ID, IStatus.OK, null, null);
+ 		LinkedList<IArtifactRequest> requestsPending = new LinkedList<IArtifactRequest>(Arrays.asList(requests));
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/ProgressStatistics.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/ProgressStatistics.java
+index dd8c89a..dd878fd 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/ProgressStatistics.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/ProgressStatistics.java
+@@ -16,7 +16,6 @@ import java.net.URI;
+ import java.text.NumberFormat;
+ import java.util.SortedMap;
+ import java.util.TreeMap;
+-import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+ import org.eclipse.equinox.p2.core.IProvisioningAgent;
+ import org.eclipse.osgi.util.NLS;
+@@ -24,7 +23,8 @@ import org.eclipse.osgi.util.NLS;
+ /**
+  * Converts progress of file download to average download speed and keeps track of
+  * when it is suitable to update a progress monitor. A suitably scaled and formatted string for use
+- * in progress monitoring is provided.
++ * in progress monitoring is provided. It will publishes {@link DownloadProgressEvent} if {@link IProvisioningAgent}
++ * is given and {@link IProvisioningEventBus} is available.
+  */
+ public class ProgressStatistics {
+ 	private static final int DEFAULT_REPORT_INTERVAL = 1000;
+@@ -33,8 +33,6 @@ public class ProgressStatistics {
+ 
+ 	private static final int SPEED_RESOLUTION = 1000;
+ 
+-	private static IProvisioningAgent agent = null;
+-
+ 	private static String convert(long amount) {
+ 		NumberFormat fmt = NumberFormat.getInstance();
+ 		if (amount < 1024)
+@@ -47,17 +45,12 @@ public class ProgressStatistics {
+ 		return fmt.format(((double) amount) / (1024 * 1024)) + "MB"; //$NON-NLS-1$
+ 	}
+ 
+-	public static void setProvisioningAgent(IProvisioningAgent agent) {
+-		ProgressStatistics.agent = agent;
+-	}
+-
+ 	private void publishEvent(DownloadProgressEvent event) {
+-		if (agent == null) {
+-			agent = ServiceHelper.getService(Activator.getContext(), IProvisioningAgent.class);
+-		}
+-		IProvisioningEventBus eventBus = (IProvisioningEventBus) agent.getService(IProvisioningEventBus.SERVICE_NAME);
+-		if (eventBus != null) {
+-			eventBus.publishEvent(event);
++		if (m_agent != null) {
++			IProvisioningEventBus eventBus = (IProvisioningEventBus) m_agent.getService(IProvisioningEventBus.SERVICE_NAME);
++			if (eventBus != null) {
++				eventBus.publishEvent(event);
++			}
+ 		}
+ 	}
+ 
+@@ -79,7 +72,9 @@ public class ProgressStatistics {
+ 
+ 	URI m_uri;
+ 
+-	public ProgressStatistics(URI uri, String fileName, long total) {
++	IProvisioningAgent m_agent;
++
++	public ProgressStatistics(IProvisioningAgent agent, URI uri, String fileName, long total) {
+ 		m_startTime = System.currentTimeMillis();
+ 		m_fileName = fileName;
+ 
+@@ -91,6 +86,7 @@ public class ProgressStatistics {
+ 		m_recentSpeedMap = new TreeMap<Long, Long>();
+ 		m_recentSpeedMapKey = 0L;
+ 		m_uri = uri;
++		m_agent = agent;
+ 	}
+ 
+ 	public long getAverageSpeed() {
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProvisioningEventTest2.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProvisioningEventTest2.java
+new file mode 100644
+index 0000000..3e8d6bc
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProvisioningEventTest2.java
+@@ -0,0 +1,90 @@
++/*******************************************************************************
++ *  Copyright (c) 2012 Wind River and others.
++ *  All rights reserved. This program and the accompanying materials
++ *  are made available under the terms of the Eclipse Public License v1.0
++ *  which accompanies this distribution, and is available at
++ *  http://www.eclipse.org/legal/epl-v10.html
++ * 
++ *  Contributors:
++ *     Wind River - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.p2.tests.engine;
++
++import java.net.URI;
++import java.util.EventObject;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.ProvisioningAgent;
++import org.eclipse.equinox.internal.p2.engine.CommitOperationEvent;
++import org.eclipse.equinox.internal.p2.engine.RollbackOperationEvent;
++import org.eclipse.equinox.internal.p2.repository.DownloadProgressEvent;
++import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
++import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
++import org.eclipse.equinox.internal.provisional.p2.core.eventbus.ProvisioningListener;
++import org.eclipse.equinox.p2.core.ProvisionException;
++import org.eclipse.equinox.p2.engine.*;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
++import org.eclipse.equinox.p2.query.IQueryResult;
++import org.eclipse.equinox.p2.query.QueryUtil;
++import org.eclipse.equinox.p2.repository.artifact.IArtifactRepository;
++import org.eclipse.equinox.p2.repository.metadata.IMetadataRepositoryManager;
++import org.eclipse.equinox.p2.tests.TestActivator;
++import org.eclipse.equinox.p2.tests.testserver.helper.AbstractTestServerClientCase;
++import org.junit.Test;
++
++public class ProvisioningEventTest2 extends AbstractTestServerClientCase {
++
++	@Test
++	public void testDownloadEventFromMultipleAgents() throws ProvisionException, OperationCanceledException, InterruptedException {
++		ProvisioningAgent newAgent = new ProvisioningAgent();
++		newAgent.setBundleContext(TestActivator.getContext());
++		IProvisioningEventBus eventBus = (IProvisioningEventBus) newAgent.getService(IProvisioningEventBus.SERVICE_NAME);
++		class DownloadProvisiongEventListener implements ProvisioningListener {
++			boolean notifiedDownloadProgressEvent = false;
++			CountDownLatch latch = new CountDownLatch(1);
++
++			public void notify(EventObject o) {
++				if (o instanceof DownloadProgressEvent) {
++					notifiedDownloadProgressEvent = true;
++				} else if (o instanceof CommitOperationEvent || o instanceof RollbackOperationEvent)
++					latch.countDown();
++			}
++		}
++		DownloadProvisiongEventListener provListener = new DownloadProvisiongEventListener();
++		DownloadProvisiongEventListener provListener1 = new DownloadProvisiongEventListener();
++		eventBus.addListener(provListener);
++
++		IProvisioningEventBus eventBus2 = (IProvisioningEventBus) getAgent().getService(IProvisioningEventBus.SERVICE_NAME);
++		try {
++			URI repoLoc = URI.create(getBaseURL() + "/public/emptyJarRepo");
++			//remove any existing profile with the same name
++			final String name = "testProfile";
++			IProfileRegistry profileRegistry = (IProfileRegistry) getAgent().getService(IProfileRegistry.SERVICE_NAME);
++			profileRegistry.removeProfile(name);
++			IProfile profile = profileRegistry.addProfile(name, null);
++			// clean possible cached artifacts
++			IArtifactRepository bundlePool = Util.getBundlePoolRepository(getAgent(), profile);
++			bundlePool.removeAll(new NullProgressMonitor());
++			ProvisioningContext context = new ProvisioningContext(getAgent());
++			context.setArtifactRepositories(new URI[] {repoLoc});
++			context.setMetadataRepositories(new URI[] {repoLoc});
++			IEngine engine = (IEngine) getAgent().getService(IEngine.SERVICE_NAME);
++			IProvisioningPlan plan = engine.createPlan(profile, context);
++			IMetadataRepositoryManager metaManager = (IMetadataRepositoryManager) getAgent().getService(IMetadataRepositoryManager.SERVICE_NAME);
++			IQueryResult<IInstallableUnit> allIUs = metaManager.loadRepository(repoLoc, null).query(QueryUtil.ALL_UNITS, null);
++			for (IInstallableUnit iu : allIUs.toSet()) {
++				plan.addInstallableUnit(iu);
++			}
++
++			eventBus2.addListener(provListener1);
++			IStatus status = engine.perform(plan, new NullProgressMonitor());
++			assertTrue("Provisioning was failed.", status.isOK());
++			provListener1.latch.await(10, TimeUnit.SECONDS);
++			assertTrue("Listener1 is NOT notified by DownloadProgressEvent.", provListener1.notifiedDownloadProgressEvent);
++			assertFalse("Listener should NOT be notified by DownloadProgressEvent.", provListener.notifiedDownloadProgressEvent);
++		} finally {
++			eventBus2.removeListener(provListener1);
++		}
++	}
++}
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/JarURLMetadataRepositoryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/JarURLMetadataRepositoryTest.java
+index 74dd506..6b82268 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/JarURLMetadataRepositoryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/JarURLMetadataRepositoryTest.java
+@@ -17,10 +17,7 @@ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.util.*;
+ import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.core.ProvisioningAgent;
+ import org.eclipse.equinox.internal.p2.core.helpers.FileUtils;
+-import org.eclipse.equinox.internal.p2.repository.ProgressStatistics;
+-import org.eclipse.equinox.p2.core.IProvisioningAgent;
+ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitDescription;
+@@ -31,6 +28,7 @@ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepository;
+ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepositoryManager;
+ import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+ import org.eclipse.equinox.p2.tests.TestData;
++import org.junit.Test;
+ 
+ public class JarURLMetadataRepositoryTest extends AbstractProvisioningTest {
+ 
+@@ -60,11 +58,9 @@ public class JarURLMetadataRepositoryTest extends AbstractProvisioningTest {
+ 	 * Tests loading a repository in a zip file.
+ 	 * This test case comes from bug 369834.
+ 	 */
+-	public void _testZipFileRepository() throws IOException, ProvisionException, OperationCanceledException {
++	@Test
++	public void testZipFileRepository() throws IOException, ProvisionException, OperationCanceledException {
+ 		//ensure a random agent doesn't cause it to fail
+-		IProvisioningAgent other = new ProvisioningAgent();
+-		other.stop();
+-		ProgressStatistics.setProvisioningAgent(other);
+ 		File zip = TestData.getFile("bug369834", "f-TestBuild-group.group.group.zip");
+ 		URI location = URIUtil.toJarURI(zip.toURI(), new Path(""));
+ 		IMetadataRepository repo = manager.loadRepository(location, null);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/repository/AllTestServerTests.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/repository/AllTestServerTests.java
+index 1ef02ad..33b75d3 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/repository/AllTestServerTests.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/repository/AllTestServerTests.java
+@@ -15,6 +15,7 @@ import junit.framework.Test;
+ import junit.framework.TestSuite;
+ import org.eclipse.equinox.p2.tests.artifact.repository.MirrorRequestTest2;
+ import org.eclipse.equinox.p2.tests.artifact.repository.StatsTest;
++import org.eclipse.equinox.p2.tests.engine.ProvisioningEventTest2;
+ import org.eclipse.equinox.p2.tests.testserver.helper.AbstractTestServerSuite;
+ 
+ public class AllTestServerTests extends AbstractTestServerSuite {
+@@ -37,6 +38,7 @@ public class AllTestServerTests extends AbstractTestServerSuite {
+ 		suite.addTestSuite(NTLMTest.class);
+ 		suite.addTestSuite(MirrorRequestTest2.class);
+ 		suite.addTestSuite(StatsTest.class);
++		suite.addTestSuite(ProvisioningEventTest2.class);
+ 
+ 		suite.addTest(new AbstractTestServerSuite("stopServer"));
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/repository/FileReaderTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/repository/FileReaderTest.java
+index 41eae21..04d7567 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/repository/FileReaderTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/repository/FileReaderTest.java
+@@ -48,7 +48,7 @@ public class FileReaderTest extends AbstractTestServerClientCase {
+ 	 */
+ 	public void testReadStream() throws URISyntaxException, CoreException, IOException {
+ 		RepositoryTransport transport = new RepositoryTransport();
+-		URI toDownload = new URI("http://localhost:8080/public/index.html");
++		URI toDownload = new URI(getBaseURL() + "/public/index.html");
+ 		final NullProgressMonitor monitor = new NullProgressMonitor();
+ 		InputStream stream = transport.stream(toDownload, monitor);
+ 		stream.close();
+@@ -60,7 +60,7 @@ public class FileReaderTest extends AbstractTestServerClientCase {
+ 	 */
+ 	public void testRead() throws URISyntaxException, CoreException, IOException {
+ 		RepositoryTransport transport = new RepositoryTransport();
+-		URI toDownload = new URI("http://localhost:8080/public/index.html");
++		URI toDownload = new URI(getBaseURL() + "/public/index.html");
+ 		OutputStream target = new ByteArrayOutputStream();
+ 		final NullProgressMonitor monitor = new NullProgressMonitor();
+ 		IStatus result = transport.download(toDownload, target, monitor);
+diff --git a/bundles/org.eclipse.equinox.p2.testserver/webfiles/emptyJarRepo/content.xml b/bundles/org.eclipse.equinox.p2.testserver/webfiles/emptyJarRepo/content.xml
+new file mode 100644
+index 0000000..fbcb1c4
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.testserver/webfiles/emptyJarRepo/content.xml
+@@ -0,0 +1,29 @@
++<?xml version='1.0' encoding='UTF-8'?>
++<?metadataRepository version='1.1.0'?>
++
++<repository name='Test Repo'
++	type='org.eclipse.equinox.internal.p2.metadata.repository.LocalMetadataRepository'
++	version='1'>
++
++	<properties size='1'>
++		<property name='p2.timestamp' value='1239212031654' />
++	</properties>
++
++	<units size='4'>
++		<unit id='A' version='1.0.0'>
++			<properties>
++				<property name='org.eclipse.equinox.p2.type.group' value='true' />
++			</properties>
++			<artifacts size='1'>
++				<artifact classifier='test.txt' id='HelloWorldText'
++					version='1.0.0' />
++			</artifacts>
++			<provides size='1'>
++				<provided namespace='org.eclipse.equinox.p2.iu' name='A'
++					version='1.0.0' />
++			</provides>
++			<touchpoint id="org.eclipse.equinox.p2.native" version="1.0.0"/>
++		</unit>
++	</units>
++
++</repository>
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/ECFTransportComponent.java b/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/ECFTransportComponent.java
+index fac6c24..e0c26e0 100644
+--- a/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/ECFTransportComponent.java
++++ b/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/ECFTransportComponent.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2011 IBM Corporation and others.
++ * Copyright (c) 2011, 2012 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -16,7 +16,7 @@ import org.eclipse.equinox.p2.core.spi.IAgentServiceFactory;
+ public class ECFTransportComponent implements IAgentServiceFactory {
+ 
+ 	public Object createService(IProvisioningAgent agent) {
+-		return new RepositoryTransport();
++		return new RepositoryTransport(agent);
+ 	}
+ 	
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/FileReader.java b/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/FileReader.java
+index d1760c6..a4a5237 100644
+--- a/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/FileReader.java
++++ b/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/FileReader.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2006, 2010 Cloudsmith Inc.
++ * Copyright (c) 2006, 2012 Cloudsmith Inc.
+  *  All rights reserved. This program and the accompanying materials
+  *  are made available under the terms of the Eclipse Public License v1.0
+  *  which accompanies this distribution, and is available at
+@@ -12,16 +12,41 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.internal.p2.transport.ecf;
+ 
+-import java.io.*;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.io.PipedInputStream;
++import java.io.PipedOutputStream;
+ import java.net.SocketTimeoutException;
+ import java.net.URI;
+ import java.util.Date;
+-import org.eclipse.core.runtime.*;
++
++import org.eclipse.core.runtime.CoreException;
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.NullProgressMonitor;
++import org.eclipse.core.runtime.OperationCanceledException;
++import org.eclipse.core.runtime.Status;
++import org.eclipse.core.runtime.SubProgressMonitor;
+ import org.eclipse.core.runtime.jobs.Job;
+ import org.eclipse.ecf.core.security.IConnectContext;
+-import org.eclipse.ecf.filetransfer.*;
+-import org.eclipse.ecf.filetransfer.events.*;
+-import org.eclipse.ecf.filetransfer.identity.*;
++import org.eclipse.ecf.filetransfer.FileTransferJob;
++import org.eclipse.ecf.filetransfer.IFileRangeSpecification;
++import org.eclipse.ecf.filetransfer.IFileTransferListener;
++import org.eclipse.ecf.filetransfer.IIncomingFileTransfer;
++import org.eclipse.ecf.filetransfer.IRetrieveFileTransferContainerAdapter;
++import org.eclipse.ecf.filetransfer.IncomingFileTransferException;
++import org.eclipse.ecf.filetransfer.UserCancelledException;
++import org.eclipse.ecf.filetransfer.events.IFileTransferConnectStartEvent;
++import org.eclipse.ecf.filetransfer.events.IFileTransferEvent;
++import org.eclipse.ecf.filetransfer.events.IIncomingFileTransferEvent;
++import org.eclipse.ecf.filetransfer.events.IIncomingFileTransferReceiveDataEvent;
++import org.eclipse.ecf.filetransfer.events.IIncomingFileTransferReceiveDoneEvent;
++import org.eclipse.ecf.filetransfer.events.IIncomingFileTransferReceiveStartEvent;
++import org.eclipse.ecf.filetransfer.identity.FileCreateException;
++import org.eclipse.ecf.filetransfer.identity.FileIDFactory;
++import org.eclipse.ecf.filetransfer.identity.IFileID;
+ import org.eclipse.ecf.filetransfer.service.IRetrieveFileTransferFactory;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.repository.AuthenticationFailedException;
+@@ -31,6 +56,7 @@ import org.eclipse.equinox.internal.p2.repository.Messages;
+ import org.eclipse.equinox.internal.p2.repository.ProgressStatistics;
+ import org.eclipse.equinox.internal.p2.repository.RepositoryPreferences;
+ import org.eclipse.equinox.internal.p2.repository.RepositoryTracing;
++import org.eclipse.equinox.p2.core.IProvisioningAgent;
+ import org.eclipse.osgi.util.NLS;
+ 
+ /**
+@@ -72,12 +98,13 @@ public final class FileReader extends FileTransferJob implements IFileTransferLi
+ 	protected IFileTransferConnectStartEvent connectEvent;
+ 	private Job cancelJob;
+ 	private boolean monitorStarted;
++	private IProvisioningAgent agent;
+ 
+ 	/**
+ 	 * Create a new FileReader that will retry failed connection attempts and sleep some amount of time between each
+ 	 * attempt.
+ 	 */
+-	public FileReader(IConnectContext aConnectContext) {
++	public FileReader(IProvisioningAgent aAgent, IConnectContext aConnectContext) {
+ 		super(Messages.FileTransport_reader); // job label
+ 
+ 		// Hide this job.
+@@ -86,6 +113,7 @@ public final class FileReader extends FileTransferJob implements IFileTransferLi
+ 		connectionRetryCount = RepositoryPreferences.getConnectionRetryCount();
+ 		connectionRetryDelay = RepositoryPreferences.getConnectionMsRetryDelay();
+ 		connectContext = aConnectContext;
++		this.agent = aAgent;
+ 	}
+ 
+ 	public FileInfo getLastFileInfo() {
+@@ -155,7 +183,7 @@ public final class FileReader extends FileTransferJob implements IFileTransferLi
+ 				return;
+ 			}
+ 			long fileLength = source.getFileLength();
+-			ProgressStatistics stats = new ProgressStatistics(requestUri, source.getRemoteFileName(), fileLength);
++			ProgressStatistics stats = new ProgressStatistics(agent, requestUri, source.getRemoteFileName(), fileLength);
+ 			setStatistics(stats);
+ 
+ 			if (theMonitor != null) {
+diff --git a/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/RepositoryTransport.java b/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/RepositoryTransport.java
+index cf43309..4af4001 100644
+--- a/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/RepositoryTransport.java
++++ b/bundles/org.eclipse.equinox.p2.transport.ecf/src/org/eclipse/equinox/internal/p2/transport/ecf/RepositoryTransport.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2006, 2011, IBM Corporation and other.
++ * Copyright (c) 2006, 2012 IBM Corporation and other.
+  * The code, documentation and other materials contained herein have been
+  * licensed under the Eclipse Public License - v 1.0 by the copyright holder
+  * listed above, as the Initial Contributor under such license. The text of
+@@ -56,11 +56,11 @@ import org.eclipse.osgi.util.NLS;
+  * Download is performed by {@link FileReader}, and file browsing is performed by
+  * {@link FileInfoReader}.
+  */
+-public class RepositoryTransport extends Transport implements IAgentServiceFactory {
+-	private static RepositoryTransport instance;
++public class RepositoryTransport extends Transport {
+ 
+ 	public static final String TIMEOUT_RETRY = "org.eclipse.equinox.p2.transport.ecf.retry"; //$NON-NLS-1$
+ 	private static Map<URI, Integer> socketExceptionRetry = null;
++	private IProvisioningAgent agent = null;
+ 	/**
+ 	 * Returns an shared instance of Generic Transport
+ 	 */
+@@ -70,6 +70,19 @@ public class RepositoryTransport extends Transport implements IAgentServiceFacto
+ 	//		}
+ 	//		return instance;
+ 	//	}
++	
++	public RepositoryTransport() {
++		this(null);
++	}
++	
++	/**
++	 * 
++	 * @param agent If agent is <code>null</code>, it means client would like to use RepositoryTransport as a download utility, 
++	 * don't want to publish download progress.
++	 */
++	public RepositoryTransport(IProvisioningAgent agent) {
++		this.agent = agent;
++	}
+ 
+ 	public IStatus download(URI toDownload, OutputStream target, long startPos, IProgressMonitor monitor) {
+ 
+@@ -83,7 +96,7 @@ public class RepositoryTransport extends Transport implements IAgentServiceFacto
+ 				IConnectContext context = (loginDetails == null) ? null : ConnectContextFactory.createUsernamePasswordConnectContext(loginDetails.getUserName(), loginDetails.getPassword());
+ 
+ 				// perform the download
+-				reader = new FileReader(context);
++				reader = new FileReader(agent, context);
+ 				reader.readInto(toDownload, target, startPos, monitor);
+ 
+ 				// check that job ended ok - throw exceptions otherwise
+@@ -149,7 +162,7 @@ public class RepositoryTransport extends Transport implements IAgentServiceFacto
+ 				IConnectContext context = (loginDetails == null) ? null : ConnectContextFactory.createUsernamePasswordConnectContext(loginDetails.getUserName(), loginDetails.getPassword());
+ 
+ 				// perform the streamed download
+-				reader = new FileReader(context);
++				reader = new FileReader(agent, context);
+ 				return reader.read(toDownload, monitor);
+ 			} catch (UserCancelledException e) {
+ 				throw new OperationCanceledException();
+@@ -316,9 +329,4 @@ public class RepositoryTransport extends Transport implements IAgentServiceFacto
+ 						: RepositoryStatus.codeToMessage(code, toDownload.toString()), t);
+ 	}
+ 
+-	public Object createService(IProvisioningAgent agent) {
+-		if (instance ==  null)
+-			return instance;
+-		return instance;
+-	}
+ }

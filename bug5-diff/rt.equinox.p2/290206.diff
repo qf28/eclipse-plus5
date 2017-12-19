@@ -1,0 +1,314 @@
+commit dda41c7d886f47b5cfabf1b38a089fdef1fcca51
+Author: John Arthorne <johna>
+Date:   Wed Sep 23 02:34:29 2009 +0000
+
+    Bug 290206 -  Inject event bus into repository managers
+
+2	0	bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+28	1	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Activator.java
+3	1	bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
+1	0	bundles/org.eclipse.equinox.p2.metadata.generator/META-INF/MANIFEST.MF
+3	2	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
+15	10	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Activator.java
+3	5	bundles/org.eclipse.equinox.p2.repository/META-INF/MANIFEST.MF
+32	9	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+index 86959eb..47a52bd 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/META-INF/MANIFEST.MF
+@@ -56,6 +56,7 @@ Import-Package: javax.xml.parsers,
+  org.eclipse.equinox.internal.p2.repository,
+  org.eclipse.equinox.internal.p2.repository.helpers,
+  org.eclipse.equinox.internal.provisional.p2.core,
++ org.eclipse.equinox.internal.provisional.p2.core.eventbus,
+  org.eclipse.equinox.internal.provisional.p2.core.location,
+  org.eclipse.equinox.internal.provisional.p2.metadata,
+  org.eclipse.equinox.internal.provisional.p2.repository,
+@@ -65,6 +66,7 @@ Import-Package: javax.xml.parsers,
+  org.eclipse.osgi.signedcontent;version="1.0.0",
+  org.eclipse.osgi.util;version="1.1.0",
+  org.osgi.framework;version="1.3.0",
++ org.osgi.util.tracker;version="1.4.0",
+  org.w3c.dom,
+  org.xml.sax;resolution:=optional
+ Bundle-Activator: org.eclipse.equinox.internal.p2.artifact.repository.Activator
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Activator.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Activator.java
+index 6343fb2..ee7fcd4 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Activator.java
+@@ -11,15 +11,19 @@
+ package org.eclipse.equinox.internal.p2.artifact.repository;
+ 
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
++import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+ import org.osgi.framework.*;
++import org.osgi.util.tracker.ServiceTracker;
++import org.osgi.util.tracker.ServiceTrackerCustomizer;
+ 
+-public class Activator implements BundleActivator {
++public class Activator implements BundleActivator, ServiceTrackerCustomizer {
+ 	public static final String ID = "org.eclipse.equinox.p2.artifact.repository"; //$NON-NLS-1$
+ 	public static final String REPO_PROVIDER_XPT = ID + '.' + "artifactRepositories"; //$NON-NLS-1$
+ 
+ 	private static BundleContext context;
+ 	private ServiceRegistration repositoryManagerRegistration;
+ 	private ArtifactRepositoryManager repositoryManager;
++	private ServiceTracker busTracker;
+ 
+ 	public static BundleContext getContext() {
+ 		return Activator.context;
+@@ -29,6 +33,11 @@ public class Activator implements BundleActivator {
+ 		Activator.context = aContext;
+ 		repositoryManager = new ArtifactRepositoryManager();
+ 		repositoryManagerRegistration = aContext.registerService(IArtifactRepositoryManager.class.getName(), repositoryManager, null);
++
++		// need to track event bus coming and going to make sure cache gets cleaned on
++		// repository removals
++		busTracker = new ServiceTracker(context, IProvisioningEventBus.SERVICE_NAME, this);
++		busTracker.open();
+ 	}
+ 
+ 	public void stop(BundleContext aContext) throws Exception {
+@@ -40,6 +49,24 @@ public class Activator implements BundleActivator {
+ 			repositoryManager.shutdown();
+ 			repositoryManager = null;
+ 		}
++		busTracker.close();
++	}
++
++	public Object addingService(ServiceReference reference) {
++		IProvisioningEventBus bus = (IProvisioningEventBus) context.getService(reference);
++		if (repositoryManager != null)
++			repositoryManager.setEventBus(bus);
++		return bus;
++	}
++
++	public void modifiedService(ServiceReference reference, Object service) {
++		// ignored
++
++	}
++
++	public void removedService(ServiceReference reference, Object service) {
++		if (repositoryManager != null)
++			repositoryManager.unsetEventBus((IProvisioningEventBus) service);
+ 	}
+ 
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java b/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
+index a67cfe5..9417943 100644
+--- a/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
+@@ -120,7 +120,9 @@ public class Activator implements BundleActivator {
+ 		//register a metadata repository manager if there isn't one already registered
+ 		metadataRepositoryReference = context.getServiceReference(IMetadataRepositoryManager.SERVICE_NAME);
+ 		if (metadataRepositoryReference == null) {
+-			registrationDefaultManager = context.registerService(IMetadataRepositoryManager.SERVICE_NAME, new MetadataRepositoryManager(), null);
++			final MetadataRepositoryManager manager = new MetadataRepositoryManager();
++			manager.setEventBus(bus);
++			registrationDefaultManager = context.registerService(IMetadataRepositoryManager.SERVICE_NAME, manager, null);
+ 			metadataRepositoryReference = registrationDefaultManager.getReference();
+ 		}
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.metadata.generator/META-INF/MANIFEST.MF
+index c463372..7af44e4 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/META-INF/MANIFEST.MF
+@@ -15,6 +15,7 @@ Import-Package: javax.xml.parsers,
+  org.eclipse.equinox.internal.p2.artifact.repository,
+  org.eclipse.equinox.internal.p2.metadata,
+  org.eclipse.equinox.internal.p2.metadata.repository,
++ org.eclipse.equinox.internal.p2.repository.helpers,
+  org.eclipse.equinox.internal.provisional.frameworkadmin,
+  org.eclipse.equinox.internal.provisional.p2.artifact.repository,
+  org.eclipse.equinox.internal.provisional.p2.artifact.repository.processing,
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
+index 86a32ed..1f46d99 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/p2/metadata/generator/EclipseGeneratorApplication.java
+@@ -10,8 +10,6 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.metadata.generator;
+ 
+-import org.eclipse.equinox.internal.provisional.p2.repository.IRepository;
+-
+ import java.io.File;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+@@ -33,6 +31,7 @@ import org.eclipse.equinox.internal.provisional.p2.metadata.generator.EclipseIns
+ import org.eclipse.equinox.internal.provisional.p2.metadata.generator.Generator;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
++import org.eclipse.equinox.internal.provisional.p2.repository.IRepository;
+ import org.eclipse.osgi.util.NLS;
+ import org.osgi.framework.ServiceRegistration;
+ 
+@@ -308,6 +307,7 @@ public class EclipseGeneratorApplication implements IApplication {
+ 	private void registerDefaultArtifactRepoManager() {
+ 		if (ServiceHelper.getService(Activator.getContext(), IArtifactRepositoryManager.class.getName()) == null) {
+ 			defaultArtifactManager = new ArtifactRepositoryManager();
++			defaultArtifactManager.setEventBus(bus);
+ 			registrationDefaultArtifactManager = Activator.getContext().registerService(IArtifactRepositoryManager.class.getName(), defaultArtifactManager, null);
+ 		}
+ 	}
+@@ -315,6 +315,7 @@ public class EclipseGeneratorApplication implements IApplication {
+ 	private void registerDefaultMetadataRepoManager() {
+ 		if (ServiceHelper.getService(Activator.getContext(), IMetadataRepositoryManager.class.getName()) == null) {
+ 			defaultMetadataManager = new MetadataRepositoryManager();
++			defaultMetadataManager.setEventBus(bus);
+ 			registrationDefaultMetadataManager = Activator.getContext().registerService(IMetadataRepositoryManager.class.getName(), defaultMetadataManager, null);
+ 		}
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Activator.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Activator.java
+index 83380b3..f8fa8c1 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Activator.java
+@@ -26,7 +26,7 @@ public class Activator implements BundleActivator, ServiceTrackerCustomizer {
+ 	private static CacheManager cacheManager;
+ 	private ServiceRegistration repositoryManagerRegistration;
+ 	private MetadataRepositoryManager repositoryManager;
+-	private ServiceTracker tracker;
++	private ServiceTracker busTracker;
+ 
+ 	public static BundleContext getContext() {
+ 		return bundleContext;
+@@ -40,14 +40,15 @@ public class Activator implements BundleActivator, ServiceTrackerCustomizer {
+ 		Activator.bundleContext = context;
+ 		cacheManager = new CacheManager();
+ 
+-		// need to track event bus coming and going to make sure cache gets cleaned on
+-		// repository removals
+-		tracker = new ServiceTracker(context, IProvisioningEventBus.SERVICE_NAME, this);
+-		tracker.open();
+-
+ 		cacheManager.registerRepoEventListener();
+ 		repositoryManager = new MetadataRepositoryManager();
+ 		repositoryManagerRegistration = context.registerService(IMetadataRepositoryManager.class.getName(), repositoryManager, null);
++
++		// need to track event bus coming and going to make sure cache gets cleaned on
++		// repository removals
++		busTracker = new ServiceTracker(context, IProvisioningEventBus.SERVICE_NAME, this);
++		busTracker.open();
++
+ 	}
+ 
+ 	public void stop(BundleContext context) throws Exception {
+@@ -66,8 +67,12 @@ public class Activator implements BundleActivator, ServiceTrackerCustomizer {
+ 	}
+ 
+ 	public Object addingService(ServiceReference reference) {
+-		cacheManager.registerRepoEventListener();
+-		return null;
++		IProvisioningEventBus bus = (IProvisioningEventBus) bundleContext.getService(reference);
++		if (repositoryManager != null)
++			repositoryManager.setEventBus(bus);
++		if (cacheManager != null)
++			cacheManager.registerRepoEventListener();
++		return bus;
+ 	}
+ 
+ 	public void modifiedService(ServiceReference reference, Object service) {
+@@ -76,7 +81,7 @@ public class Activator implements BundleActivator, ServiceTrackerCustomizer {
+ 	}
+ 
+ 	public void removedService(ServiceReference reference, Object service) {
+-		// ignored
+-
++		if (repositoryManager != null)
++			repositoryManager.unsetEventBus((IProvisioningEventBus) service);
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.repository/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.repository/META-INF/MANIFEST.MF
+index bb6edbc..2da8cce 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.repository/META-INF/MANIFEST.MF
+@@ -30,16 +30,14 @@ Import-Package: javax.xml.parsers,
+  org.xml.sax,
+  org.xml.sax.helpers
+ Export-Package: org.eclipse.equinox.internal.p2.persistence;x-friends:="org.eclipse.equinox.p2.artifact.repository,org.eclipse.equinox.p2.engine,org.eclipse.equinox.p2.metadata.repository",
+- org.eclipse.equinox.internal.p2.repository;
+-  x-friends:="org.eclipse.equinox.p2.artifact.repository,
+-   org.eclipse.equinox.p2.metadata.repository,
+- org.eclipse.equinox.p2.updatesite",
++ org.eclipse.equinox.internal.p2.repository;x-friends:="org.eclipse.equinox.p2.artifact.repository,org.eclipse.equinox.p2.metadata.repository,org.eclipse.equinox.p2.updatesite",
+  org.eclipse.equinox.internal.p2.repository.helpers;
+   x-friends:="org.eclipse.equinox.p2.artifact.repository,
+    org.eclipse.equinox.p2.exemplarysetup,
+    org.eclipse.equinox.p2.metadata.repository,
+    org.eclipse.equinox.p2.updatesite,
+    org.eclipse.equinox.p2.repository.tools,
+-   org.eclipse.equinox.p2.ui",
++   org.eclipse.equinox.p2.ui,
++   org.eclipse.equinox.p2.metadata.generator",
+  org.eclipse.equinox.internal.provisional.p2.repository;uses:="org.osgi.framework,org.eclipse.core.runtime",
+  org.eclipse.equinox.internal.provisional.spi.p2.repository
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
+index 0568be5..8670f22 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
+@@ -80,11 +80,10 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 	 * Set used to manage exclusive load locks on repository locations.
+ 	 */
+ 	private Map loadLocks = new HashMap();
++	protected IProvisioningEventBus eventBus;
+ 
+ 	protected AbstractRepositoryManager() {
+-		IProvisioningEventBus bus = (IProvisioningEventBus) ServiceHelper.getService(Activator.getContext(), IProvisioningEventBus.SERVICE_NAME);
+-		if (bus != null)
+-			bus.addListener(this);
++		super();
+ 	}
+ 
+ 	/**
+@@ -197,9 +196,8 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 	}
+ 
+ 	private void broadcastChangeEvent(URI location, int repositoryType, int kind, boolean isEnabled) {
+-		IProvisioningEventBus bus = (IProvisioningEventBus) ServiceHelper.getService(Activator.getContext(), IProvisioningEventBus.class.getName());
+-		if (bus != null)
+-			bus.publishEvent(new RepositoryEvent(location, repositoryType, kind, isEnabled));
++		if (eventBus != null)
++			eventBus.publishEvent(new RepositoryEvent(location, repositoryType, kind, isEnabled));
+ 	}
+ 
+ 	/**
+@@ -954,12 +952,37 @@ public abstract class AbstractRepositoryManager implements IRepositoryManager, P
+ 	}
+ 
+ 	/**
++	 * Injects the event bus service to be used by this repository manager.
++	 * @param bus The event bus being added
++	 */
++	public void setEventBus(IProvisioningEventBus bus) {
++		if (eventBus == bus)
++			return;
++		if (eventBus != null)
++			unsetEventBus(eventBus);
++		this.eventBus = bus;
++		eventBus.addListener(this);
++	}
++
++	/**
++	 * Removes the event bus service used by this repository manager
++	 * @param bus The bus being removed
++	 */
++	public void unsetEventBus(IProvisioningEventBus bus) {
++		if (bus == eventBus) {
++			eventBus.removeListener(this);
++			eventBus = null;
++		}
++	}
++
++	/**
+ 	 * Shuts down the repository manager.
+ 	 */
+ 	public void shutdown() {
+-		IProvisioningEventBus bus = (IProvisioningEventBus) ServiceHelper.getService(Activator.getContext(), IProvisioningEventBus.SERVICE_NAME);
+-		if (bus != null)
+-			bus.removeListener(this);
++		if (eventBus != null) {
++			eventBus.removeListener(this);
++			eventBus = null;
++		}
+ 		//ensure all repository state in memory is written to disk
+ 		boolean changed = false;
+ 		synchronized (repositoryLock) {

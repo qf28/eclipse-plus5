@@ -1,0 +1,1018 @@
+commit 7d3afc3f27245407e5b0867cd3ab93a9ed55ea79
+Author: Sasikanth Bharadwaj <sasikanth.bharadwaj@in.ibm.com>
+Date:   Mon Oct 5 11:52:13 2015 +0530
+
+    Fixed bug 479119: [1.8][compiler][codegen] Improve code generated
+    for Serializable
+    method/constructor references
+    
+    Change-Id: If094addee2233268183113df5ff56143c110836d
+    Task-Url: https://bugs.eclipse.org/bugs/show_bug.cgi?id=479119
+
+4	4	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/LambdaExpressionsTest.java
+250	2	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/SerializableLambdaTest.java
+19	11	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ClassFile.java
+13	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+0	13	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+5	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+156	125	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
+37	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java
+27	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SyntheticMethodBinding.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/LambdaExpressionsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/LambdaExpressionsTest.java
+index 698d72d..0e76693 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/LambdaExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/LambdaExpressionsTest.java
+@@ -4969,14 +4969,14 @@ public void test447119c() {
+ 				"        SerializableFunction<List<String>, List<String>> f = X::foo;\n" +
+ 				"        Method[] methods = X.class.getDeclaredMethods();\n" +
+ 				"        for (Method m : methods) {\n" +
+-				"        	if (m.getName().contains(\"lambda\")) {\n" +
++				"        	if (m.getName().contains(\"foo\")) {\n" +
+ 				"        		System.out.println(\"- \" + m.getGenericReturnType() + \" \" + m.getName() + \"(\" + Arrays.asList(m.getGenericParameterTypes()) + \")\");\n" +
+ 				"        	}\n" +
+ 				"        }\n" +
+ 				"    }\n" +
+ 				"}\n"
+ 			},
+-			"- java.util.List<java.lang.String> lambda$0([java.util.List<java.lang.String>])");
++			"- java.util.List<java.lang.String> foo([java.util.List<java.lang.String>])");
+ }
+ // https://bugs.eclipse.org/bugs/show_bug.cgi?id=447119, [1.8][compiler] method references lost generic type information (4.4 -> 4.4.1 regression) 
+ public void test447119d() {
+@@ -5017,9 +5017,9 @@ public void test447119d() {
+ 				"	}\n" +
+ 				"}\n"
+ 			},
+-			"Lambda binds to: X.lambda$0\n" + 
++			"Lambda binds to: X.noop\n" + 
+ 			"Methods (with generics):\n" + 
+-			"[- java.util.List<java.lang.String> lambda$0(java.util.List<java.lang.String>), - java.util.List<java.lang.String> noop(java.util.List<java.lang.String>)]",
++			"[- java.util.List<java.lang.String> noop(java.util.List<java.lang.String>)]",
+ 			null,
+ 			true,
+ 			new String [] { "-Ddummy" }); // Not sure, unless we force the VM to not be reused by passing dummy vm argument, the generated program aborts midway through its execution.
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/SerializableLambdaTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/SerializableLambdaTest.java
+index e9111e8..86a4714 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/SerializableLambdaTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/SerializableLambdaTest.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2014 GoPivotal, Inc. All Rights Reserved.
++ * Copyright (c) 2014, 2016 GoPivotal, Inc. and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -15,6 +15,7 @@
+  *        Olivier Tardieu tardieu@us.ibm.com - Contributions for
+  *                          Bug 442416 - $deserializeLambda$ missing cases for nested lambdas
+  *                          Bug 442418 - $deserializeLambda$ off-by-one error when deserializing the captured arguments of a lambda that also capture this
++ *        IBM Corporation - Additional tests
+  *******************************************************************************/
+ package org.eclipse.jdt.core.tests.compiler.regression;
+ 
+@@ -1532,7 +1533,254 @@ public class SerializableLambdaTest extends AbstractRegressionTest {
+ 				null,true,
+ 				new String[]{"-Ddummy"}); // Not sure, unless we force the VM to not be reused by passing dummy vm argument, the generated program aborts midway through its execution.
+ 	}
+-	
++
++	public void testbug479119() {
++		this.runConformTest(
++			new String[]{
++				"Testbed.java",
++				"import java.io.ObjectStreamClass;\n" + 
++				"import java.io.Serializable;\n" + 
++				"import java.lang.invoke.SerializedLambda;\n" + 
++				"import java.lang.reflect.Method;\n" + 
++				"import java.util.function.IntFunction;\n" + 
++				"import java.util.stream.Stream;\n" + 
++				"public class Testbed {\n" + 
++				"	public static void main(String[] args) {\n" + 
++				"		System.out.println(getMethod(Testbed::foo).equals(getMethod(Testbed::foo)));\n" + 
++				"	}\n" + 
++				"	private static void foo() { }\n" + 
++				"	static interface MethodRef extends Runnable, Serializable { }\n" + 
++				"	private static Method getMethod(MethodRef methodRef) {\n" + 
++				"		try {\n" + 
++				"			final Method invokeWriteReplaceMethod = ObjectStreamClass.class.getDeclaredMethod(\"invokeWriteReplace\", Object.class);\n" + 
++				"			invokeWriteReplaceMethod.setAccessible(true);\n" + 
++				"			final SerializedLambda l = (SerializedLambda)invokeWriteReplaceMethod.invoke(\n" + 
++				"					ObjectStreamClass.lookupAny(methodRef.getClass()),\n" + 
++				"					methodRef\n" + 
++				"				);\n" + 
++				"			System.out.println(\"Looking for \" + l.getImplClass() + \".\" + l.getImplMethodName());\n" + 
++				"			final Method[] methods = Stream.of(Class.forName(l.getImplClass()).getDeclaredMethods()).\n" + 
++				"				filter(m -> m.getName().equals(l.getImplMethodName())).\n" + 
++				"				toArray(Method[]::new);\n" + 
++				"			if(methods.length != 1) throw new AssertionError(\"TODO: check signature\");\n" + 
++				"			return methods[0];\n" + 
++				"		} catch(Exception e) {\n" + 
++				"			throw new RuntimeException(e);\n" + 
++				"		}\n" + 
++				"	}\n" + 
++				"}\n"
++		},
++		"Looking for Testbed.foo\n" +
++		"Looking for Testbed.foo\n" +
++		"true",
++		null,true,
++		new String[]{"-Ddummy"});
++		
++		String bootstrapEntries = printBootstrapMethodsAttribute(OUTPUT_DIR + File.separator + "Testbed.class");
++		String expectedOutput = 
++				"0: invokestatic java/lang/invoke/LambdaMetafactory.altMetafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;\n"+
++				"  Method arguments:\n"+
++				"    ()V\n"+
++				"    invokestatic Testbed.foo:()V\n"+
++				"    ()V\n"+
++				"    1\n"+
++				"1: invokestatic java/lang/invoke/LambdaMetafactory.metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;\n"+
++				"  Method arguments:\n"+
++				"    (Ljava/lang/Object;)Z\n"+
++				"    invokestatic Testbed.lambda$0:(Ljava/lang/invoke/SerializedLambda;Ljava/lang/reflect/Method;)Z\n"+
++				"    (Ljava/lang/reflect/Method;)Z\n"+
++				"2: invokestatic java/lang/invoke/LambdaMetafactory.metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;\n"+
++				"  Method arguments:\n"+
++				"    (I)Ljava/lang/Object;\n"+
++				"    invokestatic Testbed.lambda$1:(I)[Ljava/lang/reflect/Method;\n"+
++				"    (I)[Ljava/lang/reflect/Method;\n";
++
++		checkExpected(expectedOutput, bootstrapEntries);
++	}
++
++	public void testbug479119a() {
++		this.runConformTest(
++			new String[]{
++				"Testbed.java",
++				"import java.io.ObjectStreamClass;\n" + 
++				"import java.io.Serializable;\n" + 
++				"import java.lang.invoke.SerializedLambda;\n" + 
++				"import java.lang.reflect.Constructor;\n" + 
++				"import java.lang.reflect.Executable;\n" + 
++				"import java.lang.reflect.Method;\n" + 
++				"import java.util.function.IntFunction;\n" + 
++				"import java.util.stream.Stream;\n" + 
++				"public class Testbed {\n" + 
++				"	public static void main(String[] args) {\n" + 
++				"		System.out.println(getMethod(Testbed::foo).equals(getMethod(Testbed::foo)));\n" + 
++				"		System.out.println(getMethod(new Foo()::method).equals(getMethod(new Bar()::method)));\n" + 
++				"		System.out.println(getMethod(MethodRefImpl::new).equals(getMethod(MethodRefImpl::new)));\n" + 
++				"	}\n" + 
++				"	static class MethodRefImpl implements MethodRef {\n" + 
++				"		@Override\n" + 
++				"		public void run() {}\n" + 
++				"	}\n" + 
++				"	public static class Base {\n" + 
++				"        public void method () {}\n" + 
++				"    }\n" + 
++				"    public static class Foo extends Base {}\n" + 
++				"    public static class Bar extends Base {}\n" + 
++				"	private static void foo() { }\n" + 
++				"	static interface MethodRef extends Runnable, Serializable { }\n" + 
++				"	private static Executable getMethod(MethodRef methodRef) {\n" + 
++				"		try {\n" + 
++				"			final Method invokeWriteReplaceMethod = ObjectStreamClass.class.getDeclaredMethod(\"invokeWriteReplace\", Object.class);\n" + 
++				"			invokeWriteReplaceMethod.setAccessible(true);\n" + 
++				"			final SerializedLambda l = (SerializedLambda)invokeWriteReplaceMethod.invoke(\n" + 
++				"					ObjectStreamClass.lookupAny(methodRef.getClass()),\n" + 
++				"					methodRef\n" + 
++				"				);\n" + 
++				"			System.out.println(\"Looking for \" + l.getImplClass() + \".\" + l.getImplMethodName());\n" + 
++				"			boolean isConstructor = l.getImplMethodName().indexOf(\"<init>\") >= 0;\n" + 
++				"			final Executable[] methods = Stream.of(isConstructor ? Class.forName(l.getImplClass()).getDeclaredConstructors() : Class.forName(l.getImplClass()).getDeclaredMethods()).\n" + 
++				"				filter(m -> m.getName().equals(isConstructor ? l.getImplClass() : l.getImplMethodName())).\n" + 
++				"				toArray(isConstructor ? Constructor[]::new : Method[]::new);\n" + 
++				"			if(methods.length != 1) throw new AssertionError(\"TODO: check signature\");\n" + 
++				"			return methods[0];\n" + 
++				"		} catch(Exception e) {\n" + 
++				"			throw new RuntimeException(e);\n" + 
++				"		}\n" + 
++				"	}\n" + 
++				"}\n"
++		},
++		"Looking for Testbed.foo\n" +
++		"Looking for Testbed.foo\n" +
++		"true\n" +
++		"Looking for Testbed$Base.method\n" +
++		"Looking for Testbed$Base.method\n" +
++		"true\n" +
++		"Looking for Testbed$MethodRefImpl.<init>\n" +
++		"Looking for Testbed$MethodRefImpl.<init>\n" +
++		"true",
++		null,true,
++		new String[]{"-Ddummy"});
++	}
++
++	// Serializable reference expressions that share the same name
++	public void testbug479119b() {
++		this.runConformTest(
++			new String[]{
++				"X.java",
++				"import java.io.ByteArrayInputStream;\n" + 
++				"import java.io.ByteArrayOutputStream;\n" + 
++				"import java.io.IOException;\n" + 
++				"import java.io.ObjectInputStream;\n" + 
++				"import java.io.ObjectOutputStream;\n" + 
++				"import java.io.Serializable;\n" + 
++				"public class X {\n" + 
++				"    public static interface Consumer<T> extends Serializable {\n" + 
++				"        void accept(T t);\n" + 
++				"    }\n" + 
++				"    public static class Foo {\n" + 
++				"    	public void method () {\n" + 
++				"        	System.out.println(\"Foo\");\n" + 
++				"        }\n" + 
++				"    }\n" + 
++				"    public static class Bar {\n" + 
++				"    	public void method () {\n" + 
++				"        	System.out.println(\"Bar\");\n" + 
++				"        }\n" + 
++				"    }\n" + 
++				"    public static void main (String[] args) throws IOException, ClassNotFoundException {\n" + 
++				"        Consumer<Foo> foo = Foo::method;\n" + 
++				"        Consumer<Bar> bar = Bar::method;\n" + 
++				"        Consumer<Foo> baz = (b) -> {b.method();};\n" + 
++				"        ByteArrayOutputStream debug=new ByteArrayOutputStream();\n" + 
++				"		try(ObjectOutputStream oo=new ObjectOutputStream(debug)) {\n" + 
++				"			oo.writeObject(bar);\n" + 
++				"		}\n" + 
++				"		try(ObjectInputStream oi=new ObjectInputStream(new ByteArrayInputStream(debug.toByteArray()))) {\n" + 
++				"			Consumer<Bar> x = (Consumer)oi.readObject();\n" + 
++				"			x.accept(new Bar());\n" + 
++				"		}\n" + 
++				"		debug.reset();\n" + 
++				"		try(ObjectOutputStream oo=new ObjectOutputStream(debug)) {\n" + 
++				"			oo.writeObject(foo);\n" + 
++				"		}\n" + 
++				"		try(ObjectInputStream oi=new ObjectInputStream(new ByteArrayInputStream(debug.toByteArray()))) {\n" + 
++				"			Consumer<Foo> x = (Consumer)oi.readObject();\n" + 
++				"			x.accept(new Foo());\n" + 
++				"		}\n" + 
++				"    }\n" + 
++				"}\n"
++		},
++		"Bar\n" +
++		"Foo",
++		null,true,
++		new String[]{"-Ddummy"});
++	}
++	public void testbug479119_comment20() {
++		this.runConformTest(
++			new String[]{
++				"Testbed.java",
++				"import java.io.ByteArrayInputStream;\n" + 
++				"import java.io.ByteArrayOutputStream;\n" + 
++				"import java.io.IOException;\n" + 
++				"import java.io.ObjectInputStream;\n" + 
++				"import java.io.ObjectOutputStream;\n" + 
++				"import java.io.Serializable;\n" + 
++				"interface FI extends Serializable{\n" + 
++				"	void run(Testbed args);\n" + 
++				"}\n" + 
++				"interface IF extends Serializable{\n" + 
++				"	void run();\n" + 
++				"}\n" + 
++				"public class Testbed implements Serializable{\n" + 
++				"	String f;\n" + 
++				"	Testbed(String str) {\n" + 
++				"		f = str;\n" + 
++				"	}\n" + 
++				"	void test() throws IOException, ClassNotFoundException {\n" + 
++				"		accept(Testbed::foo);\n" + 
++				"		accept(this::foo);		\n" + 
++				"	}\n" + 
++				"	void foo() {\n" + 
++				"		System.out.println(this.f);\n" + 
++				"	}\n" + 
++				"	void accept(FI fi) {\n" + 
++				"		fi.run(this);\n" + 
++				"	}\n" + 
++				"	void accept(IF i) {\n" + 
++				"		i.run();\n" + 
++				"	}\n" + 
++				"	public static void main(String[] args) throws ClassNotFoundException, IOException {\n" + 
++				"		Testbed t = new Testbed(\"IF\");\n" + 
++				"		Testbed t2 = new Testbed(\"FI\");\n" + 
++				"		IF i = t::foo;\n" + 
++				"		FI f = Testbed::foo;\n" + 
++				"		ByteArrayOutputStream debug=new ByteArrayOutputStream();\n" + 
++				"		try(ObjectOutputStream oo=new ObjectOutputStream(debug))\n" + 
++				"		{\n" + 
++				"			oo.writeObject(i);\n" + 
++				"		}\n" + 
++				"		try(ObjectInputStream oi=new ObjectInputStream(new ByteArrayInputStream(debug.toByteArray())))\n" + 
++				"		{\n" + 
++				"			IF x = (IF)oi.readObject();\n" + 
++				"			t.accept(x);\n" + 
++				"		}\n" + 
++				"		debug=new ByteArrayOutputStream();\n" + 
++				"		try(ObjectOutputStream oo=new ObjectOutputStream(debug))\n" + 
++				"		{\n" + 
++				"			oo.writeObject(f);\n" + 
++				"		}\n" + 
++				"		try(ObjectInputStream oi=new ObjectInputStream(new ByteArrayInputStream(debug.toByteArray())))\n" + 
++				"		{\n" + 
++				"			FI x = (FI)oi.readObject();\n" + 
++				"			t2.accept(x);\n" + 
++				"		}\n" + 
++				"	}\n" + 
++				"}"
++		},
++		"IF\n" +
++		"FI",
++		null,true,
++		new String[]{"-Ddummy"});
++	}
+ 	// ---
+ 	
+ 	private void checkExpected(String expected, String actual) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ClassFile.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ClassFile.java
+index 8809103..2239276 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ClassFile.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ClassFile.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2015 IBM Corporation and others.
++ * Copyright (c) 2000, 2016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -60,6 +60,7 @@ import org.eclipse.jdt.internal.compiler.ast.MethodDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.NormalAnnotation;
+ import org.eclipse.jdt.internal.compiler.ast.QualifiedNameReference;
+ import org.eclipse.jdt.internal.compiler.ast.Receiver;
++import org.eclipse.jdt.internal.compiler.ast.ReferenceExpression;
+ import org.eclipse.jdt.internal.compiler.ast.SingleMemberAnnotation;
+ import org.eclipse.jdt.internal.compiler.ast.SingleNameReference;
+ import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
+@@ -75,10 +76,10 @@ import org.eclipse.jdt.internal.compiler.codegen.ExceptionLabel;
+ import org.eclipse.jdt.internal.compiler.codegen.Opcodes;
+ import org.eclipse.jdt.internal.compiler.codegen.StackMapFrame;
+ import org.eclipse.jdt.internal.compiler.codegen.StackMapFrameCodeStream;
+-import org.eclipse.jdt.internal.compiler.codegen.TypeAnnotationCodeStream;
+ import org.eclipse.jdt.internal.compiler.codegen.StackMapFrameCodeStream.ExceptionMarker;
+ import org.eclipse.jdt.internal.compiler.codegen.StackMapFrameCodeStream.StackDepthMarker;
+ import org.eclipse.jdt.internal.compiler.codegen.StackMapFrameCodeStream.StackMarker;
++import org.eclipse.jdt.internal.compiler.codegen.TypeAnnotationCodeStream;
+ import org.eclipse.jdt.internal.compiler.codegen.VerificationTypeInfo;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.impl.Constant;
+@@ -951,6 +952,9 @@ public class ClassFile implements TypeConstants, TypeIds {
+ 						case SyntheticMethodBinding.DeserializeLambda:
+ 							deserializeLambdaMethod = syntheticMethod; // delay processing
+ 							break;
++						case SyntheticMethodBinding.SerializableMethodReference:
++							// Nothing to be done
++							break;
+ 					}
+ 				}
+ 				emittedSyntheticsCount = currentSyntheticsCount;
+@@ -2927,12 +2931,9 @@ public class ClassFile implements TypeConstants, TypeIds {
+ 			FunctionalExpression functional = (FunctionalExpression) functionalExpressionList.get(i);
+ 			MethodBinding [] bridges = functional.getRequiredBridges();
+ 			TypeBinding[] markerInterfaces = null;
+-			if (functional instanceof LambdaExpression && 
+-				   (((markerInterfaces=((LambdaExpression)functional).getMarkerInterfaces()) != null) ||
+-				   	((LambdaExpression)functional).isSerializable) ||
+-				   	bridges != null) {
+-				
+-				LambdaExpression lambdaEx = (LambdaExpression)functional;
++			if ((functional instanceof LambdaExpression
++					&& (((markerInterfaces = ((LambdaExpression) functional).getMarkerInterfaces()) != null))
++					|| bridges != null) || functional.isSerializable) {
+ 				// may need even more space
+ 				int extraSpace = 2; // at least 2 more than when the normal metafactory is used, for the bitflags entry
+ 				if (markerInterfaces != null) {
+@@ -2974,7 +2975,7 @@ public class ClassFile implements TypeConstants, TypeIds {
+ 				this.contents[localContentsOffset++] = (byte) methodTypeIndex;
+ 
+ 				int bitflags = 0;
+-				if (lambdaEx.isSerializable) {
++				if (functional.isSerializable) {
+ 					bitflags |= ClassFileConstants.FLAG_SERIALIZABLE;
+ 				}
+ 				if (markerInterfaces!=null) {
+@@ -5209,10 +5210,17 @@ public class ClassFile implements TypeConstants, TypeIds {
+ 		if (this.bootstrapMethods == null) {
+ 			this.bootstrapMethods = new ArrayList();
+ 		}
++		if (expression instanceof ReferenceExpression) {
++			for (int i = 0; i < this.bootstrapMethods.size(); i++) {
++				FunctionalExpression fexp = (FunctionalExpression) this.bootstrapMethods.get(i);
++				if (fexp.binding == expression.binding
++						&& TypeBinding.equalsEquals(fexp.expectedType(), expression.expectedType()))
++					return expression.bootstrapMethodNumber = i;
++			}
++		}
+ 		this.bootstrapMethods.add(expression);
+ 		// Record which bootstrap method was assigned to the expression
+-		expression.bootstrapMethodNumber = this.bootstrapMethods.size() - 1;
+-		return this.bootstrapMethods.size() - 1;
++		return expression.bootstrapMethodNumber = this.bootstrapMethods.size() - 1;
+ 	}
+ 
+ 	public void reset(SourceTypeBinding typeBinding) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+index 39f9085..86cbe9e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+@@ -47,6 +47,7 @@ import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.Scope;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBindingVisitor;
++import org.eclipse.jdt.internal.compiler.lookup.TypeIds;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeVariableBinding;
+ 
+ public abstract class FunctionalExpression extends Expression {
+@@ -63,6 +64,7 @@ public abstract class FunctionalExpression extends Expression {
+ 	public boolean shouldCaptureInstance = false; // Whether the expression needs access to instance data of enclosing type
+ 	protected static IErrorHandlingPolicy silentErrorHandlingPolicy = DefaultErrorHandlingPolicies.ignoreAllProblems();
+ 	private boolean hasReportedSamProblem = false;
++	public boolean isSerializable;
+ 
+ 	public FunctionalExpression(CompilationResult compilationResult) {
+ 		this.compilationResult = compilationResult;
+@@ -185,6 +187,17 @@ public abstract class FunctionalExpression extends Expression {
+ 		
+ 		this.descriptor = sam;
+ 		if (skipKosherCheck || kosherDescriptor(blockScope, sam, true)) {
++			if (this.expectedType instanceof IntersectionTypeBinding18) {
++				ReferenceBinding[] intersectingTypes =  ((IntersectionTypeBinding18)this.expectedType).intersectingTypes;
++				for (int t = 0, max = intersectingTypes.length; t < max; t++) {
++					if (intersectingTypes[t].findSuperTypeOriginatingFrom(TypeIds.T_JavaIoSerializable, false /*Serializable is not a class*/) != null) {
++						this.isSerializable = true;
++						break;
++					}
++				}
++			} else if (this.expectedType.findSuperTypeOriginatingFrom(TypeIds.T_JavaIoSerializable, false /*Serializable is not a class*/) != null) {
++				this.isSerializable = true;
++			}
+ 			if (blockScope.environment().globalOptions.isAnnotationBasedNullAnalysisEnabled)
+ 				NullAnnotationMatching.checkForContradictions(sam, this, blockScope);
+ 			return this.resolvedType = this.expectedType;		
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index dd4fc96..2d2908a 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -110,7 +110,6 @@ public class LambdaExpression extends FunctionalExpression implements IPolyExpre
+ 	boolean voidCompatible = true;
+ 	boolean valueCompatible = false;
+ 	boolean returnsValue;
+-	public boolean isSerializable;
+ 	private boolean requiresGenericSignature;
+ 	boolean returnsVoid;
+ 	public LambdaExpression original = this;
+@@ -434,18 +433,6 @@ public class LambdaExpression extends FunctionalExpression implements IPolyExpre
+ 			if (!this.returnsVoid && !this.returnsValue)
+ 				this.valueCompatible = this.body.doesNotCompleteNormally();
+ 		}
+-		if (this.expectedType instanceof IntersectionTypeBinding18) {
+-			ReferenceBinding[] intersectingTypes =  ((IntersectionTypeBinding18)this.expectedType).intersectingTypes;
+-			for (int t = 0, max = intersectingTypes.length; t < max; t++) {
+-				if (intersectingTypes[t].findSuperTypeOriginatingFrom(TypeIds.T_JavaIoSerializable, false /*Serializable is not a class*/) != null) {
+-					this.isSerializable = true;
+-					break;
+-				}
+-			}
+-		} else if (this.expectedType != null && 
+-				   this.expectedType.findSuperTypeOriginatingFrom(TypeIds.T_JavaIoSerializable, false /*Serializable is not a class*/) != null) {
+-			this.isSerializable = true;
+-		}
+ 		if ((this.binding.tagBits & TagBits.HasMissingType) != 0) {
+ 			this.scope.problemReporter().missingTypeInLambda(this, this.binding);
+ 		}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+index 52a8a98..9a9afdc 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+@@ -103,7 +103,7 @@ public class ReferenceExpression extends FunctionalExpression implements IPolyEx
+ 	public int nameSourceStart;
+ 
+ 	public TypeBinding receiverType;
+-	private boolean haveReceiver;
++	public boolean haveReceiver;
+ 	public TypeBinding[] resolvedTypeArguments;
+ 	private boolean typeArgumentsHaveErrors;
+ 	
+@@ -264,8 +264,7 @@ public class ReferenceExpression extends FunctionalExpression implements IPolyEx
+ 		// these cases are either too complicated, impossible to handle or result in significant code duplication 
+ 		return (this.binding.isVarargs() || 
+ 				(isConstructorReference() && this.receiverType.syntheticOuterLocalVariables() != null && this.shouldCaptureInstance) ||
+-				this.expectedType instanceof IntersectionTypeBinding18 || // marker interfaces require alternate meta factory.
+-				this.expectedType.findSuperTypeOriginatingFrom(currentScope.getJavaIoSerializable()) != null || // serialization support.
++				this.expectedType instanceof IntersectionTypeBinding18 || // marker interfaces require alternate meta factory. 
+ 				this.requiresBridges()); // bridges.
+ 		// To fix: We should opt for direct code generation wherever possible.
+ 	}
+@@ -296,7 +295,9 @@ public class ReferenceExpression extends FunctionalExpression implements IPolyEx
+ 				}
+ 			}
+ 		}
+-		
++		if (this.isSerializable) {
++			sourceType.addSyntheticMethod(this);
++		}
+ 		int pc = codeStream.position;
+ 		StringBuffer buffer = new StringBuffer();
+ 		int argumentsSize = 0;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
+index 33fcd6d..1d916e9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/codegen/CodeStream.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2015 IBM Corporation and others.
++ * Copyright (c) 2000, 2016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -43,8 +43,10 @@ import org.eclipse.jdt.internal.compiler.ast.ArrayAllocationExpression;
+ import org.eclipse.jdt.internal.compiler.ast.ExplicitConstructorCall;
+ import org.eclipse.jdt.internal.compiler.ast.Expression;
+ import org.eclipse.jdt.internal.compiler.ast.FieldDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.FunctionalExpression;
+ import org.eclipse.jdt.internal.compiler.ast.LambdaExpression;
+ import org.eclipse.jdt.internal.compiler.ast.OperatorIds;
++import org.eclipse.jdt.internal.compiler.ast.ReferenceExpression;
+ import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.TypeReference;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+@@ -2522,28 +2524,24 @@ public void generateSyntheticBodyForEnumValueOf(SyntheticMethodBinding methodBin
+ public void generateSyntheticBodyForDeserializeLambda(SyntheticMethodBinding methodBinding,SyntheticMethodBinding[] syntheticMethodBindings) {
+ 	initializeMaxLocals(methodBinding);
+ 
+-	// Compute the list of the serializable lambdas from the full set of synthetic method bindings
+-	// Also compute a map of hashcodes to a list of serializable lambdas whose names share a hashcode 
+-	List syntheticsForSerializableLambdas = new ArrayList();	
+-	Map hashcodesToLambdas = new LinkedHashMap();
++	// Compute a map of hashcodes to a list of synthetic methods whose names share a hashcode 
++	Map hashcodesTosynthetics = new LinkedHashMap();
+ 	for (int i=0,max=syntheticMethodBindings.length;i<max;i++) {
+ 		SyntheticMethodBinding syntheticMethodBinding = syntheticMethodBindings[i];
+-		if (syntheticMethodBinding.lambda!=null && syntheticMethodBinding.lambda.isSerializable) {
+-			syntheticsForSerializableLambdas.add(syntheticMethodBinding);
++		if (syntheticMethodBinding.lambda!=null && syntheticMethodBinding.lambda.isSerializable ||
++				syntheticMethodBinding.serializableMethodRef != null) {
+ 			// TODO can I use > Java 1.4 features here?
+ 			Integer hashcode = new Integer(new String(syntheticMethodBinding.selector).hashCode());
+-			List lambdasForThisHashcode = (List)hashcodesToLambdas.get(hashcode);
+-			if (hashcodesToLambdas.get(hashcode)==null) {
+-				lambdasForThisHashcode = new ArrayList();
+-				hashcodesToLambdas.put(hashcode,lambdasForThisHashcode);
++			List syntheticssForThisHashcode = (List)hashcodesTosynthetics.get(hashcode);
++			if (syntheticssForThisHashcode==null) {
++				syntheticssForThisHashcode = new ArrayList();
++				hashcodesTosynthetics.put(hashcode,syntheticssForThisHashcode);
+ 			}
+-			lambdasForThisHashcode.add(syntheticMethodBinding);
++			syntheticssForThisHashcode.add(syntheticMethodBinding);
+ 		}
+ 	}
+-	int lambdaCount = syntheticsForSerializableLambdas.size();
+ 	ClassScope scope = ((SourceTypeBinding)methodBinding.declaringClass).scope;
+ 	
+-	
+ 	// Generate the first switch, on method name hashcode
+ 	aload_0();
+ 	invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName, ConstantPool.GetImplMethodName, ConstantPool.GetImplMethodNameSignature);
+@@ -2561,11 +2559,11 @@ public void generateSyntheticBodyForDeserializeLambda(SyntheticMethodBinding met
+ 	
+ 	BranchLabel label = new BranchLabel(this);
+ 	CaseLabel defaultLabel = new CaseLabel(this);
+-	int numberOfHashcodes = hashcodesToLambdas.size();
++	int numberOfHashcodes = hashcodesTosynthetics.size();
+ 	CaseLabel[] switchLabels = new CaseLabel[numberOfHashcodes];
+ 	int[] keys = new int[numberOfHashcodes];
+ 	int[] sortedIndexes = new int[numberOfHashcodes];
+-	Set hashcodes = hashcodesToLambdas.keySet();
++	Set hashcodes = hashcodesTosynthetics.keySet();
+ 	Iterator hashcodeIterator = hashcodes.iterator();
+ 	int index=0;
+ 	while (hashcodeIterator.hasNext()) {
+@@ -2585,152 +2583,185 @@ public void generateSyntheticBodyForDeserializeLambda(SyntheticMethodBinding met
+ 	index = 0;
+ 	while (hashcodeIterator.hasNext()) {
+ 		Integer hashcode = (Integer)hashcodeIterator.next();
+-		List lambdas = (List)hashcodesToLambdas.get(hashcode);
++		List synthetics = (List)hashcodesTosynthetics.get(hashcode);
+ 		switchLabels[index].place();
+ 		BranchLabel nextOne = new BranchLabel(this);
+ 		// Loop through all lambdas that share the same hashcode
+-		for (int j=0,max=lambdas.size();j<max;j++) {
+-			SyntheticMethodBinding syntheticMethodBinding = (SyntheticMethodBinding)lambdas.get(j);
++		// TODO: isn't doing this for just one of these enough because they all share
++		// the same name?
++		for (int j=0,max=synthetics.size();j<max;j++) {
++			SyntheticMethodBinding syntheticMethodBinding = (SyntheticMethodBinding)synthetics.get(j);
+ 			aload_1();
+ 			ldc(new String(syntheticMethodBinding.selector));
+ 			invokeStringEquals();
+ 			ifeq(nextOne);
+-			loadInt(index++);
++			loadInt(index);
+ 			istore_2();
+ 			goto_(label);
+ 			nextOne.place();
+ 			nextOne = new BranchLabel(this);
+ 		}
++		index++;
+ 		goto_(label);
+ 	}
+ 	defaultLabel.place();
+ 	label.place();
+-	
++	int syntheticsCount = hashcodes.size();
+ 	// Second block is switching on the lambda id, -1 is the error (unrecognized) case
+-	switchLabels = new CaseLabel[lambdaCount];
+-	keys = new int[lambdaCount];
+-	sortedIndexes = new int[lambdaCount];
++	switchLabels = new CaseLabel[syntheticsCount];
++	keys = new int[syntheticsCount];
++	sortedIndexes = new int[syntheticsCount];
+ 	BranchLabel errorLabel = new BranchLabel(this);
+ 	defaultLabel = new CaseLabel(this);
+ 	iload_2();
+-	for (int j=0;j<lambdaCount;j++) {
++	for (int j=0;j<syntheticsCount;j++) {
+ 		switchLabels[j] = new CaseLabel(this);
+ 		keys[j] = j;
+ 		sortedIndexes[j] = j;
+ 	}
+-	System.arraycopy(keys,0,(localKeysCopy = new int[lambdaCount]),0,lambdaCount);
++	System.arraycopy(keys,0,(localKeysCopy = new int[syntheticsCount]),0,syntheticsCount);
+ 	// TODO no need to sort here? They should all be in order
+-	sort(localKeysCopy, 0, lambdaCount-1, sortedIndexes);
++	sort(localKeysCopy, 0, syntheticsCount-1, sortedIndexes);
+ 	// TODO need to use a tableswitch at some size threshold?
+ 	lookupswitch(defaultLabel, keys, sortedIndexes, switchLabels);
+-	for (int i=0;i<lambdaCount;i++) {
+-		SyntheticMethodBinding syntheticMethodBinding = (SyntheticMethodBinding)syntheticsForSerializableLambdas.get(i);
+-		switchLabels[i].place();
+-		
+-		// Compare ImplMethodKind
+-		aload_0();
+-		LambdaExpression lambdaEx = syntheticMethodBinding.lambda;
+-		MethodBinding mb = lambdaEx.binding;
+-		invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName, 
+-				ConstantPool.GetImplMethodKind, ConstantPool.GetImplMethodKindSignature);
+-		byte methodKind = 0;
+-		if (mb.isStatic()) {
+-			methodKind = ClassFileConstants.MethodHandleRefKindInvokeStatic;
+-		} else if (mb.isPrivate()) {
+-			methodKind = ClassFileConstants.MethodHandleRefKindInvokeSpecial;
+-		} else {
+-			methodKind = ClassFileConstants.MethodHandleRefKindInvokeVirtual;
+-		}
+-		bipush(methodKind);// TODO see table below
+-		if_icmpne(errorLabel);
++	hashcodeIterator = hashcodes.iterator();
++	int hashcodeIndex = 0;
++	while (hashcodeIterator.hasNext()) {
++		Integer hashcode = (Integer)hashcodeIterator.next();
++		List synthetics = (List)hashcodesTosynthetics.get(hashcode);
++		switchLabels[hashcodeIndex++].place();
++		BranchLabel nextOne = synthetics.size() > 1 ? new BranchLabel(this) : errorLabel;
++		// Loop through all lambdas that share the same hashcode
++		for (int j = 0, count = synthetics.size(); j < count; j++) {
++			SyntheticMethodBinding syntheticMethodBinding = (SyntheticMethodBinding) synthetics.get(j);
++			// Compare ImplMethodKind
++			aload_0();
++			FunctionalExpression funcEx = syntheticMethodBinding.lambda != null ? syntheticMethodBinding.lambda
++					: syntheticMethodBinding.serializableMethodRef;
++			MethodBinding mb = funcEx.binding;
++			invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName,
++					ConstantPool.GetImplMethodKind, ConstantPool.GetImplMethodKindSignature);
++			byte methodKind = 0;
++			if (mb.isStatic()) {
++				methodKind = ClassFileConstants.MethodHandleRefKindInvokeStatic;
++			} else if (mb.isPrivate()) {
++				methodKind = ClassFileConstants.MethodHandleRefKindInvokeSpecial;
++			} else {
++				methodKind = ClassFileConstants.MethodHandleRefKindInvokeVirtual;
++			}
++			bipush(methodKind);// TODO see table below
++			if_icmpne(nextOne);
+ 
+-		// Compare FunctionalInterfaceClass
+-		aload_0();
+-		invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName, 
+-				ConstantPool.GetFunctionalInterfaceClass, ConstantPool.GetFunctionalInterfaceClassSignature);
+-		String functionalInterface = null;
+-		final TypeBinding expectedType = lambdaEx.expectedType();
+-		if (expectedType instanceof IntersectionTypeBinding18) {
+-			functionalInterface = new String(((IntersectionTypeBinding18)expectedType).getSAMType(scope).constantPoolName());
+-		} else {
+-			functionalInterface = new String(expectedType.constantPoolName());
+-		}
+-		ldc(functionalInterface);// e.g. "com/foo/X$Foo"
+-		invokeObjectEquals();
+-		ifeq(errorLabel);
+-		
+-		// Compare FunctionalInterfaceMethodName
+-		aload_0();
+-		invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName, 
+-				ConstantPool.GetFunctionalInterfaceMethodName, ConstantPool.GetFunctionalInterfaceMethodNameSignature);
+-		ldc(new String(lambdaEx.descriptor.selector)); // e.g. "m"
+-		invokeObjectEquals();
+-		ifeq(errorLabel);
++			// Compare FunctionalInterfaceClass
++			aload_0();
++			invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName,
++					ConstantPool.GetFunctionalInterfaceClass, ConstantPool.GetFunctionalInterfaceClassSignature);
++			String functionalInterface = null;
++			final TypeBinding expectedType = funcEx.expectedType();
++			if (expectedType instanceof IntersectionTypeBinding18) {
++				functionalInterface = new String(
++						((IntersectionTypeBinding18) expectedType).getSAMType(scope).constantPoolName());
++			} else {
++				functionalInterface = new String(expectedType.constantPoolName());
++			}
++			ldc(functionalInterface);// e.g. "com/foo/X$Foo"
++			invokeObjectEquals();
++			ifeq(nextOne);
+ 
+-		// Compare FunctionalInterfaceMethodSignature
+-		aload_0();
+-		invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName, 
+-				ConstantPool.GetFunctionalInterfaceMethodSignature, ConstantPool.GetFunctionalInterfaceMethodSignatureSignature);
+-		ldc(new String(lambdaEx.descriptor.original().signature())); // e.g "()I"
+-		invokeObjectEquals();
+-		ifeq(errorLabel);
++			// Compare FunctionalInterfaceMethodName
++			aload_0();
++			invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName,
++					ConstantPool.GetFunctionalInterfaceMethodName,
++					ConstantPool.GetFunctionalInterfaceMethodNameSignature);
++			ldc(new String(funcEx.descriptor.selector)); // e.g. "m"
++			invokeObjectEquals();
++			ifeq(nextOne);
+ 
+-		// Compare ImplClass
+-		aload_0();
+-		invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName, 
+-				ConstantPool.GetImplClass, ConstantPool.GetImplClassSignature);
+-		ldc(new String(mb.declaringClass.constantPoolName())); // e.g. "com/foo/X"
+-		invokeObjectEquals();
+-		ifeq(errorLabel);
++			// Compare FunctionalInterfaceMethodSignature
++			aload_0();
++			invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName,
++					ConstantPool.GetFunctionalInterfaceMethodSignature,
++					ConstantPool.GetFunctionalInterfaceMethodSignatureSignature);
++			ldc(new String(funcEx.descriptor.original().signature())); // e.g "()I"
++			invokeObjectEquals();
++			ifeq(nextOne);
+ 
+-		// Compare ImplMethodSignature
+-		aload_0();
+-		invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName, 
+-				ConstantPool.GetImplMethodSignature, ConstantPool.GetImplMethodSignatureSignature);
+-		ldc(new String(mb.signature())); // e.g. "(I)I"
+-		invokeObjectEquals();
+-		ifeq(errorLabel);
+-
+-		// Captured arguments
+-		StringBuffer sig = new StringBuffer("("); //$NON-NLS-1$
+-		index = 0;
+-		if (lambdaEx.shouldCaptureInstance) {
++			// Compare ImplClass
+ 			aload_0();
+-			loadInt(index++);
+-			invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName, 
+-					ConstantPool.GetCapturedArg, ConstantPool.GetCapturedArgSignature);
+-			checkcast(mb.declaringClass);
+-			sig.append(mb.declaringClass.signature());
+-		}
+-		
+-		SyntheticArgumentBinding[] outerLocalVariables = lambdaEx.outerLocalVariables;
+-		for (int p=0,max=outerLocalVariables.length;p<max;p++) {
++			invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName,
++					ConstantPool.GetImplClass, ConstantPool.GetImplClassSignature);
++			ldc(new String(mb.declaringClass.constantPoolName())); // e.g. "com/foo/X"
++			invokeObjectEquals();
++			ifeq(nextOne);
++
++			// Compare ImplMethodSignature
+ 			aload_0();
+-			loadInt(index);
+-			invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName, 
+-					ConstantPool.GetCapturedArg, ConstantPool.GetCapturedArgSignature);
+-			TypeBinding varType = outerLocalVariables[p].type;
+-			if (varType.isBaseType()) {
+-				checkcast(scope.boxing(varType));
+-				generateUnboxingConversion(varType.id);
+-				if (varType.id == TypeIds.T_JavaLangLong || varType.id == TypeIds.T_JavaLangDouble) {
+-					index++;
++			invoke(Opcodes.OPC_invokevirtual, 1, 1, ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName,
++					ConstantPool.GetImplMethodSignature, ConstantPool.GetImplMethodSignatureSignature);
++			ldc(new String(mb.signature())); // e.g. "(I)I"
++			invokeObjectEquals();
++			ifeq(nextOne);
++
++			// Captured arguments
++			StringBuffer sig = new StringBuffer("("); //$NON-NLS-1$
++			index = 0;
++			boolean isLambda = funcEx instanceof LambdaExpression;
++			TypeBinding receiverType = null;
++			SyntheticArgumentBinding[] outerLocalVariables = null;
++			if (isLambda) {
++				LambdaExpression lambdaEx = (LambdaExpression) funcEx;
++				if (lambdaEx.shouldCaptureInstance)
++					receiverType = mb.declaringClass;
++				outerLocalVariables = lambdaEx.outerLocalVariables;
++			} else {
++				ReferenceExpression refEx = (ReferenceExpression)funcEx;
++				if (refEx.haveReceiver)
++					receiverType = ((ReferenceExpression)funcEx).receiverType;
++				// Should never have outer locals
++			}
++			if (receiverType != null) {
++				aload_0();
++				loadInt(index++);
++				invoke(Opcodes.OPC_invokevirtual, 1, 1,
++						ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName,
++						ConstantPool.GetCapturedArg, ConstantPool.GetCapturedArgSignature);
++				checkcast(isLambda ? mb.declaringClass : ((ReferenceExpression)funcEx).receiverType);
++				sig.append(mb.declaringClass.signature());
++			}
++			for (int p = 0, max = outerLocalVariables == null ? 0 : outerLocalVariables.length; p < max; p++) {
++				TypeBinding varType = outerLocalVariables[p].type;
++				aload_0();
++				loadInt(index);
++				invoke(Opcodes.OPC_invokevirtual, 1, 1,
++						ConstantPool.JavaLangInvokeSerializedLambdaConstantPoolName,
++						ConstantPool.GetCapturedArg, ConstantPool.GetCapturedArgSignature);
++				if (varType.isBaseType()) {
++					checkcast(scope.boxing(varType));
++					generateUnboxingConversion(varType.id);
++					if (varType.id == TypeIds.T_JavaLangLong || varType.id == TypeIds.T_JavaLangDouble) {
++						index++;
++					}
++				} else {
++					checkcast(varType);
+ 				}
++				index++;
++				sig.append(varType.signature());
++			}
++			sig.append(")"); //$NON-NLS-1$
++			if (funcEx.resolvedType instanceof IntersectionTypeBinding18) {
++				sig.append(((IntersectionTypeBinding18) funcEx.resolvedType).getSAMType(scope).signature());
+ 			} else {
+-				checkcast(varType);
++				sig.append(funcEx.resolvedType.signature());
++			}
++			// Example: invokeDynamic(0, 0, 1, "m".toCharArray(), "()Lcom/foo/X$Foo;".toCharArray());
++			invokeDynamic(funcEx.bootstrapMethodNumber, index, 1, funcEx.descriptor.selector,
++					sig.toString().toCharArray());
++			areturn();
++			if (j < count - 1) {
++				nextOne.place();
++				nextOne = j < count - 2 ? new BranchLabel(this) : errorLabel;
+ 			}
+-			index++;
+-			sig.append(varType.signature());
+-		}
+-		sig.append(")"); //$NON-NLS-1$
+-		if (lambdaEx.resolvedType instanceof IntersectionTypeBinding18) {
+-			sig.append(((IntersectionTypeBinding18)lambdaEx.resolvedType).getSAMType(scope).signature());
+-		} else {
+-			sig.append(lambdaEx.resolvedType.signature());
+ 		}
+-		// Example: invokeDynamic(0, 0, 1, "m".toCharArray(), "()Lcom/foo/X$Foo;".toCharArray());
+-		invokeDynamic(lambdaEx.bootstrapMethodNumber, index, 1, lambdaEx.descriptor.selector, sig.toString().toCharArray());
+-		areturn();
+ 	}
+ 	
+ 	removeVariable(lvb1);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java
+index 7ae4663..542d07b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java
+@@ -60,6 +60,7 @@ import org.eclipse.jdt.internal.compiler.ast.Argument;
+ import org.eclipse.jdt.internal.compiler.ast.FieldDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.LambdaExpression;
+ import org.eclipse.jdt.internal.compiler.ast.MethodDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.ReferenceExpression;
+ import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.TypeParameter;
+ import org.eclipse.jdt.internal.compiler.ast.TypeReference;
+@@ -615,17 +616,47 @@ public SyntheticMethodBinding addSyntheticMethod(LambdaExpression lambda) {
+ 	
+ 	// Create a $deserializeLambda$ method if necessary, one is shared amongst all lambdas
+ 	if (lambda.isSerializable) {
+-		SyntheticMethodBinding[] deserializeLambdaMethods = (SyntheticMethodBinding[]) this.synthetics[SourceTypeBinding.METHOD_EMUL].get(TypeConstants.DESERIALIZE_LAMBDA);
+-		if (deserializeLambdaMethods == null) {
+-			SyntheticMethodBinding deserializeLambdaMethod = new SyntheticMethodBinding(this);
+-			this.synthetics[SourceTypeBinding.METHOD_EMUL].put(TypeConstants.DESERIALIZE_LAMBDA,deserializeLambdaMethods = new SyntheticMethodBinding[1]);
+-			deserializeLambdaMethods[0] = deserializeLambdaMethod;
+-		}
++		addDeserializeLambdaMethod();
+ 	}
+ 	
+ 	return lambdaMethod;
+ }
++/*
++ * Add a synthetic method for the reference expression as a place holder for code generation
++ * only if the reference expression's target is serializable 
++ * 
++ */
++public SyntheticMethodBinding addSyntheticMethod(ReferenceExpression ref) {
++	if (!isPrototype()) throw new IllegalStateException();
++	if (!ref.isSerializable)
++		return null;
++	if (this.synthetics == null)
++		this.synthetics = new HashMap[MAX_SYNTHETICS];
++	if (this.synthetics[SourceTypeBinding.METHOD_EMUL] == null)
++		this.synthetics[SourceTypeBinding.METHOD_EMUL] = new HashMap(5);
++	
++	SyntheticMethodBinding lambdaMethod = null;
++	SyntheticMethodBinding[] lambdaMethods = (SyntheticMethodBinding[]) this.synthetics[SourceTypeBinding.METHOD_EMUL].get(ref);
++	if (lambdaMethods == null) {
++		lambdaMethod = new SyntheticMethodBinding(ref, this);
++		this.synthetics[SourceTypeBinding.METHOD_EMUL].put(ref, lambdaMethods = new SyntheticMethodBinding[1]);
++		lambdaMethods[0] = lambdaMethod;
++	} else {
++		lambdaMethod = lambdaMethods[0];
++	}
+ 
++	// Create a $deserializeLambda$ method, one is shared amongst all lambdas
++	addDeserializeLambdaMethod();	
++	return lambdaMethod;
++}
++private void addDeserializeLambdaMethod() {
++	SyntheticMethodBinding[] deserializeLambdaMethods = (SyntheticMethodBinding[]) this.synthetics[SourceTypeBinding.METHOD_EMUL].get(TypeConstants.DESERIALIZE_LAMBDA);
++	if (deserializeLambdaMethods == null) {
++		SyntheticMethodBinding deserializeLambdaMethod = new SyntheticMethodBinding(this);
++		this.synthetics[SourceTypeBinding.METHOD_EMUL].put(TypeConstants.DESERIALIZE_LAMBDA,deserializeLambdaMethods = new SyntheticMethodBinding[1]);
++		deserializeLambdaMethods[0] = deserializeLambdaMethod;
++	}
++}
+ /* Add a new synthetic access method for access to <targetMethod>.
+  * Must distinguish access method used for super access from others (need to use invokespecial bytecode)
+ 	Answer the new method or the existing method if one already existed.
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SyntheticMethodBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SyntheticMethodBinding.java
+index 0e2153d..6a7b43b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SyntheticMethodBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SyntheticMethodBinding.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2015 IBM Corporation and others.
++ * Copyright (c) 2000, 2016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -20,6 +20,7 @@ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.ast.AbstractMethodDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.FieldDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.LambdaExpression;
++import org.eclipse.jdt.internal.compiler.ast.ReferenceExpression;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ 
+ public class SyntheticMethodBinding extends MethodBinding {
+@@ -29,7 +30,11 @@ public class SyntheticMethodBinding extends MethodBinding {
+ 	public MethodBinding targetMethod;			// method or constructor
+ 	public TypeBinding targetEnumType; 			// enum type
+ 	public LambdaExpression lambda;
+-	
++	/**
++	 * Method reference expression whose target FI is Serializable. Should be set when
++	 * purpose is {@link #SerializableMethodReference}
++	 */
++	public ReferenceExpression serializableMethodRef;
+ 	public int purpose;
+ 
+ 	// fields used to generate enum constants when too many
+@@ -53,6 +58,11 @@ public class SyntheticMethodBinding extends MethodBinding {
+ 	public static final int ArrayClone = 15; // X[]::clone
+     public static final int FactoryMethod = 16; // for indy call to private constructor.
+     public static final int DeserializeLambda = 17; // For supporting lambda deserialization.
++    /**
++     * Serves as a placeholder for a method reference whose target FI is Serializable.
++     * Is never directly materialized in bytecode
++     */
++    public static final int SerializableMethodReference = 18;
+     
+ 	public int sourceStart = 0; // start position of the matching declaration
+ 	public int index; // used for sorting access methods in the class file
+@@ -380,6 +390,21 @@ public class SyntheticMethodBinding extends MethodBinding {
+ 		this.index = methodId;
+ 	}
+ 
++	public SyntheticMethodBinding(ReferenceExpression ref, SourceTypeBinding declaringClass) {
++		this.serializableMethodRef = ref;
++	    this.declaringClass = declaringClass;
++	    this.selector = ref.binding.selector;
++	    this.modifiers = ref.binding.modifiers;
++		this.tagBits |= (TagBits.AnnotationResolved | TagBits.DeprecatedAnnotationResolved) | (ref.binding.tagBits & TagBits.HasParameterAnnotations);
++	    this.returnType = ref.binding.returnType;
++	    this.parameters = ref.binding.parameters;
++	    this.thrownExceptions = ref.binding.thrownExceptions;
++	    this.purpose = SyntheticMethodBinding.SerializableMethodReference;
++		SyntheticMethodBinding[] knownAccessMethods = declaringClass.syntheticMethods();
++		int methodId = knownAccessMethods == null ? 0 : knownAccessMethods.length;
++		this.index = methodId;
++	}
++
+ 	public SyntheticMethodBinding(MethodBinding privateConstructor, MethodBinding publicConstructor, char[] selector, TypeBinding[] enclosingInstances, SourceTypeBinding declaringClass) {
+ 	    this.declaringClass = declaringClass;
+ 	    this.selector = selector;

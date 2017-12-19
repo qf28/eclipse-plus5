@@ -1,0 +1,1618 @@
+commit 683ea9e225586815608aba47b7144305522e9131
+Author: Jesper S Moller <jesper@selskabet.org>
+Date:   Sun Feb 10 18:30:01 2013 -0500
+
+    Bug 382721: Support for effectively final handling for lambdas & inner
+    classes.
+
+6	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+3	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+3	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+7	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompoundAssignment.java
+7	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+19	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
+4	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+3	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+11	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+10	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+index b610d87..4c3d8ec 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+@@ -172,6 +172,8 @@
+  *									RedundantNullCheckOnNonNullExpression
+  *      Jesper S Moller  - added the following constants
+  *									TargetTypeNotAFunctionalInterface
++ *									OuterLocalMustBeEffectivelyFinal
++ *									OuterLocalUnderLambdaMustBeEffectivelyFinal
+  *******************************************************************************/
+ package org.eclipse.jdt.core.compiler;
+ 
+@@ -1368,6 +1370,10 @@ void setSourceStart(int sourceStart);
+ 	int UnusedTypeParameter = TypeRelated + 661;
+ 	/** @since 3.9 */
+ 	int IllegalArrayOfUnionType = TypeRelated + 662;
++	/** @since 3.9 */
++	int OuterLocalMustBeEffectivelyFinal = Internal + 663;
++	/** @since 3.9 */
++	int OuterLocalUnderLambdaMustBeEffectivelyFinal = Internal + 664;
+ 
+ 	/**
+ 	 * Null analysis for other kinds of expressions, syntactically nonnull
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+index 635d63a..8cfc26e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+@@ -20,6 +20,8 @@
+  *								bug 374605 - Unreasonable warning for enum-based switch statements
+  *								bug 384870 - [compiler] @Deprecated annotation not detected if preceded by other annotation
+  *								bug 393719 - [compiler] inconsistent warnings on iteration variables
++ *     Jesper S Moller - Contributions for
++ *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -138,6 +140,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 	// for single name references
+ 	public static final int DepthSHIFT = 5;	// Bit6 -> Bit13
+ 	public static final int DepthMASK = Bit6|Bit7|Bit8|Bit9|Bit10|Bit11|Bit12|Bit13; // 8 bits for actual depth value (max. 255)
++	public static final int IsFromOutsideLambda = Bit14;
+ 
+ 	// for statements
+ 	public static final int IsReachable = Bit32;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+index f081a1d..f6d5e48 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+@@ -58,6 +58,9 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ // a field reference, a blank final field reference, a field of an enclosing instance or
+ // just a local variable.
+ 	LocalVariableBinding local = this.lhs.localVariableBinding();
++	if (local != null && flowInfo.isPotentiallyAssigned(local)) {
++		local.tagBits &= ~TagBits.IsEffectivelyFinal;
++	}
+ 	if ((this.expression.implicitConversion & TypeIds.UNBOXING) != 0) {
+ 		this.expression.checkNPE(currentScope, flowContext, flowInfo);
+ 	}
+@@ -195,10 +198,6 @@ public TypeBinding resolveType(BlockScope scope) {
+ 	if (lhsType != null) {
+ 		this.resolvedType = lhsType.capture(scope, this.sourceEnd);
+ 	}
+-	LocalVariableBinding localVariableBinding = this.lhs.localVariableBinding();
+-	if (localVariableBinding != null) {
+-		localVariableBinding.tagBits &= ~TagBits.IsEffectivelyFinal;
+-	}
+ 	TypeBinding rhsType = this.expression.resolveType(scope);
+ 	if (lhsType == null || rhsType == null) {
+ 		return null;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompoundAssignment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompoundAssignment.java
+index 3ab010e..c87ae6f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompoundAssignment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompoundAssignment.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -10,6 +10,8 @@
+  *     Stephan Herrmann - Contribution for
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
+  *								bug 383368 - [compiler][null] syntactic null analysis for field references
++ *     Jesper S Moller - Contributions for
++ *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -39,6 +41,10 @@ public class CompoundAssignment extends Assignment implements OperatorIds {
+ 
+ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext,
+ 		FlowInfo flowInfo) {
++	LocalVariableBinding localVariableBinding = this.lhs.localVariableBinding();
++	if (localVariableBinding != null && flowInfo.isPotentiallyAssigned(localVariableBinding)) {
++		localVariableBinding.tagBits &= ~TagBits.IsEffectivelyFinal;
++	}
+ 	// record setting a variable: various scenarii are possible, setting an array reference,
+ 	// a field reference, a blank final field reference, a field of an enclosing instance or
+ 	// just a local variable.
+@@ -130,10 +136,6 @@ public int nullStatus(FlowInfo flowInfo, FlowContext flowContext) {
+ 		TypeBinding originalExpressionType = this.expression.resolveType(scope);
+ 		if (originalLhsType == null || originalExpressionType == null)
+ 			return null;
+-		LocalVariableBinding localVariableBinding = this.lhs.localVariableBinding();
+-		if (localVariableBinding != null) {
+-			localVariableBinding.tagBits &= ~TagBits.IsEffectivelyFinal;
+-		}
+ 		// autoboxing support
+ 		LookupEnvironment env = scope.environment();
+ 		TypeBinding lhsType = originalLhsType, expressionType = originalExpressionType;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 9ce858e..5c2a18e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -13,6 +13,7 @@
+  *     IBM Corporation - initial API and implementation
+  *     Jesper S Moller - Contributions for
+  *							bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
++ *							bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -20,6 +21,7 @@ import org.eclipse.jdt.core.compiler.CategorizedProblem;
+ import org.eclipse.jdt.internal.compiler.ASTVisitor;
+ import org.eclipse.jdt.internal.compiler.CompilationResult;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
++import org.eclipse.jdt.internal.compiler.codegen.CodeStream;
+ import org.eclipse.jdt.internal.compiler.flow.ExceptionHandlingFlowContext;
+ import org.eclipse.jdt.internal.compiler.flow.FlowContext;
+ import org.eclipse.jdt.internal.compiler.flow.FlowInfo;
+@@ -54,6 +56,11 @@ public class LambdaExpression extends FunctionalExpression implements ProblemSev
+ 		this.body = body;
+ 	}
+ 	
++	public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean valueRequired) {
++		super.generateCode(currentScope, codeStream, valueRequired);
++		if (!this.ignoreFurtherInvestigation) this.body.generateCode(this.scope, codeStream); // TODO put into new method
++	}
++
+ 	/* This code is arranged so that we can continue with as much analysis as possible while avoiding 
+ 	 * mine fields that would result in a slew of spurious messages. This method is a merger of:
+ 	 * @see org.eclipse.jdt.internal.compiler.lookup.MethodScope.createMethod(AbstractMethodDeclaration)
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
+index eca8adc..7c91cd5 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -13,9 +13,12 @@
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann - Contribution for
+  *								bug 331649 - [compiler][null] consider null annotations for fields
++ *     Jesper S Moller - Contributions for
++ *							bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
++import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.lookup.*;
+ 
+ public abstract class NameReference extends Reference implements InvocationSite {
+@@ -84,4 +87,19 @@ public void setFieldIndex(int index){
+ public abstract String unboundReferenceErrorName();
+ 
+ public abstract char[][] getName();
++
++protected void checkEffectivelyFinalAccess(BlockScope currentScope) {
++	if (this.binding instanceof LocalVariableBinding) {
++		LocalVariableBinding localBinding = (LocalVariableBinding) this.binding;
++		if (!localBinding.isFinal() && ((this.bits & ASTNode.DepthMASK) != 0 || (this.bits & ASTNode.IsFromOutsideLambda) != 0)) {
++			if (currentScope.compilerOptions().complianceLevel >= ClassFileConstants.JDK1_8) {
++				if (!localBinding.isEffectivelyFinal()) {
++					currentScope.problemReporter().cannotReferToNonEffectivelyFinalOuterLocal(localBinding, this);
++				}
++			} else {
++				currentScope.problemReporter().cannotReferToNonFinalOuterLocal(localBinding, this);
++			}
++		}
++	}
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+index 9081d52..8cec7fb 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -17,6 +17,8 @@
+  *								bug 365519 - editorial cleanup after bug 186342 and bug 365387
+  *								bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *     Jesper S Moller - Contributions for
++ *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *								bug 331649 - [compiler][null] consider null annotations for fields
+  *								bug 383368 - [compiler][null] syntactic null analysis for field references
+  *******************************************************************************/
+@@ -341,6 +343,7 @@ public void generateAssignment(BlockScope currentScope, CodeStream codeStream, A
+ }
+ 
+ public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean valueRequired) {
++	checkEffectivelyFinalAccess(currentScope);
+ 	int pc = codeStream.position;
+ 	if (this.constant != Constant.NotAConstant) {
+ 		if (valueRequired) {
+@@ -1006,9 +1009,6 @@ public TypeBinding resolveType(BlockScope scope) {
+ 					this.bits &= ~ASTNode.RestrictiveFlagMASK; // clear bits
+ 					this.bits |= Binding.LOCAL;
+ 					LocalVariableBinding local = (LocalVariableBinding) this.binding;
+-					if (!local.isFinal() && ((this.bits & ASTNode.DepthMASK) != 0)) {
+-						scope.problemReporter().cannotReferToNonFinalOuterLocal((LocalVariableBinding) this.binding, this);
+-					}
+ 					if (local.type != null && (local.type.tagBits & TagBits.HasMissingType) != 0) {
+ 						// only complain if field reference (for local, its type got flagged already)
+ 						return null;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+index d7f3de9..1a140bf 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -16,6 +16,7 @@
+  *								bug 185682 - Increment/decrement operators mark local variables as read
+  *								bug 331649 - [compiler][null] consider null annotations for fields
+  *								bug 383368 - [compiler][null] syntactic null analysis for field references
++ *     Jesper S Moller - <jesper@selskabet.org>   - Contributions for bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -394,6 +395,7 @@ public void generateAssignment(BlockScope currentScope, CodeStream codeStream, A
+ }
+ 
+ public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean valueRequired) {
++	checkEffectivelyFinalAccess(currentScope);
+ 	int pc = codeStream.position;
+ 	if (this.constant != Constant.NotAConstant) {
+ 		if (valueRequired) {
+@@ -984,9 +986,6 @@ public TypeBinding resolveType(BlockScope scope) {
+ 					if (this.binding instanceof LocalVariableBinding) {
+ 						this.bits &= ~ASTNode.RestrictiveFlagMASK;  // clear bits
+ 						this.bits |= Binding.LOCAL;
+-						if (!variable.isFinal() && (this.bits & ASTNode.DepthMASK) != 0) {
+-							scope.problemReporter().cannotReferToNonFinalOuterLocal((LocalVariableBinding)variable, this);
+-						}
+ 						variableType = variable.type;
+ 						this.constant = (this.bits & ASTNode.IsStrictlyAssigned) == 0 ? variable.constant() : Constant.NotAConstant;
+ 					} else {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index 0504390..b9f8312 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -15,6 +15,8 @@
+  *	 							bug 186342 - [compiler][null] Using annotations for null checking
+  *								bug 387612 - Unreachable catch block...exception is never thrown from the try
+  *								bug 395002 - Self bound generic class doesn't resolve bounds properly for wildcards for certain parametrisation.
++ *     Jesper S Moller - Contributions for
++ *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -1715,6 +1717,7 @@ public abstract class Scope {
+ 				Scope scope = this;
+ 				int depth = 0;
+ 				int foundDepth = 0;
++				boolean isInsideLambda = false;
+ 				ReferenceBinding foundActualReceiverType = null;
+ 				done : while (true) { // done when a COMPILATION_UNIT_SCOPE is found
+ 					switch (scope.kind) {
+@@ -1737,6 +1740,10 @@ public abstract class Scope {
+ 										ProblemReasons.InheritedNameHidesEnclosingName);
+ 								if (depth > 0)
+ 									invocationSite.setDepth(depth);
++								if (isInsideLambda && invocationSite instanceof NameReference) {
++									NameReference nameReference = (NameReference) invocationSite;
++									nameReference.bits |= ASTNode.IsFromOutsideLambda;
++								}
+ 								return variableBinding;
+ 							}
+ 							break;
+@@ -1826,6 +1833,9 @@ public abstract class Scope {
+ 						case COMPILATION_UNIT_SCOPE :
+ 							break done;
+ 					}
++					if (scope.kind == METHOD_SCOPE && scope.parent != null && scope.parent.kind != CLASS_SCOPE) {
++						isInsideLambda = true;
++					}
+ 					scope = scope.parent;
+ 				}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index 505f292..13473fd 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -34,6 +34,7 @@
+  *								bug 382789 - [compiler][null] warn when syntactically-nonnull expression is compared against null
+  *      Jesper S Moller <jesper@selskabet.org> -  Contributions for
+  *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
++ *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.problem;
+ 
+@@ -1238,6 +1239,15 @@ public void cannotReferToNonFinalOuterLocal(LocalVariableBinding local, ASTNode
+ 		nodeSourceStart(local, location),
+ 		nodeSourceEnd(local, location));
+ }
++public void cannotReferToNonEffectivelyFinalOuterLocal(LocalVariableBinding local, ASTNode location) {
++	String[] arguments =new String[]{ new String(local.readableName())};
++	this.handle(
++		(location.bits & ASTNode.IsFromOutsideLambda) != 0 ? IProblem.OuterLocalMustBeEffectivelyFinal : IProblem.OuterLocalUnderLambdaMustBeEffectivelyFinal, 
++		arguments,
++		arguments,
++		nodeSourceStart(local, location),
++		nodeSourceEnd(local, location));
++}
+ public void cannotReturnInInitializer(ASTNode location) {
+ 	this.handle(
+ 		IProblem.CannotReturnInInitializer,
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+index 7b231db..4789b32 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+@@ -625,6 +625,8 @@
+ 
+ ### MORE TYPE RELATED
+ 662 = Illegal attempt to create arrays of union types
++663 = The variable {0} must be must be final or effectively final if used in an inner class
++664 = The variable {0} must be must be final or effectively final if used in a lambda expression
+ 
+ ### NULL ANALYSIS FOR OTHER EXPRESSIONS
+ 670 = Null comparison always yields false: this expression cannot be null
+commit 9966baba46edc3df548fabd09b133cadc0093ca6
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Mon Feb 11 18:45:49 2013 -0500
+
+    Fixed Bug 382721 - [1.8][compiler] Effectively final variables needs
+    special
+    treatment
+
+0	2	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+129	67	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+0	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+4	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+4	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompoundAssignment.java
+17	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+11	15	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
+6	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+14	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+4	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodScope.java
+25	7	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+2	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+2	1	org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
+7	2	org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetSingleNameReference.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+index 86110f6..c6f6cea 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+@@ -807,7 +807,6 @@ public void test011_problem_categories() {
+ 		expectedProblemAttributes.put("ObjectHasNoSuperclass", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+ 		expectedProblemAttributes.put("ObjectMustBeClass", new ProblemAttributes(CategorizedProblem.CAT_INTERNAL));
+ 		expectedProblemAttributes.put("OuterLocalMustBeEffectivelyFinal", new ProblemAttributes(CategorizedProblem.CAT_INTERNAL));
+-		expectedProblemAttributes.put("OuterLocalUnderLambdaMustBeEffectivelyFinal", new ProblemAttributes(CategorizedProblem.CAT_INTERNAL));
+ 		expectedProblemAttributes.put("OuterLocalMustBeFinal", new ProblemAttributes(CategorizedProblem.CAT_INTERNAL));
+ 		expectedProblemAttributes.put("OverridingDeprecatedMethod", new ProblemAttributes(CategorizedProblem.CAT_DEPRECATION));
+ 		expectedProblemAttributes.put("OverridingMethodWithoutSuperInvocation", new ProblemAttributes(CategorizedProblem.CAT_POTENTIAL_PROGRAMMING_PROBLEM));
+@@ -1565,7 +1564,6 @@ public void test012_compiler_problems_tuning() {
+ 		expectedProblemAttributes.put("ObjectMustBeClass", SKIP);
+ 		expectedProblemAttributes.put("OuterLocalMustBeEffectivelyFinal", SKIP);
+ 		expectedProblemAttributes.put("OuterLocalMustBeFinal", SKIP);
+-		expectedProblemAttributes.put("OuterLocalUnderLambdaMustBeEffectivelyFinal", SKIP);
+ 		expectedProblemAttributes.put("OverridingDeprecatedMethod", new ProblemAttributes(JavaCore.COMPILER_PB_DEPRECATION));
+ 		expectedProblemAttributes.put("OverridingMethodWithoutSuperInvocation", new ProblemAttributes(JavaCore.COMPILER_PB_OVERRIDING_METHOD_WITHOUT_SUPER_INVOCATION));
+ 		expectedProblemAttributes.put("OverridingNonVisibleMethod", new ProblemAttributes(JavaCore.COMPILER_PB_OVERRIDING_PACKAGE_DEFAULT_METHOD));
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+index 390762c..c022a89 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+@@ -607,12 +607,7 @@ public void test016() {
+ 				"2. ERROR in X.java (at line 8)\n" + 
+ 				"	I i3 = () -> { return 42; };\n" + 
+ 				"	                      ^^\n" + 
+-				"Type mismatch: cannot convert from int to String\n" + 
+-				"----------\n" + 
+-				"3. ERROR in X.java (at line 10)\n" + 
+-				"	I i5 = () -> {};\n" + 
+-				"	       ^^^^^^^^\n" + 
+-				"This method must return a result of type String\n" + 
++				"Type mismatch: cannot convert from int to String\n" +
+ 				"----------\n");
+ }
+ // Bug 398734 - [1.8][compiler] Lambda expression type or return type should be checked against the target functional interface method's result type
+@@ -643,11 +638,6 @@ public void test017() {
+ 				"	I i4 = () -> { return \"Hello\"; };\n" + 
+ 				"	                      ^^^^^^^\n" + 
+ 				"Type mismatch: cannot convert from String to Integer\n" + 
+-				"----------\n" + 
+-				"3. ERROR in X.java (at line 10)\n" + 
+-				"	I i5 = () -> {};\n" + 
+-				"	       ^^^^^^^^\n" + 
+-				"This method must return a result of type Integer\n" + 
+ 				"----------\n");
+ }
+ // Bug 398734 - [1.8][compiler] Lambda expression type or return type should be checked against the target functional interface method's result type
+@@ -1777,10 +1767,6 @@ public void test047() {
+ 					"        System.out.println(var); // Error: var is not effectively final\n" + 
+ 					"      }\n" + 
+ 					"    };\n" + 
+-					"    I x2 = () -> {\n" + 
+-					"      System.out.println(args); // OK: args is not re-assignment since declaration/first assignment\n" + 
+-					"      System.out.println(var); // Error: var is not effectively final\n" + 
+-					"    };\n" + 
+ 					"    var=2;\n" + 
+ 					"  }\n" + 
+ 					"}" ,
+@@ -1789,18 +1775,64 @@ public void test047() {
+ 				"1. ERROR in X.java (at line 10)\n" + 
+ 				"	System.out.println(var); // Error: var is not effectively final\n" + 
+ 				"	                   ^^^\n" + 
+-				"The variable var must be must be final or effectively final if used in a lambda expression\n" + 
+-				"----------\n" + 
+-				"2. ERROR in X.java (at line 15)\n" + 
+-				"	System.out.println(var); // Error: var is not effectively final\n" + 
+-				"	                   ^^^\n" + 
+-				"The variable var must be must be final or effectively final if used in an inner class\n" + 
++				"Variable var is required to be final or effectively final\n" + 
+ 				"----------\n"
+ 				);
+ }
+-
+ // https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
+ public void test048() {
++	// This test checks that the simple cases are OK
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" + 
++					"	void doit();\n" + 
++					"}\n" + 
++					"public class X {\n" + 
++					"  public static void main(String[] args) {\n" + 
++					"    int var = 2;\n" + 
++					"    I x2 = () -> {\n" + 
++					"      System.out.println(var); // Error: var is not effectively final\n" + 
++					"    };\n" + 
++					"    var=2;\n" + 
++					"  }\n" + 
++					"}" ,
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 8)\n" + 
++				"	System.out.println(var); // Error: var is not effectively final\n" + 
++				"	                   ^^^\n" + 
++				"Variable var is required to be final or effectively final\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test049() {
++	// This test checks that the simple cases are OK
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" + 
++					"	void doit();\n" + 
++					"}\n" + 
++					"public class X {\n" + 
++					"  public static void main(String[] args) {\n" + 
++					"    int var = 2;\n" + 
++					"    I x2 = () -> {\n" + 
++					"      System.out.println(args); // OK: args is not re-assignment since declaration/first assignment\n" + 
++					"    };\n" + 
++					"    var=2;\n" + 
++					"  }\n" + 
++					"}" ,
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 8)\n" + 
++				"	System.out.println(args); // OK: args is not re-assignment since declaration/first assignment\n" + 
++				"	                   ^^^^\n" + 
++				"Missing code implementation in the compiler\n" +  // expected since emulation path computation is not in place.
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test050() {
+ 	// This test checks that common semantic checks are indeed run
+ 	this.runNegativeTest(
+ 			new String[] {
+@@ -1816,43 +1848,47 @@ public void test048() {
+ 					"      I x2 = () -> {\n" + 
+ 					"        System.out.println(ioe.getMessage()); // OK: args is not re-assignment since declaration/first assignment\n" + 
+ 					"      };\n" + 
+-					"    };\n" + 
++					"    };\n"+
++					"  }\n" +
++					"}\n"
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 10)\n" + 
++				"	System.out.println(ioe.getMessage()); // OK: args is not re-assignment since declaration/first assignment\n" + 
++				"	                   ^^^\n" + 
++				"Missing code implementation in the compiler\n" + // expected since emulation path computation is not in place.
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test051() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" + 
++					"	void doit();\n" + 
++					"}\n" + 
++					"public class X {\n" + 
++					"  public static void main(String[] args) {\n" + 
+ 					"    java.util.List<String> list = new java.util.ArrayList<>();\n" + 
+ 					"    for (String s : list) {\n" + 
+ 					"      I x2 = () -> {\n" + 
+ 					"        System.out.println(s); // OK: args is not re-assignment since declaration/first assignment\n" + 
+ 					"      };\n" + 
+ 					"    };\n" + 
+-					"    for (String s2 : list) {\n" + 
+-					"      s2 = \"Nice!\";\n" + 
+-					"      I x2 = () -> {\n" + 
+-					"        System.out.println(s2); // Error: var is not effectively final\n" + 
+-					"      };\n" + 
+-					"    };\n" + 
+ 					"  }\n" + 
+ 					"\n" +
+-					"  void foo() {\n" + 
+-					"    try {\n" + 
+-					"      \n" + 
+-					"  } catch (NullPointerException | ArrayIndexOutOfBoundsException e) {\n" + 
+-					"    I i = () -> {\n" + 
+-					"      System.out.println(e);\n" + 
+-					"     };\n" + 
+-					"    }\n" + 
+-					"  }\n" +
+ 					"}\n" ,
+ 				},
+ 				"----------\n" + 
+-				"1. ERROR in X.java (at line 22)\n" + 
+-				"	System.out.println(s2); // Error: var is not effectively final\n" + 
+-				"	                   ^^\n" + 
+-				"The variable s2 must be must be final or effectively final if used in an inner class\n" + 
+-				"----------\n"
+-				);
++				"1. ERROR in X.java (at line 9)\n" + 
++				"	System.out.println(s); // OK: args is not re-assignment since declaration/first assignment\n" + 
++				"	                   ^\n" + 
++				"Missing code implementation in the compiler\n" + // expected since emulation path computation is not in place.
++				"----------\n");
+ }
+-
+ // https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
+-public void test049() {
++public void test052() {
+ 	// This test checks that common semantic checks are indeed run
+ 	this.runNegativeTest(
+ 			new String[] {
+@@ -1862,19 +1898,7 @@ public void test049() {
+ 					"}\n" + 
+ 					"public class X {\n" + 
+ 					"  public static void main(String[] args) {\n" + 
+-					"    try {\n" + 
+-					"      new java.io.File(\"dweep\").getCanonicalPath();\n" + 
+-					"    } catch (java.io.IOException ioe) {\n" + 
+-					"      I x2 = () -> {\n" + 
+-					"        System.out.println(ioe.getMessage()); // OK: args is not re-assignment since declaration/first assignment\n" + 
+-					"      };\n" + 
+-					"    };\n" + 
+ 					"    java.util.List<String> list = new java.util.ArrayList<>();\n" + 
+-					"    for (String s : list) {\n" + 
+-					"      I x2 = () -> {\n" + 
+-					"        System.out.println(s); // OK: args is not re-assignment since declaration/first assignment\n" + 
+-					"      };\n" + 
+-					"    };\n" + 
+ 					"    for (String s2 : list) {\n" + 
+ 					"      s2 = \"Nice!\";\n" + 
+ 					"      I x2 = () -> {\n" + 
+@@ -1883,15 +1907,53 @@ public void test049() {
+ 					"    };\n" + 
+ 					"  }\n" + 
+ 					"\n" +
++					"}\n" ,
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 10)\n" + 
++				"	System.out.println(s2); // Error: var is not effectively final\n" + 
++				"	                   ^^\n" + 
++				"Variable s2 is required to be final or effectively final\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test053() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" + 
++					"	void doit();\n" + 
++					"}\n" + 
++					"public class X {\n" + 
+ 					"  void foo() {\n" + 
+ 					"    try {\n" + 
+-					"      \n" + 
++					"       System.out.println(\"try\");\n" +
+ 					"  } catch (NullPointerException | ArrayIndexOutOfBoundsException e) {\n" + 
+ 					"    I i = () -> {\n" + 
+ 					"      System.out.println(e);\n" + 
+ 					"     };\n" + 
+ 					"    }\n" + 
+ 					"  }\n" +
++					"}\n" ,
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 10)\n" + 
++				"	System.out.println(e);\n" + 
++				"	                   ^\n" + 
++				"Missing code implementation in the compiler\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test054() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" + 
++					"	void doit();\n" + 
++					"}\n" + 
++					"public class X {\n" + 
+ 					"  void foo2(String[] args) {\n" + 
+ 					"   int var;\n" + 
+ 					"   if (args != null)\n" + 
+@@ -1900,19 +1962,19 @@ public void test049() {
+ 					"      var = 2;\n" + 
+ 					"   I x = new I() {\n" + 
+ 					"     public void doit() {\n" + 
+-					"       System.out.println(var);\n" + 
++					"       System.out.println(var);\n" +  // no error here.
++					"       args = null;\n" + // error here.
+ 					"     }\n" + 
+ 					"   };\n" + 
+ 					"  }\n" +
+ 					"}\n" ,
+-				},
++				}, 		
+ 				"----------\n" + 
+-				"1. ERROR in X.java (at line 22)\n" + 
+-				"	System.out.println(s2); // Error: var is not effectively final\n" + 
+-				"	                   ^^\n" + 
+-				"The variable s2 must be must be final or effectively final if used in an inner class\n" + 
+-				"----------\n"
+-				);
++				"1. ERROR in X.java (at line 14)\n" + 
++				"	args = null;\n" + 
++				"	^^^^\n" + 
++				"Variable args is required to be final or effectively final\n" + 
++				"----------\n");
+ }
+ 
+ public static Class testClass() {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+index 4c3d8ec..fcf7d73 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+@@ -173,7 +173,6 @@
+  *      Jesper S Moller  - added the following constants
+  *									TargetTypeNotAFunctionalInterface
+  *									OuterLocalMustBeEffectivelyFinal
+- *									OuterLocalUnderLambdaMustBeEffectivelyFinal
+  *******************************************************************************/
+ package org.eclipse.jdt.core.compiler;
+ 
+@@ -1372,8 +1371,6 @@ void setSourceStart(int sourceStart);
+ 	int IllegalArrayOfUnionType = TypeRelated + 662;
+ 	/** @since 3.9 */
+ 	int OuterLocalMustBeEffectivelyFinal = Internal + 663;
+-	/** @since 3.9 */
+-	int OuterLocalUnderLambdaMustBeEffectivelyFinal = Internal + 664;
+ 
+ 	/**
+ 	 * Null analysis for other kinds of expressions, syntactically nonnull
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+index 8cfc26e..ab32c40 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+@@ -55,7 +55,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 	public final static int Bit17 = 0x10000;			// compound assigned (reference lhs) | unchecked (msg, alloc, explicit constr call)
+ 	public final static int Bit18 = 0x20000;			// non null (expression) | onDemand (import reference)
+ 	public final static int Bit19 = 0x40000;			// didResolve (parameterized qualified type ref/parameterized single type ref)  | empty (javadoc return statement) | needReceiverGenericCast (msg/fieldref)
+-	public final static int Bit20 = 0x80000;			// contains syntax errors (method declaration, type declaration, field declarations, initializer)
++	public final static int Bit20 = 0x80000;			// contains syntax errors (method declaration, type declaration, field declarations, initializer), typeref: <> name ref: lambda capture)
+ 	public final static int Bit21 = 0x100000;
+ 	public final static int Bit22 = 0x200000;			// parenthesis count (expression) | used (import reference)
+ 	public final static int Bit23 = 0x400000;			// parenthesis count (expression)
+@@ -140,7 +140,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 	// for single name references
+ 	public static final int DepthSHIFT = 5;	// Bit6 -> Bit13
+ 	public static final int DepthMASK = Bit6|Bit7|Bit8|Bit9|Bit10|Bit11|Bit12|Bit13; // 8 bits for actual depth value (max. 255)
+-	public static final int IsFromOutsideLambda = Bit14;
++	public static final int IsCapturedOuterLocal = Bit20;
+ 
+ 	// for statements
+ 	public static final int IsReachable = Bit32;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+index f6d5e48..a368ff9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+@@ -58,9 +58,6 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ // a field reference, a blank final field reference, a field of an enclosing instance or
+ // just a local variable.
+ 	LocalVariableBinding local = this.lhs.localVariableBinding();
+-	if (local != null && flowInfo.isPotentiallyAssigned(local)) {
+-		local.tagBits &= ~TagBits.IsEffectivelyFinal;
+-	}
+ 	if ((this.expression.implicitConversion & TypeIds.UNBOXING) != 0) {
+ 		this.expression.checkNPE(currentScope, flowContext, flowInfo);
+ 	}
+@@ -198,6 +195,10 @@ public TypeBinding resolveType(BlockScope scope) {
+ 	if (lhsType != null) {
+ 		this.resolvedType = lhsType.capture(scope, this.sourceEnd);
+ 	}
++	LocalVariableBinding localVariableBinding = this.lhs.localVariableBinding();
++	if (localVariableBinding != null && localVariableBinding.isCatchParameter()) { 
++		localVariableBinding.tagBits &= ~TagBits.IsEffectivelyFinal;  // as it is already definitely assigned, we can conclude already. Also note: catch parameter cannot be compound assigned.
++	}
+ 	TypeBinding rhsType = this.expression.resolveType(scope);
+ 	if (lhsType == null || rhsType == null) {
+ 		return null;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompoundAssignment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompoundAssignment.java
+index c87ae6f..135735c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompoundAssignment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompoundAssignment.java
+@@ -5,6 +5,10 @@
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  * 
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann - Contribution for
+@@ -41,10 +45,6 @@ public class CompoundAssignment extends Assignment implements OperatorIds {
+ 
+ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext,
+ 		FlowInfo flowInfo) {
+-	LocalVariableBinding localVariableBinding = this.lhs.localVariableBinding();
+-	if (localVariableBinding != null && flowInfo.isPotentiallyAssigned(localVariableBinding)) {
+-		localVariableBinding.tagBits &= ~TagBits.IsEffectivelyFinal;
+-	}
+ 	// record setting a variable: various scenarii are possible, setting an array reference,
+ 	// a field reference, a blank final field reference, a field of an enclosing instance or
+ 	// just a local variable.
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 5c2a18e..f54e633 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -33,6 +33,7 @@ import org.eclipse.jdt.internal.compiler.lookup.ExtraCompilerModifiers;
+ import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.MethodScope;
+ import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
++import org.eclipse.jdt.internal.compiler.lookup.Scope;
+ import org.eclipse.jdt.internal.compiler.lookup.TagBits;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+@@ -57,8 +58,11 @@ public class LambdaExpression extends FunctionalExpression implements ProblemSev
+ 	}
+ 	
+ 	public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean valueRequired) {
++		if (this.ignoreFurtherInvestigation) {
++			return;
++		}
+ 		super.generateCode(currentScope, codeStream, valueRequired);
+-		if (!this.ignoreFurtherInvestigation) this.body.generateCode(this.scope, codeStream); // TODO put into new method
++		this.body.generateCode(this.scope, codeStream);
+ 	}
+ 
+ 	/* This code is arranged so that we can continue with as much analysis as possible while avoiding 
+@@ -292,6 +296,18 @@ public class LambdaExpression extends FunctionalExpression implements ProblemSev
+ 
+ 	public void tagAsHavingErrors() {
+ 		this.ignoreFurtherInvestigation = true;
++		Scope parent = this.scope.parent;
++		while (parent != null) {
++			switch(parent.kind) {
++				case Scope.CLASS_SCOPE:
++				case Scope.METHOD_SCOPE:
++					parent.referenceContext().tagAsHavingErrors();
++					return;
++				default:
++					parent = parent.parent;
++					break;
++			}
++		}
+ 	}
+ 
+ 	public TypeBinding expectedResultType() {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
+index 7c91cd5..4d9cf8b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2012 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -13,13 +13,11 @@
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann - Contribution for
+  *								bug 331649 - [compiler][null] consider null annotations for fields
+- *     Jesper S Moller - Contributions for
+- *							bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.lookup.*;
++import org.eclipse.jdt.internal.compiler.problem.AbortMethod;
+ 
+ public abstract class NameReference extends Reference implements InvocationSite {
+ 
+@@ -88,17 +86,15 @@ public abstract String unboundReferenceErrorName();
+ 
+ public abstract char[][] getName();
+ 
+-protected void checkEffectivelyFinalAccess(BlockScope currentScope) {
+-	if (this.binding instanceof LocalVariableBinding) {
+-		LocalVariableBinding localBinding = (LocalVariableBinding) this.binding;
+-		if (!localBinding.isFinal() && ((this.bits & ASTNode.DepthMASK) != 0 || (this.bits & ASTNode.IsFromOutsideLambda) != 0)) {
+-			if (currentScope.compilerOptions().complianceLevel >= ClassFileConstants.JDK1_8) {
+-				if (!localBinding.isEffectivelyFinal()) {
+-					currentScope.problemReporter().cannotReferToNonEffectivelyFinalOuterLocal(localBinding, this);
+-				}
+-			} else {
+-				currentScope.problemReporter().cannotReferToNonFinalOuterLocal(localBinding, this);
+-			}
++/* Called during code generation to ensure that outer locals's effectively finality is guaranteed. 
++   Aborts if constraints are violated. Due to various complexities, this check is not conveniently
++   implementable in resolve/analyze phases.
++*/
++protected void checkEffectiveFinality(LocalVariableBinding localBinding, Scope scope) {
++	if ((this.bits & ASTNode.IsCapturedOuterLocal) != 0) {
++		if (!localBinding.isFinal() && !localBinding.isEffectivelyFinal()) {
++			scope.problemReporter().cannotReferToNonEffectivelyFinalOuterLocal(localBinding, this);
++			throw new AbortMethod(scope.referenceCompilationUnit().compilationResult, null);
+ 		}
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+index 8cec7fb..af38e22 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+@@ -343,7 +343,6 @@ public void generateAssignment(BlockScope currentScope, CodeStream codeStream, A
+ }
+ 
+ public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean valueRequired) {
+-	checkEffectivelyFinalAccess(currentScope);
+ 	int pc = codeStream.position;
+ 	if (this.constant != Constant.NotAConstant) {
+ 		if (valueRequired) {
+@@ -592,7 +591,8 @@ public FieldBinding generateReadSequence(BlockScope currentScope, CodeStream cod
+ 				// no implicit conversion
+ 			} else {
+ 				// outer local?
+-				if ((this.bits & ASTNode.DepthMASK) != 0) {
++				if ((this.bits & ASTNode.IsCapturedOuterLocal) != 0) {
++					checkEffectiveFinality(localBinding, currentScope);
+ 					// outer local can be reached either through a synthetic arg or a synthetic field
+ 					VariableBinding[] path = currentScope.getEmulationPath(localBinding);
+ 					codeStream.generateOuterAccess(path, this, localBinding, currentScope);
+@@ -1009,6 +1009,10 @@ public TypeBinding resolveType(BlockScope scope) {
+ 					this.bits &= ~ASTNode.RestrictiveFlagMASK; // clear bits
+ 					this.bits |= Binding.LOCAL;
+ 					LocalVariableBinding local = (LocalVariableBinding) this.binding;
++					if (!local.isFinal() && ((this.bits & ASTNode.IsCapturedOuterLocal) != 0)) { 
++						if (scope.compilerOptions().sourceLevel < ClassFileConstants.JDK1_8) // for 8, defer till effective finality could be ascertained.
++							scope.problemReporter().cannotReferToNonFinalOuterLocal((LocalVariableBinding) this.binding, this);
++					}
+ 					if (local.type != null && (local.type.tagBits & TagBits.HasMissingType) != 0) {
+ 						// only complain if field reference (for local, its type got flagged already)
+ 						return null;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+index 1a140bf..78feed1 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/SingleNameReference.java
+@@ -137,12 +137,19 @@ public FlowInfo analyseAssignment(BlockScope currentScope, FlowContext flowConte
+ 			break;
+ 		case Binding.LOCAL : // assigning to a local variable
+ 			LocalVariableBinding localBinding = (LocalVariableBinding) this.binding;
++			final boolean isFinal = localBinding.isFinal();
+ 			if (!flowInfo.isDefinitelyAssigned(localBinding)){// for local variable debug attributes
+ 				this.bits |= ASTNode.FirstAssignmentToLocal;
+ 			} else {
+ 				this.bits &= ~ASTNode.FirstAssignmentToLocal;
+ 			}
+-			if (localBinding.isFinal()) {
++			if (flowInfo.isPotentiallyAssigned(localBinding)) {
++				localBinding.tagBits &= ~TagBits.IsEffectivelyFinal;
++				if (!isFinal && (this.bits & ASTNode.IsCapturedOuterLocal) != 0) {
++					currentScope.problemReporter().cannotReferToNonEffectivelyFinalOuterLocal(localBinding, this);
++				}
++			}
++			if (isFinal) {
+ 				if ((this.bits & ASTNode.DepthMASK) == 0) {
+ 					// tolerate assignment to final local in unreachable code (45674)
+ 					if ((isReachable && isCompound) || !localBinding.isBlankFinal()){
+@@ -395,7 +402,6 @@ public void generateAssignment(BlockScope currentScope, CodeStream codeStream, A
+ }
+ 
+ public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean valueRequired) {
+-	checkEffectivelyFinalAccess(currentScope);
+ 	int pc = codeStream.position;
+ 	if (this.constant != Constant.NotAConstant) {
+ 		if (valueRequired) {
+@@ -475,7 +481,8 @@ public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean
+ 					return;
+ 				}
+ 				// outer local?
+-				if ((this.bits & ASTNode.DepthMASK) != 0) {
++				if ((this.bits & ASTNode.IsCapturedOuterLocal) != 0) {
++					checkEffectiveFinality(localBinding, currentScope);
+ 					// outer local can be reached either through a synthetic arg or a synthetic field
+ 					VariableBinding[] path = currentScope.getEmulationPath(localBinding);
+ 					codeStream.generateOuterAccess(path, this, localBinding, currentScope);
+@@ -986,6 +993,10 @@ public TypeBinding resolveType(BlockScope scope) {
+ 					if (this.binding instanceof LocalVariableBinding) {
+ 						this.bits &= ~ASTNode.RestrictiveFlagMASK;  // clear bits
+ 						this.bits |= Binding.LOCAL;
++						if (!variable.isFinal() && (this.bits & ASTNode.IsCapturedOuterLocal) != 0) {
++							if (scope.compilerOptions().sourceLevel < ClassFileConstants.JDK1_8) // for 8, defer till effective finality could be ascertained.
++								scope.problemReporter().cannotReferToNonFinalOuterLocal((LocalVariableBinding)variable, this);
++						}
+ 						variableType = variable.type;
+ 						this.constant = (this.bits & ASTNode.IsStrictlyAssigned) == 0 ? variable.constant() : Constant.NotAConstant;
+ 					} else {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodScope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodScope.java
+index 07ee75f..fdd3474 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodScope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/MethodScope.java
+@@ -438,6 +438,10 @@ public boolean isInsideInitializer() {
+ 	return (this.referenceContext instanceof TypeDeclaration);
+ }
+ 
++public boolean isLambdaScope() {
++	return this.referenceContext instanceof LambdaExpression;
++}
++
+ public boolean isInsideInitializerOrConstructor() {
+ 	return (this.referenceContext instanceof TypeDeclaration)
+ 		|| (this.referenceContext instanceof ConstructorDeclaration);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index b9f8312..695526c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -521,6 +521,24 @@ public abstract class Scope {
+ 		} while (scope != null);
+ 		return (CompilationUnitScope) lastScope;
+ 	}
++	
++	public boolean isLambdaScope() {
++		return false;
++	}
++	
++	public boolean isLambdaSubscope() {
++		for (Scope scope = this; scope != null; scope = scope.parent) {
++			switch (scope.kind) {
++				case BLOCK_SCOPE:
++			        continue;
++				case METHOD_SCOPE:
++					return scope.isLambdaScope();
++				default:
++					return false;
++			}
++		}
++		return false;
++	}
+ 
+ 	/**
+ 	 * Finds the most specific compiler options
+@@ -1717,7 +1735,7 @@ public abstract class Scope {
+ 				Scope scope = this;
+ 				int depth = 0;
+ 				int foundDepth = 0;
+-				boolean isInsideLambda = false;
++				boolean shouldCaptureOuterLocals = false;
+ 				ReferenceBinding foundActualReceiverType = null;
+ 				done : while (true) { // done when a COMPILATION_UNIT_SCOPE is found
+ 					switch (scope.kind) {
+@@ -1740,9 +1758,9 @@ public abstract class Scope {
+ 										ProblemReasons.InheritedNameHidesEnclosingName);
+ 								if (depth > 0)
+ 									invocationSite.setDepth(depth);
+-								if (isInsideLambda && invocationSite instanceof NameReference) {
+-									NameReference nameReference = (NameReference) invocationSite;
+-									nameReference.bits |= ASTNode.IsFromOutsideLambda;
++								if (shouldCaptureOuterLocals && invocationSite instanceof NameReference) {
++										NameReference nameReference = (NameReference) invocationSite;
++										nameReference.bits |= ASTNode.IsCapturedOuterLocal;
+ 								}
+ 								return variableBinding;
+ 							}
+@@ -1823,6 +1841,7 @@ public abstract class Scope {
+ 							}
+ 							insideTypeAnnotation = false;
+ 							depth++;
++							shouldCaptureOuterLocals = true;
+ 							insideStaticContext |= receiverType.isStatic();
+ 							// 1EX5I8Z - accessing outer fields within a constructor call is permitted
+ 							// in order to do so, we change the flag as we exit from the type, not the method
+@@ -1833,9 +1852,8 @@ public abstract class Scope {
+ 						case COMPILATION_UNIT_SCOPE :
+ 							break done;
+ 					}
+-					if (scope.kind == METHOD_SCOPE && scope.parent != null && scope.parent.kind != CLASS_SCOPE) {
+-						isInsideLambda = true;
+-					}
++					if (scope.isLambdaScope()) // Not in Kansas anymore ...
++						shouldCaptureOuterLocals = true;
+ 					scope = scope.parent;
+ 				}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index 13473fd..97875c7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -1240,9 +1240,9 @@ public void cannotReferToNonFinalOuterLocal(LocalVariableBinding local, ASTNode
+ 		nodeSourceEnd(local, location));
+ }
+ public void cannotReferToNonEffectivelyFinalOuterLocal(LocalVariableBinding local, ASTNode location) {
+-	String[] arguments =new String[]{ new String(local.readableName())};
++	String[] arguments = new String[] { new String(local.readableName()) };
+ 	this.handle(
+-		(location.bits & ASTNode.IsFromOutsideLambda) != 0 ? IProblem.OuterLocalMustBeEffectivelyFinal : IProblem.OuterLocalUnderLambdaMustBeEffectivelyFinal, 
++		IProblem.OuterLocalMustBeEffectivelyFinal, 
+ 		arguments,
+ 		arguments,
+ 		nodeSourceStart(local, location),
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+index 4789b32..4b641a1 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+@@ -50,7 +50,7 @@
+ 22 = No enclosing instance of the type {0} is accessible in scope
+ 23 = Illegal enclosing instance specification for type {0}
+ 24 = Cannot define static initializer in inner type {0}
+-25 = Cannot refer to a non-final variable {0} inside an inner class defined in a different method
++25 = Cannot refer to the non-final variable {0} in a different method inside an inner class
+ 26 = The member interface {0} can only be defined inside a top-level class or interface
+ 27 = Cannot use an expression of the type {0} as a valid enclosing instance
+ 28 = No enclosing instance of type {0} is available due to some intermediate constructor invocation
+@@ -625,8 +625,7 @@
+ 
+ ### MORE TYPE RELATED
+ 662 = Illegal attempt to create arrays of union types
+-663 = The variable {0} must be must be final or effectively final if used in an inner class
+-664 = The variable {0} must be must be final or effectively final if used in a lambda expression
++663 = Variable {0} is required to be final or effectively final
+ 
+ ### NULL ANALYSIS FOR OTHER EXPRESSIONS
+ 670 = Null comparison always yields false: this expression cannot be null
+diff --git a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
+index 831c22c..e85c2bf 100644
+--- a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
++++ b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
+@@ -340,7 +340,8 @@ public FieldBinding generateReadSequence(BlockScope currentScope, CodeStream cod
+ 				// no implicit conversion
+ 			} else {
+ 				// outer local?
+-				if ((this.bits & DepthMASK) != 0) {
++				if ((this.bits & IsCapturedOuterLocal) != 0) {
++					checkEffectiveFinality(localBinding, currentScope);
+ 					// outer local can be reached either through a synthetic arg or a synthetic field
+ 					VariableBinding[] path = currentScope.getEmulationPath(localBinding);
+ 					codeStream.generateOuterAccess(path, this, localBinding, currentScope);
+diff --git a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetSingleNameReference.java b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetSingleNameReference.java
+index ea2877b..42034a7 100644
+--- a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetSingleNameReference.java
++++ b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetSingleNameReference.java
+@@ -1,9 +1,13 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2011 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+@@ -283,7 +287,8 @@ public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean
+ 				if (!valueRequired)
+ 					break;
+ 				// outer local?
+-				if ((this.bits & DepthMASK) != 0) {
++				if ((this.bits & IsCapturedOuterLocal) != 0) {
++					checkEffectiveFinality(localBinding, currentScope);
+ 					// outer local can be reached either through a synthetic arg or a synthetic field
+ 					VariableBinding[] path = currentScope.getEmulationPath(localBinding);
+ 					codeStream.generateOuterAccess(path, this, localBinding, currentScope);
+commit d32dbe370312bc68ef5b59c6268bfdfcda839b17
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Tue Feb 12 01:26:21 2013 -0500
+
+    More tests for Bug 382721 - [1.8][compiler] Effectively final variables
+    needs special treatment
+
+393	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+5	1	org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+index c022a89..ba99972 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+@@ -1976,7 +1976,399 @@ public void test054() {
+ 				"Variable args is required to be final or effectively final\n" + 
+ 				"----------\n");
+ }
+-
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test055() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" + 
++					"	void doit();\n" + 
++					"}\n" + 
++					"public class X {\n" + 
++					"  void foo(final int x) {\n" + 
++					"    I i = () -> {\n" + 
++					"      x = 10;\n" + 
++					"     };\n" + 
++					"  }\n" +
++					"}\n" ,
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 7)\n" + 
++				"	x = 10;\n" + 
++				"	^\n" + 
++				"The final local variable x cannot be assigned. It must be blank and not using a compound assignment\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test056() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" + 
++					"	void doit();\n" + 
++					"}\n" + 
++					"public class X {\n" + 
++					"  void foo(final int x) {\n" + 
++					"    X i = new X() {\n" + 
++					"      { x = 10; }\n" + 
++					"     };\n" + 
++					"  }\n" +
++					"}\n" ,
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 7)\n" + 
++				"	{ x = 10; }\n" + 
++				"	  ^\n" + 
++				"The final local variable x cannot be assigned, since it is defined in an enclosing type\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test057() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" + 
++					"	void doit();\n" + 
++					"}\n" + 
++					"public class X {\n" + 
++					"  void foo(int x) {\n" + 
++					"    I i = () -> {\n" + 
++					"      x = 10;\n" + 
++					"     };\n" + 
++					"  }\n" +
++					"}\n" ,
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 7)\n" + 
++				"	x = 10;\n" + 
++				"	^\n" + 
++				"Variable x is required to be final or effectively final\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test058() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" + 
++					"	void doit();\n" + 
++					"}\n" + 
++					"public class X {\n" + 
++					"  void foo(int x) {\n" + 
++					"    X i = new X() {\n" + 
++					"      { x = 10; }\n" + 
++					"     };\n" + 
++					"  }\n" +
++					"}\n" ,
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 7)\n" + 
++				"	{ x = 10; }\n" + 
++				"	  ^\n" + 
++				"Variable x is required to be final or effectively final\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test059() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" +
++					"	void foo();\n" +
++					"}\n" +
++					"class X {\n" +
++					"	void foo(int [] p) {\n" +
++					"		for (int is : p) {\n" +
++					"			I j = new I () {\n" +
++					"				public void foo() {\n" +
++					"					System.out.println(is);\n" +
++					"				};\n" +
++					"			};\n" +
++					"		}\n" +
++					"	}\n" +
++					"}\n",
++				},
++				"");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test060() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" +
++					"	void foo();\n" +
++					"}\n" +
++					"class X {\n" +
++					"	void foo(int [] p) {\n" +
++					"		for (int is : p) {\n" +
++					"			I j = () -> {\n" +
++					"					System.out.println(is);\n" +
++					"			};\n" +
++					"		}\n" +
++					"	}\n" +
++					"}\n",
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 8)\n" + 
++				"	System.out.println(is);\n" + 
++				"	                   ^^\n" + 
++				"Missing code implementation in the compiler\n" + // expected. 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test061() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" + 
++					"	void doit();\n" + 
++					"}\n" + 
++					"public class X {\n" + 
++					"  void foo2(String[] args) {\n" + 
++					"   int var;\n" + 
++					"   if (args != null)\n" + 
++					"      var = args.length;\n" + 
++					"   else\n" + 
++					"      var = 2;\n" + 
++					"   I x = () ->  {\n" + 
++					"       System.out.println(var);\n" +  // no error here.
++					"       args = null;\n" + // error here.
++					"   };\n" + 
++					"  }\n" +
++					"}\n" ,
++				}, 		
++				"----------\n" + 
++				"1. ERROR in X.java (at line 13)\n" + 
++				"	args = null;\n" + 
++				"	^^^^\n" + 
++				"Variable args is required to be final or effectively final\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test062() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" +
++					"	void doit();\n" +
++					"}\n" +
++					"public class X {\n" +
++					"  public static void main(String[] args) {\n" +
++					"    int var;\n" +
++					"    if (args != null) {\n" +
++					"       var = args.length;\n" +
++					"       I x = new I() {\n" +
++					"         public void doit() {\n" +
++					"           System.out.println(var);\n" +
++					"         }\n" +
++					"       };\n" +
++					"    } else {\n" +
++					"       var = 2; // HERE\n" +
++					"    }\n" +
++					"  }\n" +
++					"}\n",
++				},
++				"");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test063() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"import java.io.IOException;\n" +
++					"interface I {\n" +
++					"    void doit();\n" +
++					"}\n" +
++					"public class X {\n" +
++					"  public static void main(String[] args) throws IOException {\n" +
++					"\n" +
++					"	try {\n" +
++					"		throw new IOException();\n" +
++					"	} catch (Exception e) {\n" +
++					"		if (args == null) {\n" +
++					"			throw e;\n" +
++					"		} \n" +
++					"                else {\n" +
++					"			e = null;\n" +
++					"		}\n" +
++					"	}\n" +
++					"  }\n" +
++					"}\n",
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 12)\n" + 
++				"	throw e;\n" + 
++				"	^^^^^^^^\n" + 
++				"Unhandled exception type Exception\n" + 
++				"----------\n" + 
++				"2. WARNING in X.java (at line 14)\n" + 
++				"	else {\n" + 
++				"			e = null;\n" + 
++				"		}\n" + 
++				"	     ^^^^^^^^^^^^^^^^^^\n" + 
++				"Statement unnecessarily nested within else clause. The corresponding then clause does not complete normally\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test064() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"import java.io.IOException;\n" +
++					"interface I {\n" +
++					"    void doit();\n" +
++					"}\n" +
++					"public class X {\n" +
++					"  public static void main(String[] args) throws IOException {\n" +
++					"\n" +
++					"	try {\n" +
++					"		throw new IOException();\n" +
++					"	} catch (Exception e) {\n" +
++					"		if (args == null) {\n" +
++					"			throw e;\n" +
++					"		} \n" +
++					"	}\n" +
++					"  }\n" +
++					"}\n",
++				},
++				"");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test065() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" +
++					"	void foo();\n" +
++					"}\n" +
++					"class X {\n" +
++					"	void foo() {\n" +
++					"		int x = 10;\n" +
++					"		I i = () -> {\n" +
++					"			System.out.println(x++);\n" +
++					"		};\n" +
++					"	}\n" +
++					"}\n",
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 8)\n" + 
++				"	System.out.println(x++);\n" + 
++				"	                   ^\n" + 
++				"Variable x is required to be final or effectively final\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test066() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"import java.io.IOException;\n" +
++					"class X {\n" +
++					"	void foo(int x) throws IOException {\n" +
++					"		try {\n" +
++					"			throw new IOException();\n" +
++					"		} catch (Exception e) {\n" +
++					"			if (x == 0) {\n" +
++					"				throw e;\n" +
++					"			} else {\n" +
++					"				e = null;\n" +
++					"			}\n" +
++					"		}\n" +
++					"	}\n" +
++					"}\n" ,
++				},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 8)\n" + 
++				"	throw e;\n" + 
++				"	^^^^^^^^\n" + 
++				"Unhandled exception type Exception\n" + 
++				"----------\n" + 
++				"2. WARNING in X.java (at line 9)\n" + 
++				"	} else {\n" + 
++				"				e = null;\n" + 
++				"			}\n" + 
++				"	       ^^^^^^^^^^^^^^^^^^^^\n" + 
++				"Statement unnecessarily nested within else clause. The corresponding then clause does not complete normally\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test067() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" +
++					"	void doit ();\n" +
++					"}\n" +
++					"class X {\n" +
++					"	int p;\n" +
++					"	void foo(int p) {\n" +
++					"		int i = 10;\n" +
++					"		X x = new X();\n" +
++					"		x = new X();\n" +
++					"		I l = () -> {\n" +
++					"			x.p = i++;\n" +
++					"		};\n" +
++					"	}\n" +
++					"}\n",
++				},
++				"----------\n" + 
++				"1. WARNING in X.java (at line 6)\n" + 
++				"	void foo(int p) {\n" + 
++				"	             ^\n" + 
++				"The parameter p is hiding a field from type X\n" + 
++				"----------\n" + 
++				"2. ERROR in X.java (at line 11)\n" + 
++				"	x.p = i++;\n" + 
++				"	      ^\n" + 
++				"Variable i is required to be final or effectively final\n" + 
++				"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=382721, [1.8][compiler] Effectively final variables needs special treatment
++public void test068() {
++	// This test checks that common semantic checks are indeed run
++	this.runNegativeTest(
++			new String[] {
++					"X.java",
++					"interface I {\n" +
++					"	void doit ();\n" +
++					"}\n" +
++					"class X {\n" +
++					"	int p;\n" +
++					"	void foo(int p) {\n" +
++					"		int i = 10;\n" +
++					"		X x = new X();\n" +
++					"		x = new X();\n" +
++					"		I l = () -> {\n" +
++					"			x.p = i;\n" +
++					"		};\n" +
++					"	}\n" +
++					"}\n",
++				},
++				"----------\n" + 
++				"1. WARNING in X.java (at line 6)\n" + 
++				"	void foo(int p) {\n" + 
++				"	             ^\n" + 
++				"The parameter p is hiding a field from type X\n" + 
++				"----------\n" + 
++				"2. ERROR in X.java (at line 11)\n" + 
++				"	x.p = i;\n" + 
++				"	^\n" + 
++				"Variable x is required to be final or effectively final\n" + 
++				"----------\n");
++}
+ public static Class testClass() {
+ 	return NegativeLambdaExpressionsTest.class;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
+index 4d9cf8b..bc90626 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/NameReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -13,6 +13,8 @@
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann - Contribution for
+  *								bug 331649 - [compiler][null] consider null annotations for fields
++ *     Jesper S Moller - Contributions for
++ *							bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+index af38e22..7ad4ca6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.java
+@@ -1009,7 +1009,7 @@ public TypeBinding resolveType(BlockScope scope) {
+ 					this.bits &= ~ASTNode.RestrictiveFlagMASK; // clear bits
+ 					this.bits |= Binding.LOCAL;
+ 					LocalVariableBinding local = (LocalVariableBinding) this.binding;
+-					if (!local.isFinal() && ((this.bits & ASTNode.IsCapturedOuterLocal) != 0)) { 
++					if (!local.isFinal() && (this.bits & ASTNode.IsCapturedOuterLocal) != 0) { 
+ 						if (scope.compilerOptions().sourceLevel < ClassFileConstants.JDK1_8) // for 8, defer till effective finality could be ascertained.
+ 							scope.problemReporter().cannotReferToNonFinalOuterLocal((LocalVariableBinding) this.binding, this);
+ 					}
+diff --git a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
+index e85c2bf..9e15270 100644
+--- a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
++++ b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetQualifiedNameReference.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2010 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann <stephan@cs.tu-berlin.de> - Contribution for bug 185682 - Increment/decrement operators mark local variables as read

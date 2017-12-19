@@ -1,0 +1,243 @@
+commit 917f313ba5ca3f32518017465bedaa5a5f37ab39
+Author: Simon Kaegi <skaegi>
+Date:   Fri Nov 28 22:36:05 2008 +0000
+
+    Bug 252890 [engine] Rollback reason should be logged
+
+3	5	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ActionManager.java
+8	4	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+60	9	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
+5	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
+3	2	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
+7	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ActionManager.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ActionManager.java
+index f38fdbc..9c0cbe8 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ActionManager.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ActionManager.java
+@@ -57,15 +57,13 @@ public class ActionManager implements IRegistryChangeListener {
+ 				if (touchpointType != null) {
+ 					String touchpointVersion = actionElement.getAttribute(TOUCHPOINT_VERSION);
+ 					Touchpoint touchpoint = TouchpointManager.getInstance().getTouchpoint(touchpointType, touchpointVersion);
+-					if (touchpoint == null) {
+-						reportError(NLS.bind(Messages.ActionManager_Required_Touchpoint_Not_Found, touchpointType, actionId));
+-						return null;
+-					}
++					if (touchpoint == null)
++						throw new IllegalArgumentException(NLS.bind(Messages.ActionManager_Required_Touchpoint_Not_Found, touchpointType, actionId));
+ 					action.setTouchpoint(touchpoint);
+ 				}
+ 				return action;
+ 			} catch (CoreException e) {
+-				reportError(NLS.bind(Messages.ActionManager_Exception_Creating_Action_Extension, actionId));
++				throw new IllegalArgumentException(NLS.bind(Messages.ActionManager_Exception_Creating_Action_Extension, actionId));
+ 			}
+ 		}
+ 		return null;
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+index f1c0c06..4424679 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+@@ -11,6 +11,7 @@
+ package org.eclipse.equinox.internal.provisional.p2.engine;
+ 
+ import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.engine.*;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+@@ -54,13 +55,16 @@ public class Engine implements IEngine {
+ 			MultiStatus result = phaseSet.perform(session, profile, operands, context, monitor);
+ 			if (result.matches(IStatus.ERROR | IStatus.CANCEL)) {
+ 				eventBus.publishEvent(new RollbackOperationEvent(profile, phaseSet, operands, this, result));
+-				session.rollback();
++				IStatus status = session.rollback();
++				if (status.matches(IStatus.ERROR))
++					LogHelper.log(status);
+ 			} else {
+-				if (profile.isChanged()) {
++				if (profile.isChanged())
+ 					profileRegistry.updateProfile(profile);
+-				}
+ 				eventBus.publishEvent(new CommitOperationEvent(profile, phaseSet, operands, this));
+-				session.commit();
++				IStatus status = session.commit();
++				if (status.matches(IStatus.ERROR))
++					LogHelper.log(status);
+ 			}
+ 			//if there is only one child status, return that status instead because it will have more context
+ 			IStatus[] children = result.getChildren();
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
+index 1ed6a47..12f52b6 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
+@@ -13,6 +13,7 @@ package org.eclipse.equinox.internal.provisional.p2.engine;
+ import java.util.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
++import org.eclipse.osgi.util.NLS;
+ 
+ public class EngineSession {
+ 
+@@ -43,19 +44,44 @@ public class EngineSession {
+ 	}
+ 
+ 	public IStatus commit() {
+-		MultiStatus result = new MultiStatus(EngineActivator.ID, IStatus.OK, null, null);
++		MultiStatus status = new MultiStatus(EngineActivator.ID, IStatus.OK, null, null);
+ 		phaseActionRecordsPairs.clear();
+ 		for (Iterator iterator = touchpoints.iterator(); iterator.hasNext();) {
+ 			Touchpoint touchpoint = (Touchpoint) iterator.next();
+-			result.add(touchpoint.commit(profile));
++			try {
++				status.add(touchpoint.commit(profile));
++			} catch (RuntimeException e) {
++				// "touchpoint.commit" calls user code and might throw an unchecked exception
++				// we catch the error here to gather information on where the problem occurred.
++				status.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.touchpoint_commit_error, touchpoint.getClass().getName()), e));
++			} catch (LinkageError e) {
++				// Catch linkage errors as these are generally recoverable but let other Errors propagate (see bug 222001)
++				status.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.touchpoint_commit_error, touchpoint.getClass().getName()), e));
++			}
+ 		}
+-		return result;
++
++		if (status.matches(IStatus.ERROR)) {
++			MultiStatus result = new MultiStatus(EngineActivator.ID, IStatus.ERROR, NLS.bind(Messages.session_commit_error, profile.getProfileId()), null);
++			result.merge(status);
++			return result;
++		}
++		return status;
+ 	}
+ 
+ 	public IStatus rollback() {
+-		MultiStatus result = new MultiStatus(EngineActivator.ID, IStatus.OK, null, null);
++		MultiStatus status = new MultiStatus(EngineActivator.ID, IStatus.OK, null, null);
++
+ 		if (currentPhase != null) {
+-			result.add(rollBackPhase(currentPhase, currentActionRecords));
++			try {
++				status.add(rollBackPhase(currentPhase, currentActionRecords));
++			} catch (RuntimeException e) {
++				// "phase.undo" calls user code and might throw an unchecked exception
++				// we catch the error here to gather information on where the problem occurred.
++				status.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.phase_undo_error, currentPhase.getClass().getName()), e));
++			} catch (LinkageError e) {
++				// Catch linkage errors as these are generally recoverable but let other Errors propagate (see bug 222001)
++				status.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.phase_undo_error, currentPhase.getClass().getName()), e));
++			}
+ 			currentPhase = null;
+ 			currentActionRecords = null;
+ 			currentRecord = null;
+@@ -65,14 +91,39 @@ public class EngineSession {
+ 			Object[] pair = (Object[]) it.previous();
+ 			Phase phase = (Phase) pair[0];
+ 			List actionRecords = (List) pair[1];
+-			result.add(rollBackPhase(phase, actionRecords));
++			try {
++				status.add(rollBackPhase(phase, actionRecords));
++			} catch (RuntimeException e) {
++				// "phase.undo" calls user code and might throw an unchecked exception
++				// we catch the error here to gather information on where the problem occurred.
++				status.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.phase_undo_error, phase.getClass().getName()), e));
++			} catch (LinkageError e) {
++				// Catch linkage errors as these are generally recoverable but let other Errors propagate (see bug 222001)
++				status.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.phase_undo_error, phase.getClass().getName()), e));
++			}
+ 		}
++
+ 		phaseActionRecordsPairs.clear();
+ 		for (Iterator iterator = touchpoints.iterator(); iterator.hasNext();) {
+-			Touchpoint touchpoint = (Touchpoint) iterator.next();
+-			result.add(touchpoint.rollback(profile));
++			try {
++				Touchpoint touchpoint = (Touchpoint) iterator.next();
++				status.add(touchpoint.commit(profile));
++			} catch (RuntimeException e) {
++				// "touchpoint.commit" calls user code and might throw an unchecked exception
++				// we catch the error here to gather information on where the problem occurred.
++				status.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.touchpoint_rollback_error, Touchpoint.class.getName()), e));
++			} catch (LinkageError e) {
++				// Catch linkage errors as these are generally recoverable but let other Errors propagate (see bug 222001)
++				status.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.touchpoint_rollback_error, Touchpoint.class.getName()), e));
++			}
+ 		}
+-		return result;
++
++		if (status.matches(IStatus.ERROR)) {
++			MultiStatus result = new MultiStatus(EngineActivator.ID, IStatus.ERROR, NLS.bind(Messages.session_commit_error, profile.getProfileId()), null);
++			result.merge(status);
++			return result;
++		}
++		return status;
+ 	}
+ 
+ 	private IStatus rollBackPhase(Phase phase, List actionRecords) {
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
+index 604a143..e8a0306 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Messages.java
+@@ -35,6 +35,11 @@ public class Messages extends NLS {
+ 	public static String phaseid_not_set;
+ 	public static String Engine_Operation_Canceled_By_User;
+ 	public static String InstallableUnitEvent_type_not_install_or_uninstall;
++	public static String touchpoint_commit_error;
++	public static String touchpoint_rollback_error;
++	public static String phase_undo_error;
++	public static String session_commit_error;
++	public static String session_rollback_error;
+ 
+ 	static {
+ 		// initialize resource bundle
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
+index aefae1c..fed804a 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
+@@ -14,6 +14,7 @@ import java.util.*;
+ import java.util.Map.Entry;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.engine.EngineActivator;
++import org.eclipse.osgi.util.NLS;
+ 
+ public abstract class Phase {
+ 	protected static final String PARM_OPERAND = "operand"; //$NON-NLS-1$
+@@ -190,7 +191,7 @@ public abstract class Phase {
+ 			Touchpoint touchpoint = action.getTouchpoint();
+ 			if (touchpoint != null) {
+ 				mergeStatus(status, initializeTouchpointParameters(profile, operand, operandParameters, touchpoint, new NullProgressMonitor()));
+-				if (status.matches(IStatus.ERROR | IStatus.CANCEL))
++				if (status.matches(IStatus.ERROR))
+ 					return;
+ 
+ 				parameters = (Map) touchpointToTouchpointOperandParameters.get(touchpoint);
+@@ -250,7 +251,7 @@ public abstract class Phase {
+ 	 * this phase. Subclasses should override.
+ 	 */
+ 	protected String getProblemMessage() {
+-		return Messages.phase_error;
++		return NLS.bind(Messages.phase_error, getClass().getName());
+ 	}
+ 
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
+index afc9a99..e9b0f7a 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/messages.properties
+@@ -16,11 +16,17 @@ null_phases=Phases must not be null
+ null_phaseset=PhaseSet must not be null.
+ null_profile=Profile must not be null.
+ required_touchpoint_not_found=The required {0} touchpoint was not found
+-phase_error=An error occurred during provisioning.
++touchpoint_commit_error=An error occurred while committing the {0} touchpoint.
++touchpoint_rollback_error=An error occurred while rolling back the {0} touchpoint.
++phase_error=An error occurred during the {0} phase.
++phase_undo_error=An error occurred while undoing the {0} phase.
+ phase_not_started=There is no phase to end.
+ phase_started=A phase is already started.
+ phaseid_not_positive=Phase weight must be positive.
+ phaseid_not_set=Phase id must be set.
++session_commit_error=An error occurred while committing the engine session for profile: {0}.
++session_rollback_error=An error occurred while rolling back the engine session for profile: {0}.
++
+ Engine_Operation_Canceled_By_User=Operation canceled by the user.
+ InstallableUnitEvent_type_not_install_or_uninstall=type must be either UNINSTALL(0) or INSTALL(1)
+ CertificateChecker_CertificateError=An invalid certificate was found.

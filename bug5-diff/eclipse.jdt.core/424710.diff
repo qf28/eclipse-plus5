@@ -1,0 +1,255 @@
+commit 16bbff04917b9cd9bd7cceaf4adfc1563daef0bc
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Mon Jan 6 23:51:14 2014 +0100
+
+    Bug 424710 - [1.8][compiler] CCE in
+    SingleNameReference.localVariableBinding
+
+31	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+8	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+12	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+3	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+index 3fd93b2..c510888 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+@@ -437,4 +437,35 @@ public void testBug424637() {
+ 		"Unhandled exception type IOException\n" + 
+ 		"----------\n");
+ }
++public void testBug424710() {
++	runConformTest(
++		new String[] {
++			"MapperTest.java",
++			"import java.util.ArrayList;\n" + 
++			"import java.util.Arrays;\n" + 
++			"import java.util.List;\n" + 
++			"import java.util.function.Function;\n" + 
++			"import java.util.regex.Matcher;\n" + 
++			"import java.util.regex.Pattern;\n" + 
++			"import java.util.stream.Stream;\n" + 
++			"\n" + 
++			"public class MapperTest {\n" + 
++			"\n" + 
++			"    public static void main( String... argv ){\n" + 
++			"        List<String> data = Arrays.asList(\"abc\", \"123\", \"1a\", \"?!?\");\n" + 
++			"        List<Pattern> patterns = Arrays.asList(Pattern.compile(\"[a-z]+\"), Pattern.compile(\"[0-9]+\"));\n" + 
++			"		patterns.stream()\n" + 
++			"				.flatMap(\n" + 
++			"						p -> {\n" + 
++			"							Stream<Matcher> map = data.stream().map(p::matcher);\n" + 
++			"							Stream<Matcher> filter = map.filter(Matcher::find);\n" + 
++			"							Function<? super Matcher, ? extends Object> mapper = Matcher::group;\n" + 
++			"							mapper = matcher -> matcher.group();\n" + 
++			"							return filter.map(mapper);\n" + 
++			"						})\n" + 
++			"				.forEach(System.out::println);\n" + 
++			"    }\n" + 
++			"}\n"
++		});
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+index d9c4c23..93f9bd7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+@@ -24,6 +24,7 @@
+  *								Bug 417295 - [1.8[[null] Massage type annotated null analysis to gel well with deep encoded type bindings.
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
+  *								Bug 424742 - [1.8] NPE in LambdaExpression.isCompatibleWith
++ *								Bug 424710 - [1.8][compiler] CCE in SingleNameReference.localVariableBinding
+  *     Jesper S Moller - Contributions for
+  *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *								bug 412153 - [1.8][compiler] Check validity of annotations which may be repeatable
+@@ -657,7 +658,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 			if (candidateMethod instanceof ParameterizedGenericMethodBinding) {
+ 				infCtx = invocation.getInferenceContext((ParameterizedGenericMethodBinding) candidateMethod);
+ 				if (infCtx != null) {
+-					if (!infCtx.hasFinished)
++					if (infCtx.stepCompleted < InferenceContext18.TYPE_INFERRED)
+ 						return; // not yet ready for pushing type information down to arguments
+ 					variableArity &= infCtx.isVarArgs(); // TODO: if no infCtx is available, do we have to re-check if this is a varargs invocation?
+ 				}
+@@ -682,7 +683,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 					if (binding instanceof ParameterizedGenericMethodBinding) {
+ 						ParameterizedGenericMethodBinding parameterizedMethod = (ParameterizedGenericMethodBinding) binding;
+ 						InferenceContext18 innerContext = innerInvocation.getInferenceContext(parameterizedMethod);
+-						if (innerContext != null && !innerContext.hasFinished) {							
++						if (innerContext != null && innerContext.stepCompleted < InferenceContext18.TYPE_INFERRED) {							
+ 							argument.setExpectedType(parameterType);
+ 							MethodBinding improvedBinding = innerContext.inferInvocationType(innerInvocation, parameterizedMethod);
+ 							innerInvocation.updateBindings(improvedBinding);
+@@ -692,8 +693,11 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 				}
+ 
+ 				if (argument.isPolyExpression()) {
+-					// poly expressions in an invocation context need to be resolved now:
+-					updatedArgumentType = argument.checkAgainstFinalTargetType(parameterType);
++					// poly expressions in an invocation context may need to be resolved now:
++					if (infCtx != null && infCtx.stepCompleted == InferenceContext18.BINDINGS_UPDATED)
++						updatedArgumentType = argument.resolvedType; // in this case argument was already resolved via InferenceContext18.acceptPendingPolyArguments()
++					else
++						updatedArgumentType = argument.checkAgainstFinalTargetType(parameterType);
+ 
+ 					if (problemReason == ProblemReasons.NoError // preserve errors
+ 							&& updatedArgumentType != null					// do we have a relevant update? ...
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+index 5dedd20..d1bbb29 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+@@ -26,6 +26,7 @@
+  *							Bug 417295 - [1.8[[null] Massage type annotated null analysis to gel well with deep encoded type bindings.
+  *							Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
+  *							Bug 424727 - [compiler][null] NullPointerException in nullAnnotationUnsupportedLocation(ProblemReporter.java:5708)
++ *							Bug 424710 - [1.8][compiler] CCE in SingleNameReference.localVariableBinding
+  *     Jesper S Moller <jesper@selskabet.org> - Contributions for
+  *							bug 378674 - "The method can be declared as static" is wrong
+  *     Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+@@ -644,7 +645,8 @@ public boolean updateBindings(MethodBinding updatedBinding) {
+ 		InferenceContext18 ctx = (InferenceContext18)this.inferenceContexts.removeKey(this.binding);
+ 		if (ctx != null && updatedBinding instanceof ParameterizedGenericMethodBinding) {
+ 			this.inferenceContexts.put(updatedBinding, ctx);
+-			ctx.hasFinished = true;
++			// solution may have come from an outer inference, mark now that this (inner) is done (but not deep inners):
++			ctx.stepCompleted = InferenceContext18.TYPE_INFERRED;
+ 		}
+ 	}
+ 	this.binding = updatedBinding;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+index 679709d..31cb63d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+@@ -19,6 +19,7 @@
+  *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *								bug 403147 - [compiler][null] FUP of bug 400761: consolidate interaction between unboxing, NPE, and deferred checking
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
++ *								Bug 424710 - [1.8][compiler] CCE in SingleNameReference.localVariableBinding
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 409245 - [1.8][compiler] Type annotations dropped when call is routed through a synthetic bridge method
+  *******************************************************************************/
+@@ -502,7 +503,8 @@ public class ExplicitConstructorCall extends Statement implements Invocation, Ex
+ 			InferenceContext18 ctx = (InferenceContext18)this.inferenceContexts.removeKey(this.binding);
+ 			if (ctx != null && updatedBinding instanceof ParameterizedGenericMethodBinding) {
+ 				this.inferenceContexts.put(updatedBinding, ctx);
+-				ctx.hasFinished = true;
++				// solution may have come from an outer inference, mark now that this (inner) is done (but not deep inners):
++				ctx.stepCompleted = InferenceContext18.TYPE_INFERRED;
+ 			}
+ 		}
+ 		this.binding = updatedBinding;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index 0bfcb35..31a235c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -40,6 +40,7 @@
+  *								Bug 417295 - [1.8[[null] Massage type annotated null analysis to gel well with deep encoded type bindings.
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
+  *								Bug 423504 - [1.8] Implement "18.5.3 Functional Interface Parameterization Inference"
++ *								Bug 424710 - [1.8][compiler] CCE in SingleNameReference.localVariableBinding
+  *     Jesper S Moller - Contributions for
+  *								Bug 378674 - "The method can be declared as static" is wrong
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+@@ -974,7 +975,8 @@ public boolean updateBindings(MethodBinding updatedBinding) {
+ 		InferenceContext18 ctx = (InferenceContext18)this.inferenceContexts.removeKey(this.binding);
+ 		if (ctx != null && updatedBinding instanceof ParameterizedGenericMethodBinding) {
+ 			this.inferenceContexts.put(updatedBinding, ctx);
+-			ctx.hasFinished=true;
++			// solution may have come from an outer inference, mark now that this (inner) is done (but not deep inners):
++			ctx.stepCompleted = InferenceContext18.TYPE_INFERRED;
+ 		}
+ 	}
+ 	this.binding = updatedBinding;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index 7a7e0cb..427ef04 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -163,8 +163,16 @@ public class InferenceContext18 {
+ 	BoundSet storedSolution;
+ 	/** One of CHECK_STRICT, CHECK_LOOSE, or CHECK_VARARGS. */
+ 	int inferenceKind;
+-	/** Once an invocation inference has passed 18.5.2 inference, flip this to true to avoid repeated inference of the same task. */
+-	public boolean hasFinished = false;
++	/** Marks how much work has been done so far? Used to avoid performing any of these tasks more than once. */
++	public int stepCompleted = NOT_INFERRED;
++
++	public static int NOT_INFERRED = 0;
++	/** Applicability Inference (18.5.1) has been completed. */
++	public static int APPLICABILITY_INFERRED = 1;
++	/** Invocation Type Inference (18.5.2) has been completed. */
++	public static int TYPE_INFERRED = 2;
++	/** All nested elements have been fully resolved. */
++	public static int BINDINGS_UPDATED = 3;
+ 	
+ 	// ---
+ 
+@@ -419,7 +427,7 @@ public class InferenceContext18 {
+ 				return null;
+ 			return this.currentBounds = solution; // this is final, keep the result:
+ 		} finally {
+-			this.hasFinished = true;
++			this.stepCompleted = TYPE_INFERRED;
+ 		}
+ 	}
+ 
+@@ -880,6 +888,7 @@ public class InferenceContext18 {
+ 				}
+ 			}
+ 		}
++		this.stepCompleted = BINDINGS_UPDATED; // we're done-done
+ 	}
+ 
+ 	private void acceptPendingPolyArguments(final BoundSet acceptedResult, TypeBinding[] parameterTypes, boolean isVarArgs) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+index f14d972..75978a4 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+@@ -17,6 +17,7 @@
+  *								Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099
+  *								bug 413958 - Function override returning inherited Generic Type
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
++ *								Bug 424710 - [1.8][compiler] CCE in SingleNameReference.localVariableBinding
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -121,6 +122,7 @@ public class ParameterizedGenericMethodBinding extends ParameterizedMethodBindin
+ 						}
+ 						if (provisionalResult != null && infCtx18.isResolved(provisionalResult)) {
+ 							infCtx18.storedSolution = provisionalResult;
++							infCtx18.stepCompleted = InferenceContext18.APPLICABILITY_INFERRED;
+ 						}
+ 					} else {
+ 						provisionalResult = infCtx18.storedSolution;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index 05c2797..319badf 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -24,6 +24,7 @@
+  *								Bug 416183 - [1.8][compiler][null] Overload resolution fails with null annotations
+  *								Bug 416176 - [1.8][compiler][null] null type annotations cause grief on type variables
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
++ *								Bug 424710 - [1.8][compiler] CCE in SingleNameReference.localVariableBinding
+  *     Jesper S Moller - Contributions for
+  *								Bug 378674 - "The method can be declared as static" is wrong
+  *  							Bug 405066 - [1.8][compiler][codegen] Implement code generation infrastructure for JSR335
+@@ -786,7 +787,7 @@ public abstract class Scope {
+ 							if (innerBinding instanceof ParameterizedGenericMethodBinding) {
+ 								ParameterizedGenericMethodBinding innerParameterized = (ParameterizedGenericMethodBinding) innerBinding;
+ 								InferenceContext18 infCtx18 = innerPoly.getInferenceContext(innerParameterized);
+-								if (infCtx18 != null && !infCtx18.hasFinished) {
++								if (infCtx18 != null && infCtx18.stepCompleted < InferenceContext18.TYPE_INFERRED) {
+ 									// not detected as compatible, because inference still needs to complete?
+ 									invocArg.setExpectedType(targetType);
+ 									MethodBinding solution = infCtx18.inferInvocationType(innerPoly, innerParameterized);
+@@ -4869,7 +4870,7 @@ public abstract class Scope {
+ 			Invocation invocation = (Invocation) invocationSite;
+ 			ParameterizedGenericMethodBinding parameterizedMethod = (ParameterizedGenericMethodBinding) applicable;
+ 			InferenceContext18 infCtx18 = invocation.getInferenceContext(parameterizedMethod);
+-			if (infCtx18 != null && !infCtx18.hasFinished) {
++			if (infCtx18 != null && infCtx18.stepCompleted < InferenceContext18.TYPE_INFERRED) {
+ 				return infCtx18.inferInvocationType(invocation, argumentTypes, parameterizedMethod);
+ 			}
+ 		}

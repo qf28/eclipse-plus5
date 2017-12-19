@@ -1,0 +1,3293 @@
+commit 9c4d992b585e683ac977f6194b91643d4152f8f3
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Jul 6 12:19:06 2017 +0200
+
+    Bug 517808: [9][compiler] Implement lookup (module, package, type) based
+    on the 2017-05-25 version of JLS
+    - resolved FIXME re accessibility of package vs. type
+
+74	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+1	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index e18a30e..1324ee8 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -3063,6 +3063,80 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 		}
+ 	}
+ 	
++	public void testNonPublic1() throws CoreException {
++		if (!isJRE9) return;
++		try {
++			String[] sources1 = {
++					"src/module-info.java", 
++					"module mod.one { \n" +
++					"	exports pm;\n" +
++					"}",
++					"src/pm/C1.java", 
++					"package pm;\n" +
++					"class C1 {\n" +
++					"	public void test() {}\n" +
++					"}\n"
++			};
++			IJavaProject p1 = setupModuleProject("mod.one", sources1);
++			IClasspathEntry dep = JavaCore.newProjectEntry(p1.getPath());
++			p1.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++
++			String[] sources2 = {
++					"src/module-info.java", 
++					"module mod.two { \n" +
++					"	requires mod.one;\n" +
++					"}",
++					"src/pm/sub/C2.java", 
++					"package pm.sub;\n" +
++					"class C2 {\n" +
++					"	public void foo() {}\n" +
++					"}\n",
++					"src/po/Client.java", 
++					"package po;\n" + 
++					"import pm.*;\n" + // package is exported but type C1 is not public
++					"public class Client {\n" + 
++					"    void test1(C1 one) {\n" +
++					"        one.test();\n" + 
++					"    }\n" + 
++					"}\n"
++			};
++
++			IJavaProject p2 = setupModuleProject("mod.two", sources2, new IClasspathEntry[] { dep });
++			this.workingCopies = new ICompilationUnit[3];
++			this.workingCopies[0] = getCompilationUnit("/mod.two/src/module-info.java").getWorkingCopy(this.wcOwner, null);
++			this.workingCopies[1] = getCompilationUnit("/mod.two/src/pm/sub/C2.java").getWorkingCopy(this.wcOwner, null);
++			this.problemRequestor.initialize(sources2[5].toCharArray());
++			this.workingCopies[2] = getCompilationUnit("/mod.two/src/po/Client.java").getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++					"Unexpected problems",
++					"----------\n" + 
++					"1. ERROR in /mod.two/src/po/Client.java (at line 4)\n" + 
++					"	void test1(C1 one) {\n" + 
++					"	           ^^\n" + 
++					"The type C1 is not visible\n" + 
++					"----------\n" + 
++					"2. ERROR in /mod.two/src/po/Client.java (at line 5)\n" + 
++					"	one.test();\n" + 
++					"	^^^\n" + 
++					"The type C1 is not visible\n" + 
++					"----------\n",
++					this.problemRequestor);
++
++			String expectedError = "The type C1 is not visible\n" + 
++									"The type C1 is not visible";
++			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.INCREMENTAL_BUILD, null);
++			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers", expectedError, markers);
++
++			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers", expectedError, markers);
++		} finally {
++			deleteProject("mod.one");
++			deleteProject("mod.two");
++		}
++	}
++
+ 	// sort by CHAR_START
+ 	protected void sortMarkers(IMarker[] markers) {
+ 		Arrays.sort(markers, (a,b) -> a.getAttribute(IMarker.CHAR_START, 0) - b.getAttribute(IMarker.CHAR_START, 0)); 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+index ee41870..dcb7cac 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+@@ -169,6 +169,7 @@ ReferenceBinding getType(char[] name, ModuleBinding mod) {
+ 		return new ProblemReferenceBinding(new char[][]{ name }, referenceBinding, ProblemReasons.InternalNameProvided);
+ 	if (!mod.canAccess(this))
+ 		return new ProblemReferenceBinding(referenceBinding.compoundName, referenceBinding, ProblemReasons.NotAccessible);
++	// at this point we have only checked accessibility of the package, accessibility of the type will be checked by callers
+ 	return referenceBinding;
+ }
+ /* Answer the type named name if it exists in the cache.
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+index f2cf168..80124d5 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+@@ -185,7 +185,7 @@ public class SplitPackageBinding extends PackageBinding {
+ 		boolean accessible = false;
+ 		for (PackageBinding incarnation : this.incarnations) {
+ 			ReferenceBinding type = incarnation.getType(name, mod);
+-			if (type != null) { // FIXME(SHMOD) differentiate non-public vs. non-exported
++			if (type != null) {
+ 				if (candidate == null || !accessible) {
+ 					candidate = type;
+ 					accessible = mod.canAccess(incarnation);
+@@ -196,6 +196,7 @@ public class SplitPackageBinding extends PackageBinding {
+ 		}
+ 		if (candidate != null && !accessible)
+ 			return new ProblemReferenceBinding(candidate.compoundName, candidate, ProblemReasons.NotAccessible); // TODO(SHMOD) more info
++		// at this point we have only checked unique accessibility of the package, accessibility of the type will be checked by callers
+ 		return candidate;
+ 	}
+ 
+commit b4116e5805eef16c4c8ee88cbc8be35a1cbbb5eb
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Jul 6 14:22:31 2017 +0200
+
+    Bug 517808: [9][compiler] Implement lookup (module, package, type) based
+    on the 2017-05-25 version of JLS
+    - resolved FIXME: caching of requiredModules seems to work now
+
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+index 452d7b7..8f1c425 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+@@ -313,8 +313,8 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	 *   An array of all required modules
+ 	 */
+ 	public ModuleBinding[] getAllRequiredModules() {
+-//		if (this.requiredModules != null) // FIXME(SHMOD): for caching: when invoked? must have resolved first)
+-//			return this.requiredModules;
++		if (this.requiredModules != null)
++			return this.requiredModules;
+ 
+ 		Collection<ModuleBinding> allRequires = dependencyCollector().get();
+ 		if (allRequires.contains(this)) {
+commit 370ddc614308b880713c9bfd1740772f1eaad0a3
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Jul 6 17:32:40 2017 +0200
+
+    Bug 517808: [9][compiler] Implement lookup (module, package, type) based
+    on the 2017-05-25 version of JLS
+    - resolving for binary modules incl. bridge to dom
+    - improve NameLookup for multi-project situations
+    
+    Change-Id: If15577f8c0954974bdd3381979cc973fa7426380
+
+67	38	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter9Test.java
+1	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IUpdatableModule.java
+44	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryModuleBinding.java
+13	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceModuleBinding.java
+2	2	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ModuleBinding.java
+30	19	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter9Test.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter9Test.java
+index 8df8a2b..0965197 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter9Test.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/dom/ASTConverter9Test.java
+@@ -403,10 +403,25 @@ public class ASTConverter9Test extends ConverterTestSetup {
+ 					"public interface I22 {}\n");
+ 
+ 			addClasspathEntry(project1, JavaCore.newProjectEntry(project2.getPath()));
++
++			// workaround: I need a way to navigate from a source module to a binary module containing "uses" and "provides":
++			IJavaProject project3 = createJavaProject("third", new String[] {"src"}, new String[] {jcl9lib}, "bin", "9");
++			project3.open(null);
++			addClasspathEntry(project3, JavaCore.newContainerEntry(new Path("org.eclipse.jdt.MODULE_PATH")));
++			String thirdFile = 
++					"module third {\n" +
++					"    requires first;\n" +
++					"}";
++			createFile("/third/src/module-info.java",	thirdFile);
++			addClasspathEntry(project3, JavaCore.newProjectEntry(project1.getPath()));
++			//
++
+ 			project1.close(); // sync
+ 			project2.close();
++			project3.close();
+ 			project2.open(null);
+ 			project1.open(null);
++			project3.open(null);
+ 
+ 			ICompilationUnit sourceUnit1 = getCompilationUnit("ConverterTests9" , "src", "", "module-info.java"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+ 			ASTNode unit1 = runConversion(AST_INTERNAL_JLS9, sourceUnit1, true);
+@@ -415,51 +430,65 @@ public class ASTConverter9Test extends ConverterTestSetup {
+ 			checkSourceRange(moduleDecl1, fileContent, fileContent);
+ 
+ 			IModuleBinding moduleBinding = moduleDecl1.resolveBinding();
+-			assertTrue("Module Binding null", moduleBinding != null);
+-			String name = moduleBinding.getName();
+-			assertTrue("Module Name null", name != null);
+-			assertTrue("Wrong Module Name", name.equals("first"));
+-			
+ 			Name modName1 = moduleDecl1.getName();
+ 			IBinding binding = modName1.resolveBinding();
+ 			assertTrue("binding not a module binding", binding instanceof IModuleBinding);
+ 			moduleBinding = (IModuleBinding) binding;
+-			assertTrue("Module Binding null", moduleBinding != null);
+-			name = moduleBinding.getName();
+-			assertTrue("Module Name null", name != null);
+-			assertTrue("Wrong Module Name", name.equals("first"));
+-
+-			IModuleBinding[] reqs = moduleBinding.getRequiredModules();
+-			assertTrue("Null requires", reqs != null);
+-			assertTrue("incorrect number of requires modules", reqs.length == 1);
+-			assertTrue("incorrect name for requires modules", reqs[0].getName().equals("second"));
+-
+-			IPackageBinding[] secPacks = reqs[0].getExportedPackages();
+-			assertTrue("Packages Exported in second module null", secPacks != null);
+-			assertTrue("Incorrect number of exported packages in second module", secPacks.length == 1);
+-			IPackageBinding pack22 = secPacks[0];
+-			assertTrue("Incorrect Package", pack22.getName().equals("pack22"));
+ 
+-			ITypeBinding[] uses = moduleBinding.getUses();
+-			assertTrue("uses null", uses != null);
+-			assertTrue("Incorrect number of uses", uses.length == 1);
+-			assertTrue("Incorrect uses", uses[0].getQualifiedName().equals("pack22.I22"));
+-
+-			ITypeBinding[] services = moduleBinding.getServices();
+-			assertTrue("services null", services != null);
+-			assertTrue("Incorrect number of services", services.length == 1);
+-			for (ITypeBinding s : services) {
+-				assertTrue("Incorrect service", s.getQualifiedName().equals("pack22.I22"));
+-				ITypeBinding[] implementations = moduleBinding.getImplementations(s);
+-				assertTrue("implementations null", implementations != null);
+-				assertTrue("Incorrect number of implementations", implementations.length == 1);
+-				assertTrue("Incorrect implementation", implementations[0].getQualifiedName().equals("pack1.X11"));
+-			}
+-
+-		}
+-		finally {
++			assertModuleFirstDetails(moduleBinding);
++			
++			// indirectly fetch the binary version of "first" via "third":
++			ICompilationUnit sourceUnit3 = getCompilationUnit("third" , "src", "", "module-info.java"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
++			ASTNode unit3 = runConversion(AST_INTERNAL_JLS9, sourceUnit3, true);
++			assertEquals("Not a compilation unit", ASTNode.COMPILATION_UNIT, unit3.getNodeType());
++			ModuleDeclaration moduleDecl3 = ((CompilationUnit) unit3).getModule();
++			IModuleBinding firstModAsBinary = moduleDecl3.resolveBinding().getRequiredModules()[0];
++
++			assertModuleFirstDetails(firstModAsBinary);
++		
++		} finally {
+ 			deleteProject("ConverterTests9");
+ 			deleteProject("second");
++			deleteProject("third");
++		}
++	}
++
++	private void assertModuleFirstDetails(IModuleBinding moduleBinding) {
++		assertTrue("Module Binding null", moduleBinding != null);
++		String name = moduleBinding.getName();
++		assertTrue("Module Name null", name != null);
++		assertTrue("Wrong Module Name", name.equals("first"));
++		
++		assertTrue("Module Binding null", moduleBinding != null);
++		name = moduleBinding.getName();
++		assertTrue("Module Name null", name != null);
++		assertTrue("Wrong Module Name", name.equals("first"));
++
++		IModuleBinding[] reqs = moduleBinding.getRequiredModules();
++		assertTrue("Null requires", reqs != null);
++		assertTrue("incorrect number of requires modules", reqs.length == 1);
++		assertTrue("incorrect name for requires modules", reqs[0].getName().equals("second"));
++
++		IPackageBinding[] secPacks = reqs[0].getExportedPackages();
++		assertTrue("Packages Exported in second module null", secPacks != null);
++		assertTrue("Incorrect number of exported packages in second module", secPacks.length == 1);
++		IPackageBinding pack22 = secPacks[0];
++		assertTrue("Incorrect Package", pack22.getName().equals("pack22"));
++
++		ITypeBinding[] uses = moduleBinding.getUses();
++		assertTrue("uses null", uses != null);
++		assertTrue("Incorrect number of uses", uses.length == 1);
++		assertTrue("Incorrect uses", uses[0].getQualifiedName().equals("pack22.I22"));
++
++		ITypeBinding[] services = moduleBinding.getServices();
++		assertTrue("services null", services != null);
++		assertTrue("Incorrect number of services", services.length == 1);
++		for (ITypeBinding s : services) {
++			assertTrue("Incorrect service", s.getQualifiedName().equals("pack22.I22"));
++			ITypeBinding[] implementations = moduleBinding.getImplementations(s);
++			assertTrue("implementations null", implementations != null);
++			assertTrue("Incorrect number of implementations", implementations.length == 1);
++			assertTrue("Incorrect implementation", implementations[0].getQualifiedName().equals("pack1.X11"));
+ 		}
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IUpdatableModule.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IUpdatableModule.java
+index 8d3385c..a055a3b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IUpdatableModule.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IUpdatableModule.java
+@@ -25,13 +25,12 @@ import java.util.function.Consumer;
+  */
+ public interface IUpdatableModule {
+ 	
+-	enum UpdateKind { MODULE, PACKAGE, TYPE }
++	enum UpdateKind { MODULE, PACKAGE }
+ 
+ 	/** Structure for update operations, sorted by {@link UpdateKind}. */
+ 	class UpdatesByKind {
+ 		List<Consumer<IUpdatableModule>> moduleUpdates = Collections.emptyList();
+ 		List<Consumer<IUpdatableModule>> packageUpdates = Collections.emptyList();
+-		List<Consumer<IUpdatableModule>> typeUpdates = Collections.emptyList();
+ 		public List<Consumer<IUpdatableModule>> getList(UpdateKind kind, boolean create) {
+ 			switch (kind) {
+ 				case MODULE:
+@@ -42,10 +41,6 @@ public interface IUpdatableModule {
+ 					if (this.packageUpdates == Collections.EMPTY_LIST && create)
+ 						this.packageUpdates = new ArrayList<>();
+ 					return this.packageUpdates;
+-				case TYPE:
+-					if (this.typeUpdates == Collections.EMPTY_LIST && create)
+-						this.typeUpdates = new ArrayList<>();
+-					return this.typeUpdates;
+ 				default:
+ 					throw new IllegalArgumentException("Unknown enum value "+kind); //$NON-NLS-1$
+ 			}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryModuleBinding.java
+index 4798d2c..0a2ae9e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryModuleBinding.java
+@@ -14,16 +14,21 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
++import java.util.HashMap;
++
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.IModule.IModuleReference;
+ import org.eclipse.jdt.internal.compiler.env.IModule.IPackageExport;
++import org.eclipse.jdt.internal.compiler.env.IModule.IService;
+ 
+ public class BinaryModuleBinding extends ModuleBinding {
+ 	
+ 	private IPackageExport[] unresolvedExports;
+ 	private IPackageExport[] unresolvedOpens;
++	private char[][] unresolvedUses;
++	private IService[] unresolvedProvides;
+ 	
+ 	/**
+ 	 * Construct a named module from binary.
+@@ -42,8 +47,6 @@ public class BinaryModuleBinding extends ModuleBinding {
+ 		if (module.isOpen())
+ 			this.modifiers |= ClassFileConstants.ACC_OPEN;
+ 
+-		// FIXME(SHMOD): the following triggers a lot of recursive resolving, make it more lazy!
+-
+ 		IModuleReference[] requiresReferences = module.requires();
+ 		this.requires = new ModuleBinding[requiresReferences.length];
+ 		this.requiresTransitive = new ModuleBinding[requiresReferences.length];
+@@ -65,6 +68,8 @@ public class BinaryModuleBinding extends ModuleBinding {
+ 
+ 		this.unresolvedExports = module.exports();
+ 		this.unresolvedOpens = module.opens();
++		this.unresolvedUses = module.uses();
++		this.unresolvedProvides = module.provides();
+ 	}
+ 	
+ 	@Override
+@@ -96,9 +101,42 @@ public class BinaryModuleBinding extends ModuleBinding {
+ 			this.openedPackages[i] = declaredPackage;
+ 			recordOpensRestrictions(declaredPackage, opens.targets());
+ 		}
+-		// FIXME(SHMOD): impl resolving of uses/services/implementations from binary
+-		this.uses = Binding.NO_TYPES;
+-		this.services = Binding.NO_TYPES;
+-		this.implementations = null;
++	}
++	
++	@Override
++	public TypeBinding[] getUses() {
++		if (this.uses == null) {
++			this.uses = new TypeBinding[this.unresolvedUses.length];
++			for (int i = 0; i < this.unresolvedUses.length; i++)
++				this.uses[i] = this.environment.getType(CharOperation.splitOn('.', this.unresolvedUses[i]), this);
++		}
++		return super.getUses();
++	}
++	
++	@Override
++	public TypeBinding[] getServices() {
++		if (this.services == null)
++			resolveServices();
++		return super.getServices();
++	}
++
++	@Override
++	public TypeBinding[] getImplementations(TypeBinding binding) {
++		if (this.implementations == null)
++			resolveServices();
++		return super.getImplementations(binding);
++	}
++
++	private void resolveServices() {
++		this.services = new TypeBinding[this.unresolvedProvides.length];
++		this.implementations = new HashMap<>();
++		for (int i = 0; i < this.unresolvedProvides.length; i++) {
++			this.services[i] = this.environment.getType(CharOperation.splitOn('.', this.unresolvedProvides[i].name()), this);
++			char[][] implNames = this.unresolvedProvides[i].with();
++			TypeBinding[] impls = new TypeBinding[implNames.length];
++			for (int j = 0; j < implNames.length; j++)
++				impls[j] = this.environment.getType(CharOperation.splitOn('.', implNames[j]), this);
++			this.implementations.put(this.services[i], impls);
++		}
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+index 8f1c425..eac79a6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+@@ -82,9 +82,9 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	private Map<PackageBinding,SimpleSetOfCharArray> exportRestrictions; // RHS is unresolved names, because unresolvable names are legal in this position
+ 	protected PackageBinding[] openedPackages;
+ 	private Map<PackageBinding,SimpleSetOfCharArray> openRestrictions; // RHS is unresolved names, because unresolvable names are legal in this position
+-	public TypeBinding[] uses;
+-	public TypeBinding[] services;
+-	public Map<TypeBinding,Collection<TypeBinding>> implementations;
++	protected TypeBinding[] uses;
++	protected TypeBinding[] services;
++	public Map<TypeBinding,TypeBinding[]> implementations;
+ 	public int modifiers;
+ 	public LookupEnvironment environment;
+ 	public int tagBits;
+@@ -162,9 +162,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	}
+ 	public TypeBinding[] getImplementations(TypeBinding binding) {
+ 		if (this.implementations != null) {
+-			Collection<TypeBinding> impls = this.implementations.get(binding);
+-			if (impls != null)
+-				return impls.toArray(new TypeBinding[impls.size()]);
++			return this.implementations.get(binding);
+ 		}
+ 		return null;
+ 	}
+@@ -176,6 +174,15 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 		completeIfNeeded(UpdateKind.MODULE);
+ 		return this.requiresTransitive;
+ 	}
++	
++	public TypeBinding[] getUses() {
++		return this.uses;
++	}
++	
++	public TypeBinding[] getServices() {
++		return this.services;
++	}
++
+ 	private void completeIfNeeded(IUpdatableModule.UpdateKind kind) {
+ 		if (!this.isComplete[kind.ordinal()]) {
+ 			this.isComplete[kind.ordinal()] = true;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceModuleBinding.java
+index 2b8592e..c6a1f27 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceModuleBinding.java
+@@ -52,7 +52,7 @@ public class SourceModuleBinding extends ModuleBinding {
+ 	public void setImplementations(TypeBinding infBinding, Collection<TypeBinding> resolvedImplementations) {
+ 		if (this.implementations == null)
+ 			this.implementations = new HashMap<>();
+-		this.implementations.put(infBinding, resolvedImplementations);
++		this.implementations.put(infBinding, resolvedImplementations.toArray(new TypeBinding[resolvedImplementations.size()]));
+ 	}
+ 
+ 	private <T> T[] merge(T[] one, T[] two, IntFunction<T[]> supplier) {
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ModuleBinding.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ModuleBinding.java
+index d1d7c58..b7c4eb8 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ModuleBinding.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/ModuleBinding.java
+@@ -217,14 +217,14 @@ class ModuleBinding implements IModuleBinding {
+ 	@Override
+ 	public ITypeBinding[] getUses() {
+ 		if (this.uses == null)
+-			this.uses = getTypes(this.binding.uses);
++			this.uses = getTypes(this.binding.getUses());
+ 		return this.uses;
+ 	}
+ 
+ 	@Override
+ 	public ITypeBinding[] getServices() {
+ 		if (this.services == null)
+-			this.services = getTypes(this.binding.services);
++			this.services = getTypes(this.binding.getServices());
+ 		return this.services;
+ 	}
+ 	@Override
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+index 295b28c..d37eb0c 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+@@ -20,6 +20,7 @@ import java.util.*;
+ import org.eclipse.core.resources.*;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.Path;
+ import org.eclipse.core.runtime.jobs.ISchedulingRule;
+ import org.eclipse.jdt.core.IClassFile;
+ import org.eclipse.jdt.core.IClasspathEntry;
+@@ -1265,19 +1266,17 @@ public class NameLookup implements SuffixConstants {
+ 		if (moduleContext == null) // includes the case where looking for module UNNAMED or ANY
+ 			return isPackage(pkgName);
+ 		
+-		Object value = this.packageFragments.get(pkgName);
+-		if (value instanceof PackageFragmentRoot) {
+-			PackageFragmentRoot root = (PackageFragmentRoot)value;
+-			return moduleMatches(root, moduleContext);
+-		} else {
+-			IPackageFragmentRoot[] roots = (IPackageFragmentRoot[]) value;
+-			if (roots != null) {
+-				for (int i = 0, length = roots.length; i < length; i++) {
+-					PackageFragmentRoot root = (PackageFragmentRoot) roots[i];
+-					if (moduleMatches(root, moduleContext))
+-						return true;
++		switch (moduleContext.getElementType()) {
++			case IJavaElement.PACKAGE_FRAGMENT_ROOT:
++				IPackageFragmentRoot moduleRoot = (IPackageFragmentRoot) moduleContext;
++				return moduleRoot.getPackageFragment(String.join(".", pkgName)).exists(); //$NON-NLS-1$
++			case IJavaElement.JAVA_PROJECT:
++				try {
++					IJavaElement element = ((IJavaProject) moduleContext).findElement(new Path(String.join("/", pkgName))); //$NON-NLS-1$
++					return element instanceof IPackageFragment;
++				} catch (JavaModelException e) {
++					return false;
+ 				}
+-			}
+ 		}
+ 		return false;
+ 	}
+@@ -1341,14 +1340,26 @@ public class NameLookup implements SuffixConstants {
+ 			seekModuleAwarePartialPackageFragments(name, requestor, moduleContext);
+ 			return;
+ 		}
+-		
+-		String[] splittedName = Util.splitOn('.', name, 0, name.length());
+-		int pkgIndex = this.packageFragments.getIndex(splittedName);
+-		if (pkgIndex == -1)
+-			return;
+-		checkModulePackages(requestor, moduleContext, pkgIndex);
+-		
++		switch (moduleContext.getElementType()) {
++			case IJavaElement.PACKAGE_FRAGMENT_ROOT:
++				IPackageFragmentRoot moduleRoot = (IPackageFragmentRoot) moduleContext;
++				IPackageFragment fragment = moduleRoot.getPackageFragment(name);
++				if (fragment.exists())
++					requestor.acceptPackageFragment(fragment);
++				break;
++			case IJavaElement.JAVA_PROJECT:
++				try {
++					for (IPackageFragmentRoot fragmentRoot : ((IJavaProject) moduleContext).getPackageFragmentRoots()) {
++						fragment = fragmentRoot.getPackageFragment(name);
++						if (fragment.exists())
++							requestor.acceptPackageFragment(fragment);
++					}
++				} catch (JavaModelException e) {
++					// silent
++				}
++		}
+ 	}
++
+ 	/**
+ 	 * Notifies the given requestor of all package fragments with the
+ 	 * given name. Checks the requestor at regular intervals to see if the
+commit c00bc3fdd83212c5995041d716296940002538ab
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Jul 6 21:44:26 2017 +0200
+
+    Bug 517808: [9][compiler] Implement lookup (module, package, type) based
+    on the 2017-05-25 version of JLS
+    - fill gaps in name environments, partial revert to Java 8 versions
+    - remove now-unused indirections
+    
+    
+    
+    Change-Id: I25ecf36143e2104a1ac05a0ef89ecb4e78712a7a
+
+1	19	org.eclipse.jdt.compiler.tool/src/org/eclipse/jdt/internal/compiler/batch/ClasspathJsr199.java
+1	19	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathDirectory.java
+2	19	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+3	20	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJrt.java
+2	2	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileFinder.java
+36	8	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+2	3	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/Main.java
+5	6	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ModuleFinder.java
+4	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModule.java
+0	54	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleEnvironment.java
+11	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModulePathEntry.java
+0	30	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IPackageLookup.java
+0	89	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/ITypeLookup.java
+15	48	org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/NameEnvironmentWithProgress.java
+2	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+1	15	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+2	24	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JrtPackageFragmentRoot.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleSourcePathManager.java
+14	7	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ProjectEntry.java
+2	15	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+3	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJMod.java
+1	22	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+3	20	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+1	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
+1	28	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
+24	22	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+0	21	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
+diff --git a/org.eclipse.jdt.compiler.tool/src/org/eclipse/jdt/internal/compiler/batch/ClasspathJsr199.java b/org.eclipse.jdt.compiler.tool/src/org/eclipse/jdt/internal/compiler/batch/ClasspathJsr199.java
+index 9628b70..401014e 100644
+--- a/org.eclipse.jdt.compiler.tool/src/org/eclipse/jdt/internal/compiler/batch/ClasspathJsr199.java
++++ b/org.eclipse.jdt.compiler.tool/src/org/eclipse/jdt/internal/compiler/batch/ClasspathJsr199.java
+@@ -32,13 +32,10 @@ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ 
+ @SuppressWarnings({ "rawtypes", "unchecked" })
+-public class ClasspathJsr199 extends ClasspathLocation implements IModuleEnvironment {
++public class ClasspathJsr199 extends ClasspathLocation {
+ 	private static final Set<JavaFileObject.Kind> fileTypes = new HashSet<>();
+ 
+ 	static {
+@@ -231,14 +228,6 @@ public class ClasspathJsr199 extends ClasspathLocation implements IModuleEnviron
+ 		// TODO Auto-generated method stub
+ 		return null;
+ 	}
+-	@Override
+-	public ITypeLookup typeLookup() {
+-		return this::findClass;
+-	}
+-	@Override
+-	public IPackageLookup packageLookup() {
+-		return this::isPackage;
+-	}
+ 
+ 	@Override
+ 	public NameEnvironmentAnswer findClass(char[] typeName, String qualifiedPackageName,
+@@ -246,11 +235,4 @@ public class ClasspathJsr199 extends ClasspathLocation implements IModuleEnviron
+ 		//
+ 		return findClass(typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName, false);
+ 	}
+-
+-	@Override
+-	public IModuleEnvironment getLookupEnvironment() {
+-		//
+-		return this;
+-	}
+-
+ }
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathDirectory.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathDirectory.java
+index 8eb90e1..a54d089 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathDirectory.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathDirectory.java
+@@ -28,10 +28,7 @@ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationProvider;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.lookup.AutoModule;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+@@ -49,7 +46,7 @@ import java.util.List;
+ import java.util.Map;
+ 
+ @SuppressWarnings({"rawtypes", "unchecked"})
+-public class ClasspathDirectory extends ClasspathLocation implements IModuleEnvironment {
++public class ClasspathDirectory extends ClasspathLocation {
+ 
+ private Hashtable directoryCache;
+ private String[] missingPackageHolder = new String[1];
+@@ -313,19 +310,4 @@ public IModule getModule() {
+ 	}
+ 	return this.module;
+ }
+-@Override
+-public ITypeLookup typeLookup() {
+-	return this::findClass;
+-}
+-
+-@Override
+-public IPackageLookup packageLookup() {
+-	return this::isPackage;
+-}
+-
+-@Override
+-public IModuleEnvironment getLookupEnvironment() {
+-	// 
+-	return this;
+-}
+ }
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+index 6b9a0ce..e6db8ec 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJar.java
+@@ -36,10 +36,7 @@ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationProvider;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.lookup.AutoModule;
+ import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding.ExternalAnnotationStatus;
+@@ -48,7 +45,7 @@ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.compiler.util.Util;
+ 
+ @SuppressWarnings({"rawtypes", "unchecked"})
+-public class ClasspathJar extends ClasspathLocation implements IModuleEnvironment {
++public class ClasspathJar extends ClasspathLocation {
+ 
+ protected File file;
+ protected ZipFile zipFile;
+@@ -209,7 +206,7 @@ void acceptModule(byte[] content) {
+ 		return;
+ 	ClassFileReader reader = null;
+ 	try {
+-		reader = new ClassFileReader(content, IModuleEnvironment.MODULE_INFO_CLASS.toCharArray());
++		reader = new ClassFileReader(content, IModule.MODULE_INFO_CLASS.toCharArray());
+ 	} catch (ClassFormatException e) {
+ 		e.printStackTrace();
+ 	}
+@@ -298,18 +295,4 @@ public IModule getModule() {
+ 	}
+ 	return this.module;
+ }
+-@Override
+-public ITypeLookup typeLookup() {
+-	return this::findClass;
+-}
+-@Override
+-public IPackageLookup packageLookup() {
+-	return this::isPackage;
+-}
+-
+-@Override
+-public IModuleEnvironment getLookupEnvironment() {
+-	// 
+-	return this;
+-}
+ }
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJrt.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJrt.java
+index e0dc497..20d825e 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJrt.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ClasspathJrt.java
+@@ -35,17 +35,14 @@ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IMultiModuleEntry;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding.ExternalAnnotationStatus;
+ import org.eclipse.jdt.internal.compiler.util.JRTUtil;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ 
+ @SuppressWarnings({"rawtypes", "unchecked"})
+-public class ClasspathJrt extends ClasspathLocation implements IMultiModuleEntry, IModuleEnvironment {
++public class ClasspathJrt extends ClasspathLocation implements IMultiModuleEntry {
+ 	protected File file;
+ 	protected ZipFile annotationZipFile;
+ 	protected boolean closeZipFileAtEnd;
+@@ -207,7 +204,7 @@ public class ClasspathJrt extends ClasspathLocation implements IMultiModuleEntry
+ 					@Override
+ 					public FileVisitResult visitModule(Path mod) throws IOException {
+ 						try {
+-							ClasspathJrt.this.acceptModule(JRTUtil.getClassfileContent(ClasspathJrt.this.file, IModuleEnvironment.MODULE_INFO_CLASS, mod.toString()));
++							ClasspathJrt.this.acceptModule(JRTUtil.getClassfileContent(ClasspathJrt.this.file, IModule.MODULE_INFO_CLASS, mod.toString()));
+ 						} catch (ClassFormatException e) {
+ 							e.printStackTrace();
+ 						}
+@@ -237,7 +234,7 @@ public class ClasspathJrt extends ClasspathLocation implements IMultiModuleEntry
+ 			return;
+ 		ClassFileReader reader = null;
+ 		try {
+-			reader = new ClassFileReader(content, IModuleEnvironment.MODULE_INFO_CLASS.toCharArray());
++			reader = new ClassFileReader(content, IModule.MODULE_INFO_CLASS.toCharArray());
+ 		} catch (ClassFormatException e) {
+ 			e.printStackTrace();
+ 		}
+@@ -348,21 +345,7 @@ public class ClasspathJrt extends ClasspathLocation implements IMultiModuleEntry
+ 		return null;
+ 	}
+ 	@Override
+-	public ITypeLookup typeLookup() {
+-		return this::findClass;
+-	}
+-	@Override
+-	public IPackageLookup packageLookup() {
+-		return this::isPackage;
+-	}
+-	@Override
+ 	public boolean servesModule(char[] moduleName) {
+ 		return getModule(moduleName) != null;
+ 	}
+-
+-	@Override
+-	public IModuleEnvironment getLookupEnvironment() {
+-		//
+-		return this;
+-	}
+ }
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileFinder.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileFinder.java
+index efefe89..416e5b9 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileFinder.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileFinder.java
+@@ -18,7 +18,7 @@ import java.io.File;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
++import org.eclipse.jdt.internal.compiler.env.IModule;
+ 
+ public class FileFinder {
+ 
+@@ -48,7 +48,7 @@ private static void find0(File f, String pattern, List<String> collector) {
+ 				if (name.endsWith(pattern)) {
+ 					// NOTE: This handles only the lower case name. Check with the spec about
+ 					// Naming of the module descriptor before making this code code insensitive.
+-					if (name.endsWith(IModuleEnvironment.MODULE_INFO_JAVA)) {
++					if (name.endsWith(IModule.MODULE_INFO_JAVA)) {
+ 						collector.add(0, current.getAbsolutePath());
+ 					} else {
+ 						collector.add(current.getAbsolutePath());
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+index bc4e748..fdb0a91 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+@@ -27,7 +27,6 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.function.Consumer;
+-import java.util.stream.Stream;
+ import java.util.zip.ZipFile;
+ 
+ import org.eclipse.jdt.core.compiler.CharOperation;
+@@ -40,7 +39,6 @@ import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.IModuleAwareNameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.env.IUpdatableModule;
+ import org.eclipse.jdt.internal.compiler.env.IUpdatableModule.UpdateKind;
+ import org.eclipse.jdt.internal.compiler.env.IUpdatableModule.UpdatesByKind;
+@@ -375,13 +373,43 @@ private NameEnvironmentAnswer internalFindClass(String qualifiedTypeName, char[]
+ 			? Util.EMPTY_STRING
+ 			: qualifiedBinaryFileName.substring(0, qualifiedTypeName.length() - typeName.length - 1);
+ 
+-	if (moduleName == ModuleBinding.ANY) {
+-		// TODO(SHMOD): revert to Java 8 version?
+-		return Stream.of(this.classpaths)
+-				.map(p -> p.getLookupEnvironment().typeLookup())
+-				.reduce(ITypeLookup::chain)
+-				.map(t -> t.findClass(typeName, qualifiedPackageName, null, qualifiedBinaryFileName, asBinaryOnly)).orElse(null);
++	if (moduleName == ModuleBinding.ANY || moduleName == ModuleBinding.UNNAMED || this.moduleLocations == null) {
++		String qp2 = File.separatorChar == '/' ? qualifiedPackageName : qualifiedPackageName.replace('/', File.separatorChar);
++		NameEnvironmentAnswer suggestedAnswer = null;
++		if (qualifiedPackageName == qp2) {
++			for (int i = 0, length = this.classpaths.length; i < length; i++) {
++				if (moduleName == ModuleBinding.UNNAMED && this.classpaths[i].getModule() != null) continue;
++				NameEnvironmentAnswer answer = this.classpaths[i].findClass(typeName, qualifiedPackageName, null, qualifiedBinaryFileName, asBinaryOnly);
++				if (answer != null) {
++					if (!answer.ignoreIfBetter()) {
++						if (answer.isBetter(suggestedAnswer))
++							return answer;
++					} else if (answer.isBetter(suggestedAnswer))
++						// remember suggestion and keep looking
++						suggestedAnswer = answer;
++				}
++			}
++		} else {
++			String qb2 = qualifiedBinaryFileName.replace('/', File.separatorChar);
++			for (int i = 0, length = this.classpaths.length; i < length; i++) {
++				Classpath p = this.classpaths[i];
++				if (moduleName == ModuleBinding.UNNAMED && p.getModule() != null) continue;
++				NameEnvironmentAnswer answer = (p instanceof ClasspathJar)
++					? p.findClass(typeName, qualifiedPackageName, null, qualifiedBinaryFileName, asBinaryOnly)
++					: p.findClass(typeName, qp2, null, qb2, asBinaryOnly);
++				if (answer != null) {
++					if (!answer.ignoreIfBetter()) {
++						if (answer.isBetter(suggestedAnswer))
++							return answer;
++					} else if (answer.isBetter(suggestedAnswer))
++						// remember suggestion and keep looking
++						suggestedAnswer = answer;
++				}
++			}
++		}
++		return suggestedAnswer;
+ 	}
++	// searching for a specific named module:
+ 	String moduleNameString = String.valueOf(moduleName);
+ 	Classpath classpath = this.moduleLocations.get(moduleNameString);
+ 	if (classpath != null) {
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/Main.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/Main.java
+index 76f2739..5dcfe2d 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/Main.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/Main.java
+@@ -91,7 +91,6 @@ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.IModule.IPackageExport;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IUpdatableModule.UpdateKind;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerStats;
+@@ -3095,7 +3094,7 @@ private IModule extractModuleDesc(String fileName) {
+ 	opts.put(CompilerOptions.OPTION_Source, this.options.get(CompilerOptions.OPTION_Compliance));
+ 	Parser parser = new Parser(new ProblemReporter(getHandlingPolicy(), 
+ 			new CompilerOptions(opts), getProblemFactory()), false);
+-	if (fileName.toLowerCase().endsWith(IModuleEnvironment.MODULE_INFO_JAVA)) {
++	if (fileName.toLowerCase().endsWith(IModule.MODULE_INFO_JAVA)) {
+ 		
+ 		ICompilationUnit cu = new CompilationUnit(null, fileName, null);
+ 		CompilationResult compilationResult = new CompilationResult(cu, 0, 1, 10);
+@@ -3103,7 +3102,7 @@ private IModule extractModuleDesc(String fileName) {
+ 		if (unit.isModuleInfo() && unit.moduleDeclaration != null) {
+ 			mod = new BasicModule(unit.moduleDeclaration, null);
+ 		}
+-	} else if (fileName.toLowerCase().endsWith(IModuleEnvironment.MODULE_INFO_CLASS)) {
++	} else if (fileName.toLowerCase().endsWith(IModule.MODULE_INFO_CLASS)) {
+ 		try {
+ 			ClassFileReader reader = ClassFileReader.read(fileName); // Check the absolute path?
+ 			mod = reader.getModuleDeclaration();
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ModuleFinder.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ModuleFinder.java
+index d59e0ec..bb0aabf 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ModuleFinder.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/ModuleFinder.java
+@@ -31,7 +31,6 @@ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.PackageExportImpl;
+ import org.eclipse.jdt.internal.compiler.lookup.AutoModule;
+ import org.eclipse.jdt.internal.compiler.parser.Parser;
+@@ -60,8 +59,8 @@ public class ModuleFinder {
+ 						String[] list = file.list(new FilenameFilter() {
+ 							@Override
+ 							public boolean accept(File dir, String name) {
+-								if (dir == file && (name.equalsIgnoreCase(IModuleEnvironment.MODULE_INFO_CLASS)
+-										|| name.equalsIgnoreCase(IModuleEnvironment.MODULE_INFO_JAVA))) {
++								if (dir == file && (name.equalsIgnoreCase(IModule.MODULE_INFO_CLASS)
++										|| name.equalsIgnoreCase(IModule.MODULE_INFO_JAVA))) {
+ 									return true;
+ 								}
+ 								return false;
+@@ -70,10 +69,10 @@ public class ModuleFinder {
+ 						if (list.length > 0) {
+ 							String fileName = list[0];
+ 							switch (fileName) {
+-								case IModuleEnvironment.MODULE_INFO_CLASS:
++								case IModule.MODULE_INFO_CLASS:
+ 									module = ModuleFinder.extractModuleFromClass(new File(file, fileName), modulePath);
+ 									break;
+-								case IModuleEnvironment.MODULE_INFO_JAVA:
++								case IModule.MODULE_INFO_JAVA:
+ 									module = ModuleFinder.extractModuleFromSource(new File(file, fileName), parser, modulePath);
+ 									break;
+ 							}
+@@ -175,7 +174,7 @@ public class ModuleFinder {
+ 		ZipFile zipFile = null;
+ 		try {
+ 			zipFile = new ZipFile(file);
+-			ClassFileReader reader = ClassFileReader.read(zipFile, IModuleEnvironment.MODULE_INFO_CLASS);
++			ClassFileReader reader = ClassFileReader.read(zipFile, IModule.MODULE_INFO_CLASS);
+ 			IModule module = getModule(reader);
+ 			if (module != null) {
+ 				return reader.getModuleDeclaration();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModule.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModule.java
+index 12e5b7f..996d22d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModule.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModule.java
+@@ -25,6 +25,10 @@ public interface IModule {
+ 	public static IModule[] NO_MODULES = new IModule[0];
+ 	public static IPackageExport[] NO_OPENS = new IPackageExport[0];
+ 
++	public String MODULE_INFO = "module-info"; //$NON-NLS-1$
++	public String MODULE_INFO_JAVA = "module-info.java"; //$NON-NLS-1$
++	public String MODULE_INFO_CLASS = "module-info.class"; //$NON-NLS-1$
++
+ 	public char[] name();
+ 
+ 	public IModuleReference[] requires();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleEnvironment.java
+deleted file mode 100644
+index 008aa7a..0000000
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModuleEnvironment.java
++++ /dev/null
+@@ -1,54 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2016, 2017 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * This is an implementation of an early-draft specification developed under the Java
+- * Community Process (JCP) and is made available for testing and evaluation purposes
+- * only. The code is not compatible with any specification of the JCP.
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.jdt.internal.compiler.env;
+-
+-/**
+- * The module environment provides a callback API that the compiler
+- * can use to look up types, compilation units, and packages in the 
+- * context of one or modules. A lookup environment for a module can
+- * be obtained from the IModulePathEntry that contributes the module
+- * 
+- */
+-public interface IModuleEnvironment {
+-	static String MODULE_INFO = "module-info"; //$NON-NLS-1$
+-	static String MODULE_INFO_JAVA = "module-info.java"; //$NON-NLS-1$
+-	static String MODULE_INFO_CLASS = "module-info.class"; //$NON-NLS-1$
+-
+-	/**
+-	 * A way to lookup types in a module
+-	 * 
+-	 * @return A TypeLookup that can look up types in a module
+-	 */
+-	ITypeLookup typeLookup();
+-	
+-	/**
+-	 * A way to lookup packages in a module
+-	 * 
+-	 * @return A PackageLookup that can look up packages in a module
+-	 */
+-	IPackageLookup packageLookup();
+-
+-	/**
+-	  * Answer whether qualifiedName is the name of a known package in the
+-	  * module this environment represents
+-	  * The default package is always assumed to exist. 
+-	  * 
+-	  * @param qualifiedName
+-	  * @param moduleName
+-	  */
+-	default boolean isPackage(String qualifiedName, String moduleName) {
+-		return packageLookup().isPackage(qualifiedName, moduleName);
+-	}
+-}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModulePathEntry.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModulePathEntry.java
+index 0163c84..7404b10 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModulePathEntry.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModulePathEntry.java
+@@ -14,6 +14,7 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.env;
+ 
++import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ 
+ /**
+@@ -58,14 +59,13 @@ public interface IModulePathEntry {
+ 		return getModule(name) != null;
+ 	}
+ 
+-	char[][] getModulesDeclaringPackage(String qualifiedPackageName, /*@Nullable*/String moduleName);
+-
+ 	/**
+-	 * Return the look up environment for this entry. Should be used when one needs to
+-	 * look up types/packages in all the modules contributed by this entry
+-	 * 
++	 * Answer the relevant modules that declare the given package.
++	 * If moduleName is ModuleBinding.ANY then all packages are relevant,
++	 * if moduleName is ModuleBinding.UNNAMED, then only packages in the unnamed module are relevant,
++	 * otherwise consider only packages in the module identified by moduleName.
+ 	 */
+-	IModuleEnvironment getLookupEnvironment();
++	char[][] getModulesDeclaringPackage(String qualifiedPackageName, /*@Nullable*/String moduleName);
+ 
+ 	/**
+ 	 * Specifies whether this entry represents an automatic module.
+@@ -75,4 +75,9 @@ public interface IModulePathEntry {
+ 	public default boolean isAutomaticModule() {
+ 		return false;
+ 	}
++
++	/** Tests whether the current entry represents the given java project. */
++	public default boolean equalsProject(IJavaProject project) {
++		return false;
++	}
+ }
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IPackageLookup.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IPackageLookup.java
+deleted file mode 100644
+index 31b34dc..0000000
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IPackageLookup.java
++++ /dev/null
+@@ -1,30 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2016, 2017 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * This is an implementation of an early-draft specification developed under the Java
+- * Community Process (JCP) and is made available for testing and evaluation purposes
+- * only. The code is not compatible with any specification of the JCP.
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.jdt.internal.compiler.env;
+-/**
+- * Functional interface for looking up packages
+- * 
+- */
+-public interface IPackageLookup {
+-
+-	IPackageLookup Dummy = (qualifiedPackageName, moduleName) -> false;
+-
+-	/**
+-	 * Answer whether qualifiedPackageName is the name of a known package
+-	 * The default package is always assumed to exist.
+-	 *
+-	 */
+-	boolean isPackage(String qualifiedPackageName, String moduleName);
+-}
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/ITypeLookup.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/ITypeLookup.java
+deleted file mode 100644
+index a147b85..0000000
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/ITypeLookup.java
++++ /dev/null
+@@ -1,89 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2016, 2017 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * This is an implementation of an early-draft specification developed under the Java
+- * Community Process (JCP) and is made available for testing and evaluation purposes
+- * only. The code is not compatible with any specification of the JCP.
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.jdt.internal.compiler.env;
+-
+-import java.util.function.BiFunction;
+-
+-/**
+- * Functional interface for looking up types
+- * 
+- */
+-public interface ITypeLookup {
+-
+-	ITypeLookup Dummy = (typeName, qualifiedPackageName, moduleName,qualifiedBinaryFileName, binaryOnly) -> null;
+-
+-	/**
+-	 * Find the class named typeName with binary file name qualifiedBinaryFileName in the package whose full name is qualifiedPackageName
+-	 * 
+-	 * @param typeName
+-	 * @param qualifiedPackageName
+-	 * @param moduleName
+-	 * @param qualifiedBinaryFileName
+-	 * @return NameEnvironmentAnswer if found, otherwise null
+-	 */
+-	default public NameEnvironmentAnswer findClass(char[] typeName, String qualifiedPackageName, String moduleName, String qualifiedBinaryFileName) {
+-		return findClass(typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName, false);
+-	}
+-
+-	/**
+-	 * Find the class named typeName with binary file name qualifiedBinaryFileName in the package whose full name is qualifiedPackageName
+-	 * 
+-	 * @param typeName
+-	 * @param qualifiedPackageName
+-	 * @param moduleName
+-	 * @param qualifiedBinaryFileName
+-	 * @param asBinaryOnly Look for only binary files
+-	 * @return NameEnvironmentAnswer if found, otherwise null
+-	 */
+-	public NameEnvironmentAnswer findClass(char[] typeName, String qualifiedPackageName, String moduleName, String qualifiedBinaryFileName, boolean asBinaryOnly);
+-
+-	BiFunction<NameEnvironmentAnswer, ITypeLookup, ITypeLookup> orBetter = (suggested, other) -> {
+-		return (typeName, qualifiedPackageName, moduleName,qualifiedBinaryFileName, binaryOnly) -> {
+-			NameEnvironmentAnswer answer = other.findClass(typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName, binaryOnly); // FIXME(SHMOD) dupl. mod name
+-			if (answer != null) {
+-				if (!answer.ignoreIfBetter()) {
+-					if (answer.isBetter(suggested))
+-						return answer;
+-				} else if (answer.isBetter(suggested))
+-					// remember suggestion and keep looking
+-					return answer;
+-			}
+-			return suggested;
+-		};
+-	};
+-
+-	/**
+-	 * Returns a composed TypeLookup that represents a short circuiting TypeLookup which returns
+-	 * the better answer between this TypeLookup and other
+-	 *   
+-	 * @param other
+-	 * @return Chained TypeLookup
+-	 */
+-	default ITypeLookup chain(ITypeLookup other) {
+-		NameEnvironmentAnswer suggestedAnswer = null;
+-		return (typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName, binaryOnly) -> {
+-			NameEnvironmentAnswer answer = findClass(typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName, binaryOnly);
+-			if (answer != null) {
+-				if (!answer.ignoreIfBetter()) {
+-					if (answer.isBetter(suggestedAnswer))
+-						return answer;
+-				} else if (answer.isBetter(suggestedAnswer))
+-					// remember suggestion and keep looking
+-					return orBetter.apply(answer, other).findClass(typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName, binaryOnly);
+-			}
+-			return orBetter.apply(suggestedAnswer, other).findClass(typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName);
+-		};
+-	}
+-}
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/NameEnvironmentWithProgress.java b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/NameEnvironmentWithProgress.java
+index f24fd6c..c9e8fd2 100644
+--- a/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/NameEnvironmentWithProgress.java
++++ b/org.eclipse.jdt.core/dom/org/eclipse/jdt/core/dom/NameEnvironmentWithProgress.java
+@@ -16,9 +16,6 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.core.dom;
+ 
+-import java.util.function.Function;
+-import java.util.stream.Stream;
+-
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.OperationCanceledException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+@@ -26,7 +23,6 @@ import org.eclipse.jdt.internal.compiler.batch.ClasspathDirectory;
+ import org.eclipse.jdt.internal.compiler.batch.FileSystem;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+ import org.eclipse.jdt.internal.core.INameEnvironmentWithProgress;
+ import org.eclipse.jdt.internal.core.NameLookup;
+@@ -53,60 +49,31 @@ class NameEnvironmentWithProgress extends FileSystem implements INameEnvironment
+ 	public NameEnvironmentAnswer findType(char[] typeName, char[][] packageName, char[] moduleName) {
+ 		return findType(typeName, packageName, true, moduleName);
+ 	}
+-	public NameEnvironmentAnswer findType(char[] typeName, char[][] packageName, boolean searchSecondaryTypes, char[] moduleName) {
++	public NameEnvironmentAnswer findType(char[] typeName, char[][] packageName, boolean searchWithSecondaryTypes, char[] moduleName) {
+ 		checkCanceled();
+ 		NameEnvironmentAnswer answer = super.findType(typeName, packageName, moduleName);
+-		if (answer == null && searchSecondaryTypes) {
++		if (answer == null && searchWithSecondaryTypes) {
+ 			NameEnvironmentAnswer suggestedAnswer = null;
+ 			String qualifiedPackageName = new String(CharOperation.concatWith(packageName, '/'));
+ 			String qualifiedTypeName = new String(CharOperation.concatWith(packageName, typeName, '/'));
+ 			String qualifiedBinaryFileName = qualifiedTypeName + SUFFIX_STRING_class;
+ 			for (int i = 0, length = this.classpaths.length; i < length; i++) {
+ 				if (!(this.classpaths[i] instanceof ClasspathDirectory)) continue;
+-// FIXME(SHMOD): crippled
+ 				ClasspathDirectory classpathDirectory = (ClasspathDirectory) this.classpaths[i];
+-//				for (IModule iModule : modules) {
+-//					if (!classpathDirectory.servesModule(iModule.name())) continue;
+-//					answer = classpathDirectory.findSecondaryInClass(typeName, qualifiedPackageName, qualifiedBinaryFileName);
+-//					if (answer != null) {
+-//						if (!answer.ignoreIfBetter()) {
+-//							if (answer.isBetter(suggestedAnswer))
+-//								return answer;
+-//						} else if (answer.isBetter(suggestedAnswer))
+-//							// remember suggestion and keep looking
+-//							suggestedAnswer = answer;
+-//					}
+-//				}
+-			}
+-			Function<ClasspathDirectory, ITypeLookup> secondaryTypesLookup = d -> {
+-				return (t, qPackageName, moduleName2,qBinaryFileName, asBinaryOnly) -> {
+-					return d.findSecondaryInClass(t, qPackageName, qBinaryFileName);
+-				};
+-			};
+-			if (moduleName == ModuleBinding.ANY) {
+-				answer =  Stream.of(this.classpaths)
+-						.filter(env -> env instanceof ClasspathDirectory)
+-						.map(p -> (ClasspathDirectory)p)
+-						.map(secondaryTypesLookup)
+-						.reduce(ITypeLookup::chain)
+-						.map(t -> t.findClass(typeName, qualifiedPackageName, null, qualifiedBinaryFileName)).orElse(null);
+-			} else {
+-				// FIXME(SHMOD) verify vs. version below
+-				String moduleNameString = String.valueOf(moduleName);
+-				for (int i = 0, length = this.classpaths.length; i < length; i++) {
+-					if (!(this.classpaths[i] instanceof ClasspathDirectory)) continue;
+-					ClasspathDirectory classpathDirectory = (ClasspathDirectory) this.classpaths[i];
+-					if (classpathDirectory.servesModule(moduleName)) {
+-						answer = classpathDirectory.findClass(typeName, qualifiedPackageName, moduleNameString, qualifiedBinaryFileName);
+-					}
++				if (moduleName == ModuleBinding.UNNAMED) {
++					if (classpathDirectory.getModule() != null) continue;
++				} else if (moduleName != ModuleBinding.ANY) {
++					if (!classpathDirectory.servesModule(moduleName)) continue;
++				}
++				answer = classpathDirectory.findSecondaryInClass(typeName, qualifiedPackageName, qualifiedBinaryFileName);
++				if (answer != null) {
++					if (!answer.ignoreIfBetter()) {
++						if (answer.isBetter(suggestedAnswer))
++							return answer;
++					} else if (answer.isBetter(suggestedAnswer))
++						// remember suggestion and keep looking
++						suggestedAnswer = answer;
+ 				}
+-//				answer = context.getEnvironment()
+-//						.filter(env -> env instanceof ClasspathDirectory)
+-//						.map(p -> (ClasspathDirectory)p)
+-//						.map(secondaryTypesLookup)
+-//						.reduce(ITypeLookup::chain)
+-//						.map(lookup -> lookup.findClass(typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName))
+-//						.orElse(null);
+ 			}
+ 		}
+ 		return answer;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+index a73205a..d54efb2 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+@@ -45,7 +45,7 @@ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationProvider;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.IDependent;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
++import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.core.nd.java.JavaNames;
+ import org.eclipse.jdt.internal.core.nd.java.model.BinaryTypeDescriptor;
+@@ -387,7 +387,7 @@ private IBinaryType getJarBinaryTypeInfo() throws CoreException, IOException, Cl
+ 	IBinaryType result = null;
+ 	IPackageFragmentRoot root = getPackageFragmentRoot();
+ 	if (getPackageFragmentRoot() instanceof JarPackageFragmentRoot) {
+-		if (root instanceof JrtPackageFragmentRoot || this.name.equals(IModuleEnvironment.MODULE_INFO)) {
++		if (root instanceof JrtPackageFragmentRoot || this.name.equals(IModule.MODULE_INFO)) {
+ 			PackageFragment pkg = (PackageFragment) getParent();
+ 			JarPackageFragmentRoot jarRoot = (JarPackageFragmentRoot) getPackageFragmentRoot();
+ 			String entryName = jarRoot.getClassFilePath(Util.concatWith(pkg.names, getElementName(), '/'));
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+index 3fe2dba..b6b1780 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+@@ -78,9 +78,6 @@ import org.eclipse.jdt.core.WorkingCopyOwner;
+ import org.eclipse.jdt.core.compiler.CategorizedProblem;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.core.eval.IEvaluationContext;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.compiler.util.JRTUtil;
+ import org.eclipse.jdt.internal.compiler.util.ObjectVector;
+@@ -122,7 +119,7 @@ import org.xml.sax.SAXException;
+ @SuppressWarnings({ "rawtypes", "unchecked" })
+ public class JavaProject
+ 	extends Openable
+-	implements IJavaProject, IProjectNature, IModuleEnvironment, SuffixConstants {
++	implements IJavaProject, IProjectNature, SuffixConstants {
+ 
+ 	/**
+ 	 * Name of file containing project classpath
+@@ -3374,15 +3371,4 @@ public class JavaProject
+ 		}
+ 		info.setModule(module);
+ 	}
+-	@Override
+-	public ITypeLookup typeLookup() {
+-		// No direct way to lookup, use the java model APIs instead
+-		return ITypeLookup.Dummy;
+-	}
+-
+-	@Override
+-	public IPackageLookup packageLookup() {
+-		// No direct way to lookup, use the java model APIs instead
+-		return IPackageLookup.Dummy;
+-	}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JrtPackageFragmentRoot.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JrtPackageFragmentRoot.java
+index a285c72..9f63f27 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JrtPackageFragmentRoot.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JrtPackageFragmentRoot.java
+@@ -27,10 +27,7 @@ import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.util.JRTUtil;
+ import org.eclipse.jdt.internal.core.util.HashtableOfArrayToObject;
+@@ -42,7 +39,7 @@ import org.eclipse.jdt.internal.core.util.Util;
+  * @see org.eclipse.jdt.core.IPackageFragmentRoot
+  * @see org.eclipse.jdt.internal.core.JarPackageFragmentRootInfo
+  */
+-public class JrtPackageFragmentRoot extends JarPackageFragmentRoot implements IModulePathEntry, IModuleEnvironment {
++public class JrtPackageFragmentRoot extends JarPackageFragmentRoot implements IModulePathEntry {
+ 
+ 	String moduleName;
+ 	
+@@ -134,24 +131,6 @@ public class JrtPackageFragmentRoot extends JarPackageFragmentRoot implements IM
+ 	}
+ 
+ 	@Override
+-	public IModuleEnvironment getLookupEnvironment() {
+-		// 
+-		return this;
+-	}
+-
+-	@Override
+-	public ITypeLookup typeLookup() {
+-		// No direct way to lookup, use the java model APIs instead
+-		return ITypeLookup.Dummy;
+-	}
+-
+-	@Override
+-	public IPackageLookup packageLookup() {
+-		// No direct way to lookup, use the java model APIs instead
+-		return IPackageLookup.Dummy;
+-	}
+-
+-	@Override
+ 	public IModule getModule() {
+ 		IModuleDescription desc = getModuleDescription();
+ 		if (desc != null) {
+@@ -168,10 +147,9 @@ public class JrtPackageFragmentRoot extends JarPackageFragmentRoot implements IM
+ 	public char[][] getModulesDeclaringPackage(String qualifiedPackageName, String requestedModuleName) {
+ 		if (requestedModuleName != null && !requestedModuleName.equals(this.moduleName))
+ 			return null;
+-		if (isPackage(qualifiedPackageName, requestedModuleName)) {
++		if (getPackageFragment(qualifiedPackageName).exists()) {
+ 			return new char[][] { requestedModuleName.toCharArray() };
+ 		}
+ 		return null;
+ 	}
+-
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleSourcePathManager.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleSourcePathManager.java
+index 52b8dc1..b4965c6 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleSourcePathManager.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleSourcePathManager.java
+@@ -57,7 +57,7 @@ public class ModuleSourcePathManager {
+ 
+ 	public void removeEntry(JavaProject javaProject) {
+ 		Entry<String, IModulePathEntry> entry = this.knownModules.entrySet().stream()
+-			.filter(e -> e.getValue().getLookupEnvironment().equals(javaProject))
++			.filter(e -> e.getValue().equalsProject(javaProject))
+ 			.findFirst()
+ 			.orElse(null);
+ 
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ProjectEntry.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ProjectEntry.java
+index 8b2834f..23d9b6b 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ProjectEntry.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ProjectEntry.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2016 IBM Corporation.
++ * Copyright (c) 2016, 2017 IBM Corporation.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -14,11 +14,14 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
++import org.eclipse.core.runtime.Path;
++import org.eclipse.jdt.core.IJavaElement;
++import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IModuleDescription;
++import org.eclipse.jdt.core.IPackageFragment;
+ import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
+ 
+ /**
+@@ -47,9 +50,8 @@ public class ProjectEntry implements IModulePathEntry {
+ 	}
+ 
+ 	@Override
+-	public IModuleEnvironment getLookupEnvironment() {
+-		// 
+-		return this.project;
++	public boolean equalsProject(IJavaProject otherProject) {
++		return this.project.equals(otherProject);
+ 	}
+ 
+ 	@Override
+@@ -67,8 +69,13 @@ public class ProjectEntry implements IModulePathEntry {
+ 		} else if (!String.valueOf(mod.name()).equals(moduleName)) {
+ 			return null;
+ 		}
+-		if (this.project.isPackage(qualifiedPackageName, moduleName))
+-			return mod != null ? new char[][] { mod.name() } : CharOperation.NO_CHAR_CHAR;
++		try {
++			IJavaElement element = this.project.findElement(new Path(qualifiedPackageName.replace('.', '/')));
++			if (element instanceof IPackageFragment)
++				return mod != null ? new char[][] { mod.name() } : CharOperation.NO_CHAR_CHAR;
++		} catch (JavaModelException e) {
++			return null;
++		}
+ 		return null;
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+index 8e56c51..340d4f0 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathDirectory.java
+@@ -27,10 +27,8 @@ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
++import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.lookup.AutoModule;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+@@ -88,7 +86,7 @@ ClasspathDirectory initializeModule() {
+ 				String name = m.getName();
+ 				// Note: Look only inside the default package.
+ 				if (m.getType() == IResource.FILE && org.eclipse.jdt.internal.compiler.util.Util.isClassFileName(name)) {
+-					if (name.equalsIgnoreCase(IModuleEnvironment.MODULE_INFO_CLASS)) {
++					if (name.equalsIgnoreCase(IModule.MODULE_INFO_CLASS)) {
+ 						try {
+ 							this.acceptModule( Util.newClassFileReader(m));
+ 							this.isAutoModule = false;
+@@ -245,17 +243,6 @@ public String debugPathString() {
+ }
+ 
+ @Override
+-public ITypeLookup typeLookup() {
+-	//
+-	return this::findClass;
+-}
+-
+-@Override
+-public IPackageLookup packageLookup() {
+-	return this::isPackage;
+-}
+-
+-@Override
+ public NameEnvironmentAnswer findClass(String typeName, String qualifiedPackageName, String moduleName, String qualifiedBinaryFileName) {
+ 	// 
+ 	return findClass(typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName, false);
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJMod.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJMod.java
+index 2d213a7..5f5e91a 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJMod.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJMod.java
+@@ -30,6 +30,7 @@ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
++import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.util.SimpleSet;
+@@ -40,7 +41,7 @@ public class ClasspathJMod extends ClasspathJar {
+ 
+ 	public static char[] CLASSES = "classes".toCharArray(); //$NON-NLS-1$
+ 	public static char[] CLASSES_FOLDER = "classes/".toCharArray(); //$NON-NLS-1$
+-	private static int MODULE_DESCRIPTOR_NAME_LENGTH = MODULE_INFO_CLASS.length();
++	private static int MODULE_DESCRIPTOR_NAME_LENGTH = IModule.MODULE_INFO_CLASS.length();
+ 
+ 	ClasspathJMod(String zipFilename, long lastModified, AccessRuleSet accessRuleSet, IPath externalAnnotationPath, INameEnvironment env) {
+ 		super(zipFilename, lastModified, accessRuleSet, externalAnnotationPath, env, true);
+@@ -96,7 +97,7 @@ public class ClasspathJMod extends ClasspathJar {
+ 				if (CharOperation.equals(CLASSES, folder)) {
+ 					char[] fileName = CharOperation.subarray(entryName, index + 1, entryName.length);
+ 					if (modInfo == null && fileName.length == MODULE_DESCRIPTOR_NAME_LENGTH) {
+-						if (CharOperation.equals(fileName, MODULE_INFO_CLASS.toCharArray())) {
++						if (CharOperation.equals(fileName, IModule.MODULE_INFO_CLASS.toCharArray())) {
+ 							InputStream stream = null;
+ 							InputStream inputStream;
+ 							try {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+index 6c530ee..5e0f2aa 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+@@ -33,11 +33,8 @@ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.lookup.AutoModule;
+ import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding.ExternalAnnotationStatus;
+@@ -111,7 +108,7 @@ protected String readJarContent(final SimpleSet packageSet) {
+ 			int folderEnd = fileName.lastIndexOf('/');
+ 			folderEnd += 1;
+ 			String className = fileName.substring(folderEnd, fileName.length());
+-			if (className.equalsIgnoreCase(MODULE_INFO_CLASS)) {
++			if (className.equalsIgnoreCase(IModule.MODULE_INFO_CLASS)) {
+ 				modInfo = fileName;
+ 			}
+ 		}
+@@ -342,24 +339,6 @@ public IModule getModule() {
+ }
+ 
+ @Override
+-public IModuleEnvironment getLookupEnvironment() {
+-	//
+-	return this;
+-}
+-
+-@Override
+-public ITypeLookup typeLookup() {
+-	// 
+-	return this::findClass;
+-}
+-
+-@Override
+-public IPackageLookup packageLookup() {
+-	//
+-	return this::isPackage;
+-}
+-
+-@Override
+ public NameEnvironmentAnswer findClass(String typeName, String qualifiedPackageName, String moduleName, String qualifiedBinaryFileName) {
+ 	// 
+ 	return findClass(typeName, qualifiedPackageName, moduleName, qualifiedBinaryFileName, false);
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+index 24819a3..d42a791 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJrt.java
+@@ -34,12 +34,9 @@ import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+ import org.eclipse.jdt.internal.compiler.classfmt.ExternalAnnotationDecorator;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IMultiModuleEntry;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.util.JRTUtil;
+ import org.eclipse.jdt.internal.compiler.util.SimpleSet;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+@@ -94,7 +91,7 @@ static HashMap<String, SimpleSet> findPackagesInModules(final ClasspathJrt jrt)
+ 			public FileVisitResult visitModule(Path mod) throws IOException {
+ 				String name = mod.toString();
+ 				try {
+-					jrt.acceptModule(JRTUtil.getClassfileContent(imageFile, IModuleEnvironment.MODULE_INFO_CLASS, name));
++					jrt.acceptModule(JRTUtil.getClassfileContent(imageFile, IModule.MODULE_INFO_CLASS, name));
+ 				} catch (ClassFormatException e) {
+ 					e.printStackTrace();
+ 				}
+@@ -137,7 +134,7 @@ public static void loadModules(final ClasspathJrt jrt) {
+ 				@Override
+ 				public FileVisitResult visitModule(Path mod) throws IOException {
+ 					try {
+-						jrt.acceptModule(JRTUtil.getClassfileContent(imageFile, IModuleEnvironment.MODULE_INFO_CLASS, mod.toString()));
++						jrt.acceptModule(JRTUtil.getClassfileContent(imageFile, IModule.MODULE_INFO_CLASS, mod.toString()));
+ 					} catch (ClassFormatException e) {
+ 						e.printStackTrace();
+ 					}
+@@ -158,7 +155,7 @@ void acceptModule(byte[] content) {
+ 		return;
+ 	ClassFileReader reader = null;
+ 	try {
+-		reader = new ClassFileReader(content, IModuleEnvironment.MODULE_INFO_CLASS.toCharArray());
++		reader = new ClassFileReader(content, IModule.MODULE_INFO_CLASS.toCharArray());
+ 	} catch (ClassFormatException e) {
+ 		e.printStackTrace();
+ 	}
+@@ -263,20 +260,6 @@ public Collection<String> getModuleNames() {
+ 		return cache.keySet();
+ 	return Collections.emptyList();
+ }
+-@Override
+-public ITypeLookup typeLookup() {
+-	return this::findClass;
+-}
+-@Override
+-public IPackageLookup packageLookup() {
+-	return this::isPackage;
+-}
+-
+-@Override
+-public IModuleEnvironment getLookupEnvironment() {
+-	//
+-	return this;
+-}
+ 
+ @Override
+ public NameEnvironmentAnswer findClass(String typeName, String qualifiedPackageName, String moduleName, String qualifiedBinaryFileName) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
+index 6bc5d23..4fadc24 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathLocation.java
+@@ -21,13 +21,12 @@ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
+ import org.eclipse.jdt.internal.compiler.util.Util;
+ 
+-public abstract class ClasspathLocation implements IModuleEnvironment {
++public abstract class ClasspathLocation {
+ 
+ 	protected boolean isAutoModule;
+ 	protected IModule module;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
+index d95eb4c..b3c9218 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2016 IBM Corporation and others.
++ * Copyright (c) 2016, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -14,15 +14,11 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.builder;
+ 
+-import java.util.stream.Stream;
+ 
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ 
+ /**
+  * Represents a project on the module path.
+@@ -32,21 +28,6 @@ public class ModulePathEntry implements IModulePathEntry {
+ 	private IPath path;
+ 	/*private*/ ClasspathLocation[] locations;
+ 	IModule module;
+-	IModuleEnvironment env = null;
+-
+-	class ModuleEnvironment implements IModuleEnvironment {
+-		@Override
+-		public ITypeLookup typeLookup() {
+-			//
+-			return Stream.of(ModulePathEntry.this.locations).map(loc -> loc.typeLookup()).reduce(ITypeLookup::chain).orElse(ITypeLookup.Dummy);
+-		}
+-
+-		@Override
+-		public IPackageLookup packageLookup() {
+-			// 
+-			return (name, moduleName) -> Stream.of(ModulePathEntry.this.locations).map(loc -> loc.packageLookup()).anyMatch(p -> p.isPackage(name, moduleName));
+-		}
+-	}
+ 
+ 	ModulePathEntry(IPath path, IModule module, ClasspathLocation[] locations) {
+ 		this.path = path;
+@@ -67,14 +48,6 @@ public class ModulePathEntry implements IModulePathEntry {
+ 		return this.module;
+ 	}
+ 
+-	@Override
+-	public IModuleEnvironment getLookupEnvironment() {
+-		//
+-		if (this.env == null)
+-			this.env = new ModuleEnvironment();
+-		return this.env;
+-	}
+-
+ 	// TODO: This is only needed because SourceFile.module() uses the module set on the location
+ 	// Once we have a mechanism to map a folder to a module path entry, this should no longer be
+ 	// needed
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+index b68b52a..b284f00 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+@@ -39,7 +39,6 @@ import org.eclipse.jdt.internal.core.*;
+ import java.io.*;
+ import java.util.*;
+ import java.util.stream.Collectors;
+-import java.util.stream.Stream;
+ 
+ @SuppressWarnings({"rawtypes", "unchecked"})
+ public class NameEnvironment implements IModuleAwareNameEnvironment, SuffixConstants {
+@@ -378,30 +377,33 @@ private NameEnvironmentAnswer findClass(String qualifiedTypeName, char[] typeNam
+ 	String qPackageName =  (qualifiedTypeName.length() == typeName.length) ? Util.EMPTY_STRING :
+ 		qBinaryFileName.substring(0, qBinaryFileName.length() - typeName.length - 7);
+ 	char[] binaryFileName = CharOperation.concat(typeName, SUFFIX_class);
+-	if (moduleName == null || this.modulePathEntries == null) {
+-		return Stream.of(this.binaryLocations)
+-				.map(p -> p.typeLookup())
+-				.reduce(ITypeLookup::chain)
+-				.map(t -> t.findClass(binaryFileName, qPackageName, null, qBinaryFileName)).orElse(null);
++
++	ClasspathLocation[] relevantLocations;
++	if (moduleName != null && this.modulePathEntries != null) {
++		IModulePathEntry modulePathEntry = this.modulePathEntries.get(moduleName);
++		if (modulePathEntry instanceof ModulePathEntry) {
++			relevantLocations = ((ModulePathEntry) modulePathEntry).getClasspathLocations();
++		} else if (modulePathEntry instanceof ClasspathLocation) {
++			return ((ClasspathLocation) modulePathEntry).findClass(typeName, qPackageName, moduleName, qBinaryFileName, false);
++		} else {
++			return null;
++		}
++	} else {
++		relevantLocations = this.binaryLocations;
+ 	}
+-	IModulePathEntry modulePathEntry = this.modulePathEntries.get(moduleName);
+-	if (modulePathEntry instanceof ModulePathEntry) {
+-		NameEnvironmentAnswer suggestedAnswer = null;
+-		for (ClasspathLocation classpathLocation : ((ModulePathEntry) modulePathEntry).getClasspathLocations()) {
+-			NameEnvironmentAnswer answer = classpathLocation.findClass(binaryFileName, qPackageName, moduleName, qBinaryFileName, false);
+-			if (answer != null) {
+-				if (!answer.ignoreIfBetter()) {
+-					if (answer.isBetter(suggestedAnswer))
+-						return answer;
+-				} else if (answer.isBetter(suggestedAnswer))
+-					// remember suggestion and keep looking
+-					suggestedAnswer = answer;
+-			}
++	NameEnvironmentAnswer suggestedAnswer = null;
++	for (ClasspathLocation classpathLocation : relevantLocations) {
++		NameEnvironmentAnswer answer = classpathLocation.findClass(binaryFileName, qPackageName, moduleName, qBinaryFileName, false);
++		if (answer != null) {
++			if (!answer.ignoreIfBetter()) {
++				if (answer.isBetter(suggestedAnswer))
++					return answer;
++			} else if (answer.isBetter(suggestedAnswer))
++				// remember suggestion and keep looking
++				suggestedAnswer = answer;
+ 		}
+-	} else if (modulePathEntry instanceof ClasspathLocation) {
+-		return ((ClasspathLocation) modulePathEntry).findClass(typeName, qPackageName, moduleName, qBinaryFileName, false);
+ 	}
+-	return null;
++	return suggestedAnswer;
+ }
+ 
+ @Override
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
+index b5a0d55..782338d 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/ClasspathSourceDirectory.java
+@@ -27,10 +27,7 @@ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IType;
+ import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+-import org.eclipse.jdt.internal.compiler.env.IModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
+-import org.eclipse.jdt.internal.compiler.env.IPackageLookup;
+-import org.eclipse.jdt.internal.compiler.env.ITypeLookup;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.core.JavaModelManager;
+ import org.eclipse.jdt.internal.core.builder.ClasspathLocation;
+@@ -156,22 +153,4 @@ public String toString() {
+ public String debugPathString() {
+ 	return this.sourceFolder.getFullPath().toString();
+ }
+-
+-@Override
+-public ITypeLookup typeLookup() {
+-	//
+-	return this::findClass;
+-}
+-
+-@Override
+-public IPackageLookup packageLookup() {
+-	//
+-	return this::isPackage;
+-}
+-
+-@Override
+-public IModuleEnvironment getLookupEnvironment() {
+-	return this;
+-}
+-
+ }
+commit c3b94a49dbda6e563ce2828a5e6e4dbc928da991
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Jul 8 00:49:56 2017 +0200
+
+    Bug 517808: [9][compiler] Implement lookup (module, package, type) based
+    on the 2017-05-25 version of JLS
+    - remember "primaryModule" to aid resolving URB from a split package
+    - moduleName for BasicCompilationUnit when created from IJavaElement
+    - current project must be modular to switch SearchEnv to module mode
+    - fix / vs. \ issues in FileSystem.internalFindClass() and Main
+    - implement detection of package conflicts (imports & QTR)
+    
+    Change-Id: I511202ba192428c24fab6d28d906ca7e1eac018e
+
+2	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+86	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+1	1	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+1	1	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/Main.java
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+11	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedTypeReference.java
+18	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
+3	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+8	7	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+30	9	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/UnresolvedReferenceBinding.java
+19	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+1	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+13	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BasicCompilationUnit.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+index 7c06449..27d0582 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+@@ -877,6 +877,7 @@ public void test011_problem_categories() {
+ 		expectedProblemAttributes.put("NotAccessibleMethod", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+ 		expectedProblemAttributes.put("NotAccessibleType", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+ 		expectedProblemAttributes.put("NotAccessiblePackage", new ProblemAttributes(CategorizedProblem.CAT_IMPORT));
++		expectedProblemAttributes.put("ConflictingPackageFromModules", new ProblemAttributes(CategorizedProblem.CAT_IMPORT));
+ 		expectedProblemAttributes.put("NotVisibleConstructor", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+ 		expectedProblemAttributes.put("NotVisibleConstructorInDefaultConstructor", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+ 		expectedProblemAttributes.put("NotVisibleConstructorInImplicitConstructorCall", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+@@ -1755,6 +1756,7 @@ public void test012_compiler_problems_tuning() {
+ 		expectedProblemAttributes.put("NotAccessibleMethod", SKIP);
+ 		expectedProblemAttributes.put("NotAccessibleType", SKIP);
+ 		expectedProblemAttributes.put("NotAccessiblePackage", SKIP);
++		expectedProblemAttributes.put("ConflictingPackageFromModules", SKIP);		
+ 		expectedProblemAttributes.put("NotVisibleConstructor", SKIP);
+ 		expectedProblemAttributes.put("NotVisibleConstructorInDefaultConstructor", SKIP);
+ 		expectedProblemAttributes.put("NotVisibleConstructorInImplicitConstructorCall", SKIP);
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+index 800c515..70efe79 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+@@ -478,7 +478,7 @@ public class ModuleCompilationTests extends AbstractBatchCompilerTest {
+ 						"	requires mod.one;\n" +
+ 						"	requires mod.two;\n" +
+ 						"}");
+-		writeFile(moduleLoc + File.separator + "p", "Z.java", 
++		writeFile(moduleLoc + File.separator + "r", "Z.java", 
+ 						"package r;\n" +
+ 						"public class Z extends Object {\n" +
+ 						"	p.X x = null;\n" +
+@@ -1753,4 +1753,89 @@ public class ModuleCompilationTests extends AbstractBatchCompilerTest {
+ 				"1 problem (1 error)\n",
+ 				false);
+ 	}
++
++	public void testPackageConflict1() {
++		File outputDirectory = new File(OUTPUT_DIR);
++		Util.flushDirectoryContent(outputDirectory);
++		String out = "bin";
++		String directory = OUTPUT_DIR + File.separator + "src";
++		
++		String moduleLoc = directory + File.separator + "mod.one";
++		writeFile(moduleLoc, "module-info.java", 
++						"module mod.one { \n" +
++						"	exports pm;\n" +
++						"	exports p2;\n" +
++						"}");
++		writeFile(moduleLoc + File.separator + "pm", "C1.java", 
++						"package pm;\n" +
++						"public class C1 {\n" +
++						"}\n");
++		writeFile(moduleLoc + File.separator + "p2", "C2.java", 
++						"package p2;\n" +
++						"public class C2 {\n" +
++						"}\n");
++
++		moduleLoc = directory + File.separator + "mod.two";
++		writeFile(moduleLoc, "module-info.java", 
++						"module mod.two { \n" +
++						"	exports pm;\n" +
++						"	exports p2.sub;\n" +
++						"}");
++		writeFile(moduleLoc + File.separator + "pm", "C3.java", 
++						"package pm;\n" +
++						"public class C3 {\n" +
++						"}\n");
++		writeFile(moduleLoc + File.separator + "p2" + File.separator + "sub", "C4.java", 
++						"package p2.sub;\n" +
++						"public class C4 {\n" +
++						"}\n");
++
++		moduleLoc = directory + File.separator + "mod.three";
++		writeFile(moduleLoc, "module-info.java", 
++						"module mod.three { \n" +
++						"	requires mod.one;\n" +
++						"	requires mod.two;\n" +
++						"}");
++		writeFile(moduleLoc + File.separator + "po", "Client.java", 
++						"package po;\n" + 
++						"import pm.*;\n" +
++						"import pm.C3;\n" +
++						"import p2.C2;\n" +
++						"public class Client {\n" + 
++						"    void test1(C1 one) {\n" + 
++						"    }\n" +
++						"	 pm.C1 f1;\n" +
++						"	 p2.sub.C4 f4;\n" + // no conflict mod.one/p2 <-> mod.two/p2.sub
++						"}\n");
++
++		StringBuffer buffer = new StringBuffer();
++		buffer.append("-d " + OUTPUT_DIR + File.separator + out )
++			.append(" -9 ")
++			.append(" -classpath \"")
++			.append(Util.getJavaClassLibsAsString())
++			.append("\" ")
++			.append(" --module-source-path " + "\"" + directory + "\"");
++
++		runNegativeTest(new String[]{}, 
++				buffer.toString(), 
++				"",
++				"----------\n" + 
++				"1. ERROR in ---OUTPUT_DIR_PLACEHOLDER---/src/mod.three/po/Client.java (at line 2)\n" + 
++				"	import pm.*;\n" + 
++				"	       ^^\n" + 
++				"The package pm is accessible from more than one module: mod.one, mod.two\n" + 
++				"----------\n" + 
++				"2. ERROR in ---OUTPUT_DIR_PLACEHOLDER---/src/mod.three/po/Client.java (at line 3)\n" + 
++				"	import pm.C3;\n" + 
++				"	       ^^\n" + 
++				"The package pm is accessible from more than one module: mod.one, mod.two\n" + 
++				"----------\n" + 
++				"3. ERROR in ---OUTPUT_DIR_PLACEHOLDER---/src/mod.three/po/Client.java (at line 8)\n" + 
++				"	pm.C1 f1;\n" + 
++				"	^^\n" + 
++				"The package pm is accessible from more than one module: mod.one, mod.two\n" + 
++				"----------\n" + 
++				"3 problems (3 errors)\n",
++				false);
++	}
+ }
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+index fdb0a91..15cb3b3 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/FileSystem.java
+@@ -394,7 +394,7 @@ private NameEnvironmentAnswer internalFindClass(String qualifiedTypeName, char[]
+ 			for (int i = 0, length = this.classpaths.length; i < length; i++) {
+ 				Classpath p = this.classpaths[i];
+ 				if (moduleName == ModuleBinding.UNNAMED && p.getModule() != null) continue;
+-				NameEnvironmentAnswer answer = (p instanceof ClasspathJar)
++				NameEnvironmentAnswer answer = (p instanceof ClasspathJar || p instanceof ClasspathJrt)
+ 					? p.findClass(typeName, qualifiedPackageName, null, qualifiedBinaryFileName, asBinaryOnly)
+ 					: p.findClass(typeName, qp2, null, qb2, asBinaryOnly);
+ 				if (answer != null) {
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/Main.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/Main.java
+index 5dcfe2d..f1dcadc 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/Main.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/Main.java
+@@ -3305,7 +3305,7 @@ public CompilationUnit[] getCompilationUnits() {
+ 						shouldIgnoreOptionalProblems(this.ignoreOptionalProblemsFromFolders, fileName.toCharArray()), 
+ 						this.modNames[i]);
+ 				if (isModuleInfo) {
+-					int lastSlash = CharOperation.lastIndexOf('/', units[i].fileName);
++					int lastSlash = CharOperation.lastIndexOf(File.separatorChar, units[i].fileName);
+ 					if (lastSlash != -1) {
+ 						pathToModCU.put(String.valueOf(CharOperation.subarray(units[i].fileName, 0, lastSlash)), units[i]);
+ 					}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+index 7bdb895..647c141 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+@@ -1958,6 +1958,8 @@ void setSourceStart(int sourceStart);
+ 	int NotAccessibleConstructor = MethodRelated + 1453;
+ 	/** @since 3.13 BETA_JAVA9 */
+ 	int NotAccessiblePackage = ImportRelated + 1454;
++	/** @since 3.13 BETA_JAVA9 */
++	int ConflictingPackageFromModules = ImportRelated + 1455;
+ 
+ 	/** @since 3.13 */
+ 	int RedundantNullDefaultAnnotationLocal = Internal + 1062;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedTypeReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedTypeReference.java
+index b10f83e..2509f1e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedTypeReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedTypeReference.java
+@@ -111,11 +111,21 @@ public class QualifiedTypeReference extends TypeReference {
+ 			return (ReferenceBinding) binding; // not found
+ 		}
+ 	    PackageBinding packageBinding = binding == null ? null : (PackageBinding) binding;
++	    int typeStart = packageBinding == null ? 0 : packageBinding.compoundName.length;
++	    
++	    if (packageBinding instanceof SplitPackageBinding) {
++	    	SplitPackageBinding splitPackage = (SplitPackageBinding) packageBinding;
++	    	if (splitPackage.hasConflict()) {
++	    		scope.problemReporter().conflictingPackagesFromModules(splitPackage, this.sourceStart, (int)this.sourcePositions[typeStart-1]);
++	    		this.resolvedType = new ProblemReferenceBinding(this.tokens, null, ProblemReasons.Ambiguous);
++	    		return null;
++	    	}
++	    }
+ 	    rejectAnnotationsOnPackageQualifiers(scope, packageBinding);
+ 
+ 	    boolean isClassScope = scope.kind == Scope.CLASS_SCOPE;
+ 	    ReferenceBinding qualifiedType = null;
+-		for (int i = packageBinding == null ? 0 : packageBinding.compoundName.length, max = this.tokens.length, last = max-1; i < max; i++) {
++		for (int i = typeStart, max = this.tokens.length, last = max-1; i < max; i++) {
+ 			findNextTypeBinding(i, scope, packageBinding);
+ 			if (!this.resolvedType.isValidBinding())
+ 				return this.resolvedType;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
+index 3fcd9e3..d231bb6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
+@@ -424,6 +424,13 @@ void faultInImports() {
+ 				problemReporter().importProblem(importReference, importBinding);
+ 				continue nextImport;
+ 			}
++			if (importBinding instanceof SplitPackageBinding) {
++				SplitPackageBinding splitPackage = (SplitPackageBinding) importBinding;
++				if (splitPackage.hasConflict()) {
++					problemReporter().conflictingPackagesFromModules(splitPackage, importReference.sourceStart, importReference.sourceEnd);
++					continue nextImport;
++				}
++			}
+ 			if (importReference.isStatic() && importBinding instanceof PackageBinding) {
+ 				problemReporter().cannotImportPackage(importReference);
+ 				continue nextImport;
+@@ -445,6 +452,17 @@ void faultInImports() {
+ 			if (importBinding instanceof PackageBinding) {
+ 				problemReporter().cannotImportPackage(importReference);
+ 				continue nextImport;
++			} else if (this.environment.useModuleSystem && importBinding instanceof ReferenceBinding) {
++				// re-get to find a possible split package:
++				Binding importedPackage = findImport(((ReferenceBinding) importBinding).fPackage.compoundName, false, true);
++				if (importedPackage instanceof SplitPackageBinding) {
++					SplitPackageBinding splitPackage = (SplitPackageBinding) importedPackage;
++					if (splitPackage.hasConflict()) {
++						int sourceEnd = (int) importReference.sourcePositions[splitPackage.compoundName.length-1];
++						problemReporter().conflictingPackagesFromModules(splitPackage, importReference.sourceStart, sourceEnd);
++						continue nextImport;
++					}
++				}
+ 			}
+ 			// all the code here which checks for valid bindings have been moved to the method 
+ 			// checkAndRecordImportBinding() since bug 361327
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+index e2d428f..60a850e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+@@ -714,7 +714,7 @@ private PackageBinding computePackageFrom(char[][] constantPoolName, boolean isM
+ 				for (char[] mod : declaringModules) {
+ 					ModuleBinding declaringModule = this.root.getModule(mod);
+ 					if (declaringModule != null)
+-						packageBinding = SplitPackageBinding.combine(declaringModule.getTopLevelPackage(constantPoolName[0]), packageBinding);
++						packageBinding = SplitPackageBinding.combine(declaringModule.getTopLevelPackage(constantPoolName[0]), packageBinding, this.module);
+ 				}
+ 			}
+ 		}
+@@ -734,7 +734,7 @@ private PackageBinding computePackageFrom(char[][] constantPoolName, boolean isM
+ 					for (char[] mod : declaringModules) {
+ 						ModuleBinding declaringModule = this.root.getModule(mod);
+ 						if (declaringModule != null)
+-							packageBinding = SplitPackageBinding.combine(declaringModule.getPackage(parent.compoundName, constantPoolName[i]), packageBinding);
++							packageBinding = SplitPackageBinding.combine(declaringModule.getPackage(parent.compoundName, constantPoolName[i]), packageBinding, this.module);
+ 					}
+ 				}
+ 			}
+@@ -1611,7 +1611,7 @@ private ReferenceBinding getTypeFromCompoundName(char[][] compoundName, boolean
+ 	ReferenceBinding binding = getCachedType(compoundName);
+ 	if (binding == null) {
+ 		PackageBinding packageBinding = computePackageFrom(compoundName, false /* valid pkg */);
+-		binding = new UnresolvedReferenceBinding(compoundName, packageBinding); // TODO(SHMOD): relies on this & packageBinding for module context. Is this OK?
++		binding = new UnresolvedReferenceBinding(compoundName, packageBinding);
+ 		if (wasMissingType) {
+ 			binding.tagBits |= TagBits.HasMissingType; // record it was bound to a missing type
+ 		}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+index eac79a6..0b559ab 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+@@ -220,7 +220,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	public void addResolvedExport(PackageBinding declaredPackage, char[][] targetModules) {
+ 		int len = this.exportedPackages.length;
+ 		if (declaredPackage == null || !declaredPackage.isValidBinding()) {
+-			// FIXME(SHMOD) error reporting
++			// FIXME(SHMOD) use a problem binding? See https://bugs.eclipse.org/518794#c13
+ 			return;
+ 		}
+ 		if (len == 0) {
+@@ -235,7 +235,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	public void addResolvedOpens(PackageBinding declaredPackage, char[][] targetModules) {
+ 		int len = this.openedPackages.length;
+ 		if (declaredPackage == null || !declaredPackage.isValidBinding()) {
+-			// FIXME(SHMOD) error reporting
++			// FIXME(SHMOD) use a problem binding? See https://bugs.eclipse.org/518794#c13
+ 			return;
+ 		}
+ 		if (len == 0) {
+@@ -374,7 +374,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 			PackageBinding[] initializedExports = getExports();
+ 			for (int i = 0; i < initializedExports.length; i++) {
+ 				PackageBinding export = initializedExports[i];
+-				if (export.subsumes(pkg)) {
++				if (export.subsumes(resolved)) {
+ 					if (this.exportRestrictions != null) {
+ 						SimpleSetOfCharArray restrictions = this.exportRestrictions.get(export);
+ 						if (restrictions != null)
+@@ -421,7 +421,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 					for (char[] declaringModuleName : declaringModuleNames) {
+ 						ModuleBinding declaringModule = this.environment.root.getModule(declaringModuleName);
+ 						if (declaringModule != null)
+-							binding = SplitPackageBinding.combine(declaringModule.getTopLevelPackage(name), binding);
++							binding = SplitPackageBinding.combine(declaringModule.getTopLevelPackage(name), binding, declaringModule);
+ 					}
+ 				}
+ 			}
+@@ -433,7 +433,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 		// enrich with split-siblings from visible modules:
+ 		for (ModuleBinding required : getAllRequiredModules()) {
+ 			if (required == this) continue;
+-			binding = SplitPackageBinding.combine(required.getTopLevelPackage(name), binding);
++			binding = SplitPackageBinding.combine(required.getTopLevelPackage(name), binding, this);
+ 		}
+ 
+ 		// remember:
+@@ -522,13 +522,14 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	}
+ 
+ 	private PackageBinding combineWithChildrenOfSplitPackage(PackageBinding childPackage, SplitPackageBinding splitParent, char[] name) {
++		ModuleBinding primaryModule = childPackage != null ? childPackage.enclosingModule : splitParent.enclosingModule;
+ 		// see if other incarnations contribute to the child package, too:
+ 		for (PackageBinding incarnation :  splitParent.incarnations) {
+ 			ModuleBinding moduleBinding = incarnation.enclosingModule;
+ 			if (moduleBinding == this)
+ 				continue;
+ 			PackageBinding next = moduleBinding.getVisiblePackage(incarnation, name);
+-			childPackage = SplitPackageBinding.combine(next, childPackage);
++			childPackage = SplitPackageBinding.combine(next, childPackage, primaryModule);
+ 		}
+ 		return childPackage;
+ 	}
+@@ -591,7 +592,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 			char[] packageName = packageBinding.readableName();
+ 			if (checkForSplit) {
+ 				for (ModuleBinding moduleBinding : getAllRequiredModules())
+-					packageBinding = SplitPackageBinding.combine(moduleBinding.getVisiblePackage(packageBinding.compoundName), packageBinding);
++					packageBinding = SplitPackageBinding.combine(moduleBinding.getVisiblePackage(packageBinding.compoundName), packageBinding, this);
+ 			}
+ 			this.declaredPackages.put(packageName, packageBinding);
+ 		}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+index dcb7cac..50efb2b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+@@ -37,7 +37,7 @@ public class PackageBinding extends Binding implements TypeConstants {
+ 	// one of Binding.{NO_NULL_DEFAULT,NULL_UNSPECIFIED_BY_DEFAULT,NONNULL_BY_DEFAULT}
+ 	protected int defaultNullness = NO_NULL_DEFAULT;
+ 
+-	ModuleBinding enclosingModule;
++	public ModuleBinding enclosingModule;
+ 
+ protected PackageBinding() {
+ 	// for creating problem package
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+index 80124d5..bd78ade 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+@@ -22,9 +22,18 @@ import org.eclipse.jdt.core.compiler.CharOperation;
+ 
+ public class SplitPackageBinding extends PackageBinding {
+ 	Set<ModuleBinding> declaringModules;
+-	Set<PackageBinding> incarnations;
++	public Set<PackageBinding> incarnations;
+ 	
+-	public static PackageBinding combine(PackageBinding binding, PackageBinding previous) {
++	/**
++	 * Combine two potential package bindings, answering either the better of those if the other has a problem,
++	 * or combine both into a split package.
++	 * @param binding one candidate
++	 * @param previous a previous candidate
++	 * @param primaryModule when constructing a new SplitPackageBinding this primary module will define the
++	 * 	focus when later an UnresolvedReferenceBinding is resolved relative to this SplitPackageBinding.
++	 * @return one of: <code>null</code>, a regular PackageBinding or a SplitPackageBinding.
++	 */
++	public static PackageBinding combine(PackageBinding binding, PackageBinding previous, ModuleBinding primaryModule) {
+ 		if (previous == null || !previous.isValidBinding())
+ 			return binding == LookupEnvironment.TheNotFoundPackage ? null : binding;
+ 		if (binding == null || !binding.isValidBinding())
+@@ -33,13 +42,13 @@ public class SplitPackageBinding extends PackageBinding {
+ 			return previous;
+ 		if (binding.subsumes(previous))
+ 			return binding;
+-		SplitPackageBinding split = new SplitPackageBinding(previous);
++		SplitPackageBinding split = new SplitPackageBinding(previous, primaryModule);
+ 		split.add(binding);
+ 		return split;
+ 	}
+ 
+-	public SplitPackageBinding(PackageBinding initialBinding) {
+-		super(initialBinding.compoundName, initialBinding.parent, initialBinding.environment, initialBinding.enclosingModule);
++	public SplitPackageBinding(PackageBinding initialBinding, ModuleBinding primaryModule) {
++		super(initialBinding.compoundName, initialBinding.parent, primaryModule.environment, primaryModule);
+ 		this.declaringModules = new HashSet<>();
+ 		this.incarnations = new HashSet<>();
+ 		if (initialBinding instanceof SplitPackageBinding) {
+@@ -66,7 +75,7 @@ public class SplitPackageBinding extends PackageBinding {
+ 	void addPackage(PackageBinding element) {
+ 		char[] simpleName = element.compoundName[element.compoundName.length-1];
+ 		PackageBinding visible = this.knownPackages.get(simpleName);
+-		visible = SplitPackageBinding.combine(element, visible);
++		visible = SplitPackageBinding.combine(element, visible, this.enclosingModule);
+ 		this.knownPackages.put(simpleName, visible);
+ 		PackageBinding incarnation = getIncarnation(element.enclosingModule);
+ 		if (incarnation != null)
+@@ -84,7 +93,7 @@ public class SplitPackageBinding extends PackageBinding {
+ 			PackageBinding package0 = incarnation.getPackage0(name);
+ 			if (package0 == null)
+ 				return null; // if any incarnation lacks cached info, a full findPackage will be necessary 
+-			candidate = combine(package0, candidate);
++			candidate = combine(package0, candidate, this.enclosingModule);
+ 		}
+ 		if (candidate != null)
+ 			this.knownPackages.put(name, candidate);
+@@ -110,7 +119,7 @@ public class SplitPackageBinding extends PackageBinding {
+ 			result = candidates.iterator().next();
+ 		} else if (count > 1) {
+ 			Iterator<PackageBinding> iterator = candidates.iterator();
+-			SplitPackageBinding split = new SplitPackageBinding(iterator.next());
++			SplitPackageBinding split = new SplitPackageBinding(iterator.next(), this.enclosingModule);
+ 			while (iterator.hasNext())
+ 				split.add(iterator.next());
+ 			result = split;
+@@ -204,7 +213,19 @@ public class SplitPackageBinding extends PackageBinding {
+ 	public boolean isDeclaredIn(ModuleBinding moduleBinding) {
+ 		return this.declaringModules.contains(moduleBinding);
+ 	}
+-	
++
++	public boolean hasConflict() {
++		int visibleCount = 0;
++		for (PackageBinding incarnation : this.incarnations) {
++			if (incarnation.knownTypes != null && incarnation.knownTypes.elementSize > 0) { // FIXME(SHMOD): this is a workaround for checking existence of any CU
++				if (this.enclosingModule.canAccess(incarnation)) 
++					if (++visibleCount > 1)
++						return true;
++			}
++		}
++		return false;
++	}
++
+ 	@Override
+ 	public String toString() {
+ 		StringBuilder buf = new StringBuilder(super.toString());
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/UnresolvedReferenceBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/UnresolvedReferenceBinding.java
+index 1302bc7..dbf8460 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/UnresolvedReferenceBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/UnresolvedReferenceBinding.java
+@@ -103,7 +103,7 @@ ReferenceBinding resolve(LookupEnvironment environment, boolean convertGenericTo
+ 		char[] typeName = this.compoundName[this.compoundName.length - 1];
+ 		targetType = this.fPackage.getType0(typeName);
+ 		if (targetType == this) { //$IDENTITY-COMPARISON$
+-			targetType = environment.askForType(this.compoundName, this.fPackage.enclosingModule); // FIXME(SHMOD): split package?
++			targetType = environment.askForType(this.compoundName, this.fPackage.enclosingModule);
+ 		}
+ 		if ((targetType == null || targetType == this) && CharOperation.contains('.', typeName)) { //$IDENTITY-COMPARISON$
+ 			// bug 491354: this complements the NameLookup#seekTypes(..), which performs the same adaptation
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index 26a7ef0..d58f339 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -83,6 +83,7 @@ import java.io.PrintWriter;
+ import java.io.StringWriter;
+ import java.util.Iterator;
+ import java.util.List;
++import java.util.stream.Collectors;
+ 
+ import org.eclipse.jdt.core.compiler.CategorizedProblem;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+@@ -183,6 +184,7 @@ import org.eclipse.jdt.internal.compiler.lookup.ProblemReferenceBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.Scope;
+ import org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding;
++import org.eclipse.jdt.internal.compiler.lookup.SplitPackageBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.SyntheticArgumentBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.TagBits;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+@@ -3208,6 +3210,23 @@ public void importProblem(ImportReference importRef, Binding expectedImport) {
+ 	}
+ 	invalidType(importRef, (TypeBinding)expectedImport);
+ }
++public void conflictingPackagesFromModules(SplitPackageBinding splitPackage, int sourceStart, int sourceEnd) {
++	ModuleBinding enclosingModule = splitPackage.enclosingModule;
++	String modules = splitPackage.incarnations.stream()
++						.filter(enclosingModule::canAccess)
++						.map(p -> String.valueOf(p.enclosingModule.name()))
++						.sorted()
++						.collect(Collectors.joining(", ")); //$NON-NLS-1$
++	String[] arguments = new String[] {
++						CharOperation.toString(splitPackage.compoundName),
++						modules };
++	this.handle(
++			IProblem.ConflictingPackageFromModules,
++			arguments,
++			arguments,
++			sourceStart,
++			sourceEnd);
++}
+ public void incompatibleExceptionInThrowsClause(SourceTypeBinding type, MethodBinding currentMethod, MethodBinding inheritedMethod, ReferenceBinding exceptionType) {
+ 	if (TypeBinding.equalsEquals(type, currentMethod.declaringClass)) {
+ 		int id;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+index 9cc54b9..560aa80 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+@@ -919,6 +919,7 @@
+ 1452 = The method {1}({2}) from the type {0} is not accessible
+ 1453 = The constructor {0}({1}) is not accessible
+ 1454 = The package {0} is not accessible
++1455 = The package {0} is accessible from more than one module: {1}
+ 
+ ### ELABORATIONS
+ ## Access restrictions
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BasicCompilationUnit.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BasicCompilationUnit.java
+index 7371d44..9356543 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BasicCompilationUnit.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BasicCompilationUnit.java
+@@ -22,6 +22,8 @@ import org.eclipse.core.resources.IProject;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.IJavaProject;
++import org.eclipse.jdt.core.IModuleDescription;
++import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+ import org.eclipse.jdt.internal.compiler.util.Util;
+@@ -42,6 +44,7 @@ public class BasicCompilationUnit implements ICompilationUnit {
+ 
+ 	protected char[][] packageName;
+ 	protected char[] mainTypeName;
++	protected char[] moduleName;
+ 	protected String encoding;
+ 
+ public BasicCompilationUnit(char[] contents, char[][] packageName, String fileName) {
+@@ -58,6 +61,15 @@ public BasicCompilationUnit(char[] contents, char[][] packageName, String fileNa
+ public BasicCompilationUnit(char[] contents, char[][] packageName, String fileName, IJavaElement javaElement) {
+ 	this(contents, packageName, fileName);
+ 	initEncoding(javaElement);
++	try {
++		if (javaElement != null) {
++			IModuleDescription moduleDescription = javaElement.getJavaProject().getModuleDescription();
++			if (moduleDescription != null)
++				this.moduleName = moduleDescription.getElementName().toCharArray();
++		}
++	} catch (JavaModelException e) {
++		// silent, moduleName is optional
++	}
+ }
+ 
+ /*
+@@ -146,7 +158,6 @@ public String toString(){
+ 
+ @Override
+ public char[] getModuleName() {
+-	// FIXME(SHMOD) may need a module name also here
+-	return null;
++	return this.moduleName;
+ }
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+index 47ec4e2..ad52f8b 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+@@ -74,7 +74,7 @@ public class SearchableEnvironment
+ 		this.workingCopies = workingCopies;
+ 		this.nameLookup = project.newNameLookup(workingCopies);
+ 		if (CompilerOptions.versionToJdkLevel(project.getOption(JavaCore.COMPILER_COMPLIANCE, true)) >= ClassFileConstants.JDK9) {
+-			for (IPackageFragmentRoot root : this.nameLookup.packageFragmentRoots) {
++			for (IPackageFragmentRoot root : project.getPackageFragmentRoots()) {
+ 				if (root.getModuleDescription() != null) {
+ 					this.knownModuleLocations = new HashMap<>();
+ 					break;
+commit 6d8b3e6ead7742f030cceb75549b8f4a4f43935a
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Mon Jul 17 22:52:03 2017 +0200
+
+    Bug 517808: [9][compiler] Implement lookup (module, package, type) based
+    on the 2017-05-25 version of JLS
+    fixes for additional tests in ModuleBuilderTests:
+     - fixes for the unnamed module
+     - make pack-split a responsibility of addPackage to not miss any chains
+     - more & better error reporting
+    
+    Change-Id: Id452b35aa77890aa371c0c65f1f2f9ed7ff20f65
+
+1	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+9	10	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+3	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ProvidesStatement.java
+6	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
+4	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+44	29	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+18	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+20	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+4	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+index 70efe79..b0d526d 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+@@ -902,7 +902,7 @@ public class ModuleCompilationTests extends AbstractBatchCompilerTest {
+ 	/*
+ 	 * Unnamed module tries to access a type from an unexported package successfully. 
+ 	 */
+-	public void test019() {
++	public void _test019() { // FIXME(SHMOD): check underlying assumptions
+ 		File outputDirectory = new File(OUTPUT_DIR);
+ 		Util.flushDirectoryContent(outputDirectory);
+ 		String out = "bin";
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 7281012..184374f 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -3196,7 +3196,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 	}
+ 	// test that a package declared in a module conflicts with an accessible package
+ 	// of the same name declared in another required module
+-	public void _test_conflicting_packages_declaredvsaccessible() throws CoreException {
++	public void test_conflicting_packages_declaredvsaccessible() throws CoreException {
+ 		if (!isJRE9) return;
+ 		try {
+ 			IClasspathEntry dep = JavaCore.newContainerEntry(new Path(JavaCore.MODULE_PATH_CONTAINER_ID));
+@@ -3237,8 +3237,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
+ 			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
+ 			assertMarkers("Unexpected markers", 
+-					"org.astro.World cannot be resolved to a type\n" +
+-					"Package org.astro exists in another module, org.astro",  markers);
++					"The package org.astro is accessible from more than one module: com.greetings, org.astro",  markers);
+ 		} finally {
+ 			deleteProject("org.astro");
+ 			deleteProject("com.greetings");
+@@ -3248,7 +3247,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 	// accessible package bundle.org.astro contains type World
+ 	// Type bundle.org.astro.World should not be resolved, because type
+ 	// bundle.org.astro trumps package bundle.org.astro
+-	public void _test_conflict_packagevstype() throws CoreException {
++	public void test_conflict_packagevstype() throws CoreException {
+ 		if (!isJRE9) return;
+ 		try {
+ 			IClasspathEntry dep = JavaCore.newContainerEntry(new Path(JavaCore.MODULE_PATH_CONTAINER_ID));
+@@ -3305,7 +3304,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 	// type bundle.org.astro.World should be resolved because type bundle.org.astro
+ 	// cannot be seen
+ 	// TODO - to be confirmed with spec
+-	public void _test_noconflict_concealedtype_accessiblepackage() throws CoreException {
++	public void test_noconflict_concealedtype_accessiblepackage() throws CoreException {
+ 		if (!isJRE9) return;
+ 		try {
+ 			IClasspathEntry dep = JavaCore.newContainerEntry(new Path(JavaCore.MODULE_PATH_CONTAINER_ID));
+@@ -3410,7 +3409,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 	}
+ 	// test that a package declared in a non-modular project conflicts with a package with the same name
+ 	// exported by a named module on it's build path
+-	public void _test_conflict_unnamed_declaredvsexported() throws CoreException {
++	public void test_conflict_unnamed_declaredvsexported() throws CoreException {
+ 		if (!isJRE9) return;
+ 		try {
+ 			IClasspathEntry dep = JavaCore.newContainerEntry(new Path(JavaCore.MODULE_PATH_CONTAINER_ID));
+@@ -3447,8 +3446,8 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			p2.getProject().getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
+ 			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
+ 			assertMarkers("Unexpected markers", 
+-					"org.astro.World cannot be resolved to a type\n" +
+-					"Package org.astro exists in another module, org.astro",  markers);
++					"The package org.astro is accessible from more than one module: <unnamed>, org.astro",
++					markers);
+ 		} finally {
+ 			deleteProject("org.astro");
+ 			deleteProject("com.greetings");
+@@ -3456,7 +3455,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 	}
+ 	// test that a type in an accessible package trumps an accessible package with the same name
+ 	// in the context of a non-modular project
+-	public void _test_conflict_packagevstype_unnamed() throws CoreException {
++	public void test_conflict_packagevstype_unnamed() throws CoreException {
+ 		if (!isJRE9) return;
+ 		try {
+ 			IClasspathEntry dep = JavaCore.newContainerEntry(new Path(JavaCore.MODULE_PATH_CONTAINER_ID));
+@@ -3559,7 +3558,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 	}
+ 	// test that a type in a non-accessible package does not conflict with an accessible package
+ 	// in the context of a non-modular project
+-	public void _test_noconflict_concealedtype_accessiblepackage_unnamed() throws CoreException {
++	public void test_noconflict_concealedtype_accessiblepackage_unnamed() throws CoreException {
+ 		if (!isJRE9) return;
+ 		try {
+ 			IClasspathEntry dep = JavaCore.newContainerEntry(new Path(JavaCore.MODULE_PATH_CONTAINER_ID));
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ProvidesStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ProvidesStatement.java
+index e8e6cd9..4a830b6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ProvidesStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ProvidesStatement.java
+@@ -19,7 +19,6 @@ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Set;
+ 
+-import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.core.compiler.IProblem;
+ import org.eclipse.jdt.internal.compiler.lookup.Binding;
+ import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
+@@ -78,10 +77,10 @@ public class ProvidesStatement extends ModuleStatement {
+ 				TypeBinding implType = impl;
+ 				if (provider != null) {
+ 					implType = provider.returnType;
+-					if (!implType.canBeSeenBy(scope)) {
+-						//
++					if (implType instanceof ReferenceBinding && !implType.canBeSeenBy(scope)) {
++						ReferenceBinding referenceBinding = (ReferenceBinding) implType;
+ 						scope.problemReporter().invalidType(this.implementations[i], new ProblemReferenceBinding(
+-								CharOperation.NO_CHAR_CHAR, (ReferenceBinding) implType, ProblemReasons.NotVisible));
++								referenceBinding.compoundName, referenceBinding, ProblemReasons.NotVisible));
+ 						hasErrors = true;
+ 					}
+ 				} else {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
+index d231bb6..b1ffdcf 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
+@@ -453,8 +453,13 @@ void faultInImports() {
+ 				problemReporter().cannotImportPackage(importReference);
+ 				continue nextImport;
+ 			} else if (this.environment.useModuleSystem && importBinding instanceof ReferenceBinding) {
++				PackageBinding importedPackage = ((ReferenceBinding) importBinding).fPackage;
++				if (!importedPackage.isValidBinding()) {
++					problemReporter().importProblem(importReference, importedPackage);
++					continue nextImport;
++				}
+ 				// re-get to find a possible split package:
+-				Binding importedPackage = findImport(((ReferenceBinding) importBinding).fPackage.compoundName, false, true);
++				importedPackage = (PackageBinding) findImport(importedPackage.compoundName, false, true);
+ 				if (importedPackage instanceof SplitPackageBinding) {
+ 					SplitPackageBinding splitPackage = (SplitPackageBinding) importedPackage;
+ 					if (splitPackage.hasConflict()) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+index 60a850e..d4b7a7c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+@@ -722,7 +722,7 @@ private PackageBinding computePackageFrom(char[][] constantPoolName, boolean isM
+ 			packageBinding = new PackageBinding(constantPoolName[0], this, this.module);
+ 		}
+ 		if (isMissing) packageBinding.tagBits |= TagBits.HasMissingType;
+-		this.knownPackages.put(constantPoolName[0], packageBinding);
++		this.knownPackages.put(constantPoolName[0], packageBinding); // TODO: split?
+ 	}
+ 
+ 	for (int i = 1, length = constantPoolName.length - 1; i < length; i++) {
+@@ -744,7 +744,7 @@ private PackageBinding computePackageFrom(char[][] constantPoolName, boolean isM
+ 			if (isMissing) {
+ 				packageBinding.tagBits |= TagBits.HasMissingType;
+ 			}
+-			parent.addPackage(packageBinding);
++			packageBinding = parent.addPackage(packageBinding, this.module);
+ 		}
+ 	}
+ 	return packageBinding;
+@@ -1031,7 +1031,7 @@ public PackageBinding createPackage(char[][] compoundName) {
+ 	if (packageBinding == null || packageBinding == TheNotFoundPackage) {
+ 		packageBinding = new PackageBinding(compoundName[0], this, this.module);
+ 		this.knownPackages.put(compoundName[0], packageBinding);
+-		if (this.module != null && !this.module.isUnnamed()) {
++		if (this.module != null) {
+ 			packageBinding = this.module.addPackage(packageBinding, true);
+ 			this.knownPackages.put(compoundName[0], packageBinding); // update in case of split package
+ 		}
+@@ -1067,7 +1067,7 @@ public PackageBinding createPackage(char[][] compoundName) {
+ 				}
+ 			}
+ 			packageBinding = new PackageBinding(CharOperation.subarray(compoundName, 0, i + 1), parent, this, this.module);
+-			parent.addPackage(packageBinding);
++			packageBinding = parent.addPackage(packageBinding, this.module);
+ 		}
+ 	}
+ 	if (packageBinding instanceof SplitPackageBinding)
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+index 0b559ab..e153cf7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+@@ -55,6 +55,8 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 
+ 	public static class UnNamedModule extends ModuleBinding {
+ 
++		private static final char[] UNNAMED_READABLE_NAME = "<unnamed>".toCharArray(); //$NON-NLS-1$
++
+ 		@SuppressWarnings("synthetic-access")
+ 		UnNamedModule(LookupEnvironment env) {
+ 			super(env);
+@@ -63,7 +65,9 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 			return Binding.NO_MODULES;
+ 		}
+ 		public boolean canAccess(PackageBinding pkg) {
+-			//TODO - if the package is part of a named module, then we should check if the module exports the package
++			ModuleBinding mod = pkg.enclosingModule;
++			if (mod != null && mod != this)
++				return mod.isPackageExportedTo(pkg, this);
+ 			return true;
+ 		}
+ 		@Override
+@@ -71,6 +75,10 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 			return true;
+ 		}
+ 		@Override
++		public char[] readableName() {
++			return UNNAMED_READABLE_NAME;
++		}
++		@Override
+ 		public String toString() {
+ 			return "The Unnamed Module"; //$NON-NLS-1$
+ 		}
+@@ -421,7 +429,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 					for (char[] declaringModuleName : declaringModuleNames) {
+ 						ModuleBinding declaringModule = this.environment.root.getModule(declaringModuleName);
+ 						if (declaringModule != null)
+-							binding = SplitPackageBinding.combine(declaringModule.getTopLevelPackage(name), binding, declaringModule);
++							binding = SplitPackageBinding.combine(declaringModule.getTopLevelPackage(name), binding, this);
+ 					}
+ 				}
+ 			}
+@@ -431,9 +439,22 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 		}
+ 
+ 		// enrich with split-siblings from visible modules:
+-		for (ModuleBinding required : getAllRequiredModules()) {
+-			if (required == this) continue;
+-			binding = SplitPackageBinding.combine(required.getTopLevelPackage(name), binding, this);
++		if (isUnnamed() && this.environment.useModuleSystem) {
++			IModuleAwareNameEnvironment moduleEnv = (IModuleAwareNameEnvironment) this.environment.nameEnvironment;
++			char[][] declaringModuleNames = moduleEnv.getModulesDeclaringPackage(null, name, ANY);
++			if (declaringModuleNames != null) {
++				for (char[] declaringModuleName : declaringModuleNames) {
++					if (declaringModuleName == this.moduleName) continue;
++					ModuleBinding declaringModule = this.environment.getModule(declaringModuleName);
++					if (declaringModule != null)
++						binding = SplitPackageBinding.combine(declaringModule.getTopLevelPackage(name), binding, this);
++				}
++			}
++		} else {
++			for (ModuleBinding required : getAllRequiredModules()) {
++				if (required == this) continue;
++				binding = SplitPackageBinding.combine(required.getTopLevelPackage(name), binding, this);
++			}
+ 		}
+ 
+ 		// remember:
+@@ -447,7 +468,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	}
+ 
+ 	// Given parent is visible in this module, see if there is sub package named name visible in this module
+-	private PackageBinding getVisiblePackage(PackageBinding parent, char[] name) {
++	PackageBinding getVisiblePackage(PackageBinding parent, char[] name) {
+ 		assert parent.compoundName.length > 0 : "shouldn't ask children of a default package"; //$NON-NLS-1$
+ 
+ 		// check caches:
+@@ -468,7 +489,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 		if (!parent.isDeclaredIn(this)) {
+ 			// delegate foreign packages to their declaring modules:
+ 			if (parent instanceof SplitPackageBinding)
+-				return combineWithChildrenOfSplitPackage(binding, (SplitPackageBinding) parent, name);
++				return ((SplitPackageBinding) parent).combineWithSiblings(binding, name, this);
+ 			return parent.enclosingModule.getVisiblePackage(parent, name);
+ 		}
+ 
+@@ -481,15 +502,11 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 		// create
+ 		binding = new PackageBinding(subPkgCompoundName, parent, this.environment, this);
+ 		
+-		// enrich
+-		if (parent instanceof SplitPackageBinding)
+-			binding = combineWithChildrenOfSplitPackage(binding, (SplitPackageBinding) parent, name);
+-
+ 		// remember
+ 		if (parent.compoundName.length == 0)
+ 			this.environment.knownPackages.put(name, binding);
+ 		else
+-			parent.addPackage(binding);
++			binding = parent.addPackage(binding, this);
+ 		return addPackage(binding, false);
+ 	}
+ 
+@@ -521,19 +538,6 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 		return parent;
+ 	}
+ 
+-	private PackageBinding combineWithChildrenOfSplitPackage(PackageBinding childPackage, SplitPackageBinding splitParent, char[] name) {
+-		ModuleBinding primaryModule = childPackage != null ? childPackage.enclosingModule : splitParent.enclosingModule;
+-		// see if other incarnations contribute to the child package, too:
+-		for (PackageBinding incarnation :  splitParent.incarnations) {
+-			ModuleBinding moduleBinding = incarnation.enclosingModule;
+-			if (moduleBinding == this)
+-				continue;
+-			PackageBinding next = moduleBinding.getVisiblePackage(incarnation, name);
+-			childPackage = SplitPackageBinding.combine(next, childPackage, primaryModule);
+-		}
+-		return childPackage;
+-	}
+-
+ 	/**
+ 	 * Does this module declare a package by the given name and qualified by the given parentPackageName?
+ 	 * In JLS diction a declared package is "associated" with this module.
+@@ -590,9 +594,21 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	PackageBinding addPackage(PackageBinding packageBinding, boolean checkForSplit) {
+ 		if (packageBinding.isDeclaredIn(this)) {
+ 			char[] packageName = packageBinding.readableName();
+-			if (checkForSplit) {
+-				for (ModuleBinding moduleBinding : getAllRequiredModules())
+-					packageBinding = SplitPackageBinding.combine(moduleBinding.getVisiblePackage(packageBinding.compoundName), packageBinding, this);
++			if (checkForSplit && this.environment.useModuleSystem) {
++				if (isUnnamed()) {
++					IModuleAwareNameEnvironment moduleEnv = (IModuleAwareNameEnvironment) this.environment.nameEnvironment;
++					char[][] declaringModuleNames = moduleEnv.getModulesDeclaringPackage(null, packageName, ANY);
++					if (declaringModuleNames != null) {
++						for (int i = 0; i < declaringModuleNames.length; i++) {
++							ModuleBinding otherModule = this.environment.getModule(declaringModuleNames[i]);
++							if (otherModule != null)
++								packageBinding = SplitPackageBinding.combine(otherModule.getVisiblePackage(packageBinding.compoundName), packageBinding, this);
++						}
++					}
++				} else {
++					for (ModuleBinding moduleBinding : getAllRequiredModules())
++						packageBinding = SplitPackageBinding.combine(moduleBinding.getVisiblePackage(packageBinding.compoundName), packageBinding, this);
++				}
+ 			}
+ 			this.declaredPackages.put(packageName, packageBinding);
+ 		}
+@@ -627,7 +643,6 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 
+ 	@Override
+ 	public char[] readableName() {
+-		//
+ 		return this.moduleName;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+index 50efb2b..a0446ce 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+@@ -77,9 +77,15 @@ private void addNotFoundType(char[] simpleName) {
+ 		this.knownTypes = new HashtableOfType(25);
+ 	this.knownTypes.put(simpleName, LookupEnvironment.TheNotFoundType);
+ }
+-void addPackage(PackageBinding element) {
++/**
++ * Remembers a sub-package.
++ * For a split parent package this will enclude enriching with siblings,
++ * in which case the enrichted (split) binding will be returned.
++ */
++PackageBinding addPackage(PackageBinding element, ModuleBinding module) {
+ 	if ((element.tagBits & TagBits.HasMissingType) == 0) clearMissingTagBit();
+ 	this.knownPackages.put(element.compoundName[element.compoundName.length - 1], element);
++	return element;
+ }
+ void addType(ReferenceBinding element) {
+ 	if ((element.tagBits & TagBits.HasMissingType) == 0) clearMissingTagBit();
+@@ -215,14 +221,19 @@ public Binding getTypeOrPackage(char[] name, ModuleBinding mod) {
+ 	if (packageBinding != null && packageBinding != LookupEnvironment.TheNotFoundPackage) {
+ 		return packageBinding;
+ 	}
++	ReferenceBinding problemBinding = null;
++	lookForType:
+ 	if (referenceBinding == null) { // have not looked for it before
+ 		if ((referenceBinding = this.environment.askForType(this, name, mod)) != null) {
+ 			if (referenceBinding.isNestedType()) {
+ 				return new ProblemReferenceBinding(new char[][]{name}, referenceBinding, ProblemReasons.InternalNameProvided);
+ 			}
+-			if (!mod.canAccess(referenceBinding.fPackage))
+-				return new ProblemReferenceBinding(referenceBinding.compoundName, referenceBinding, ProblemReasons.NotAccessible);
+-			return referenceBinding;
++			if (!mod.canAccess(referenceBinding.fPackage)) {
++				problemBinding = new ProblemReferenceBinding(referenceBinding.compoundName, referenceBinding, ProblemReasons.NotAccessible);
++				break lookForType;
++			} else {
++				return referenceBinding;
++			}
+ 		}
+ 
+ 		// Since name could not be found, add a problem binding
+@@ -235,12 +246,14 @@ public Binding getTypeOrPackage(char[] name, ModuleBinding mod) {
+ 			return packageBinding;
+ 		}
+ 		if (referenceBinding != null && referenceBinding != LookupEnvironment.TheNotFoundType) {
++			if (problemBinding != null)
++				return problemBinding;
+ 			return referenceBinding; // found cached missing type - check if package conflict
+ 		}
+ 		addNotFoundPackage(name);
+ 	}
+ 
+-	return null;
++	return problemBinding;
+ }
+ public final boolean isViewedAsDeprecated() {
+ 	if ((this.tagBits & TagBits.DeprecatedAnnotationResolved) == 0) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+index bd78ade..89e7300 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+@@ -72,14 +72,31 @@ public class SplitPackageBinding extends PackageBinding {
+ 	}
+ 
+ 	@Override
+-	void addPackage(PackageBinding element) {
++	PackageBinding addPackage(PackageBinding element, ModuleBinding module) {
+ 		char[] simpleName = element.compoundName[element.compoundName.length-1];
++		// enrich
++		element = combineWithSiblings(element, simpleName, module);
++
+ 		PackageBinding visible = this.knownPackages.get(simpleName);
+ 		visible = SplitPackageBinding.combine(element, visible, this.enclosingModule);
+ 		this.knownPackages.put(simpleName, visible);
+ 		PackageBinding incarnation = getIncarnation(element.enclosingModule);
+ 		if (incarnation != null)
+-			incarnation.addPackage(element);
++			incarnation.addPackage(element, module);
++		return element;
++	}
++
++	PackageBinding combineWithSiblings(PackageBinding childPackage, char[] name, ModuleBinding module) {
++		ModuleBinding primaryModule = childPackage != null ? childPackage.enclosingModule : this.enclosingModule;
++		// see if other incarnations contribute to the child package, too:
++		for (PackageBinding incarnation :  this.incarnations) {
++			ModuleBinding moduleBinding = incarnation.enclosingModule;
++			if (moduleBinding == module)
++				continue;
++			PackageBinding next = moduleBinding.getVisiblePackage(incarnation, name); // TODO(SHMOD): reduce split-package work during this invocation?
++			childPackage = combine(next, childPackage, primaryModule);
++		}
++		return childPackage;
+ 	}
+ 	
+ 	@Override
+@@ -127,7 +144,7 @@ public class SplitPackageBinding extends PackageBinding {
+ 		if (result == null)
+ 			addNotFoundPackage(name);
+ 		else
+-			addPackage(result);
++			addPackage(result, module);
+ 		return result;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index d58f339..cffc138 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -3174,13 +3174,14 @@ public void importProblem(ImportReference importRef, Binding expectedImport) {
+ 	}
+ 
+ 	if (expectedImport instanceof PackageBinding && expectedImport.problemId() == ProblemReasons.NotAccessible) {
+-		String[] arguments = new String[] {CharOperation.toString(((PackageBinding)expectedImport).compoundName)};
++		char[][] compoundName = ((PackageBinding)expectedImport).compoundName;
++		String[] arguments = new String[] {CharOperation.toString(compoundName)};
+ 		this.handleUntagged(
+ 		        IProblem.NotAccessiblePackage,
+ 		        arguments,
+ 		        arguments,
+ 		        importRef.sourceStart,
+-		        (int) importRef.sourcePositions[importRef.tokens.length - 1]);
++		        (int) importRef.sourcePositions[compoundName.length - 1]);
+ 		return;
+ 	}
+ 
+@@ -3214,7 +3215,7 @@ public void conflictingPackagesFromModules(SplitPackageBinding splitPackage, int
+ 	ModuleBinding enclosingModule = splitPackage.enclosingModule;
+ 	String modules = splitPackage.incarnations.stream()
+ 						.filter(enclosingModule::canAccess)
+-						.map(p -> String.valueOf(p.enclosingModule.name()))
++						.map(p -> String.valueOf(p.enclosingModule.readableName()))
+ 						.sorted()
+ 						.collect(Collectors.joining(", ")); //$NON-NLS-1$
+ 	String[] arguments = new String[] {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+index b284f00..66965b8 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+@@ -435,7 +435,7 @@ public char[][] getModulesDeclaringPackage(char[][] parentPackageName, char[] na
+ 	if (moduleName == ModuleBinding.UNNAMED || this.modulePathEntries == null) {
+ 		char[][] names = CharOperation.NO_CHAR_CHAR;
+ 		for (ClasspathLocation location : this.binaryLocations) {
+-			if (location.module == null) {
++			if (location.module == null && !(location instanceof ClasspathJrt)) {
+ 				char[][] declaringModules = location.getModulesDeclaringPackage(pkgName, null);
+ 				if (declaringModules != null)
+ 					names = CharOperation.arrayConcat(names, declaringModules);
+commit b5843df2dee23745686c2a4e281488e6526cf3a1
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Jul 20 00:56:35 2017 +0200
+
+    Bug 517808: [9][compiler] Implement lookup (module, package, type) based
+    on the 2017-05-25 version of JLS
+    - handling of package-vs-type conflicts
+    - fix resolving/collecting requires
+    - make type lookup via split package more robust
+    
+    Change-Id: I8e37e143c59494f7bed60e6caefdf513f0a9989a
+
+51	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+1	1	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+23	15	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+12	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+9	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceModuleBinding.java
+5	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+index b0d526d..77af968 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+@@ -1838,4 +1838,55 @@ public class ModuleCompilationTests extends AbstractBatchCompilerTest {
+ 				"3 problems (3 errors)\n",
+ 				false);
+ 	}
++	public void testPackageTypeConflict1() {
++		File outputDirectory = new File(OUTPUT_DIR);
++		Util.flushDirectoryContent(outputDirectory);
++		String out = "bin";
++		String directory = OUTPUT_DIR + File.separator + "src";
++		
++		String moduleLoc = directory + File.separator + "mod.one";
++		writeFile(moduleLoc, "module-info.java", 
++						"module mod.one { \n" +
++						"}");
++		writeFile(moduleLoc + File.separator + "p1" + File.separator + "p2", "t3.java", 
++						"package p1.p2;\n" +
++						"public class t3 {\n" +
++						"}\n");
++
++		moduleLoc = directory + File.separator + "mod.two";
++		writeFile(moduleLoc, "module-info.java", 
++						"module mod.two { \n" +
++						"	exports p1.p2.t3;\n" +
++						"}");
++		writeFile(moduleLoc + File.separator + "p1" + File.separator + "p2" + File.separator + "t3", "t4.java", 
++						"package p1.p2.t3;\n" +
++						"public class t4 {\n" +
++						"}\n");
++
++		moduleLoc = directory + File.separator + "mod.three";
++		writeFile(moduleLoc, "module-info.java", 
++						"module mod.three { \n" +
++						"	requires mod.one;\n" +
++						"	requires mod.two;\n" +
++						"}");
++		writeFile(moduleLoc + File.separator + "po", "Client.java", 
++						"package po;\n" + 
++						"public class Client {\n" + 
++						"	 p1.p2.t3.t4 f;\n" + // no conflict mod.one/p1.p2.t3 <-> mod.two/p1.p2.t3
++						"}\n");
++
++		StringBuffer buffer = new StringBuffer();
++		buffer.append("-d " + OUTPUT_DIR + File.separator + out )
++			.append(" -9 ")
++			.append(" -classpath \"")
++			.append(Util.getJavaClassLibsAsString())
++			.append("\" ")
++			.append(" --module-source-path " + "\"" + directory + "\"");
++
++		runConformTest(new String[]{}, 
++				buffer.toString(), 
++				"",
++				"",
++				false);
++	}
+ }
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index d3fe6a3..f214245 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -1886,7 +1886,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			IMarker[] markers = p2.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
+ 			sortMarkers(markers);
+ 			assertMarkers("Unexpected markers", 
+-					"The import org.astro.World cannot be resolved\n" +
++					"The type org.astro.World is not accessible\n" +
+ 					"World cannot be resolved to a type",  markers);
+ 		} finally {
+ 			deleteProject("org.astro");
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+index d4b7a7c..550dd51 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+@@ -228,7 +228,8 @@ public ReferenceBinding askForType(char[][] compoundName, /*@NonNull*/ModuleBind
+ 	NameEnvironmentAnswer[] answers = null;
+ 	if (this.useModuleSystem) {
+ 		IModuleAwareNameEnvironment moduleEnv = (IModuleAwareNameEnvironment) this.nameEnvironment;
+-		answers = askForTypeFromModules(clientModule, mod -> moduleEnv.findType(compoundName, mod.nameForLookup()));
++		answers = askForTypeFromModules(clientModule, clientModule.getAllRequiredModules(),
++				mod -> moduleEnv.findType(compoundName, mod.nameForLookup()));
+ 	} else {
+ 		NameEnvironmentAnswer answer = this.nameEnvironment.findType(compoundName);
+ 		if (answer != null) {
+@@ -286,7 +287,9 @@ ReferenceBinding askForType(PackageBinding packageBinding, char[] name, ModuleBi
+ 	if (this.nameEnvironment instanceof IModuleAwareNameEnvironment) {
+ 		IModuleAwareNameEnvironment moduleEnv = (IModuleAwareNameEnvironment) this.nameEnvironment;
+ 		final PackageBinding pack = packageBinding;
+-		answers = askForTypeFromModules(clientModule, mod -> fromSplitPackageOrOracle(moduleEnv, mod, pack, name));
++		// leverage module information from the (split?) package as to prefer NotAccessible over NotFound:
++		answers = askForTypeFromModules(null, packageBinding.getDeclaringModules(),
++				mod -> fromSplitPackageOrOracle(moduleEnv, mod, pack, name));
+ 	} else {
+ 		NameEnvironmentAnswer answer = this.nameEnvironment.findType(name, packageBinding.compoundName);
+ 		if (answer != null) {
+@@ -356,28 +359,33 @@ private ReferenceBinding combine(ReferenceBinding one, ReferenceBinding two, Mod
+ 	if (!clientModule.canAccess(two.fPackage)) return one;
+ 	return new ProblemReferenceBinding(one.compoundName, one, ProblemReasons.Ambiguous); // TODO(SHMOD): use a new problem ID
+ }
+-/** Collect answers from the oracle concerning the given clientModule and each of its required modules. */
+-private NameEnvironmentAnswer[] askForTypeFromModules(ModuleBinding clientModule, Function<ModuleBinding,NameEnvironmentAnswer> oracle)
++/** Collect answers from the oracle concerning the given clientModule (if present) and each of a set of other modules. */
++private NameEnvironmentAnswer[] askForTypeFromModules(ModuleBinding clientModule, ModuleBinding[] otherModules,
++		Function<ModuleBinding,NameEnvironmentAnswer> oracle)
+ {
+-	if (clientModule.nameForLookup() == ModuleBinding.ANY) {
++	if (clientModule != null && clientModule.nameForLookup() == ModuleBinding.ANY) {
+ 		NameEnvironmentAnswer answer = oracle.apply(clientModule);
+ 		if (answer != null)
+ 			answer.moduleBinding = this.root.getModuleFromAnswer(answer);
+ 		return new NameEnvironmentAnswer[] { answer };
+ 	} else {
+-		ModuleBinding[] requiredModules = clientModule.getAllRequiredModules();
+-		NameEnvironmentAnswer[] answers = new NameEnvironmentAnswer[requiredModules.length+1];
+ 		boolean found = false;
+-		NameEnvironmentAnswer answer = oracle.apply(clientModule);
+-		if (answer != null) {
+-			answer.moduleBinding = clientModule;
+-			answers[answers.length-1] = answer;
+-			found = true;
++		NameEnvironmentAnswer[] answers = null;
++		if (clientModule != null) {
++			answers = new NameEnvironmentAnswer[otherModules.length+1];
++			NameEnvironmentAnswer answer = oracle.apply(clientModule);
++			if (answer != null) {
++				answer.moduleBinding = clientModule;
++				answers[answers.length-1] = answer;
++				found = true;
++			}
++		} else {
++			answers = new NameEnvironmentAnswer[otherModules.length];
+ 		}
+-		for (int i = 0; i < requiredModules.length; i++) {
+-			answer = oracle.apply(requiredModules[i]);
++		for (int i = 0; i < otherModules.length; i++) {
++			NameEnvironmentAnswer answer = oracle.apply(otherModules[i]);
+ 			if (answer != null) {
+-				answer.moduleBinding = requiredModules[i];
++				answer.moduleBinding = otherModules[i];
+ 				answers[i] = answer;
+ 				found = true;
+ 			}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+index e153cf7..5224403 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+@@ -279,7 +279,7 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 		}
+ 	}
+ 
+-	private Stream<ModuleBinding> getRequiredModules(boolean transitiveOnly) {
++	Stream<ModuleBinding> getRequiredModules(boolean transitiveOnly) {
+ 		return Stream.of(transitiveOnly ? this.getRequiresTransitive() : this.getRequires());
+ 	}
+ 	private void collectAllDependencies(Set<ModuleBinding> deps) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+index a0446ce..016d793 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+@@ -101,6 +101,10 @@ void addType(ReferenceBinding element) {
+ 			checkIfNullAnnotationType(element);
+ }
+ 
++ModuleBinding[] getDeclaringModules() {
++	return new ModuleBinding[] { this.enclosingModule };
++}
++
+ void clearMissingTagBit() {
+ 	PackageBinding current = this;
+ 	do {
+@@ -202,14 +206,18 @@ ReferenceBinding getType0(char[] name) {
+ */
+ 
+ public Binding getTypeOrPackage(char[] name, ModuleBinding mod) {
++	ReferenceBinding problemBinding = null;
+ 	ReferenceBinding referenceBinding = getType0(name);
++	lookForType0:
+ 	if (referenceBinding != null && referenceBinding != LookupEnvironment.TheNotFoundType) {
+ 		referenceBinding = (ReferenceBinding) BinaryTypeBinding.resolveType(referenceBinding, this.environment, false /* no raw conversion for now */);
+ 		if (referenceBinding.isNestedType()) {
+ 			return new ProblemReferenceBinding(new char[][]{name}, referenceBinding, ProblemReasons.InternalNameProvided);
+ 		}
+-		if (mod != this.enclosingModule && !mod.canAccess(referenceBinding.fPackage)) {
+-			return new ProblemReferenceBinding(referenceBinding.compoundName, referenceBinding, ProblemReasons.NotAccessible);
++		boolean isSameModule = (this instanceof SplitPackageBinding) ? referenceBinding.module() == mod : this.enclosingModule == mod;
++		if (!isSameModule && !mod.canAccess(referenceBinding.fPackage)) {
++			problemBinding = new ProblemReferenceBinding(referenceBinding.compoundName, referenceBinding, ProblemReasons.NotAccessible);
++			break lookForType0;
+ 		}
+ 		if ((referenceBinding.tagBits & TagBits.HasMissingType) == 0) {
+ 			return referenceBinding;
+@@ -221,14 +229,13 @@ public Binding getTypeOrPackage(char[] name, ModuleBinding mod) {
+ 	if (packageBinding != null && packageBinding != LookupEnvironment.TheNotFoundPackage) {
+ 		return packageBinding;
+ 	}
+-	ReferenceBinding problemBinding = null;
+ 	lookForType:
+-	if (referenceBinding == null) { // have not looked for it before
++	if (referenceBinding == null && problemBinding == null) { // have not looked for it before
+ 		if ((referenceBinding = this.environment.askForType(this, name, mod)) != null) {
+ 			if (referenceBinding.isNestedType()) {
+ 				return new ProblemReferenceBinding(new char[][]{name}, referenceBinding, ProblemReasons.InternalNameProvided);
+ 			}
+-			if (!mod.canAccess(referenceBinding.fPackage)) {
++			if (referenceBinding.isValidBinding() && !mod.canAccess(referenceBinding.fPackage)) {
+ 				problemBinding = new ProblemReferenceBinding(referenceBinding.compoundName, referenceBinding, ProblemReasons.NotAccessible);
+ 				break lookForType;
+ 			} else {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index 390d5a1..786905d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -2923,7 +2923,7 @@ public abstract class Scope {
+ 			if (binding == null) {
+ 				return new ProblemReferenceBinding(CharOperation.subarray(compoundName, 0, currentIndex), null /* no closest match since search for pkg*/, ProblemReasons.NotFound);
+ 			}
+-			if (!binding.isValidBinding())
++			if (!binding.isValidBinding() && binding.problemId() != ProblemReasons.Ambiguous)
+ 				return new ProblemReferenceBinding(
+ 					CharOperation.subarray(compoundName, 0, currentIndex),
+ 					binding instanceof ReferenceBinding ? (ReferenceBinding)((ReferenceBinding)binding).closestMatch() : null,
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceModuleBinding.java
+index 95461bc..2a0ded7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceModuleBinding.java
+@@ -17,6 +17,7 @@ package org.eclipse.jdt.internal.compiler.lookup;
+ import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.function.IntFunction;
++import java.util.stream.Stream;
+ 
+ public class SourceModuleBinding extends ModuleBinding {
+ 
+@@ -76,6 +77,14 @@ public class SourceModuleBinding extends ModuleBinding {
+ 	}
+ 	
+ 	@Override
++	Stream<ModuleBinding> getRequiredModules(boolean transitiveOnly) {
++		if (this.requires == NO_MODULES) {
++			this.scope.referenceContext.moduleDeclaration.resolveDirectives(this.scope);
++		}
++		return super.getRequiredModules(transitiveOnly);
++	}
++
++	@Override
+ 	public ModuleBinding[] getAllRequiredModules() {
+ 		if (this.scope != null)
+ 			this.scope.referenceContext.moduleDeclaration.resolveDirectives(this.scope);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+index 89e7300..8c97084 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SplitPackageBinding.java
+@@ -100,6 +100,11 @@ public class SplitPackageBinding extends PackageBinding {
+ 	}
+ 	
+ 	@Override
++	ModuleBinding[] getDeclaringModules() {
++		return this.declaringModules.toArray(new ModuleBinding[this.declaringModules.size()]);
++	}
++
++	@Override
+ 	PackageBinding getPackage0(char[] name) {
+ 		PackageBinding knownPackage = super.getPackage0(name);
+ 		if (knownPackage != null)

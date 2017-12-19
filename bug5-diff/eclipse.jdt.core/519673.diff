@@ -1,0 +1,296 @@
+commit 1de6e0687e2f474a4986f8438fffaa2ea16d3b43
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Wed Aug 2 16:01:44 2017 +0200
+
+    Bug 519673 - [9] Cannot export a package from another source folder
+    - part 1: NPE prevention
+    Change-Id: I4ac877102658486f6e1e655e7a08429da4561a95
+
+76	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+14	14	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ModuleDeclaration.java
+19	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryModuleBinding.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index dad5e29..54d3d1b 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -4424,6 +4424,82 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			JavaCore.setOptions(javaCoreOptions);
+ 		}
+ 	}
++	public void testSourceFolders_Bug519673() throws CoreException {
++		if (!isJRE9) return;
++		try {
++			// Setup project PSources1:
++			String[] src = new String[] { 
++					"src/module-info.java",
++					"module PSources1 {\n" +
++					"	//exports p.q;\n" +
++					"}",
++					"src2/p/q/SomeClass.java",
++					"package p.q;\n" +
++					"public class SomeClass {}",
++			};
++			IJavaProject p1 = setupModuleProject("PSources1", new String[] { "src", "src2" }, src, new IClasspathEntry[0]);
++			getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++
++			// Edit PSources1/src/module-info.java:
++			String infoSrc =
++					"module PSources1 {\n" +
++					"	exports p.q;\n" +
++					"}";
++			String infoPath = "/PSources1/src/module-info.java";
++			editFile(infoPath, infoSrc);
++			this.workingCopies = new ICompilationUnit[1];
++			char[] sourceChars = src[1].toCharArray();
++			this.problemRequestor.initialize(sourceChars);
++			this.workingCopies[0] = getCompilationUnit(infoPath).getWorkingCopy(this.wcOwner, null);
++			// was: ERROR: The package pkg does not exist or is empty
++//			assertProblems(
++//					"Unexpected problems",
++//					"----------\n" + 
++//					"----------\n",
++//					this.problemRequestor);
++
++			// Setup project PClient2:
++			String[] src2 = new String[] { 
++					"src/module-info.java",
++					"module PClient2 {\n" +
++					"	requires PSources1;\n" +
++					"}",
++					"src/x/Client.java",
++					"package x;\n" +
++					"public class Client {\n" +
++					"	p.q.SomeClass f;\n" +
++					"\n}",
++			};
++			setupModuleProject("PClient2", src2);
++			getWorkspace().build(IncrementalProjectBuilder.INCREMENTAL_BUILD, null);
++			IMarker[] markers = p1.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers", "", markers);
++
++			// Edit PClient2/src/module-info.java:
++			// was NPE in ModuleBinding.canAccess()
++			char[] info2Chars = src2[2].toCharArray();
++			this.problemRequestor.initialize(info2Chars);
++			this.workingCopies[0] = getCompilationUnit("PClient2/src/module-info.java").getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++					"Unexpected problems",
++					"----------\n" + 
++					"----------\n",
++					this.problemRequestor);
++
++			// Failed attempt to trigger NPE in ModuleBinding.isPackageExportedTo() by editing Client.java
++//			char[] source2Chars = src2[3].toCharArray();
++//			this.problemRequestor.initialize(source2Chars);
++//			this.workingCopies[0] = getCompilationUnit("PClient2/src/x/Client.java").getWorkingCopy(this.wcOwner, null);
++//			assertProblems(
++//					"Unexpected problems",
++//					"----------\n" + 
++//					"----------\n",
++//					this.problemRequestor);
++		} finally {
++			deleteProject("PSources1");
++			deleteProject("PClient2");
++		}
++	}
+ 	protected void assertNoErrors() throws CoreException {
+ 		for (IProject p : getWorkspace().getRoot().getProjects()) {
+ 			int maxSeverity = p.findMaxProblemSeverity(null, true, IResource.DEPTH_INFINITE);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ModuleDeclaration.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ModuleDeclaration.java
+index 77baf34..8007e73 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ModuleDeclaration.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ModuleDeclaration.java
+@@ -168,14 +168,14 @@ public class ModuleDeclaration extends ASTNode {
+ 				if (!exportedPkgs.add(ref.resolvedPackage)) {
+ 					cuScope.problemReporter().invalidPackageReference(IProblem.DuplicateExports, ref);
+ 				}
++				char[][] targets = null;
++				if (ref.targets != null) {
++					targets = new char[ref.targets.length][];
++					for (int j = 0; j < targets.length; j++)
++						targets[j] = ref.targets[j].moduleName;
++				}
++				this.binding.addResolvedExport(ref.resolvedPackage, targets);
+ 			}
+- 			char[][] targets = null;
+- 			if (ref.targets != null) {
+- 				targets = new char[ref.targets.length][];
+- 				for (int j = 0; j < targets.length; j++)
+-					targets[j] = ref.targets[j].moduleName;
+- 			}
+- 			this.binding.addResolvedExport(ref.resolvedPackage, targets);
+ 		}
+ 
+ 		Set<PackageBinding> openedPkgs = new HashSet<>();
+@@ -189,14 +189,14 @@ public class ModuleDeclaration extends ASTNode {
+ 						cuScope.problemReporter().invalidPackageReference(IProblem.DuplicateOpens, ref);
+ 					}
+ 				}
++				char[][] targets = null;
++				if (ref.targets != null) {
++					targets = new char[ref.targets.length][];
++					for (int j = 0; j < targets.length; j++)
++						targets[j] = ref.targets[j].moduleName;
++				}
++				this.binding.addResolvedOpens(ref.resolvedPackage, targets);
+ 			}
+- 			char[][] targets = null;
+- 			if (ref.targets != null) {
+- 				targets = new char[ref.targets.length][];
+- 				for (int j = 0; j < targets.length; j++)
+-					targets[j] = ref.targets[j].moduleName;
+- 			}
+-			this.binding.addResolvedOpens(ref.resolvedPackage, targets);
+ 		}
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryModuleBinding.java
+index 0a2ae9e..6e948b8 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryModuleBinding.java
+@@ -88,19 +88,34 @@ public class BinaryModuleBinding extends ModuleBinding {
+ 
+ 	private void resolvePackages() {
+ 		this.exportedPackages = new PackageBinding[this.unresolvedExports.length];
++		int count = 0;
+ 		for (int i = 0; i < this.unresolvedExports.length; i++) {
+ 			IPackageExport export = this.unresolvedExports[i];
+ 			PackageBinding declaredPackage = getVisiblePackage(CharOperation.splitOn('.', export.name()));
+-			this.exportedPackages[i] = declaredPackage;
+-			recordExportRestrictions(declaredPackage, export.targets());
++			if (declaredPackage != null) {
++				this.exportedPackages[count++] = declaredPackage;
++				recordExportRestrictions(declaredPackage, export.targets());
++			} else {
++				// TODO(SHMOD): report incomplete module path?
++			}
+ 		}
++		if (count < this.exportedPackages.length)
++			System.arraycopy(this.exportedPackages, 0, this.exportedPackages = new PackageBinding[count], 0, count);
++		
+ 		this.openedPackages = new PackageBinding[this.unresolvedOpens.length];
++		count = 0;
+ 		for (int i = 0; i < this.unresolvedOpens.length; i++) {
+ 			IPackageExport opens = this.unresolvedOpens[i];
+ 			PackageBinding declaredPackage = getVisiblePackage(CharOperation.splitOn('.', opens.name()));
+-			this.openedPackages[i] = declaredPackage;
+-			recordOpensRestrictions(declaredPackage, opens.targets());
++			if (declaredPackage != null) {
++				this.openedPackages[count++] = declaredPackage;
++				recordOpensRestrictions(declaredPackage, opens.targets());
++			} else {
++				// TODO(SHMOD): report incomplete module path?
++			}
+ 		}
++		if (count < this.openedPackages.length)
++			System.arraycopy(this.openedPackages, 0, this.openedPackages = new PackageBinding[count], 0, count);
+ 	}
+ 	
+ 	@Override
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+index 96098f8..fa9f32f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+@@ -222,7 +222,8 @@ public class ModuleBinding extends Binding implements IUpdatableModule {
+ 	@Override
+ 	public void addExports(char[] packageName, char[][] targetModules) {
+ 		PackageBinding declaredPackage = getVisiblePackage(CharOperation.splitOn('.', packageName));
+-		addResolvedExport(declaredPackage, targetModules);
++		if (declaredPackage != null && declaredPackage.isValidBinding())
++			addResolvedExport(declaredPackage, targetModules);
+ 	}
+ 
+ 	// ---
+commit 46dc0f52fe6e137adf452bd634ae9b8e3d98ea66
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Wed Aug 2 18:38:56 2017 +0200
+
+    Bug 519673 - [9] Cannot export a package from another source folder
+    - part 2: use project not package fragm root as module context
+    
+    Change-Id: I36ca8dbfe876d9df30625159373ae5e5d83e245f
+
+13	13	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+7	4	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+3	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 54d3d1b..776ed5e 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -4452,11 +4452,11 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			this.problemRequestor.initialize(sourceChars);
+ 			this.workingCopies[0] = getCompilationUnit(infoPath).getWorkingCopy(this.wcOwner, null);
+ 			// was: ERROR: The package pkg does not exist or is empty
+-//			assertProblems(
+-//					"Unexpected problems",
+-//					"----------\n" + 
+-//					"----------\n",
+-//					this.problemRequestor);
++			assertProblems(
++					"Unexpected problems",
++					"----------\n" + 
++					"----------\n",
++					this.problemRequestor);
+ 
+ 			// Setup project PClient2:
+ 			String[] src2 = new String[] { 
+@@ -4487,14 +4487,14 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 					this.problemRequestor);
+ 
+ 			// Failed attempt to trigger NPE in ModuleBinding.isPackageExportedTo() by editing Client.java
+-//			char[] source2Chars = src2[3].toCharArray();
+-//			this.problemRequestor.initialize(source2Chars);
+-//			this.workingCopies[0] = getCompilationUnit("PClient2/src/x/Client.java").getWorkingCopy(this.wcOwner, null);
+-//			assertProblems(
+-//					"Unexpected problems",
+-//					"----------\n" + 
+-//					"----------\n",
+-//					this.problemRequestor);
++			char[] source2Chars = src2[3].toCharArray();
++			this.problemRequestor.initialize(source2Chars);
++			this.workingCopies[0] = getCompilationUnit("PClient2/src/x/Client.java").getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++					"Unexpected problems",
++					"----------\n" + 
++					"----------\n",
++					this.problemRequestor);
+ 		} finally {
+ 			deleteProject("PSources1");
+ 			deleteProject("PClient2");
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+index 2f86ea6..0131fe2 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+@@ -1349,10 +1349,13 @@ public class NameLookup implements SuffixConstants {
+ 				break;
+ 			case IJavaElement.JAVA_PROJECT:
+ 				try {
+-					for (IPackageFragmentRoot fragmentRoot : ((IJavaProject) moduleContext).getPackageFragmentRoots()) {
+-						fragment = fragmentRoot.getPackageFragment(name);
+-						if (fragment.exists())
+-							requestor.acceptPackageFragment(fragment);
++					IJavaProject javaProject = (IJavaProject) moduleContext;
++					for (IPackageFragmentRoot fragmentRoot : javaProject.getPackageFragmentRoots()) {
++						if (!fragmentRoot.isExternal()) {
++							fragment = fragmentRoot.getPackageFragment(name);
++							if (fragment.exists())
++								requestor.acceptPackageFragment(fragment);
++						}
+ 					}
+ 				} catch (JavaModelException e) {
+ 					// silent
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+index 0609b2d..227be17 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+@@ -861,6 +861,9 @@ public class SearchableEnvironment
+ 					while (moduleContext == null && current != null) {
+ 						switch (current.getElementType()) {
+ 							case IJavaElement.PACKAGE_FRAGMENT_ROOT:
++								if (!((IPackageFragmentRoot) current).isExternal())
++									current = current.getJavaProject();
++								//$FALL-THROUGH$
+ 							case IJavaElement.JAVA_PROJECT:
+ 								moduleContext = current;
+ 								break;

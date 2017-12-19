@@ -1,0 +1,394 @@
+commit cbe2b622e81a27ceffd382724966e1dd065a9d5c
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Jan 23 14:35:27 2014 +0100
+
+    Bug 426290 - [1.8][compiler] Inference + overloading => wrong method
+    resolution ?
+
+27	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+11	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+11	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+39	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/InnerInferenceHelper.java
+6	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+11	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+4	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+19	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+5	2	org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetAllocationExpression.java
+5	2	org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetMessageSend.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+index 1ed82dc..23e475a 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+@@ -1210,4 +1210,31 @@ public void testBug426366() {
+ 			"}\n"
+ 		});
+ }
++public void testBug426290() {
++	runConformTest(
++		new String[] {
++			"X.java",
++			"import java.util.ArrayList;\n" + 
++			"import java.util.List;\n" + 
++			"\n" + 
++			"public class X {\n" + 
++			"    public static void main(String argv[]) {\n" + 
++			"       goo(foo());\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    static <T extends Number> List<T> foo() {\n" + 
++			"        return new ArrayList<T>();\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    static void goo(Object p1) {\n" + 
++			"        System.out.println(\"goo(Object)\");\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    static void goo(List<Integer> p1) {\n" + 
++			"        System.out.println(\"goo(List<Integer>)\");\n" + 
++			"    }\n" + 
++			"}\n"
++		},
++		"goo(List<Integer>)");
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+index 0cf03e8..b34bafd 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+@@ -31,6 +31,7 @@
+  *							Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation
+  *							Bug 424415 - [1.8][compiler] Eventual resolution of ReferenceExpression is not seen to be happening.
+  *							Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple candidate target types in outer overload context
++ *							Bug 426290 - [1.8][compiler] Inference + overloading => wrong method resolution ?
+  *     Jesper S Moller <jesper@selskabet.org> - Contributions for
+  *							bug 378674 - "The method can be declared as static" is wrong
+  *     Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+@@ -70,7 +71,7 @@ public class AllocationExpression extends Expression implements Invocation {
+ 
+ 	 // hold on to this context from invocation applicability inference until invocation type inference (per method candidate):
+ 	private SimpleLookupTable/*<PGMB,IC18>*/ inferenceContexts;
+-	protected boolean innersNeedUpdate; // see Invocation.innersNeedUpdate()
++	protected InnerInferenceHelper innerInferenceHelper;
+ 
+ 	/** Record to keep state between different parts of resolution. */
+ 	ResolutionState suspendedResolutionState;
+@@ -419,8 +420,10 @@ public TypeBinding resolveType(BlockScope scope) {
+ 			if ((argumentTypes[i] = argument.resolveType(scope)) == null) {
+ 				argHasError = true;
+ 			}
+-			if (sourceLevel >= ClassFileConstants.JDK1_8 && argument.isPolyExpression())
+-				this.innersNeedUpdate = true;
++			if (sourceLevel >= ClassFileConstants.JDK1_8 && argument.isPolyExpression()) {
++				if (this.innerInferenceHelper == null)
++					this.innerInferenceHelper = new InnerInferenceHelper();
++			}
+ 		}
+ 		if (argHasError) {
+ 			/* https://bugs.eclipse.org/bugs/show_bug.cgi?id=345359, if arguments have errors, completely bail out in the <> case.
+@@ -736,10 +739,13 @@ public InferenceContext18 getInferenceContext(ParameterizedGenericMethodBinding
+ 	return (InferenceContext18) this.inferenceContexts.get(method);
+ }
+ public boolean innersNeedUpdate() {
+-	return this.innersNeedUpdate;
++	return this.innerInferenceHelper != null;
+ }
+ public void innerUpdateDone() {
+-	this.innersNeedUpdate = false;
++	this.innerInferenceHelper = null;
++}
++public InnerInferenceHelper innerInferenceHelper() {
++	return this.innerInferenceHelper;
+ }
+ 
+ //-- interface InvocationSite: --
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+index 9de1bc3..1ff3c2e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+@@ -24,6 +24,7 @@
+  *								Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation
+  *								Bug 424415 - [1.8][compiler] Eventual resolution of ReferenceExpression is not seen to be happening.
+  *								Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple candidate target types in outer overload context
++ *								Bug 426290 - [1.8][compiler] Inference + overloading => wrong method resolution ?
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 409245 - [1.8][compiler] Type annotations dropped when call is routed through a synthetic bridge method
+  *******************************************************************************/
+@@ -76,7 +77,7 @@ public class ExplicitConstructorCall extends Statement implements Invocation, Ex
+ 
+ 	 // hold on to this context from invocation applicability inference until invocation type inference (per method candidate):
+ 	private SimpleLookupTable/*<PGMB,InferenceContext18>*/ inferenceContexts;
+-	private boolean innersNeedUpdate; // see Invocation.innersNeedUpdate()
++	private InnerInferenceHelper innerInferenceHelper;
+ 
+ 	public ExplicitConstructorCall(int accessMode) {
+ 		this.accessMode = accessMode;
+@@ -391,8 +392,10 @@ public class ExplicitConstructorCall extends Statement implements Invocation, Ex
+ 					if ((argumentTypes[i] = argument.resolveType(scope)) == null) {
+ 						argHasError = true;
+ 					}
+-					if (sourceLevel >= ClassFileConstants.JDK1_8 && argument.isPolyExpression())
+-						this.innersNeedUpdate = true;
++					if (sourceLevel >= ClassFileConstants.JDK1_8 && argument.isPolyExpression()) {
++						if (this.innerInferenceHelper == null)
++							this.innerInferenceHelper = new InnerInferenceHelper();
++					}
+ 				}
+ 				if (argHasError) {
+ 					if (receiverType == null) {
+@@ -528,10 +531,13 @@ public class ExplicitConstructorCall extends Statement implements Invocation, Ex
+ 				&& getInferenceContext((ParameterizedGenericMethodBinding) this.binding) != null;
+ 	}
+ 	public boolean innersNeedUpdate() {
+-		return this.innersNeedUpdate;
++		return this.innerInferenceHelper != null;
+ 	}
+ 	public void innerUpdateDone() {
+-		this.innersNeedUpdate = false;
++		this.innerInferenceHelper = null;
++	}
++	public InnerInferenceHelper innerInferenceHelper() {
++		return this.innerInferenceHelper;
+ 	}
+ 
+ 	// -- interface InvocationSite: --
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/InnerInferenceHelper.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/InnerInferenceHelper.java
+new file mode 100644
+index 0000000..eb56f0a
+--- /dev/null
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/InnerInferenceHelper.java
+@@ -0,0 +1,39 @@
++/*******************************************************************************
++ * Copyright (c) 2014 GK Software AG.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
++ * Contributors:
++ *     Stephan Herrmann - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.compiler.ast;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
++import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
++
++public class InnerInferenceHelper {
++
++	/** For each candidate method store here the array of argument types if inner inference has improved any during Invocation Type Inference. */
++	private Map/*<MethodBinding,TypeBinding[]>*/ argTypesPerCandidate = new HashMap();
++
++	public void registerInnerResult(MethodBinding method, TypeBinding resolvedType, int argCount, int argIdx) {
++		TypeBinding[] argTypes = (TypeBinding[]) this.argTypesPerCandidate.get(method);
++		if (argTypes == null)
++			this.argTypesPerCandidate.put(method, argTypes = new TypeBinding[argCount]);
++		argTypes[argIdx] = resolvedType;
++	}
++	
++	public TypeBinding[] getArgumentTypesForCandidate(MethodBinding candidate, TypeBinding[] plainArgTypes) {
++		TypeBinding[] argTypes = (TypeBinding[]) this.argTypesPerCandidate.get(candidate);
++		return argTypes != null ? argTypes : plainArgTypes;
++	}
++}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+index b58d07c..c33b5d6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+@@ -77,5 +77,11 @@ public interface Invocation extends InvocationSite {
+ 	 * Mark that updating (the need for which is signaled via {@link #innersNeedUpdate()}) has been done.
+ 	 */
+ 	void innerUpdateDone();
++
++	/**
++	 * If this invocation has any poly expressions as arguments, this method answers an inference helper 
++	 * that mediates during overload resolution, even if no actual inference happens for this invocation.
++	 */
++	InnerInferenceHelper innerInferenceHelper();
+ 	
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index e82c8e1..5e3f099 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -45,6 +45,7 @@
+  *								Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation
+  *								Bug 424415 - [1.8][compiler] Eventual resolution of ReferenceExpression is not seen to be happening.
+  *								Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple candidate target types in outer overload context
++ *								Bug 426290 - [1.8][compiler] Inference + overloading => wrong method resolution ?
+  *     Jesper S Moller - Contributions for
+  *								Bug 378674 - "The method can be declared as static" is wrong
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+@@ -109,7 +110,7 @@ public class MessageSend extends Expression implements Invocation {
+ 
+ 	 // hold on to this context from invocation applicability inference until invocation type inference (per method candidate):
+ 	private SimpleLookupTable/*<PGMB,InferenceContext18>*/ inferenceContexts;
+-	protected boolean innersNeedUpdate; // see Invocation.innersNeedUpdate()
++	protected InnerInferenceHelper innerInferenceHelper;
+ 
+ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, FlowInfo flowInfo) {
+ 	boolean nonStatic = !this.binding.isStatic();
+@@ -645,8 +646,10 @@ public TypeBinding resolveType(BlockScope scope) {
+ 			}
+ 			if (sourceLevel >= ClassFileConstants.JDK1_8) {
+ 				if (argument.isPolyExpression()
+-					|| (argument instanceof Invocation && ((Invocation)argument).usesInference()))
+-					this.innersNeedUpdate = true;
++					|| (argument instanceof Invocation && ((Invocation)argument).usesInference())) {
++					if (this.innerInferenceHelper == null)
++						this.innerInferenceHelper = new InnerInferenceHelper();
++				}
+ 			}
+ 		}
+ 		if (argHasError) {
+@@ -992,10 +995,13 @@ public boolean updateBindings(MethodBinding updatedBinding, TypeBinding targetTy
+ 	return hasUpdate;
+ }
+ public boolean innersNeedUpdate() {
+-	return this.innersNeedUpdate;
++	return this.innerInferenceHelper != null;
+ }
+ public void innerUpdateDone() {
+-	this.innersNeedUpdate = false;
++	this.innerInferenceHelper = null;
++}
++public InnerInferenceHelper innerInferenceHelper() {
++	return this.innerInferenceHelper;
+ }
+ // -- Interface InvocationSite: --
+ public InferenceContext18 freshInferenceContext(Scope scope) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+index 32565f9..067094a 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+@@ -411,8 +411,10 @@ public class QualifiedAllocationExpression extends AllocationExpression {
+ 				if ((argumentTypes[i] = argument.resolveType(scope)) == null){
+ 					hasError = true;
+ 				}
+-				if (sourceLevel >= ClassFileConstants.JDK1_8 && argument.isPolyExpression())
+-					this.innersNeedUpdate = true;
++				if (sourceLevel >= ClassFileConstants.JDK1_8 && argument.isPolyExpression()) {
++					if (this.innerInferenceHelper == null)
++						this.innerInferenceHelper = new InnerInferenceHelper();
++				}
+ 			}
+ 		}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index 3f32d0a..b293932 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -28,6 +28,7 @@
+  *								Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation
+  *								Bug 424415 - [1.8][compiler] Eventual resolution of ReferenceExpression is not seen to be happening.
+  *								Bug 426366 - [1.8][compiler] Type inference doesn't handle multiple candidate target types in outer overload context
++ *								Bug 426290 - [1.8][compiler] Inference + overloading => wrong method resolution ?
+  *     Jesper S Moller - Contributions for
+  *								Bug 378674 - "The method can be declared as static" is wrong
+  *  							Bug 405066 - [1.8][compiler][codegen] Implement code generation infrastructure for JSR335
+@@ -775,6 +776,7 @@ public abstract class Scope {
+ 			// collect inner invocations where the outer did not involve any inference:
+ 			Expression[] invocationArguments = invocation.arguments();
+ 			if (invocationArguments != null) {
++				InnerInferenceHelper innerInferenceHelper = invocation.innerInferenceHelper();
+ 				int argLen = invocationArguments.length;
+ 				boolean isVarArgs = false;
+ 				for (int i = 0; i < argLen; i++) {
+@@ -797,7 +799,10 @@ public abstract class Scope {
+ 									invocArg.setExpectedType(targetType);
+ 									MethodBinding solution = infCtx18.inferInvocationType(innerPoly, innerParameterized);
+ 									if (solution != null && solution.isValidBinding()) {
+-										innerPoly.updateBindings(solution, targetType);
++										if (innerPoly.updateBindings(solution, targetType)) {
++											if (innerInferenceHelper != null)
++												innerInferenceHelper.registerInnerResult(method, invocArg.resolvedType, argLen, i);
++										}
+ 										if (solution.returnType != null && solution.returnType.isCompatibleWith(targetType, this))
+ 											return isVarArgs ? VARARGS_COMPATIBLE : COMPATIBLE;
+ 									}
+@@ -4231,8 +4236,10 @@ public abstract class Scope {
+ 
+ 	// caveat: this is not a direct implementation of JLS
+ 	protected final MethodBinding mostSpecificMethodBinding(MethodBinding[] visible, int visibleSize, TypeBinding[] argumentTypes, final InvocationSite invocationSite, ReferenceBinding receiverType) {
+-		// Apply one level of filtering per poly expression more specific rules.
+-		if (compilerOptions().sourceLevel >= ClassFileConstants.JDK1_8) {
++
++		boolean isJdk18 = compilerOptions().sourceLevel >= ClassFileConstants.JDK1_8;
++		if (isJdk18) {
++			// Apply one level of filtering per poly expression more specific rules.
+ 			MethodBinding[] moreSpecific = new MethodBinding[visibleSize];
+ 			int count = 0;
+ 			for (int i = 0, length = argumentTypes.length; i < length; i++) {
+@@ -4270,8 +4277,15 @@ public abstract class Scope {
+ 		// JLS7 implementation  
+ 		
+ 		int[] compatibilityLevels = new int[visibleSize];
+-		for (int i = 0; i < visibleSize; i++)
+-			compatibilityLevels[i] = parameterCompatibilityLevel(visible[i], argumentTypes);
++		for (int i = 0; i < visibleSize; i++) {
++			TypeBinding[] argTypes = argumentTypes;
++			if (isJdk18 && invocationSite instanceof Invocation) {
++				InnerInferenceHelper innerInferenceHelper = ((Invocation)invocationSite).innerInferenceHelper();
++				if (innerInferenceHelper != null)
++					argTypes = innerInferenceHelper.getArgumentTypesForCandidate(visible[i], argumentTypes);
++			}
++			compatibilityLevels[i] = parameterCompatibilityLevel(visible[i], argTypes);
++		}
+ 
+ 		InvocationSite tieBreakInvocationSite = new InvocationSite() {
+ 			public TypeBinding[] genericTypeArguments() { return null; } // ignore genericTypeArgs
+diff --git a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetAllocationExpression.java b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetAllocationExpression.java
+index caf547b..6f89ed4 100644
+--- a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetAllocationExpression.java
++++ b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetAllocationExpression.java
+@@ -25,6 +25,7 @@ import org.eclipse.jdt.internal.compiler.ast.ASTNode;
+ import org.eclipse.jdt.internal.compiler.ast.AllocationExpression;
+ import org.eclipse.jdt.internal.compiler.ast.CastExpression;
+ import org.eclipse.jdt.internal.compiler.ast.Expression;
++import org.eclipse.jdt.internal.compiler.ast.InnerInferenceHelper;
+ import org.eclipse.jdt.internal.compiler.ast.ParameterizedQualifiedTypeReference;
+ import org.eclipse.jdt.internal.compiler.ast.TypeReference;
+ import org.eclipse.jdt.internal.compiler.ast.Wildcard;
+@@ -201,8 +202,10 @@ public TypeBinding resolveType(BlockScope scope) {
+ 			if ((argumentType = argumentTypes[i] = argument.resolveType(scope)) == null) {
+ 				argHasError = true;
+ 			}
+-			if (argumentType != null && argumentType.kind() == Binding.POLY_TYPE)
+-				this.innersNeedUpdate = true;
++			if (argumentType != null && argumentType.kind() == Binding.POLY_TYPE) {
++				if (this.innerInferenceHelper == null)
++					this.innerInferenceHelper = new InnerInferenceHelper();
++			}
+ 		}
+ 		if (argHasError) {
+ 			return this.resolvedType;
+diff --git a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetMessageSend.java b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetMessageSend.java
+index 0173feb..b16a22e 100644
+--- a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetMessageSend.java
++++ b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetMessageSend.java
+@@ -24,6 +24,7 @@ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.ast.ASTNode;
+ import org.eclipse.jdt.internal.compiler.ast.CastExpression;
+ import org.eclipse.jdt.internal.compiler.ast.Expression;
++import org.eclipse.jdt.internal.compiler.ast.InnerInferenceHelper;
+ import org.eclipse.jdt.internal.compiler.ast.MessageSend;
+ import org.eclipse.jdt.internal.compiler.ast.NameReference;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+@@ -239,8 +240,10 @@ public TypeBinding resolveType(BlockScope scope) {
+ 			argument.setExpressionContext(INVOCATION_CONTEXT);
+ 			if ((argumentType = argumentTypes[i] = this.arguments[i].resolveType(scope)) == null)
+ 				argHasError = true;
+-			if (argumentType != null && argumentType.kind() == Binding.POLY_TYPE)
+-				this.innersNeedUpdate = true;
++			if (argumentType != null && argumentType.kind() == Binding.POLY_TYPE) {
++				if (this.innerInferenceHelper == null)
++					this.innerInferenceHelper = new InnerInferenceHelper();
++			}
+ 		}
+ 		if (argHasError) {
+ 			if(this.actualReceiverType instanceof ReferenceBinding) {

@@ -1,0 +1,869 @@
+commit 22969d7e2941e3aebc18ff88c8cc4fc9664353f9
+Author: Mikael Barbero <mikael@eclipse.org>
+Date:   Tue Nov 15 15:46:36 2016 +0100
+
+    Bug 498116 - Replace fixed check for updates scheduler with a fuzzy one
+    
+    Checking the servers for update at a fixed time on fixed day of the week
+    can kneel the servers. However, activating automatic check for updates
+    on EPP packages is only possible by specifying a fix day and hour (see
+    bug 421779 for the decision).
+    
+    This patch replace the fixed time of the day/week of the day way check
+    for updates are scheduled. Users can choose to check "once a day", "once
+    a week" or "once a month". The initial time used for next checks is the
+    time when the user activates the option. However, it never checks for
+    update exactly after a day, a week or a month. It introduces some
+    randomness:
+    
+    - If the delay for checking for update is passed, it schedules a check
+    sometime in the next 8 hours.
+    - If the delay is well overpassed (see definition of "well overpassed"
+    below), it schedules a check in the next hour.
+    
+    The delay is considered "well overpassed" depending on the recurrence of
+    the check:
+    - If the recurrence is "once a day", the delay is considered overpassed
+    after a day and 6 hours.
+    - If the recurrence is "once a week", the delay is considered overpassed
+    after a week and 2 days.
+    - If the recurrence is "once a month", the delay is considered
+    overpassed after a week and 6 days.
+    
+    It also migrates automatically the fixed weekday/time preferences to the
+    new fuzzy scheduler.
+    
+    Change-Id: I74a8bfba6b711e98eb795c1f924840e68789f102
+    Signed-off-by: Mikael Barbero <mikael@eclipse.org>
+    Signed-off-by: Pascal Rapicault <pascal@rapicorp.com>
+
+0	2	bundles/org.eclipse.equinox.p2.tests/build.properties
+4	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/updatechecker/TestUpdateListener.java
+7	33	bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdateMessages.java
+48	114	bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdateScheduler.java
+6	1	bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdater.java
+45	50	bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdatesPreferencePage.java
+70	0	bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/LastAutoCheckForUpdateMemo.java
+4	1	bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/PreferenceConstants.java
+21	0	bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/PreferenceInitializer.java
+8	34	bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/messages.properties
+3	2	bundles/org.eclipse.equinox.p2.updatechecker/src/org/eclipse/equinox/internal/p2/updatechecker/UpdateChecker.java
+4	1	bundles/org.eclipse.equinox.p2.updatechecker/src/org/eclipse/equinox/internal/provisional/p2/updatechecker/IUpdateListener.java
+diff --git a/bundles/org.eclipse.equinox.p2.tests/build.properties b/bundles/org.eclipse.equinox.p2.tests/build.properties
+index 5ab8fbb..b44b97c 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/build.properties
++++ b/bundles/org.eclipse.equinox.p2.tests/build.properties
+@@ -20,5 +20,3 @@ bin.includes = META-INF/,\
+ customCallBack=foo.xml
+ src.includes = about.html
+ javacWarnings..=-raw,-unchecked,-varargsCast
+-javacTarget=1.5
+-javacSource=1.5
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/updatechecker/TestUpdateListener.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/updatechecker/TestUpdateListener.java
+index 84ec938..d80cc0a 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/updatechecker/TestUpdateListener.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/updatechecker/TestUpdateListener.java
+@@ -67,4 +67,8 @@ public class TestUpdateListener implements IUpdateListener {
+ 	public void reset() {
+ 		expectedCount = unexpectedCount = 0;
+ 	}
++
++	@Override
++	public void checkingForUpdates() {
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdateMessages.java b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdateMessages.java
+index bbfd89c..7b0b810 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdateMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdateMessages.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2014 IBM Corporation and others.
++ * Copyright (c) 2008, 2016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -8,6 +8,7 @@
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Christian Georgi <christian.georgi@sap.com> - Bug 432887 - Setting to show update wizard w/o notification popup
++ *     Mikael Barbero (Eclipse Foundation) - Bug 498116
+  *******************************************************************************/
+ 
+ package org.eclipse.equinox.internal.p2.ui.sdk.scheduler;
+@@ -25,38 +26,10 @@ public class AutomaticUpdateMessages extends NLS {
+ 		// load message values from bundle file
+ 		NLS.initializeMessages(BUNDLE_NAME, AutomaticUpdateMessages.class);
+ 	}
+-	public static String SchedulerStartup_day;
+-	public static String SchedulerStartup_Monday;
+-	public static String SchedulerStartup_Tuesday;
+-	public static String SchedulerStartup_Wednesday;
+-	public static String SchedulerStartup_Thursday;
+-	public static String SchedulerStartup_Friday;
+-	public static String SchedulerStartup_Saturday;
+-	public static String SchedulerStartup_Sunday;
+-	public static String SchedulerStartup_1AM;
+-	public static String SchedulerStartup_2AM;
+-	public static String SchedulerStartup_3AM;
+-	public static String SchedulerStartup_4AM;
+-	public static String SchedulerStartup_5AM;
+-	public static String SchedulerStartup_6AM;
+-	public static String SchedulerStartup_7AM;
+-	public static String SchedulerStartup_8AM;
+-	public static String SchedulerStartup_9AM;
+-	public static String SchedulerStartup_10AM;
+-	public static String SchedulerStartup_11AM;
+-	public static String SchedulerStartup_12PM;
+-	public static String SchedulerStartup_1PM;
+-	public static String SchedulerStartup_2PM;
+-	public static String SchedulerStartup_3PM;
+-	public static String SchedulerStartup_4PM;
+-	public static String SchedulerStartup_5PM;
+-	public static String SchedulerStartup_6PM;
+-	public static String SchedulerStartup_7PM;
+-	public static String SchedulerStartup_8PM;
+-	public static String SchedulerStartup_9PM;
+-	public static String SchedulerStartup_10PM;
+-	public static String SchedulerStartup_11PM;
+-	public static String SchedulerStartup_12AM;
++	public static String Pre_neon2_pref_value_everyday;
++	public static String SchedulerStartup_OnceADay;
++	public static String SchedulerStartup_OnceAWeek;
++	public static String SchedulerStartup_OnceAMonth;
+ 	public static String AutomaticUpdatesPopup_PrefLinkOnly;
+ 	public static String AutomaticUpdatesPopup_RemindAndPrefLink;
+ 	public static String AutomaticUpdatesPopup_ReminderJobTitle;
+@@ -78,6 +51,7 @@ public class AutomaticUpdateMessages extends NLS {
+ 	public static String AutomaticUpdatesPreferencePage_downloadAndNotify;
+ 	public static String AutomaticUpdatesPreferencePage_at;
+ 	public static String AutomaticUpdatesPreferencePage_GenericProductName;
++	public static String AutomaticUpdatesPreferencePage_never;
+ 	public static String AutomaticUpdatesPreferencePage_RemindGroup;
+ 	public static String AutomaticUpdatesPreferencePage_RemindSchedule;
+ 	public static String AutomaticUpdatesPreferencePage_RemindOnce;
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdateScheduler.java b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdateScheduler.java
+index d58bb52..c01c8c7 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdateScheduler.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdateScheduler.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2015 IBM Corporation and others.
++ * Copyright (c) 2008, 2016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -10,12 +10,14 @@
+  *     Ericsson AB - (Pascal Rapicault)
+  *     Ericsson AB   (Hamdan Msheik) - Bug 398833
+  *     Red Hat Inc. - Bug 460967
++ *     Mikael Barbero (Eclipse Foundation) - Bug 498116
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.ui.sdk.scheduler;
+ 
+-import com.ibm.icu.util.Calendar;
+-import com.ibm.icu.util.ULocale;
+-import org.eclipse.core.runtime.*;
++import java.util.Date;
++import java.util.Random;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.Status;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.garbagecollector.GarbageCollector;
+ import org.eclipse.equinox.internal.p2.ui.sdk.scheduler.migration.MigrationSupport;
+@@ -38,35 +40,17 @@ import org.eclipse.ui.statushandlers.StatusManager;
+ public class AutomaticUpdateScheduler implements IStartup {
+ 	public static final String MIGRATION_DIALOG_SHOWN = "migrationDialogShown"; //$NON-NLS-1$
+ 
+-	// values are to be picked up from the arrays DAYS and HOURS
+-	public static final String P_DAY = "day"; //$NON-NLS-1$
++	public static final String P_FUZZY_RECURRENCE = "fuzzy_recurrence"; //$NON-NLS-1$
+ 
+-	public static final String P_HOUR = "hour"; //$NON-NLS-1$
++	public static final String[] FUZZY_RECURRENCE = {AutomaticUpdateMessages.SchedulerStartup_OnceADay, AutomaticUpdateMessages.SchedulerStartup_OnceAWeek, AutomaticUpdateMessages.SchedulerStartup_OnceAMonth};
+ 
+-	public static final String[] DAYS;
+-
+-	public static final String[] HOURS = {AutomaticUpdateMessages.SchedulerStartup_1AM, AutomaticUpdateMessages.SchedulerStartup_2AM, AutomaticUpdateMessages.SchedulerStartup_3AM, AutomaticUpdateMessages.SchedulerStartup_4AM, AutomaticUpdateMessages.SchedulerStartup_5AM, AutomaticUpdateMessages.SchedulerStartup_6AM, AutomaticUpdateMessages.SchedulerStartup_7AM, AutomaticUpdateMessages.SchedulerStartup_8AM, AutomaticUpdateMessages.SchedulerStartup_9AM, AutomaticUpdateMessages.SchedulerStartup_10AM, AutomaticUpdateMessages.SchedulerStartup_11AM, AutomaticUpdateMessages.SchedulerStartup_12PM, AutomaticUpdateMessages.SchedulerStartup_1PM, AutomaticUpdateMessages.SchedulerStartup_2PM, AutomaticUpdateMessages.SchedulerStartup_3PM, AutomaticUpdateMessages.SchedulerStartup_4PM,
+-			AutomaticUpdateMessages.SchedulerStartup_5PM, AutomaticUpdateMessages.SchedulerStartup_6PM, AutomaticUpdateMessages.SchedulerStartup_7PM, AutomaticUpdateMessages.SchedulerStartup_8PM, AutomaticUpdateMessages.SchedulerStartup_9PM, AutomaticUpdateMessages.SchedulerStartup_10PM, AutomaticUpdateMessages.SchedulerStartup_11PM, AutomaticUpdateMessages.SchedulerStartup_12AM,};
++	private static final int ONE_HOUR_IN_MS = 60 * 60 * 1000;
++	private static final int ONE_DAY_IN_MS = 24 * ONE_HOUR_IN_MS;
+ 
+ 	private IUpdateListener listener = null;
+ 	private IUpdateChecker checker = null;
+ 	String profileId;
+ 
+-	static {
+-		Calendar calendar = Calendar.getInstance(new ULocale(Platform.getNL()));
+-		String[] daysAsStrings = {AutomaticUpdateMessages.SchedulerStartup_day, AutomaticUpdateMessages.SchedulerStartup_Sunday, AutomaticUpdateMessages.SchedulerStartup_Monday, AutomaticUpdateMessages.SchedulerStartup_Tuesday, AutomaticUpdateMessages.SchedulerStartup_Wednesday, AutomaticUpdateMessages.SchedulerStartup_Thursday, AutomaticUpdateMessages.SchedulerStartup_Friday, AutomaticUpdateMessages.SchedulerStartup_Saturday};
+-		int firstDay = calendar.getFirstDayOfWeek();
+-		DAYS = new String[8];
+-		DAYS[0] = daysAsStrings[0];
+-		int countDays = 0;
+-		for (int i = firstDay; i <= 7; i++) {
+-			DAYS[++countDays] = daysAsStrings[i];
+-		}
+-		for (int i = 1; i < firstDay; i++) {
+-			DAYS[++countDays] = daysAsStrings[i];
+-		}
+-	}
+-
+ 	/**
+ 	 * The constructor.
+ 	 */
+@@ -148,8 +132,10 @@ public class AutomaticUpdateScheduler implements IStartup {
+ 		long delay = IUpdateChecker.ONE_TIME_CHECK;
+ 		long poll = IUpdateChecker.ONE_TIME_CHECK;
+ 		if (!schedule.equals(PreferenceConstants.PREF_UPDATE_ON_STARTUP)) {
+-			delay = computeDelay(pref);
+-			poll = computePoll(pref);
++			if (schedule.equals(PreferenceConstants.PREF_UPDATE_ON_FUZZY_SCHEDULE)) {
++				delay = computeFuzzyDelay(pref);
++				poll = computeFuzzyPoll(pref);
++			}
+ 		}
+ 		// We do not access the AutomaticUpdater directly when we register
+ 		// the listener. This prevents the UI classes from being started up
+@@ -160,6 +146,9 @@ public class AutomaticUpdateScheduler implements IStartup {
+ 				AutomaticUpdatePlugin.getDefault().getAutomaticUpdater().updatesAvailable(event);
+ 			}
+ 
++			public void checkingForUpdates() {
++				AutomaticUpdatePlugin.getDefault().getAutomaticUpdater().checkingForUpdates();
++			}
+ 		};
+ 		checker.addUpdateCheck(profileId, getProfileQuery(), delay, poll, listener);
+ 
+@@ -171,98 +160,43 @@ public class AutomaticUpdateScheduler implements IStartup {
+ 		return new IUProfilePropertyQuery(IProfile.PROP_PROFILE_ROOT_IU, Boolean.TRUE.toString());
+ 	}
+ 
+-	private int getDay(IPreferenceStore pref) {
+-		String day = pref.getString(P_DAY);
+-		for (int d = 0; d < DAYS.length; d++)
+-			if (DAYS[d].equals(day))
+-				switch (d) {
+-					case 0 :
+-						return -1;
+-					case 1 :
+-						return Calendar.MONDAY;
+-					case 2 :
+-						return Calendar.TUESDAY;
+-					case 3 :
+-						return Calendar.WEDNESDAY;
+-					case 4 :
+-						return Calendar.THURSDAY;
+-					case 5 :
+-						return Calendar.FRIDAY;
+-					case 6 :
+-						return Calendar.SATURDAY;
+-					case 7 :
+-						return Calendar.SUNDAY;
+-				}
+-		return -1;
+-	}
+-
+-	private int getHour(IPreferenceStore pref) {
+-		String hour = pref.getString(P_HOUR);
+-		for (int h = 0; h < HOURS.length; h++)
+-			if (HOURS[h].equals(hour))
+-				return h + 1;
+-		return 1;
++	private static long computeFuzzyDelay(IPreferenceStore pref) {
++		Date nowDate = java.util.Calendar.getInstance().getTime();
++		long now = nowDate.getTime();
++		long lastCheckForUpdateSinceEpoch = new LastAutoCheckForUpdateMemo(AutomaticUpdatePlugin.getDefault().getAgentLocation()).readAndStoreIfAbsent(nowDate).getTime();
++		long poll = computeFuzzyPoll(pref);
++		if (now - lastCheckForUpdateSinceEpoch >= poll + getMaxDelay(pref)) {
++			// Last check for update has exceeded the max delay we allow,
++			// let's do it sometime in the next hour.
++			return new Random().nextInt(ONE_HOUR_IN_MS);
++		}
++		long delay = now - lastCheckForUpdateSinceEpoch;
++		// We do delay the next check sometime in the 8 hours after the computed schedule
++		return poll - delay + new Random().nextInt(8 * ONE_HOUR_IN_MS);
+ 	}
+ 
+-	/*
+-	 * Computes the number of milliseconds from this moment to the next
+-	 * scheduled update check. If that moment has already passed, returns 0L (start
+-	 * immediately).
+-	 */
+-	private long computeDelay(IPreferenceStore pref) {
+-
+-		int target_d = getDay(pref);
+-		int target_h = getHour(pref);
+-
+-		Calendar calendar = Calendar.getInstance();
+-		// may need to use the BootLoader locale
+-		int current_d = calendar.get(Calendar.DAY_OF_WEEK);
+-		// starts with SUNDAY
+-		int current_h = calendar.get(Calendar.HOUR_OF_DAY);
+-		int current_m = calendar.get(Calendar.MINUTE);
+-		int current_s = calendar.get(Calendar.SECOND);
+-		int current_ms = calendar.get(Calendar.MILLISECOND);
+-
+-		long delay = 0L; // milliseconds
+-
+-		if (target_d == -1) {
+-			// Compute the delay for "every day at x o'clock"
+-			// Is it now ?
+-			if (target_h == current_h && current_m == 0 && current_s == 0)
+-				return delay;
+-
+-			int delta_h = target_h - current_h;
+-			if (target_h <= current_h)
+-				delta_h += 24;
+-			delay = ((delta_h * 60 - current_m) * 60 - current_s) * 1000 - current_ms;
+-			return delay;
++	private static long getMaxDelay(IPreferenceStore pref) {
++		String recurrence = pref.getString(P_FUZZY_RECURRENCE);
++		if (AutomaticUpdateMessages.SchedulerStartup_OnceADay.equals(recurrence)) {
++			return 6 * ONE_HOUR_IN_MS;
++		} else if (AutomaticUpdateMessages.SchedulerStartup_OnceAWeek.equals(recurrence)) {
++			return 2 * ONE_DAY_IN_MS;
++		} else { // Once a month
++			return 6 * ONE_DAY_IN_MS;
+ 		}
+-		// Compute the delay for "every Xday at x o'clock"
+-		// Is it now ?
+-		if (target_d == current_d && target_h == current_h && current_m == 0 && current_s == 0)
+-			return delay;
+-
+-		int delta_d = target_d - current_d;
+-		if (target_d < current_d || target_d == current_d && (target_h < current_h || target_h == current_h && current_m > 0))
+-			delta_d += 7;
+-
+-		delay = (((delta_d * 24 + target_h - current_h) * 60 - current_m) * 60 - current_s) * 1000 - current_ms;
+-		return delay;
+ 	}
+ 
+-	/*
+-	 * Computes the number of milliseconds for the polling frequency.
+-	 * We have already established that there is a schedule, vs. only
+-	 * on startup.
+-	 */
+-	private long computePoll(IPreferenceStore pref) {
+-
+-		int target_d = getDay(pref);
+-		if (target_d == -1) {
+-			// Every 24 hours
+-			return 24 * 60 * 60 * 1000;
++	private static long computeFuzzyPoll(IPreferenceStore pref) {
++		String recurrence = pref.getString(P_FUZZY_RECURRENCE);
++		if (AutomaticUpdateMessages.SchedulerStartup_OnceADay.equals(recurrence)) {
++			return ONE_DAY_IN_MS;
++		} else if (AutomaticUpdateMessages.SchedulerStartup_OnceAWeek.equals(recurrence)) {
++			return 7 * ONE_DAY_IN_MS;
++		} else { // Once a month
++			// It's not rocket science we're doing here,
++			// let's approximate that a month is always 30 days long
++			return 30 * ONE_DAY_IN_MS;
+ 		}
+-		return 7 * 24 * 60 * 60 * 1000;
+ 	}
+ 
+ 	private void removeUpdateListener() {
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdater.java b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdater.java
+index 33c6ea2..eb25a48 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdater.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdater.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2015 IBM Corporation and others.
++ * Copyright (c) 2008, 2016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -9,6 +9,7 @@
+  *     IBM Corporation - initial API and implementation
+  *     Sonatype, Inc. - ongoing development
+  *     Christian Georgi <christian.georgi@sap.com> - Bug 432887 - Setting to show update wizard w/o notification popup
++ *     Mikael Barbero (Eclipse Foundation) - Bug 498116
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.ui.sdk.scheduler;
+ 
+@@ -91,6 +92,10 @@ public class AutomaticUpdater implements IUpdateListener {
+ 		updatesAvailable(event, true);
+ 	}
+ 
++	public void checkingForUpdates() {
++		new LastAutoCheckForUpdateMemo(AutomaticUpdatePlugin.getDefault().getAgentLocation()).store(Calendar.getInstance().getTime());
++	}
++
+ 	void updatesAvailable(final UpdateEvent event, final boolean notifyWithPopup) {
+ 		final boolean download = getPreferenceStore().getBoolean(PreferenceConstants.PREF_DOWNLOAD_ONLY);
+ 		profileId = event.getProfileId();
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdatesPreferencePage.java b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdatesPreferencePage.java
+index b590e97..516d17f 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdatesPreferencePage.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/AutomaticUpdatesPreferencePage.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- *  Copyright (c) 2007, 2014 IBM Corporation and others.
++ *  Copyright (c) 2007, 2016 IBM Corporation and others.
+  *  All rights reserved. This program and the accompanying materials
+  *  are made available under the terms of the Eclipse Public License v1.0
+  *  which accompanies this distribution, and is available at
+@@ -9,9 +9,14 @@
+  *     IBM Corporation - initial API and implementation
+  *     Johannes Michler <orgler@gmail.com> - Bug 321568 -  [ui] Preference for automatic-update-reminder doesn't work in multilanguage-environments
+  *     Christian Georgi <christian.georgi@sap.com> - Bug 432887 - Setting to show update wizard w/o notification popup
++ *     Mikael Barbero (Eclipse Foundation) - Bug 498116
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.ui.sdk.scheduler;
+ 
++import com.ibm.icu.util.Calendar;
++import java.text.DateFormat;
++import java.util.Date;
++import java.util.Locale;
+ import org.eclipse.core.runtime.IProduct;
+ import org.eclipse.core.runtime.Platform;
+ import org.eclipse.jface.dialogs.Dialog;
+@@ -37,10 +42,8 @@ public class AutomaticUpdatesPreferencePage extends PreferencePage implements IW
+ 
+ 	private Button enabledCheck;
+ 	private Button showUpdateWizard;
+-	private Button onStartupRadio, onScheduleRadio;
+-	private Combo dayCombo;
+-	private Label atLabel;
+-	private Combo hourCombo;
++	private Button onStartupRadio, onFuzzyScheduleRadio;
++	private Combo fuzzyRecurrenceCombo;
+ 	private Button searchOnlyRadio, searchAndDownloadRadio;
+ 	private Button remindOnceRadio, remindScheduleRadio;
+ 	private Combo remindElapseCombo;
+@@ -64,7 +67,7 @@ public class AutomaticUpdatesPreferencePage extends PreferencePage implements IW
+ 		createSpacer(container, 1);
+ 
+ 		updateScheduleGroup = new Group(container, SWT.NONE);
+-		updateScheduleGroup.setText(AutomaticUpdateMessages.AutomaticUpdatesPreferencePage_UpdateSchedule);
++		updateScheduleGroup.setText(NLS.bind(AutomaticUpdateMessages.AutomaticUpdatesPreferencePage_UpdateSchedule, lastCheckForUpdateDateString()));
+ 		layout = new GridLayout();
+ 		layout.numColumns = 3;
+ 		updateScheduleGroup.setLayout(layout);
+@@ -84,31 +87,24 @@ public class AutomaticUpdatesPreferencePage extends PreferencePage implements IW
+ 			}
+ 		});
+ 
+-		onScheduleRadio = new Button(updateScheduleGroup, SWT.RADIO);
+-		onScheduleRadio.setText(AutomaticUpdateMessages.AutomaticUpdatesPreferencePage_findOnSchedule);
++		onFuzzyScheduleRadio = new Button(updateScheduleGroup, SWT.RADIO);
++		onFuzzyScheduleRadio.setText(AutomaticUpdateMessages.AutomaticUpdatesPreferencePage_findOnSchedule);
+ 		gd = new GridData();
+ 		gd.horizontalSpan = 3;
+-		onScheduleRadio.setLayoutData(gd);
+-		onScheduleRadio.addSelectionListener(new SelectionAdapter() {
++		onFuzzyScheduleRadio.setLayoutData(gd);
++		onFuzzyScheduleRadio.addSelectionListener(new SelectionAdapter() {
+ 			public void widgetSelected(SelectionEvent e) {
+ 				pageChanged();
+ 			}
+ 		});
+ 
+-		dayCombo = new Combo(updateScheduleGroup, SWT.READ_ONLY);
+-		dayCombo.setItems(AutomaticUpdateScheduler.DAYS);
++		fuzzyRecurrenceCombo = new Combo(updateScheduleGroup, SWT.READ_ONLY);
++		fuzzyRecurrenceCombo.setItems(AutomaticUpdateScheduler.FUZZY_RECURRENCE);
+ 		gd = new GridData();
+ 		gd.widthHint = 200;
+ 		gd.horizontalIndent = 30;
+-		dayCombo.setLayoutData(gd);
+-
+-		atLabel = new Label(updateScheduleGroup, SWT.NULL);
+-		atLabel.setText(AutomaticUpdateMessages.AutomaticUpdatesPreferencePage_at);
+-
+-		hourCombo = new Combo(updateScheduleGroup, SWT.READ_ONLY);
+-		hourCombo.setItems(AutomaticUpdateScheduler.HOURS);
+-		gd = new GridData();
+-		hourCombo.setLayoutData(gd);
++		gd.horizontalSpan = 3;
++		fuzzyRecurrenceCombo.setLayoutData(gd);
+ 
+ 		createSpacer(container, 1);
+ 
+@@ -199,6 +195,16 @@ public class AutomaticUpdatesPreferencePage extends PreferencePage implements IW
+ 		return container;
+ 	}
+ 
++	private static String lastCheckForUpdateDateString() {
++		Date lastCheckDate = new LastAutoCheckForUpdateMemo(AutomaticUpdatePlugin.getDefault().getAgentLocation()).read();
++		if (lastCheckDate == null) {
++			return AutomaticUpdateMessages.AutomaticUpdatesPreferencePage_never;
++		}
++
++		DateFormat formatter = DateFormat.getDateTimeInstance(DateFormat.DEFAULT, DateFormat.SHORT, Locale.getDefault());
++		return formatter.format(lastCheckDate);
++	}
++
+ 	protected void createSpacer(Composite composite, int columnSpan) {
+ 		Label label = new Label(composite, SWT.NONE);
+ 		GridData gd = new GridData();
+@@ -211,8 +217,7 @@ public class AutomaticUpdatesPreferencePage extends PreferencePage implements IW
+ 		enabledCheck.setSelection(pref.getBoolean(PreferenceConstants.PREF_AUTO_UPDATE_ENABLED));
+ 		setSchedule(pref.getString(PreferenceConstants.PREF_AUTO_UPDATE_SCHEDULE));
+ 
+-		dayCombo.setText(AutomaticUpdateScheduler.DAYS[getDay(pref, false)]);
+-		hourCombo.setText(AutomaticUpdateScheduler.HOURS[getHour(pref, false)]);
++		fuzzyRecurrenceCombo.setText(AutomaticUpdateScheduler.FUZZY_RECURRENCE[getFuzzyRecurrence(pref, false)]);
+ 
+ 		remindScheduleRadio.setSelection(pref.getBoolean(PreferenceConstants.PREF_REMIND_SCHEDULE));
+ 		remindOnceRadio.setSelection(!pref.getBoolean(PreferenceConstants.PREF_REMIND_SCHEDULE));
+@@ -225,20 +230,19 @@ public class AutomaticUpdatesPreferencePage extends PreferencePage implements IW
+ 	}
+ 
+ 	private void setSchedule(String value) {
+-		if (value.equals(PreferenceConstants.PREF_UPDATE_ON_STARTUP))
++		if (value.equals(PreferenceConstants.PREF_UPDATE_ON_STARTUP)) {
+ 			onStartupRadio.setSelection(true);
+-		else
+-			onScheduleRadio.setSelection(true);
++		} else {
++			onFuzzyScheduleRadio.setSelection(true);
++		}
+ 	}
+ 
+ 	void pageChanged() {
+ 		boolean master = enabledCheck.getSelection();
+ 		updateScheduleGroup.setEnabled(master);
+ 		onStartupRadio.setEnabled(master);
+-		onScheduleRadio.setEnabled(master);
+-		dayCombo.setEnabled(master && onScheduleRadio.getSelection());
+-		atLabel.setEnabled(master && onScheduleRadio.getSelection());
+-		hourCombo.setEnabled(master && onScheduleRadio.getSelection());
++		onFuzzyScheduleRadio.setEnabled(master);
++		fuzzyRecurrenceCombo.setEnabled(master && onFuzzyScheduleRadio.getSelection());
+ 		downloadGroup.setEnabled(master);
+ 		searchOnlyRadio.setEnabled(master);
+ 		searchAndDownloadRadio.setEnabled(master);
+@@ -255,10 +259,6 @@ public class AutomaticUpdatesPreferencePage extends PreferencePage implements IW
+ 		enabledCheck.setSelection(pref.getDefaultBoolean(PreferenceConstants.PREF_AUTO_UPDATE_ENABLED));
+ 
+ 		setSchedule(pref.getDefaultString(PreferenceConstants.PREF_AUTO_UPDATE_SCHEDULE));
+-		onScheduleRadio.setSelection(pref.getDefaultBoolean(PreferenceConstants.PREF_AUTO_UPDATE_SCHEDULE));
+-
+-		dayCombo.setText(AutomaticUpdateScheduler.DAYS[getDay(pref, true)]);
+-		hourCombo.setText(AutomaticUpdateScheduler.HOURS[getHour(pref, true)]);
+ 
+ 		remindOnceRadio.setSelection(!pref.getDefaultBoolean(PreferenceConstants.PREF_REMIND_SCHEDULE));
+ 		remindScheduleRadio.setSelection(pref.getDefaultBoolean(PreferenceConstants.PREF_REMIND_SCHEDULE));
+@@ -278,10 +278,14 @@ public class AutomaticUpdatesPreferencePage extends PreferencePage implements IW
+ 	public boolean performOk() {
+ 		IPreferenceStore pref = AutomaticUpdatePlugin.getDefault().getPreferenceStore();
+ 		pref.setValue(PreferenceConstants.PREF_AUTO_UPDATE_ENABLED, enabledCheck.getSelection());
+-		if (onStartupRadio.getSelection())
++		if (onStartupRadio.getSelection()) {
+ 			pref.setValue(PreferenceConstants.PREF_AUTO_UPDATE_SCHEDULE, PreferenceConstants.PREF_UPDATE_ON_STARTUP);
+-		else
++		} else if (onFuzzyScheduleRadio.getSelection()) {
++			pref.setValue(PreferenceConstants.PREF_AUTO_UPDATE_SCHEDULE, PreferenceConstants.PREF_UPDATE_ON_FUZZY_SCHEDULE);
++			new LastAutoCheckForUpdateMemo(AutomaticUpdatePlugin.getDefault().getAgentLocation()).readAndStoreIfAbsent(Calendar.getInstance().getTime());
++		} else {
+ 			pref.setValue(PreferenceConstants.PREF_AUTO_UPDATE_SCHEDULE, PreferenceConstants.PREF_UPDATE_ON_SCHEDULE);
++		}
+ 
+ 		if (remindScheduleRadio.getSelection()) {
+ 			pref.setValue(PreferenceConstants.PREF_REMIND_SCHEDULE, true);
+@@ -290,8 +294,7 @@ public class AutomaticUpdatesPreferencePage extends PreferencePage implements IW
+ 			pref.setValue(PreferenceConstants.PREF_REMIND_SCHEDULE, false);
+ 		}
+ 
+-		pref.setValue(AutomaticUpdateScheduler.P_DAY, dayCombo.getText());
+-		pref.setValue(AutomaticUpdateScheduler.P_HOUR, hourCombo.getText());
++		pref.setValue(AutomaticUpdateScheduler.P_FUZZY_RECURRENCE, fuzzyRecurrenceCombo.getText());
+ 
+ 		pref.setValue(PreferenceConstants.PREF_DOWNLOAD_ONLY, searchAndDownloadRadio.getSelection());
+ 
+@@ -302,18 +305,10 @@ public class AutomaticUpdatesPreferencePage extends PreferencePage implements IW
+ 		return true;
+ 	}
+ 
+-	private int getDay(IPreferenceStore pref, boolean useDefault) {
+-		String day = useDefault ? pref.getDefaultString(AutomaticUpdateScheduler.P_DAY) : pref.getString(AutomaticUpdateScheduler.P_DAY);
+-		for (int i = 0; i < AutomaticUpdateScheduler.DAYS.length; i++)
+-			if (AutomaticUpdateScheduler.DAYS[i].equals(day))
+-				return i;
+-		return 0;
+-	}
+-
+-	private int getHour(IPreferenceStore pref, boolean useDefault) {
+-		String hour = useDefault ? pref.getDefaultString(AutomaticUpdateScheduler.P_HOUR) : pref.getString(AutomaticUpdateScheduler.P_HOUR);
+-		for (int i = 0; i < AutomaticUpdateScheduler.HOURS.length; i++)
+-			if (AutomaticUpdateScheduler.HOURS[i].equals(hour))
++	private int getFuzzyRecurrence(IPreferenceStore pref, boolean useDefault) {
++		String day = useDefault ? pref.getDefaultString(AutomaticUpdateScheduler.P_FUZZY_RECURRENCE) : pref.getString(AutomaticUpdateScheduler.P_FUZZY_RECURRENCE);
++		for (int i = 0; i < AutomaticUpdateScheduler.FUZZY_RECURRENCE.length; i++)
++			if (AutomaticUpdateScheduler.FUZZY_RECURRENCE[i].equals(day))
+ 				return i;
+ 		return 0;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/LastAutoCheckForUpdateMemo.java b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/LastAutoCheckForUpdateMemo.java
+new file mode 100644
+index 0000000..00f1247
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/LastAutoCheckForUpdateMemo.java
+@@ -0,0 +1,70 @@
++/*******************************************************************************
++ * Copyright (c) 2016 Eclipse Foundation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     Mikael Barbero (Eclipse Foundation) - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.ui.sdk.scheduler;
++
++import java.text.ParseException;
++import java.text.SimpleDateFormat;
++import java.util.Date;
++import java.util.Locale;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.Status;
++import org.eclipse.equinox.p2.core.IAgentLocation;
++import org.eclipse.equinox.p2.engine.IProfileRegistry;
++import org.eclipse.equinox.p2.engine.ProfileScope;
++import org.osgi.service.prefs.Preferences;
++
++public class LastAutoCheckForUpdateMemo {
++
++	private static final String LAST_CHECK_FOR_UPDATE__DATE_FORMAT = "yyyy-MM-dd'T'HH:mm:ss.SSSZ"; //$NON-NLS-1$
++
++	private final Preferences prefs;
++
++	public LastAutoCheckForUpdateMemo(IAgentLocation agentLocation) {
++		this.prefs = new ProfileScope(agentLocation, IProfileRegistry.SELF).getNode(AutomaticUpdatePlugin.PLUGIN_ID);
++	}
++
++	public Date store(Date datetime) {
++		prefs.put(PreferenceConstants.PREF_LAST_AUTO_CHECK_FOR_UPDATES, toString(datetime));
++		return datetime;
++	}
++
++	public Date readAndStoreIfAbsent(Date toStore) {
++		Date date = read();
++		if (date == null) {
++			return store(toStore);
++		}
++		return date;
++	}
++
++	public Date read() {
++		String lastCheckDateString = prefs.get(PreferenceConstants.PREF_LAST_AUTO_CHECK_FOR_UPDATES, null);
++		if (lastCheckDateString == null || lastCheckDateString.length() == 0) {
++			return null;
++		}
++		return valueOf(lastCheckDateString);
++	}
++
++	private static String toString(Date date) {
++		SimpleDateFormat dateFormat = new SimpleDateFormat(LAST_CHECK_FOR_UPDATE__DATE_FORMAT, Locale.US);
++		return dateFormat.format(date);
++	}
++
++	private static Date valueOf(String date) {
++		SimpleDateFormat dateFormat = new SimpleDateFormat(LAST_CHECK_FOR_UPDATE__DATE_FORMAT, Locale.US);
++		try {
++			return dateFormat.parse(date);
++		} catch (ParseException e) {
++			AutomaticUpdatePlugin.getDefault().getLog().log(new Status(IStatus.ERROR, AutomaticUpdatePlugin.PLUGIN_ID, e.getMessage(), e));
++			return null;
++		}
++	}
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/PreferenceConstants.java b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/PreferenceConstants.java
+index 72cf7f1..68f2047 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/PreferenceConstants.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/PreferenceConstants.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- *  Copyright (c) 2008, 2014 IBM Corporation and others.
++ *  Copyright (c) 2008, 2016 IBM Corporation and others.
+  *  All rights reserved. This program and the accompanying materials
+  *  are made available under the terms of the Eclipse Public License v1.0
+  *  which accompanies this distribution, and is available at
+@@ -9,6 +9,7 @@
+  *     IBM Corporation - initial API and implementation
+  *     Johannes Michler <orgler@gmail.com> - Bug 321568 -  [ui] Preference for automatic-update-reminder doesn't work in multilanguage-environments
+  *     Christian Georgi <christian.georgi@sap.com> - Bug 432887 - Setting to show update wizard w/o notification popup
++ *     Mikael Barbero (Eclipse Foundation) - Bug 498116
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.ui.sdk.scheduler;
+ 
+@@ -21,6 +22,7 @@ public class PreferenceConstants {
+ 	public static final String PREF_AUTO_UPDATE_SCHEDULE = "schedule"; //$NON-NLS-1$
+ 	public static final String PREF_UPDATE_ON_STARTUP = "on-startup"; //$NON-NLS-1$
+ 	public static final String PREF_UPDATE_ON_SCHEDULE = "on-schedule"; //$NON-NLS-1$  // string value defined in AutomaticUpdateScheduler 
++	public static final String PREF_UPDATE_ON_FUZZY_SCHEDULE = "on-fuzzy-schedule"; //$NON-NLS-1$
+ 	public static final String PREF_DOWNLOAD_ONLY = "download"; // value is true or false, default is false //$NON-NLS-1$
+ 	public static final String PREF_SHOW_UPDATE_WIZARD = "showUpdateWizard"; // value is true or false, default is false //$NON-NLS-1$
+ 	public static final String PREF_REMIND_SCHEDULE = "remindOnSchedule"; // value is true or false //$NON-NLS-1$
+@@ -31,4 +33,5 @@ public class PreferenceConstants {
+ 	public static final String PREF_AUTO_UPDATE_INIT = "autoUpdateInit"; //$NON-NLS-1$
+ 	public static final String PREF_MIGRATED_34 = "migrated34Prefs"; //$NON-NLS-1$
+ 	public static final String PREF_GC_ON_STARTUP = "gcOnStartup"; //$NON-NLS-1$
++	public static final String PREF_LAST_AUTO_CHECK_FOR_UPDATES = "lastAutoCheckForUpdates"; //$NON-NLS-1$
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/PreferenceInitializer.java b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/PreferenceInitializer.java
+index a3beaf7..80b8276 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/PreferenceInitializer.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/PreferenceInitializer.java
+@@ -132,6 +132,27 @@ public class PreferenceInitializer extends AbstractPreferenceInitializer {
+ 			}
+ 		}
+ 
++		// Migrate "look for updates on schedule (daily at fixed time, or weekly, at fixed weekday and time)".
++		// See https://bugs.eclipse.org/bugs/show_bug.cgi?id=498116
++		final String autoUpdateSchedule = pref.get(PreferenceConstants.PREF_AUTO_UPDATE_SCHEDULE, null);
++		if (autoUpdateSchedule != null) {
++			if (PreferenceConstants.PREF_UPDATE_ON_SCHEDULE.equals(autoUpdateSchedule)) {				
++				//Before neon.2, the update schedule could be specified to be done daily or at a specific day and time
++				pref.put(PreferenceConstants.PREF_AUTO_UPDATE_SCHEDULE, PreferenceConstants.PREF_UPDATE_ON_FUZZY_SCHEDULE);
++				final String PRE_NEON2_PREF_KEY_FOR_SCHEDULE = "day"; //$NON-NLS-1$
++				String day = pref.get(PRE_NEON2_PREF_KEY_FOR_SCHEDULE, null);
++				if (day != null) {
++					if (AutomaticUpdateMessages.Pre_neon2_pref_value_everyday.equals(day)) {
++						pref.put(AutomaticUpdateScheduler.P_FUZZY_RECURRENCE, AutomaticUpdateScheduler.FUZZY_RECURRENCE[0]);
++					} else {
++						pref.put(AutomaticUpdateScheduler.P_FUZZY_RECURRENCE, AutomaticUpdateScheduler.FUZZY_RECURRENCE[1]);
++					}
++				} else {
++					pref.put(AutomaticUpdateScheduler.P_FUZZY_RECURRENCE, AutomaticUpdateScheduler.FUZZY_RECURRENCE[1]);
++				}
++			}
++		}
++
+ 		// All migration is done, check that the value of the auto update reminder time is *not* localized
+ 		// see https://bugs.eclipse.org/bugs/show_bug.cgi?id=321568
+ 		String value = pref.get(PreferenceConstants.PREF_REMIND_ELAPSED, PreferenceConstants.PREF_REMIND_30Minutes);
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/messages.properties b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/messages.properties
+index 2d30554..ab3dfba 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk.scheduler/src/org/eclipse/equinox/internal/p2/ui/sdk/scheduler/messages.properties
+@@ -1,5 +1,5 @@
+ ###############################################################################
+-# Copyright (c) 2007, 2014 IBM Corporation and others.
++# Copyright (c) 2007, 2016 IBM Corporation and others.
+ # All rights reserved. This program and the accompanying materials
+ # are made available under the terms of the Eclipse Public License v1.0
+ # which accompanies this distribution, and is available at
+@@ -8,41 +8,14 @@
+ # Contributors:
+ #     IBM Corporation - initial API and implementation
+ #     Christian Georgi <christian.georgi@sap.com> - Bug 432887 - Setting to show update wizard w/o notification popup
++#     Mikael Barbero (Eclipse Foundation) - Bug 498116
+ ###############################################################################
+ 
+ 
+-SchedulerStartup_day=Every day
+-SchedulerStartup_Monday=Every Monday
+-SchedulerStartup_Tuesday=Every Tuesday
+-SchedulerStartup_Wednesday=Every Wednesday
+-SchedulerStartup_Thursday=Every Thursday
+-SchedulerStartup_Friday=Every Friday
+-SchedulerStartup_Saturday=Every Saturday
+-SchedulerStartup_Sunday=Every Sunday
+-SchedulerStartup_1AM=1:00 AM
+-SchedulerStartup_2AM=2:00 AM
+-SchedulerStartup_3AM=3:00 AM
+-SchedulerStartup_4AM=4:00 AM
+-SchedulerStartup_5AM=5:00 AM
+-SchedulerStartup_6AM=6:00 AM
+-SchedulerStartup_7AM=7:00 AM
+-SchedulerStartup_8AM=8:00 AM
+-SchedulerStartup_9AM=9:00 AM
+-SchedulerStartup_10AM=10:00 AM
+-SchedulerStartup_11AM=11:00 AM
+-SchedulerStartup_12PM=12:00 PM
+-SchedulerStartup_1PM=1:00 PM
+-SchedulerStartup_2PM=2:00 PM
+-SchedulerStartup_3PM=3:00 PM
+-SchedulerStartup_4PM=4:00 PM
+-SchedulerStartup_5PM=5:00 PM
+-SchedulerStartup_6PM=6:00 PM
+-SchedulerStartup_7PM=7:00 PM
+-SchedulerStartup_8PM=8:00 PM
+-SchedulerStartup_9PM=9:00 PM
+-SchedulerStartup_10PM=10:00 PM
+-SchedulerStartup_11PM=11:00 PM
+-SchedulerStartup_12AM=12:00 AM
++Pre_neon2_pref_value_everyday=Every day
++SchedulerStartup_OnceADay=Once a day
++SchedulerStartup_OnceAWeek=Once a week
++SchedulerStartup_OnceAMonth=Once a month
+ AutomaticUpdatesPopup_PrefLinkOnly=Set up <a>Reminder options</a>
+ AutomaticUpdatesPopup_RemindAndPrefLink=You will be reminded in {0}.\nSet reminder <a href="{1}">preferences</a>
+ AutomaticUpdatesPopup_ReminderJobTitle=Update reminder job
+@@ -55,7 +28,7 @@ AutomaticUpdatesPopup_UpdatesAvailableTitle=Updates Available
+ AutomaticUpdater_AutomaticDownloadOperationName=Automatic updates download
+ AutomaticUpdater_ClickToReviewUpdates=Updates are available.  Click here to review and install them.
+ AutomaticUpdater_ClickToReviewUpdatesWithProblems=Updates are available, but there may be some compatibility problems.  Click here to review them.
+-AutomaticUpdatesPreferencePage_UpdateSchedule=&Update schedule
++AutomaticUpdatesPreferencePage_UpdateSchedule=&Update schedule (last check: {0})
+ AutomaticUpdatesPreferencePage_findOnStart=Look for u&pdates each time {0} is started
+ AutomaticUpdatesPreferencePage_findOnSchedule=Look for updates on the following &schedule:
+ AutomaticUpdatesPreferencePage_directlyShowUpdateWizard=&Directly show update wizard
+@@ -66,6 +39,7 @@ AutomaticUpdatesPopup_ClickToReviewDownloaded=Software updates have been downloa
+ AutomaticUpdatesPopup_ClickToReviewNotDownloaded=Updates are available for your software.\nClick to review and install updates.
+ AutomaticUpdatesPreferencePage_at=at
+ AutomaticUpdatesPreferencePage_GenericProductName=the application
++AutomaticUpdatesPreferencePage_never=never
+ AutomaticUpdatesPreferencePage_RemindGroup=&When updates are found
+ AutomaticUpdatesPreferencePage_RemindSchedule=&Remind me about updates every:
+ AutomaticUpdatesPreferencePage_RemindOnce=Notify me &once about updates
+diff --git a/bundles/org.eclipse.equinox.p2.updatechecker/src/org/eclipse/equinox/internal/p2/updatechecker/UpdateChecker.java b/bundles/org.eclipse.equinox.p2.updatechecker/src/org/eclipse/equinox/internal/p2/updatechecker/UpdateChecker.java
+index f876bc0..54a6ab5 100644
+--- a/bundles/org.eclipse.equinox.p2.updatechecker/src/org/eclipse/equinox/internal/p2/updatechecker/UpdateChecker.java
++++ b/bundles/org.eclipse.equinox.p2.updatechecker/src/org/eclipse/equinox/internal/p2/updatechecker/UpdateChecker.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- *  Copyright (c) 2007, 2010 IBM Corporation and others.
++ *  Copyright (c) 2007, 2016 IBM Corporation and others.
+  *  All rights reserved. This program and the accompanying materials
+  *  are made available under the terms of the Eclipse Public License v1.0
+  *  which accompanies this distribution, and is available at
+@@ -8,6 +8,7 @@
+  *  Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Sonatype, Inc. - ongoing development
++ *     Mikael Barbero (Eclipse Foundation) - Bug 498116
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.updatechecker;
+ 
+@@ -68,7 +69,7 @@ public class UpdateChecker implements IUpdateChecker {
+ 					Thread.sleep(delay);
+ 				}
+ 				while (!done) {
+-
++					listener.checkingForUpdates();
+ 					trace("Checking for updates for " + profileId + " at " + getTimeStamp()); //$NON-NLS-1$ //$NON-NLS-2$
+ 					Collection<IInstallableUnit> iusWithUpdates = checkForUpdates(profileId, query);
+ 					if (iusWithUpdates.size() > 0) {
+diff --git a/bundles/org.eclipse.equinox.p2.updatechecker/src/org/eclipse/equinox/internal/provisional/p2/updatechecker/IUpdateListener.java b/bundles/org.eclipse.equinox.p2.updatechecker/src/org/eclipse/equinox/internal/provisional/p2/updatechecker/IUpdateListener.java
+index 7cde636..c4b115b 100644
+--- a/bundles/org.eclipse.equinox.p2.updatechecker/src/org/eclipse/equinox/internal/provisional/p2/updatechecker/IUpdateListener.java
++++ b/bundles/org.eclipse.equinox.p2.updatechecker/src/org/eclipse/equinox/internal/provisional/p2/updatechecker/IUpdateListener.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
++ * Copyright (c) 2007, 20016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Mikael Barbero (Eclipse Foundation) - Bug 498116
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.provisional.p2.updatechecker;
+ 
+@@ -18,4 +19,6 @@ package org.eclipse.equinox.internal.provisional.p2.updatechecker;
+ public interface IUpdateListener {
+ 
+ 	public void updatesAvailable(UpdateEvent event);
++
++	public void checkingForUpdates();
+ }

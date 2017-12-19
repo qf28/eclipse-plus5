@@ -1,0 +1,231 @@
+commit 86858dbb92e3c3c7f045572da23f0779074749a2
+Author: Manoj Palat <manpalat@in.ibm.com>
+Date:   Fri Jun 10 17:58:24 2016 +0530
+
+    Fix for bug 495863 [1.9] [code completion] targetted module reference
+    completion
+
+5	4	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+45	0	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+8	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+62	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+3	3	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+index 8603713..76c26cf 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+@@ -1916,10 +1916,11 @@ public final class CompletionEngine
+ 								ModuleReference target = targets[j];
+ 								if (target == null) break;
+ 								if (target instanceof CompletionOnModuleReference) {
++									buildContext(target, null, parsedUnit, null, null);
+ 									this.requestor.setIgnored(CompletionProposal.MODULE_REF, false); //TODO: Hack until ui fixes this issue.
+ 									if(!this.requestor.isIgnored(CompletionProposal.MODULE_REF)) {
+ 										contextAccepted = true;
+-										findModules((CompletionOnModuleReference) target);
++										findModules((CompletionOnModuleReference) target, true /* targetted */);
+ 									}
+ 									debugPrintf();
+ 									return;
+@@ -1939,7 +1940,7 @@ public final class CompletionEngine
+ 								buildContext(reference, null, parsedUnit, null, null);
+ 								this.requestor.setIgnored(CompletionProposal.MODULE_REF, false); //TODO: Hack until ui fixes this issue.
+ 								if(!this.requestor.isIgnored(CompletionProposal.MODULE_REF)) {
+-									findModules((CompletionOnModuleReference) reference);
++									findModules((CompletionOnModuleReference) reference, false /* targetted */);
+ 								}
+ 								debugPrintf();
+ 								return;
+@@ -10419,7 +10420,7 @@ public final class CompletionEngine
+ 			this.printDebug(proposal);
+ 		}
+ 	}
+-	private void findModules(CompletionOnModuleReference moduleReference) {
++	private void findModules(CompletionOnModuleReference moduleReference, boolean targetted) {
+ 
+ 		this.completionToken = CharOperation.concatWith(moduleReference.tokens, '.');
+ 		if (this.completionToken.length == 0)
+@@ -10428,7 +10429,7 @@ public final class CompletionEngine
+ 		setSourceRange(moduleReference.sourceStart, moduleReference.sourceEnd);
+ 		long completionPosition = moduleReference.sourcePositions[moduleReference.sourcePositions.length - 1];
+ 		setTokenRange((int) (completionPosition >>> 32), (int) completionPosition);
+-		this.nameEnvironment.findModules(CharOperation.toLowerCase(this.completionToken), this);
++		this.nameEnvironment.findModules(CharOperation.toLowerCase(this.completionToken), this, targetted ? this.javaProject : null);
+ 	}
+ 	private void findPackages(CompletionOnExportReference exportStatement) {
+ 
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+index b44708d..fc9c950 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+@@ -1036,6 +1036,51 @@ protected void consumeSingleExportsPkgName() {
+ 		this.restartRecovery = true; // used to avoid branching back into the regular automaton
+ 	}
+ }
++protected void consumeSingleExportsTargetName() {
++	int index;
++	/* no need to take action if not inside assist identifiers */
++	if ((index = indexOfAssistIdentifier()) < 0) {
++		super.consumeSingleExportsTargetName();
++		return;
++	}
++	/* retrieve identifiers subset and whole positions, the assist node positions
++	should include the entire replaced source. */
++	int length = this.identifierLengthStack[this.identifierLengthPtr];
++	char[][] subset = identifierSubSet(index+1); // include the assistIdentifier
++	this.identifierLengthPtr--;
++	this.identifierPtr -= length;
++	long[] positions = new long[length];
++	System.arraycopy(
++			this.identifierPositionStack,
++			this.identifierPtr + 1,
++			positions,
++			0,
++			length);
++		
++	/* build specific assist node on targetted exports statement */
++	ModuleReference reference = createAssistModuleReference(subset, positions, 0 /* no modifiers */);
++	this.assistNode = reference;
++	this.lastCheckPoint = reference.sourceEnd + 1;
++	pushOnAstStack(reference);
++
++	reference.declarationSourceEnd = reference.sourceEnd;
++	reference.declarationEnd = reference.declarationSourceEnd;
++	reference.declarationSourceStart = reference.sourceStart;
++//	if (this.currentToken == TokenNameSEMICOLON){
++//		impt.declarationSourceEnd = this.scanner.currentPosition - 1;
++//	} else {
++//	}
++//	//this.endPosition is just before the ;
++//	impt.declarationSourceStart = this.intStack[this.intPtr--];
++	// recovery - TBD
++	if (this.currentElement != null){
++		this.lastCheckPoint = reference.declarationSourceEnd+1;
++		this.currentElement = this.currentElement.add(reference, 0);
++		this.lastIgnoredToken = -1;
++		this.restartRecovery = true; // used to avoid branching back into the regular automaton
++	}
++
++}
+ protected void consumeSingleRequiresModuleName() {
+ 
+ 	int index = indexOfAssistIdentifier();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+index 738658f..e706919 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/Parser.java
+@@ -5714,6 +5714,14 @@ protected void consumeSingleExportsTargetName() {
+ 	impt.declarationEnd = impt.declarationSourceEnd;
+ //	//this.endPosition is just before the ;
+ //	impt.declarationSourceStart = this.intStack[this.intPtr--];
++	// recovery - TBD
++	if (this.currentElement != null){
++		this.lastCheckPoint = impt.declarationSourceEnd+1;
++		this.currentElement = this.currentElement.add(impt, 0);
++		this.lastIgnoredToken = -1;
++		this.restartRecovery = true; // used to avoid branching back into the regular automaton
++	}
++
+ }
+ protected void consumeExportTarget() {
+ 	int length = this.astLengthStack[this.astLengthPtr--];
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+index 2b3fb80..7046b47 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+@@ -34,6 +34,7 @@ import org.eclipse.jdt.internal.compiler.env.AccessRestriction;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
++import org.eclipse.jdt.internal.compiler.lookup.ModuleEnvironment;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.compiler.parser.ScannerHelper;
+ import org.eclipse.jdt.internal.compiler.util.HashtableOfObjectToInt;
+@@ -985,8 +986,67 @@ public class NameLookup implements SuffixConstants {
+ 				:  CharOperation.equals(needle, haystack);
+ 	}
+ 	
+-	public void seekModuleReferences(String name, IJavaElementRequestor requestor) {
+-		seekModule(name, true /* prefix */, requestor);
++	/**
++	 * Assumption is that project dependencies are setup already so that the required projects of a 
++	 * given project will include this project - module search will be done only in those projects.
++	 * Note that this does not check for cycles in module dependency graph.
++	 * @param name
++	 * @param requestor
++	 * @param javaProject
++	 */
++	public void seekTargettedModuleReferences(String name, IJavaElementRequestor requestor, IJavaProject javaProject) {
++		//seekModule(name, true /* prefix */, requestor);
++		List<IJavaProject> dependentJavaProjects = new ArrayList<>();
++		String myName = javaProject.getElementName();
++		IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
++		for (IProject project : projects) {
++			if (!JavaProject.hasJavaNature(project)) continue;
++			IJavaProject jProject = JavaCore.create (project);
++			if (jProject.equals(javaProject)) continue;
++			try {
++				String[] requiredPojects = jProject.getRequiredProjectNames();
++				for (String s : requiredPojects) {
++					if (s == null) continue;
++					if (s.equals(myName)) {
++						dependentJavaProjects.add(jProject);
++						break;
++					}
++				}
++			} catch (JavaModelException e) {
++				// TODO Auto-generated catch block
++				e.printStackTrace();
++			}
++		}
++		if (dependentJavaProjects.isEmpty()) return;
++		// At this point we have all the projects dependent on this project.
++		
++		for (IJavaProject jP : dependentJavaProjects) {
++			try {
++				if (!jP.isOpen()) continue;
++				IPackageFragmentRoot[] roots = jP.getPackageFragmentRoots();
++				for (IPackageFragmentRoot root : roots) {
++					if (root instanceof JarPackageFragmentRoot)  continue; // TODO: Add support for JPFRs?
++					root.open(null);
++					PackageFragmentRootInfo pFRI = ((PackageFragmentRootInfo) ((PackageFragmentRoot) root).getElementInfo());
++					IModule module = pFRI.getModule();
++					if (module == null) continue;
++					char[] moduleName = module.name();
++					if (moduleName == null || moduleName.equals(CharOperation.NO_CHAR) || moduleName.equals(ModuleEnvironment.UNNAMED)) continue;
++					requestor.acceptModule(module);
++				}
++			} catch (JavaModelException e) {
++				// TODO Auto-generated catch block
++				e.printStackTrace();
++			}
++		}
++	}
++
++	public void seekModuleReferences(String name, IJavaElementRequestor requestor, IJavaProject javaProject) {
++		if (javaProject != null) {
++			seekTargettedModuleReferences(name, requestor, javaProject);			
++		} else {
++			seekModule(name, true /* prefix */, requestor);
++		}
+ 	}
+ 	public void seekModule(String name, boolean prefix, IJavaElementRequestor requestor) {
+ 		int count= this.packageFragmentRoots.length;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+index a5c92c4..55e42a1 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+@@ -172,10 +172,10 @@ public class SearchableEnvironment extends ModuleEnvironment
+ 	 * The packages found are passed to:
+ 	 *    ISearchRequestor.acceptModule(char[][] moduleName)
+ 	 */
+-	public void findModules(char[] prefix, ISearchRequestor requestor) {
++	public void findModules(char[] prefix, ISearchRequestor requestor, IJavaProject javaProject) {
+ 		this.nameLookup.seekModuleReferences(
+-			new String(prefix),
+-			new SearchableEnvironmentRequestor(requestor));
++				new String(prefix),
++				new SearchableEnvironmentRequestor(requestor), javaProject);
+ 	}
+ 
+ 	/**

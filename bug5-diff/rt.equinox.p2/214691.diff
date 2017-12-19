@@ -1,0 +1,795 @@
+commit bd85bcb81ebaf5a4c4b4d60a78143b2e740add93
+Author: John Arthorne <johna>
+Date:   Fri Jan 11 20:43:03 2008 +0000
+
+    Bug 214691 [prov] [repo] Need to support progress monitor cancellation when loading repositories
+
+1	1	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
+5	2	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
+15	18	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
+13	11	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+10	27	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+7	4	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/messages.properties
+31	3	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
+4	3	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepositoryFactory.java
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
+index 27a4a61..b368b8d 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/LocalMetadataRepository.java
+@@ -161,7 +161,7 @@ public class LocalMetadataRepository extends AbstractMetadataRepository {
+ 			}
+ 			new MetadataRepositoryIO().write(this, output);
+ 		} catch (IOException e) {
+-			LogHelper.log(new Status(IStatus.ERROR, Activator.PI_METADATA_REPOSITORY, "Error saving metadata repository: " + location, e)); //$NON-NLS-1$
++			LogHelper.log(new Status(IStatus.ERROR, Activator.PI_METADATA_REPOSITORY, ProvisionException.REPOSITORY_FAILED_WRITE, "Error saving metadata repository: " + location, e)); //$NON-NLS-1$
+ 		}
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
+index 50ab3b5..88fcee9 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/Messages.java
+@@ -22,11 +22,14 @@ public class Messages extends NLS {
+ 		// Do not instantiate
+ 	}
+ 
++	public static String io_failedRead;
++	public static String io_failedWrite;
++	public static String io_IncompatibleVersion;
++	public static String io_parseError;
++
+ 	public static String REPO_LOADING;
+ 	public static String REPOMGR_ADDING_REPO;
+ 
+-	public static String MetadataRepositoryIO_Parser_Has_Incompatible_Version;
+-	public static String MetadataRepositoryIO_Parser_Error_Parsing_Repository;
+ 	public static String repoMan_exists;
+ 	public static String repoMan_failedRead;
+ 	public static String repoMan_internalError;
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
+index 99cd493..fdc1dab 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
+@@ -12,6 +12,7 @@
+ package org.eclipse.equinox.internal.p2.metadata.repository;
+ 
+ import java.io.*;
++import java.net.URL;
+ import javax.xml.parsers.ParserConfigurationException;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+@@ -19,7 +20,7 @@ import org.eclipse.equinox.internal.p2.core.helpers.OrderedProperties;
+ import org.eclipse.equinox.internal.p2.metadata.repository.io.MetadataParser;
+ import org.eclipse.equinox.internal.p2.metadata.repository.io.MetadataWriter;
+ import org.eclipse.equinox.internal.p2.persistence.XMLWriter;
+-import org.eclipse.equinox.p2.core.repository.RepositoryCreationException;
++import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+@@ -42,7 +43,7 @@ public class MetadataRepositoryIO {
+ 	 * of abstract metadata repositories.
+ 	 * This method performs buffering, and closes the stream when finished.
+ 	 */
+-	public IMetadataRepository read(InputStream input) throws RepositoryCreationException {
++	public IMetadataRepository read(URL location, InputStream input) throws ProvisionException {
+ 		BufferedInputStream bufferedInput = null;
+ 		try {
+ 			try {
+@@ -55,7 +56,7 @@ public class MetadataRepositoryIO {
+ 					case IStatus.CANCEL :
+ 						throw new OperationCanceledException();
+ 					case IStatus.ERROR :
+-						throw new RepositoryCreationException(new CoreException(result));
++						throw new ProvisionException(result);
+ 					case IStatus.WARNING :
+ 					case IStatus.INFO :
+ 						LogHelper.log(result);
+@@ -66,28 +67,24 @@ public class MetadataRepositoryIO {
+ 					bufferedInput.close();
+ 			}
+ 		} catch (IOException ioe) {
+-			throw new RepositoryCreationException(ioe);
++			String msg = NLS.bind(Messages.io_failedRead, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_READ, msg, ioe));
+ 		}
+ 	}
+ 
+ 	/**
+ 	 *
+ 	 */
+-	public void write(IMetadataRepository repository, OutputStream output) {
++	public void write(IMetadataRepository repository, OutputStream output) throws IOException {
+ 		OutputStream bufferedOutput = null;
+ 		try {
+-			try {
+-				bufferedOutput = new BufferedOutputStream(output);
+-				Writer repositoryWriter = new Writer(bufferedOutput, repository.getClass());
+-				repositoryWriter.write(repository);
+-			} finally {
+-				if (bufferedOutput != null) {
+-					bufferedOutput.close();
+-				}
++			bufferedOutput = new BufferedOutputStream(output);
++			Writer repositoryWriter = new Writer(bufferedOutput, repository.getClass());
++			repositoryWriter.write(repository);
++		} finally {
++			if (bufferedOutput != null) {
++				bufferedOutput.close();
+ 			}
+-		} catch (IOException ioe) {
+-			// TODO shouldn't this throw a core exception?
+-			ioe.printStackTrace();
+ 		}
+ 	}
+ 
+@@ -200,7 +197,7 @@ public class MetadataRepositoryIO {
+ 				if (PI_REPOSITORY_TARGET.equals(target)) {
+ 					Version repositoryVersion = extractPIVersion(target, data);
+ 					if (!MetadataRepositoryIO.XMLConstants.XML_TOLERANCE.isIncluded(repositoryVersion)) {
+-						throw new SAXException(NLS.bind(Messages.MetadataRepositoryIO_Parser_Has_Incompatible_Version, repositoryVersion, MetadataRepositoryIO.XMLConstants.XML_TOLERANCE));
++						throw new SAXException(NLS.bind(Messages.io_IncompatibleVersion, repositoryVersion, MetadataRepositoryIO.XMLConstants.XML_TOLERANCE));
+ 					}
+ 				}
+ 			}
+@@ -290,7 +287,7 @@ public class MetadataRepositoryIO {
+ 		}
+ 
+ 		protected String getErrorMessage() {
+-			return Messages.MetadataRepositoryIO_Parser_Error_Parsing_Repository;
++			return Messages.io_parseError;
+ 		}
+ 
+ 		public String toString() {
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+index 939b533..68fa88c 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+@@ -273,39 +273,41 @@ public class MetadataRepositoryManager implements IMetadataRepositoryManager {
+ 		}
+ 	}
+ 
+-	public IMetadataRepository loadRepository(URL location, IProgressMonitor progress) throws ProvisionException {
++	public IMetadataRepository loadRepository(URL location, IProgressMonitor monitor) throws ProvisionException {
+ 		Assert.isNotNull(location);
+ 		IMetadataRepository result = getRepository(location);
+ 		if (result != null)
+ 			return result;
+ 		String[] suffixes = getAllSuffixes();
+-		if (progress == null)
+-			progress = new NullProgressMonitor();
+-		progress.beginTask(NLS.bind(Messages.REPOMGR_ADDING_REPO, location.toExternalForm()), 1);
++		SubMonitor sub = SubMonitor.convert(monitor, Messages.REPOMGR_ADDING_REPO, suffixes.length * 100);
+ 		for (int i = 0; i < suffixes.length; i++) {
+-			result = loadRepository(location, suffixes[i]);
++			result = loadRepository(location, suffixes[i], sub.newChild(100));
+ 			if (result != null) {
+ 				addRepository(result);
+-				progress.done();
++				sub.done();
+ 				return result;
+ 			}
+ 		}
+-		progress.done();
++		sub.done();
+ 		fail(location, ProvisionException.REPOSITORY_NOT_FOUND);
+ 		return null;//will never get here
+ 	}
+ 
+ 	/**
+ 	 * Try to load a pre-existing repo at the given location
+-	 * @throws ProvisionException 
+ 	 */
+-	private IMetadataRepository loadRepository(URL location, String suffix) throws ProvisionException {
++	private IMetadataRepository loadRepository(URL location, String suffix, SubMonitor monitor) {
+ 		IExtension[] providers = findMatchingRepositoryExtensions(suffix);
+ 		// Loop over the candidates and return the first one that successfully loads
++		monitor.beginTask("", providers.length * 10); //$NON-NLS-1$
+ 		for (int i = 0; i < providers.length; i++) {
+ 			IMetadataRepositoryFactory factory = (IMetadataRepositoryFactory) createExecutableExtension(providers[i], FACTORY);
+-			if (factory != null)
+-				return factory.load(location);
++			try {
++				if (factory != null)
++					return factory.load(location, monitor.newChild(10));
++			} catch (ProvisionException e) {
++				//this extension couldn't load at that location - keep trying with other factories
++			}
+ 		}
+ 		return null;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+index 8fafc90..3b3c7f0 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -17,9 +17,8 @@ import java.util.jar.JarInputStream;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.core.helpers.Tracing;
+-import org.eclipse.equinox.p2.core.repository.RepositoryCreationException;
++import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+-import org.eclipse.equinox.spi.p2.core.repository.AbstractRepository;
+ import org.eclipse.equinox.spi.p2.metadata.repository.IMetadataRepositoryFactory;
+ 
+ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFactory {
+@@ -33,19 +32,17 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 		return new URLMetadataRepository(location, name);
+ 	}
+ 
+-	public IMetadataRepository load(URL location) {
++	public IMetadataRepository load(URL location, IProgressMonitor monitor) throws ProvisionException {
+ 		// load the jar
+-		IMetadataRepository result = load(location, JAR_EXTENSION);
++		IMetadataRepository result = load(location, JAR_EXTENSION, monitor);
+ 		// compressed file is not available, load the xml
+ 		if (result == null) {
+-			result = load(location, XML_EXTENSION);
++			result = load(location, XML_EXTENSION, monitor);
+ 		}
+ 		return result;
+ 	}
+ 
+-	private IMetadataRepository load(URL location, String type) {
+-		if (location == null)
+-			return null;
++	private IMetadataRepository load(URL location, String extension, IProgressMonitor monitor) throws ProvisionException {
+ 		long time = 0;
+ 		final String debugMsg = "Restoring metadata repository "; //$NON-NLS-1$
+ 		if (Tracing.DEBUG_METADATA_PARSING) {
+@@ -54,8 +51,8 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 		}
+ 		try {
+ 			URL actualFile = URLMetadataRepository.getActualLocation(location);
+-			InputStream inStream = URLMetadataRepository.getActualLocation(location, type).openStream();
+-			if (JAR_EXTENSION.equalsIgnoreCase(type)) {
++			InputStream inStream = URLMetadataRepository.getActualLocation(location, extension).openStream();
++			if (JAR_EXTENSION.equalsIgnoreCase(extension)) {
+ 				JarInputStream jInStream = new JarInputStream(inStream);
+ 				JarEntry jarEntry = jInStream.getNextJarEntry();
+ 				String entryName = new Path(actualFile.getPath()).lastSegment();
+@@ -63,13 +60,13 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 					jarEntry = jInStream.getNextJarEntry();
+ 				}
+ 				if (jarEntry == null) {
+-					throw new FileNotFoundException("Repository not found in " + actualFile.getPath() + type); //$NON-NLS-1$
++					throw new FileNotFoundException("Repository not found in " + actualFile.getPath() + extension); //$NON-NLS-1$
+ 				}
+ 				inStream = jInStream;
+ 			}
+ 			InputStream descriptorStream = new BufferedInputStream(inStream);
+ 			try {
+-				IMetadataRepository result = new MetadataRepositoryIO().read(descriptorStream);
++				IMetadataRepository result = new MetadataRepositoryIO().read(actualFile, descriptorStream);
+ 				if (result instanceof LocalMetadataRepository)
+ 					((LocalMetadataRepository) result).initializeAfterLoad(location);
+ 				if (result instanceof URLMetadataRepository)
+@@ -79,8 +76,6 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 					Tracing.debug(debugMsg + "time (ms): " + time); //$NON-NLS-1$ 
+ 				}
+ 				return result;
+-			} catch (RepositoryCreationException e) {
+-				log(debugMsg, e);
+ 			} finally {
+ 				if (descriptorStream != null)
+ 					descriptorStream.close();
+@@ -96,16 +91,4 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 	private void log(String message, Exception e) {
+ 		LogHelper.log(new Status(IStatus.ERROR, Activator.PI_METADATA_REPOSITORY, message, e));
+ 	}
+-
+-	public void restore(AbstractRepository repository, URL location) {
+-		AbstractRepository source = (AbstractRepository) load(location);
+-		if (source == null)
+-			return;
+-		if (repository.getClass() != source.getClass())
+-			throw new IllegalArgumentException("Repository type mismatch"); //$NON-NLS-1$
+-		if (repository instanceof LocalMetadataRepository)
+-			((LocalMetadataRepository) repository).revertToBackup((LocalMetadataRepository) source);
+-		else if (repository instanceof URLMetadataRepository)
+-			((URLMetadataRepository) repository).revertToBackup((URLMetadataRepository) source);
+-	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/messages.properties b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/messages.properties
+index c31c4fe..62eefac 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/messages.properties
+@@ -9,13 +9,16 @@
+ #     IBM Corporation - initial API and implementation
+ ###############################################################################
+ 
++io_failedRead=Unable to read repository at {0}
++io_failedWrite=Unable to write repository at {0}
++io_IncompatibleVersion=\
++	Metadata repository has incompatible version {0}; expected {1}
++io_parseError=\
++	Error parsing metadata repository
++
+ REPO_LOADING = Loading the repository {0}
+ REPOMGR_ADDING_REPO = Adding repository {0}
+ 
+-MetadataRepositoryIO_Parser_Has_Incompatible_Version=\
+-	Metadata repository has incompatible version {0}; expected {1}
+-MetadataRepositoryIO_Parser_Error_Parsing_Repository=\
+-	Error parsing metadata repository
+ repoMan_exists=Repository already exists at {0}
+ repoMan_failedRead=The repository could not be read: {0}
+ repoMan_internalError=Internal error
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/spi/p2/metadata/repository/IMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
+index f1f4f61..7141be9 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/spi/p2/metadata/repository/IMetadataRepositoryFactory.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -11,12 +11,40 @@
+ package org.eclipse.equinox.spi.p2.metadata.repository;
+ 
+ import java.net.URL;
++import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+ 
+ public interface IMetadataRepositoryFactory {
+ 
+-	public IMetadataRepository load(URL location) throws ProvisionException;
+-
++	/**
++	 * Creates and returns a new empty metadata repository of the given type at 
++	 * the given location.
++	 * 
++	 * @param location the location for the new repository
++	 * @param name the name of the new repository
++	 * @param type the kind of repository to create
++	 * @return the newly created repository
++	 * @throws ProvisionException if the repository could not be created.  Reasons include:
++	 * <ul>
++	 * <li>The repository type is not supported by this factory.</li>
++	 * <li>There was an error writing to the given repository location.</li>
++	 * </ul>
++	 */
+ 	public IMetadataRepository create(URL location, String name, String type) throws ProvisionException;
++
++	/**
++	 * Loads a repository corresponding to the given URL.
++	 * 
++	 * @param location The location of the repository to load
++	 * @param monitor a progress monitor, or <code>null</code> if progress
++	 *    reporting is not desired
++	 * @return The loaded metadata repository
++	 * @throws ProvisionException if the repository could not be created.  Reasons include:
++	 * <ul>
++	 * <li>There is no existing repository at that location.</li>
++	 * <li>The repository at that location could not be read.</li>
++	 * </ul>
++	 */
++	public IMetadataRepository load(URL location, IProgressMonitor monitor) throws ProvisionException;
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepositoryFactory.java
+index affd41f..c0769cf 100644
+--- a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/metadata/UpdateSiteMetadataRepositoryFactory.java
+@@ -11,18 +11,19 @@
+ package org.eclipse.equinox.internal.p2.updatesite.metadata;
+ 
+ import java.net.URL;
++import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.spi.p2.metadata.repository.IMetadataRepositoryFactory;
+ 
+ public class UpdateSiteMetadataRepositoryFactory implements IMetadataRepositoryFactory {
+ 
+-	public IMetadataRepository create(URL location, String name, String type) {
++	public IMetadataRepository create(URL location, String name, String type) throws ProvisionException {
+ 		return null;
+ 	}
+ 
+-	public IMetadataRepository load(URL location) throws ProvisionException {
+-		if (!location.getPath().endsWith("site.xml"))
++	public IMetadataRepository load(URL location, IProgressMonitor monitor) throws ProvisionException {
++		if (!location.getPath().endsWith("site.xml")) //$NON-NLS-1$
+ 			return null;
+ 		return new UpdateSiteMetadataRepository(location);
+ 	}
+commit c12bf4bc9af29c8bcd413400981c8dfff6c4251d
+Author: John Arthorne <johna>
+Date:   Fri Jan 11 21:10:16 2008 +0000
+
+    Bug 214691 [prov] [repo] Need to support progress monitor cancellation when loading repositories
+
+7	7	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
+3	1	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+1	0	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataParser.java
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
+index fdc1dab..3284ef6 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
+@@ -43,14 +43,14 @@ public class MetadataRepositoryIO {
+ 	 * of abstract metadata repositories.
+ 	 * This method performs buffering, and closes the stream when finished.
+ 	 */
+-	public IMetadataRepository read(URL location, InputStream input) throws ProvisionException {
++	public IMetadataRepository read(URL location, InputStream input, IProgressMonitor monitor) throws ProvisionException {
+ 		BufferedInputStream bufferedInput = null;
+ 		try {
+ 			try {
+ 				bufferedInput = new BufferedInputStream(input);
+ 
+ 				Parser repositoryParser = new Parser(Activator.getContext(), Activator.ID);
+-				repositoryParser.parse(input);
++				repositoryParser.parse(input, monitor);
+ 				IStatus result = repositoryParser.getStatus();
+ 				switch (result.getSeverity()) {
+ 					case IStatus.CANCEL :
+@@ -150,12 +150,10 @@ public class MetadataRepositoryIO {
+ 			super(context, bundleId);
+ 		}
+ 
+-		public void parse(File file) throws IOException {
+-			parse(new FileInputStream(file));
+-		}
+-
+-		public synchronized void parse(InputStream stream) throws IOException {
++		public synchronized void parse(InputStream stream, IProgressMonitor monitor) throws IOException {
+ 			this.status = null;
++			setProgressMonitor(monitor);
++			monitor.beginTask(Messages.REPO_LOADING, IProgressMonitor.UNKNOWN);
+ 			try {
+ 				// TODO: currently not caching the parser since we make no assumptions
+ 				//		 or restrictions on concurrent parsing
+@@ -171,6 +169,7 @@ public class MetadataRepositoryIO {
+ 			} catch (ParserConfigurationException e) {
+ 				throw new IOException(e.getMessage());
+ 			} finally {
++				monitor.done();
+ 				stream.close();
+ 			}
+ 		}
+@@ -236,6 +235,7 @@ public class MetadataRepositoryIO {
+ 			}
+ 
+ 			public void startElement(String name, Attributes attributes) {
++				checkCancel();
+ 				if (PROPERTIES_ELEMENT.equals(name)) {
+ 					if (propertiesHandler == null) {
+ 						propertiesHandler = new PropertiesHandler(this, attributes);
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+index 3b3c7f0..17d4b0d 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/SimpleMetadataRepositoryFactory.java
+@@ -33,6 +33,8 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 	}
+ 
+ 	public IMetadataRepository load(URL location, IProgressMonitor monitor) throws ProvisionException {
++		if (monitor == null)
++			monitor = new NullProgressMonitor();
+ 		// load the jar
+ 		IMetadataRepository result = load(location, JAR_EXTENSION, monitor);
+ 		// compressed file is not available, load the xml
+@@ -66,7 +68,7 @@ public class SimpleMetadataRepositoryFactory implements IMetadataRepositoryFacto
+ 			}
+ 			InputStream descriptorStream = new BufferedInputStream(inStream);
+ 			try {
+-				IMetadataRepository result = new MetadataRepositoryIO().read(actualFile, descriptorStream);
++				IMetadataRepository result = new MetadataRepositoryIO().read(actualFile, descriptorStream, monitor);
+ 				if (result instanceof LocalMetadataRepository)
+ 					((LocalMetadataRepository) result).initializeAfterLoad(location);
+ 				if (result instanceof URLMetadataRepository)
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataParser.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataParser.java
+index 079ff62..a57d67e 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataParser.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataParser.java
+@@ -114,6 +114,7 @@ public abstract class MetadataParser extends XMLParser implements XMLConstants {
+ 		}
+ 
+ 		public void startElement(String name, Attributes attributes) {
++			checkCancel();
+ 			if (PROPERTIES_ELEMENT.equals(name)) {
+ 				if (propertiesHandler == null) {
+ 					propertiesHandler = new PropertiesHandler(this, attributes);
+commit e44b8b34e81b0969fd11e066872f201318197af6
+Author: John Arthorne <johna>
+Date:   Fri Jan 11 22:00:33 2008 +0000
+
+    Bug 214691 [prov] [repo] Need to support progress monitor cancellation when loading repositories
+
+7	4	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+1	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Messages.java
+1	0	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/messages.properties
+12	17	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryFactory.java
+6	4	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryIO.java
+35	3	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/spi/p2/artifact/repository/IArtifactRepositoryFactory.java
+1	1	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepository.java
+3	2	bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepositoryFactory.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+index c533e2c..24288b1 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+@@ -282,8 +282,9 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 		if (result != null)
+ 			return result;
+ 		String[] suffixes = getAllSuffixes();
++		SubMonitor sub = SubMonitor.convert(monitor, suffixes.length * 100);
+ 		for (int i = 0; i < suffixes.length; i++) {
+-			result = loadRepository(location, suffixes[i]);
++			result = loadRepository(location, suffixes[i], sub.newChild(100));
+ 			if (result != null) {
+ 				addRepository(result);
+ 				return result;
+@@ -293,16 +294,18 @@ public class ArtifactRepositoryManager implements IArtifactRepositoryManager {
+ 		return null;
+ 	}
+ 
+-	private IArtifactRepository loadRepository(URL location, String suffix) {
++	private IArtifactRepository loadRepository(URL location, String suffix, SubMonitor monitor) {
+ 		IExtension[] providers = findMatchingRepositoryExtensions(suffix);
+ 		// Loop over the candidates and return the first one that successfully loads
++		monitor.beginTask("", providers.length * 10); //$NON-NLS-1$
+ 		for (int i = 0; i < providers.length; i++)
+ 			try {
+ 				IArtifactRepositoryFactory factory = (IArtifactRepositoryFactory) createExecutableExtension(providers[i], EL_FACTORY);
+ 				if (factory != null)
+-					return factory.load(location);
++					return factory.load(location, monitor.newChild(10));
+ 			} catch (CoreException e) {
+-				log("Unable to load repository: " + location, e); //$NON-NLS-1$
++				if (e.getStatus().getCode() != ProvisionException.REPOSITORY_NOT_FOUND)
++					log("Unable to load repository: " + location, e); //$NON-NLS-1$
+ 			}
+ 		return null;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Messages.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Messages.java
+index fd1979b..8e5e8b4 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/Messages.java
+@@ -32,6 +32,7 @@ public class Messages extends NLS {
+ 	public static String repoMan_unknownType;
+ 
+ 	public static String FileDownloadError;
++	public static String io_failedRead;
+ 	public static String io_parseError;
+ 	public static String io_incompatibleVersion;
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/messages.properties b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/messages.properties
+index 7e7e9a5..c88e811 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/messages.properties
+@@ -10,6 +10,7 @@
+ ###############################################################################
+ 
+ FileDownloadError=Error downloading {0} to {1}. 
++io_failedRead=Unable to read repository at {0}
+ io_parseError=\
+ 	Error parsing simple artifact repository
+ io_incompatibleVersion=\
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryFactory.java
+index 0144d66..75109e9 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryFactory.java
+@@ -14,21 +14,19 @@ import java.io.*;
+ import java.net.URL;
+ import java.util.jar.JarEntry;
+ import java.util.jar.JarInputStream;
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Path;
+-import org.eclipse.equinox.internal.p2.artifact.repository.ECFTransport;
+-import org.eclipse.equinox.internal.p2.artifact.repository.Transport;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.artifact.repository.*;
+ import org.eclipse.equinox.p2.artifact.repository.IArtifactRepository;
+-import org.eclipse.equinox.p2.core.repository.RepositoryCreationException;
++import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.spi.p2.artifact.repository.IArtifactRepositoryFactory;
++import org.eclipse.osgi.util.NLS;
+ 
+ public class SimpleArtifactRepositoryFactory implements IArtifactRepositoryFactory {
+ 
+-	public IArtifactRepository load(URL location) {
+-		if (location == null)
+-			return null;
++	public IArtifactRepository load(URL location, IProgressMonitor monitor) throws ProvisionException {
+ 		File temp = null;
+ 		try {
++			SubMonitor sub = SubMonitor.convert(monitor, 300);
+ 			// TODO This temporary file stuff is not very elegant. 
+ 			OutputStream artifacts = null;
+ 			temp = File.createTempFile("artifacts", ".xml"); //$NON-NLS-1$ //$NON-NLS-2$
+@@ -36,13 +34,13 @@ public class SimpleArtifactRepositoryFactory implements IArtifactRepositoryFacto
+ 			boolean compress = true;
+ 			try {
+ 				artifacts = new BufferedOutputStream(new FileOutputStream(temp));
+-				IStatus status = getTransport().download(SimpleArtifactRepository.getActualLocation(location, compress).toExternalForm(), artifacts, null);
++				IStatus status = getTransport().download(SimpleArtifactRepository.getActualLocation(location, compress).toExternalForm(), artifacts, sub.newChild(100));
+ 				if (!status.isOK()) {
+ 					// retry uncompressed
+ 					compress = false;
+-					status = getTransport().download(SimpleArtifactRepository.getActualLocation(location, compress).toExternalForm(), artifacts, null);
++					status = getTransport().download(SimpleArtifactRepository.getActualLocation(location, compress).toExternalForm(), artifacts, sub.newChild(100));
+ 					if (!status.isOK())
+-						return null;
++						throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, status.getMessage(), null));
+ 				}
+ 			} finally {
+ 				if (artifacts != null)
+@@ -65,23 +63,20 @@ public class SimpleArtifactRepositoryFactory implements IArtifactRepositoryFacto
+ 					descriptorStream = jInStream;
+ 				}
+ 				SimpleArtifactRepositoryIO io = new SimpleArtifactRepositoryIO();
+-				SimpleArtifactRepository result = (SimpleArtifactRepository) io.read(descriptorStream);
++				SimpleArtifactRepository result = (SimpleArtifactRepository) io.read(temp.toURL(), descriptorStream, sub.newChild(100));
+ 				result.initializeAfterLoad(location);
+ 				return result;
+-			} catch (RepositoryCreationException e) {
+-				return null;
+ 			} finally {
+ 				if (descriptorStream != null)
+ 					descriptorStream.close();
+ 			}
+ 		} catch (IOException e) {
+-			// TODO: should this distinguish between non-existent file
+-			//		 and other IO exceptions.
++			String msg = NLS.bind(Messages.io_failedRead, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_NOT_FOUND, msg, e));
+ 		} finally {
+ 			if (temp != null && !temp.delete())
+ 				temp.deleteOnExit();
+ 		}
+-		return null;
+ 	}
+ 
+ 	public IArtifactRepository create(URL location, String name, String type) {
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryIO.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryIO.java
+index 87beb50..9652614 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryIO.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/simple/SimpleArtifactRepositoryIO.java
+@@ -11,6 +11,7 @@
+ package org.eclipse.equinox.internal.p2.artifact.repository.simple;
+ 
+ import java.io.*;
++import java.net.URL;
+ import java.util.*;
+ import javax.xml.parsers.ParserConfigurationException;
+ import org.eclipse.core.runtime.*;
+@@ -24,7 +25,7 @@ import org.eclipse.equinox.internal.p2.persistence.XMLWriter;
+ import org.eclipse.equinox.p2.artifact.repository.ArtifactDescriptor;
+ import org.eclipse.equinox.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.p2.artifact.repository.processing.ProcessingStepDescriptor;
+-import org.eclipse.equinox.p2.core.repository.RepositoryCreationException;
++import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.metadata.IArtifactKey;
+ import org.eclipse.osgi.service.resolver.VersionRange;
+ import org.eclipse.osgi.util.NLS;
+@@ -71,7 +72,7 @@ class SimpleArtifactRepositoryIO {
+ 	 * 
+ 	 * This method performs buffering, and closes the stream when finished.
+ 	 */
+-	public IArtifactRepository read(InputStream input) throws RepositoryCreationException {
++	public IArtifactRepository read(URL location, InputStream input, IProgressMonitor monitor) throws ProvisionException {
+ 		BufferedInputStream bufferedInput = null;
+ 		try {
+ 			try {
+@@ -83,7 +84,7 @@ class SimpleArtifactRepositoryIO {
+ 					case IStatus.CANCEL :
+ 						throw new OperationCanceledException();
+ 					case IStatus.ERROR :
+-						throw new RepositoryCreationException(new CoreException(result));
++						throw new ProvisionException(result);
+ 					case IStatus.WARNING :
+ 					case IStatus.INFO :
+ 						LogHelper.log(result);
+@@ -94,7 +95,8 @@ class SimpleArtifactRepositoryIO {
+ 					bufferedInput.close();
+ 			}
+ 		} catch (IOException ioe) {
+-			throw new RepositoryCreationException(ioe);
++			String msg = NLS.bind(Messages.io_failedRead, location);
++			throw new ProvisionException(new Status(IStatus.ERROR, Activator.ID, ProvisionException.REPOSITORY_FAILED_READ, msg, ioe));
+ 		}
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/spi/p2/artifact/repository/IArtifactRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/spi/p2/artifact/repository/IArtifactRepositoryFactory.java
+index 816f556..2c9b4ef 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/spi/p2/artifact/repository/IArtifactRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/spi/p2/artifact/repository/IArtifactRepositoryFactory.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others.
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -11,11 +11,43 @@
+ package org.eclipse.equinox.spi.p2.artifact.repository;
+ 
+ import java.net.URL;
++import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.p2.artifact.repository.IArtifactRepository;
++import org.eclipse.equinox.p2.core.ProvisionException;
+ 
+ public interface IArtifactRepositoryFactory {
+ 
+-	public IArtifactRepository load(URL location);
++	/**
++	 * Creates and returns a new empty artifact repository of the given type at 
++	 * the given location.
++	 * 
++	 * @param location the location for the new repository
++	 * @param name the name of the new repository
++	 * @param type the kind of repository to create
++	 * @return the newly created repository
++	 * @throws ProvisionException if the repository could not be created.  Reasons include:
++	 * <ul>
++	 * <li>The repository type is unknown.</li>
++	 * <li>There was an error writing to the given repository location.</li>
++	 * <li>A repository already exists at that location.</li>
++	 * </ul>
++	 */
++	public IArtifactRepository create(URL location, String name, String type) throws ProvisionException;
+ 
+-	public IArtifactRepository create(URL location, String name, String type);
++	/**
++	 * Loads the repository at the given location.  The location is expected to contain 
++	 * data that describes a valid artifact repository of a known type.  If this manager
++	 * already knows a repository at the given location then that repository is returned.
++	 * 
++	 * @param location the location in which to look for a repository description
++	 * @param monitor a progress monitor, or <code>null</code> if progress
++	 *    reporting is not desired
++	 * @return a repository object for the given location
++	 * @throws ProvisionException if the repository could not be created.  Reasons include:
++	 * <ul>
++	 * <li>There is no existing repository at that location.</li>
++	 * <li>The repository at that location could not be read.</li>
++	 * </ul>
++	 */
++	public IArtifactRepository load(URL location, IProgressMonitor monitor) throws ProvisionException;
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepository.java b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepository.java
+index d22bd9e..7fd1ff5 100644
+--- a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepository.java
+@@ -35,7 +35,7 @@ public class UpdateSiteArtifactRepository extends AbstractRepository implements
+ 
+ 	private final IArtifactRepository artifactRepository;
+ 
+-	public UpdateSiteArtifactRepository(URL location) {
++	public UpdateSiteArtifactRepository(URL location, IProgressMonitor monitor) {
+ 		super("update site: " + location.toExternalForm(), null, null, location, null, null);
+ 		BundleContext context = Activator.getBundleContext();
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepositoryFactory.java
+index 4265623..e4840ad 100644
+--- a/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.updatesite/src/org/eclipse/equinox/internal/p2/updatesite/artifact/UpdateSiteArtifactRepositoryFactory.java
+@@ -11,6 +11,7 @@
+ package org.eclipse.equinox.internal.p2.updatesite.artifact;
+ 
+ import java.net.URL;
++import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.spi.p2.artifact.repository.IArtifactRepositoryFactory;
+ 
+@@ -20,9 +21,9 @@ public class UpdateSiteArtifactRepositoryFactory implements IArtifactRepositoryF
+ 		return null;
+ 	}
+ 
+-	public IArtifactRepository load(URL location) {
++	public IArtifactRepository load(URL location, IProgressMonitor monitor) {
+ 		if (!location.getPath().endsWith("site.xml"))
+ 			return null;
+-		return new UpdateSiteArtifactRepository(location);
++		return new UpdateSiteArtifactRepository(location, monitor);
+ 	}
+ }

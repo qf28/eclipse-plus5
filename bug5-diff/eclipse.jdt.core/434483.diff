@@ -1,0 +1,361 @@
+commit f0baa4687c4b232261eab4264c1bc16ee1b49e9d
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Tue Jul 29 15:42:08 2014 +0200
+
+    Bug 434483 - [1.8][compiler][inference] Type inference not picked up
+    with method reference
+
+6	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
+22	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+25	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+5	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+17	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+10	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+7	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
+index bc17caa..c01e103 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
+@@ -19,6 +19,7 @@
+  *								Bug 424286 - [1.8] Update type inference to spec version 0.9.1
+  *								Bug 426676 - [1.8][compiler] Wrong generic method type inferred from lambda expression
+  *								Bug 423505 - [1.8] Implement "18.5.4 More Specific Method Inference"
++ *								Bug 434483 - [1.8][compiler][inference] Type inference not picked up with method reference
+  *******************************************************************************/
+ package org.eclipse.jdt.core.tests.compiler.regression;
+ 
+@@ -50484,12 +50485,16 @@ public void test1444() {
+ 			"	                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
+ 			"Type safety: Unchecked cast from Iterator to Iterator<String>\n" + 
+ 			"----------\n" + 
++			(this.complianceLevel < ClassFileConstants.JDK1_8 ?
+ 			"5. WARNING in X.java (at line 22)\n" + 
+ 			"	asString = X.<String> asArray((Iterator<String>) getIterator(), String.class);\n" + 
+ 			"	                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
+ 			"Unnecessary cast from Iterator to Iterator<String>\n" + 
+ 			"----------\n" + 
+-			"6. ERROR in X.java (at line 38)\n" + 
++			"6. ERROR in X.java (at line 38)\n"
++			: // secondary error no longer reported at 1.8+
++			"5. ERROR in X.java (at line 38)\n"
++			) +
+ 			"	Zork z;\n" + 
+ 			"	^^^^\n" + 
+ 			"Zork cannot be resolved to a type\n" + 
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+index 3f59b14..faa84a1 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+@@ -21,7 +21,7 @@ import junit.framework.Test;
+ public class GenericsRegressionTest_1_8 extends AbstractRegressionTest {
+ 
+ static {
+-//	TESTS_NAMES = new String[] { "testBug428198b" };
++//	TESTS_NAMES = new String[] { "testBug434483" };
+ //	TESTS_NUMBERS = new int[] { 40, 41, 43, 45, 63, 64 };
+ //	TESTS_RANGE = new int[] { 11, -1 };
+ }
+@@ -3390,4 +3390,25 @@ public void testBug435767() {
+ 		"The method getValue(String) in the type DummyClass is not applicable for the arguments (Object)\n" + 
+ 		"----------\n");
+ }
++public void testBug434483() {
++	runConformTest(
++		new String[] {
++			"Foo.java",
++			"import java.util.*;\n" +
++			"public class Foo {\n" + 
++			"	\n" + 
++			"  // Similar to Guava's newLinkedList()\n" + 
++			"  public static <E> LinkedList<E> newLinkedList() {\n" + 
++			"    return new LinkedList<E>();\n" + 
++			"  }\n" + 
++			"	\n" + 
++			"  private final ThreadLocal<Queue<String>> brokenQueue = ThreadLocal.withInitial(Foo::newLinkedList);\n" + 
++			"	\n" + 
++			"  private final ThreadLocal<Queue<String>> workingQueue1 = ThreadLocal.withInitial(Foo::<String>newLinkedList);\n" + 
++			"	\n" + 
++			"  private final ThreadLocal<Queue<String>> workingQueue2 = ThreadLocal.withInitial(() -> Foo.<String>newLinkedList());\n" + 
++			"\n" + 
++			"}\n"
++		});
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+index c05aaf5..ed204b5 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ASTNode.java
+@@ -31,6 +31,7 @@
+  *								Bug 432348 - [1.8] Internal compiler error (NPE) after upgrade to 1.8
+  *								Bug 440143 - [1.8][null] one more case of contradictory null annotations regarding type variables
+  *								Bug 441693 - [1.8][null] Bogus warning for type argument annotated with @NonNull
++ *								Bug 434483 - [1.8][compiler][inference] Type inference not picked up with method reference
+  *     Jesper S Moller - Contributions for
+  *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *								bug 412153 - [1.8][compiler] Check validity of annotations which may be repeatable
+@@ -692,7 +693,7 @@ public abstract class ASTNode implements TypeConstants, TypeIds {
+ 			final TypeBinding[] parameters = candidateMethod.parameters;
+ 			Expression[] innerArguments = invocation.arguments();
+ 			Expression [] arguments = innerArguments;
+-			if (infCtx == null && variableArity && parameters.length == arguments.length) { // re-check
++			if (infCtx == null && variableArity && arguments != null && parameters.length == arguments.length) { // re-check
+ 				TypeBinding lastParam = parameters[parameters.length-1];
+ 				Expression lastArg = arguments[arguments.length-1];
+ 				if (lastArg.isCompatibleWith(lastParam, null)) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+index 9ce03b5..357af47 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+@@ -29,6 +29,7 @@
+  *							Bug 435570 - [1.8][null] @NonNullByDefault illegally tries to affect "throws E"
+  *							Bug 435689 - [1.8][inference] Type inference not occurring with lambda expression and method reference
+  *							Bug 438383 - [1.8][null] Bogus warning: Null type safety at method return type
++ *							Bug 434483 - [1.8][compiler][inference] Type inference not picked up with method reference
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contribution for
+  *                          Bug 383624 - [1.8][compiler] Revive code generation support for type annotations (from Olivier's work)
+  *******************************************************************************/
+@@ -87,7 +88,9 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+ 	private int depth;
+ 	private MethodBinding exactMethodBinding; // != null ==> exact method reference.
+ 	private boolean receiverPrecedesParameters = false;
++	private TypeBinding[] freeParameters; // descriptor parameters as used for method lookup - may or may not include the receiver
+ 	protected boolean trialResolution = false;
++	public int inferenceKind; // TODO: define life-cycle: when to re-initialize? How long to keep value?
+ 	
+ 	public ReferenceExpression() {
+ 		super();
+@@ -468,6 +471,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         // 15.28.1
+         final boolean isMethodReference = isMethodReference();
+         this.depth = 0;
++        this.freeParameters = descriptorParameters;
+         MethodBinding someMethod = isMethodReference ? scope.getMethod(this.receiverType, this.selector, descriptorParameters, this) :
+         											       scope.getConstructor((ReferenceBinding) this.receiverType, descriptorParameters, this);
+         int someMethodDepth = this.depth, anotherMethodDepth = 0;
+@@ -506,6 +510,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         			System.arraycopy(descriptorParameters, 1, parameters, 0, parametersLength - 1);
+         		}
+         		this.depth = 0;
++        		this.freeParameters = parameters;
+         		anotherMethod = scope.getMethod(typeToSearch, this.selector, parameters, this);
+         		anotherMethodDepth = this.depth;
+         		this.depth = 0;
+@@ -583,6 +588,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         	scope.problemReporter().unhandledException(methodExceptions[i], this);
+         }
+         if (scope.compilerOptions().isAnnotationBasedNullAnalysisEnabled) {
++        	// TODO: simplify by using this.freeParameters?
+         	int len;
+         	int expectedlen = this.binding.parameters.length;
+         	int providedLen = this.descriptor.parameters.length;
+@@ -617,6 +623,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         		}
+         	}
+         }
++        this.freeParameters = null; // not used after method lookup
+         
+     	if (checkInvocationArguments(scope, null, this.receiverType, this.binding, null, descriptorParameters, false, this))
+     		this.bits |= ASTNode.Unchecked;
+@@ -686,6 +693,18 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+ 		}
+ 	}
+ 
++	public MethodBinding prepareForInferenceResult(Scope scope) {
++		try {
++			setExpressionContext(INVOCATION_CONTEXT);
++			this.binding = null;
++			this.trialResolution = true;
++			resolveType(this.enclosingScope);
++			return this.binding;
++		} finally {
++			this.trialResolution = false;
++		}
++	}
++
+ 	public boolean isConstructorReference() {
+ 		return CharOperation.equals(this.selector,  ConstantPool.Init);
+ 	}
+@@ -710,7 +729,11 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+ 	}
+ 
+ 	public InferenceContext18 freshInferenceContext(Scope scope) {
+-		return null; // subject to inference only as an argument to an outer invocation
++		if (this.expressionContext != ExpressionContext.VANILLA_CONTEXT) {
++			Expression[] arguments = createPseudoExpressions(this.freeParameters);
++			return new InferenceContext18(scope, arguments, this);
++		}
++		return null; // shouldn't happen, actually
+ 	}
+ 
+ 	public boolean isSuperAccess() {
+@@ -770,9 +793,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+ 	}
+ 
+ 	public Expression[] createPseudoExpressions(TypeBinding[] p) {
+-		if (this.descriptor == null)
+-			return null;
+-		// from 15.28.1: 
++		// from 15.13.1: 
+ 		// ... the reference is treated as if it were an invocation with argument expressions of types P1..Pn
+ 		// ... the reference is treated as if it were an invocation with argument expressions of types P2..Pn
+ 		// (the different sets of types are passed from our resolveType to scope.getMethod(..), see someMethod, anotherMethod)
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+index f8f3f81..c24382b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+@@ -295,18 +295,19 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 			if (r.id == TypeIds.T_void)
+ 				return TRUE;
+ 			// ignore parameterization of resolve result and do a fresh start:
+-			MethodBinding original = compileTimeDecl.original();
++			MethodBinding original = compileTimeDecl.shallowOriginal();
++			TypeBinding compileTypeReturn = original.isConstructor() ? original.declaringClass : original.returnType;
+ 			if (reference.typeArguments == null
+-					&& ((original.typeVariables() != Binding.NO_TYPE_VARIABLES && r.mentionsAny(original.typeVariables(), -1))
++					&& ((original.typeVariables() != Binding.NO_TYPE_VARIABLES && compileTypeReturn.mentionsAny(original.typeVariables(), -1))
+ 						|| (original.isConstructor() && original.declaringClass.typeVariables() != Binding.NO_TYPE_VARIABLES)))
+ 							// not checking r.mentionsAny for constructors, because A::new resolves to the raw type
+ 							// whereas in fact the type of all expressions of this shape depends on their type variable (if any)
+ 			{
+-				SuspendedInferenceRecord prevInvocation = inferenceContext.enterPolyInvocation(reference, null/*no invocation arguments available*/);
++				SuspendedInferenceRecord prevInvocation = inferenceContext.enterPolyInvocation(reference, reference.createPseudoExpressions(functionType.parameters));
+ 
+ 				// Invocation Applicability Inference: 18.5.1 & Invocation Type Inference: 18.5.2
+ 				try {
+-					inferInvocationApplicability(inferenceContext, original, functionType.parameters, original.isConstructor()/*mimic a diamond?*/, inferenceContext.inferenceKind);
++					inferInvocationApplicability(inferenceContext, original, functionType.parameters, original.isConstructor()/*mimic a diamond?*/, reference.inferenceKind);
+ 					if (!inferPolyInvocationType(inferenceContext, reference, r, original))
+ 						return FALSE;
+ 					if (!original.isConstructor() 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index b39e57b..ed52407 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -1434,6 +1434,8 @@ public class InferenceContext18 {
+ 	public void rebindInnerPolies(BoundSet bounds, TypeBinding[] parameterTypes) {
+ 		// This updates all remaining poly expressions that are direct arguments of the current invocation:
+ 		// (handles FunctionalExpression & ConditionalExpression)
++		if (this.currentInvocation instanceof ReferenceExpression)
++			return; // no inner expressions
+ 		boolean isVarargs = this.inferenceKind == CHECK_VARARG;
+ 		acceptPendingPolyArguments(bounds, parameterTypes, isVarargs);
+ 		// This loops over all poly expressions for which a sub-inference was triggered:
+@@ -1441,7 +1443,17 @@ public class InferenceContext18 {
+ 		int len = this.innerPolies.size();
+ 		for (int i = 0; i < len; i++) {
+ 			Expression inner = (Expression) this.innerPolies.get(i);
+-			if (inner instanceof Invocation) {
++			if (inner instanceof ReferenceExpression) {
++				ReferenceExpression referenceExpression = (ReferenceExpression) inner;
++				MethodBinding compileTimeDecl = referenceExpression.prepareForInferenceResult(this.scope);
++				if	(compileTimeDecl != null) {
++	  				TypeVariableBinding[] variables = compileTimeDecl.typeVariables;
++					if (variables != Binding.NO_TYPE_VARIABLES) {
++						TypeBinding[] arguments = getSolutions(variables, (InvocationSite) inner, bounds);
++						referenceExpression.binding = this.environment.createParameterizedGenericMethod(compileTimeDecl, arguments);
++					}
++				}
++			} else if (inner instanceof Invocation) {
+ 				Invocation innerMessage = (Invocation) inner;
+ 				TypeBinding innerTargetType = inner.expectedType(); // may be set from acceptPendingPolyArguments
+ 				if (innerTargetType != null && !innerTargetType.isProperType(true))
+@@ -1516,7 +1528,10 @@ public class InferenceContext18 {
+ 					expression.setExpectedType(targetType);
+ 				}
+ 			} else {
+-				expression.checkAgainstFinalTargetType(targetType, this.scope);
++				if (this.innerPolies.contains(expression)) // may get here for ReferenceExpressions ...
++					expression.setExpectedType(targetType); // ... prepare for final inference via rebindInnerPolies
++				else
++					expression.checkAgainstFinalTargetType(targetType, this.scope);
+ 			}
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+index 2601908..2e96a4b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedGenericMethodBinding.java
+@@ -20,12 +20,14 @@
+  *								Bug 416182 - [1.8][compiler][null] Contradictory null annotations not rejected
+  *								Bug 429958 - [1.8][null] evaluate new DefaultLocation attribute of @NonNullByDefault
+  *								Bug 434602 - Possible error with inferred null annotations leading to contradictory null annotations
++ *								Bug 434483 - [1.8][compiler][inference] Type inference not picked up with method reference
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+ import org.eclipse.jdt.internal.compiler.ast.Expression;
+ import org.eclipse.jdt.internal.compiler.ast.Invocation;
+ import org.eclipse.jdt.internal.compiler.ast.NullAnnotationMatching;
++import org.eclipse.jdt.internal.compiler.ast.ReferenceExpression;
+ import org.eclipse.jdt.internal.compiler.ast.Wildcard;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+@@ -101,6 +103,8 @@ public class ParameterizedGenericMethodBinding extends ParameterizedMethodBindin
+ 					infCtx18 = invocationSite.freshInferenceContext(scope);
+ 				else if (invocationSite instanceof Invocation && originalMethod instanceof ParameterizedGenericMethodBinding)
+ 					infCtx18 = ((Invocation) invocationSite).getInferenceContext((ParameterizedGenericMethodBinding) originalMethod);
++				if (infCtx18 == null)
++					return originalMethod;
+ 			}
+ 			if (infCtx18 != null) {
+ 				try {
+@@ -127,6 +131,8 @@ public class ParameterizedGenericMethodBinding extends ParameterizedMethodBindin
+ 						if (provisionalResult != null && infCtx18.isResolved(provisionalResult)) {
+ 							infCtx18.storedSolution = provisionalResult;
+ 							infCtx18.stepCompleted = InferenceContext18.APPLICABILITY_INFERRED;
++							if (invocationSite instanceof ReferenceExpression)
++								((ReferenceExpression) invocationSite).inferenceKind = infCtx18.inferenceKind;
+ 						}
+ 					} else {
+ 						provisionalResult = infCtx18.storedSolution;
+@@ -165,12 +171,14 @@ public class ParameterizedGenericMethodBinding extends ParameterizedMethodBindin
+ 								if (compilerOptions.isAnnotationBasedNullAnalysisEnabled)
+ 									NullAnnotationMatching.checkForContraditions(methodSubstitute, invocationSite, scope);
+ 								infCtx18.rebindInnerPolies(result, methodSubstitute.parameters);
+-								return methodSubstitute.boundCheck18(scope, arguments);
++								MethodBinding problemMethod = methodSubstitute.boundCheck18(scope, arguments);
++								if (problemMethod != null)
++									return problemMethod;
+ 							} else {
+ 								if (invocationSite instanceof Invocation)
+ 									((Invocation) invocationSite).registerInferenceContext(methodSubstitute, infCtx18); // keep context so we can finish later
+-								return methodSubstitute;
+ 							}
++							return methodSubstitute;
+ 						}
+ 					}
+ 					return null;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index bf072d4..52d7832 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -43,6 +43,7 @@
+  *								Bug 429424 - [1.8][inference] Problem inferring type of method's parameter
+  *								Bug 429958 - [1.8][null] evaluate new DefaultLocation attribute of @NonNullByDefault
+  *								Bug 434570 - Generic type mismatch for parametrized class annotation attribute with inner class
++ *								Bug 434483 - [1.8][compiler][inference] Type inference not picked up with method reference
+  *     Jesper S Moller - Contributions for
+  *								Bug 378674 - "The method can be declared as static" is wrong
+  *  							Bug 405066 - [1.8][compiler][codegen] Implement code generation infrastructure for JSR335
+@@ -5136,7 +5137,7 @@ public abstract class Scope {
+ 	}
+ 
+ 	/**
+-	 * Given a selected applibable method, check if it has an unfinished InferenceContext18 associated.
++	 * Given a selected applicable method, check if it has an unfinished InferenceContext18 associated.
+ 	 * If so perform the outstanding Invocation Type Inference and return the improved method,
+ 	 * otherwise return the applicable method unchanged.
+ 	 */
+@@ -5152,6 +5153,11 @@ public abstract class Scope {
+ 			} else {
+ 				ASTNode.resolvePolyExpressionArguments(invocation, applicable, argumentTypes, this);
+ 			}
++		} else if (invocationSite instanceof ReferenceExpression) {
++			if (applicable instanceof ParameterizedGenericMethodBinding)
++				applicable = applicable.shallowOriginal();
++			if (applicable.typeVariables() != Binding.NO_TYPE_VARIABLES)
++				return ParameterizedGenericMethodBinding.computeCompatibleMethod(applicable, argumentTypes, this, invocationSite, FULL_INFERENCE);
+ 		}
+ 		return applicable;
+ 	}

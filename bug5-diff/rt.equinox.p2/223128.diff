@@ -1,0 +1,576 @@
+commit 10e06003b67d6d50a7a60f5dfb6ba14f6ec6721f
+Author: John Arthorne <johna>
+Date:   Thu Mar 20 00:34:38 2008 +0000
+
+    Bug 223128 Failed install with unmatched filters using dropins folder
+
+2	1	bundles/org.eclipse.equinox.p2.core/META-INF/MANIFEST.MF
+66	46	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/PBProjector.java
+10	5	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+2	1	bundles/org.eclipse.equinox.p2.reconciler.dropins/META-INF/MANIFEST.MF
+6	1	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+18	17	bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
+2	1	bundles/org.eclipse.equinox.p2.reconciler/META-INF/MANIFEST.MF
+6	1	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+18	17	bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
+27	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/AutomatedDirectorTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.core/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.core/META-INF/MANIFEST.MF
+index 8925032..d7933ae 100644
+--- a/bundles/org.eclipse.equinox.p2.core/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.core/META-INF/MANIFEST.MF
+@@ -40,7 +40,8 @@ Export-Package: org.eclipse.equinox.internal.p2.core;x-friends:="org.eclipse.equ
+    org.eclipse.equinox.p2.updatechecker.app,
+    org.eclipse.equinox.p2.garbagecollector,
+    org.eclipse.equinox.p2.console,
+-   org.eclipse.equinox.p2.updatesite",
++   org.eclipse.equinox.p2.updatesite,
++   org.eclipse.equinox.p2.reconciler.dropins",
+  org.eclipse.equinox.internal.p2.persistence;x-friends:="org.eclipse.equinox.p2.artifact.repository,org.eclipse.equinox.p2.engine,org.eclipse.equinox.p2.metadata.repository",
+  org.eclipse.equinox.internal.provisional.p2.core,
+  org.eclipse.equinox.internal.provisional.p2.core.eventbus,
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/PBProjector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/PBProjector.java
+index 2c1628e..1e155dc 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/PBProjector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/PBProjector.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007 IBM Corporation and others. All rights reserved. This
++ * Copyright (c) 2007, 2008 IBM Corporation and others. All rights reserved. This
+  * program and the accompanying materials are made available under the terms of
+  * the Eclipse Public License v1.0 which accompanies this distribution, and is
+  * available at http://www.eclipse.org/legal/epl-v10.html
+@@ -14,6 +14,7 @@ import java.util.Map.Entry;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.RequiredCapability;
++import org.eclipse.osgi.util.NLS;
+ import org.osgi.framework.InvalidSyntaxException;
+ import org.sat4j.pb.IPBSolver;
+ import org.sat4j.pb.SolverFactory;
+@@ -23,6 +24,11 @@ import org.sat4j.pb.reader.OPBEclipseReader2007;
+ import org.sat4j.reader.ParseFormatException;
+ import org.sat4j.specs.*;
+ 
++/**
++ * This class is the interface between SAT4J and the planner. It produces a
++ * boolean satisfiability problem, invokes the solver, and converts the solver result
++ * back into information understandable by the planner.
++ */
+ public class PBProjector {
+ 	private static boolean DEBUG = false;
+ 	private Picker picker;
+@@ -42,7 +48,7 @@ public class PBProjector {
+ 	private String objective;
+ 
+ 	private Collection solution;
+-	private boolean incompleteProjection = false;
++	private MultiStatus result;
+ 
+ 	private File problemFile;
+ 
+@@ -55,10 +61,7 @@ public class PBProjector {
+ 		dependencies = new ArrayList();
+ 		selectionContext = context;
+ 		nonGreedyRequirements = new ArrayList();
+-	}
+-
+-	public PBProjector(IInstallableUnit[] installRoots, IInstallableUnit[] gatherAvailableInstallableUnits, Dictionary selectionContext) {
+-		this(new Picker(gatherAvailableInstallableUnits, null), selectionContext);
++		result = new MultiStatus(DirectorActivator.PI_DIRECTOR, IStatus.OK, "Problems resolving provisioning plan.", null);
+ 	}
+ 
+ 	public void encode(IInstallableUnit[] ius, IProgressMonitor monitor) {
+@@ -69,7 +72,8 @@ public class PBProjector {
+ 				System.out.println("Start slicing: " + start); //$NON-NLS-1$
+ 			}
+ 
+-			validateInput(ius);
++			ius = validateInput(ius);
++
+ 			toConsider = new ArrayList();
+ 			toConsider.addAll(Arrays.asList(ius));
+ 			for (int i = 0; i < toConsider.size(); i++) {
+@@ -88,18 +92,46 @@ public class PBProjector {
+ 				System.out.println("Slicing complete: " + (stop - start)); //$NON-NLS-1$
+ 			}
+ 		} catch (IllegalStateException e) {
+-			// TODO Marking incomplete is good, but we need to track what caused the failure
+-			System.err.println(e.getMessage());
+-			incompleteProjection = true;
++			result.add(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, e.getMessage(), e));
+ 		}
+ 	}
+ 
+-	//This is a shortcut to simplify the error reporting when the filter of the ius we are being asked to install does not pass 
+-	private void validateInput(IInstallableUnit[] ius) {
++	/**
++	 * Filter out IUs that are not applicable to the environment, and create warnings
++	 * for each non-applicable IU.
++	 */
++	private IInstallableUnit[] validateInput(IInstallableUnit[] ius) {
++		Map versions = new HashMap();
++		List toRemove = new ArrayList();
++		ArrayList applicable = new ArrayList(ius.length);
+ 		for (int i = 0; i < ius.length; i++) {
+-			if (!isApplicable(ius[i]))
+-				throw new IllegalStateException("The IU " + ius[i] + " can't be installed in this environment because its filter does not match."); //$NON-NLS-1$//$NON-NLS-2$
++			IInstallableUnit iu = ius[i];
++			if (isApplicable(iu.getFilter())) {
++				applicable.add(iu);
++				// if we have a singleton bundle, only try to install the highest version
++				if (iu.isSingleton()) {
++					String id = iu.getId();
++					IInstallableUnit oldIU = (IInstallableUnit) versions.get(id);
++					if (oldIU == null) {
++						versions.put(id, iu);
++					} else {
++						IInstallableUnit removed = iu;
++						if (iu.getVersion().compareTo(oldIU.getVersion()) > 0) {
++							versions.put(id, iu);
++							removed = oldIU;
++						}
++						toRemove.add(removed);
++						String msg = NLS.bind("{0} version {1} cannot be installed because it is marked as a singleton and a higher version has been found.", id, removed.getVersion()); //$NON-NLS-1$
++						result.add(new Status(IStatus.WARNING, DirectorActivator.PI_DIRECTOR, msg, null));
++					}
++				}
++			} else {
++				String msg = NLS.bind("{0} cannot be installed because its filter is not satisfied in this environment.", ius[i].getId()); //$NON-NLS-1$
++				result.add(new Status(IStatus.WARNING, DirectorActivator.PI_DIRECTOR, msg, null));
++			}
+ 		}
++		applicable.removeAll(toRemove);
++		return (IInstallableUnit[]) applicable.toArray(new IInstallableUnit[applicable.size()]);
+ 	}
+ 
+ 	private void processNonGreedyRequirements() {
+@@ -144,18 +176,6 @@ public class PBProjector {
+ 		tautologies.add(" +1" + getVariable(iu) + " = 0;"); //$NON-NLS-1$//$NON-NLS-2$
+ 	}
+ 
+-	// Check whether the requirement is applicable
+-	private boolean isApplicable(RequiredCapability req) {
+-		String filter = req.getFilter();
+-		if (filter == null)
+-			return true;
+-		try {
+-			return DirectorActivator.context.createFilter(filter).match(selectionContext);
+-		} catch (InvalidSyntaxException e) {
+-			return false;
+-		}
+-	}
+-
+ 	//Write the problem generated into a temporary file
+ 	private void persist() {
+ 		try {
+@@ -199,12 +219,11 @@ public class PBProjector {
+ 		}
+ 	}
+ 
+-	private boolean isApplicable(IInstallableUnit iu) {
+-		String enablementFilter = iu.getFilter();
+-		if (enablementFilter == null)
++	private boolean isApplicable(String filter) {
++		if (filter == null)
+ 			return true;
+ 		try {
+-			return DirectorActivator.context.createFilter(enablementFilter).match(selectionContext);
++			return DirectorActivator.context.createFilter(filter).match(selectionContext);
+ 		} catch (InvalidSyntaxException e) {
+ 			return false;
+ 		}
+@@ -215,7 +234,7 @@ public class PBProjector {
+ 	private void processIU(IInstallableUnit iu) {
+ 		slice.put(iu.getId(), iu.getVersion(), iu);
+ 		explanation += " " + getVariable(iu);
+-		if (!isApplicable(iu)) {
++		if (!isApplicable(iu.getFilter())) {
+ 			createNegation(iu);
+ 			return;
+ 		}
+@@ -225,7 +244,7 @@ public class PBProjector {
+ 			return;
+ 		}
+ 		for (int i = 0; i < reqs.length; i++) {
+-			if (!isApplicable(reqs[i]) || reqs[i].isOptional())
++			if (!isApplicable(reqs[i].getFilter()) || reqs[i].isOptional())
+ 				continue;
+ 
+ 			if (!reqs[i].isGreedy()) {
+@@ -249,7 +268,7 @@ public class PBProjector {
+ 		for (int j = 0; j < found.length; j++) {
+ 			for (Iterator iterator = found[j].iterator(); iterator.hasNext();) {
+ 				IInstallableUnit match = (IInstallableUnit) iterator.next();
+-				if (!isApplicable(match))
++				if (!isApplicable(match.getFilter()))
+ 					continue;
+ 				countMatches++;
+ 				expression += " +1 " + getVariable(match); //$NON-NLS-1$
+@@ -319,8 +338,8 @@ public class PBProjector {
+ 	}
+ 
+ 	public IStatus invokeSolver(IProgressMonitor monitor) {
+-		if (incompleteProjection)
+-			return new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, 1, "Projection incomplete", null); //$NON-NLS-1$
++		if (result.getSeverity() == IStatus.ERROR)
++			return result;
+ 		IPBSolver solver = SolverFactory.newEclipseP2();
+ 		solver.setTimeout(60);
+ 		OPBEclipseReader2007 reader = new OPBEclipseReader2007(solver);
+@@ -341,11 +360,14 @@ public class PBProjector {
+ 					System.out.println(reader.decode(problem.model()));
+ 				}
+ 				backToIU(problem);
+-				return Status.OK_STATUS;
++				long stop = System.currentTimeMillis();
++				if (DEBUG)
++					System.out.println("Solver solution found: " + (stop - start)); //$NON-NLS-1$
++			} else {
++				if (DEBUG)
++					System.out.println("Unsatisfiable !"); //$NON-NLS-1$
++				result.merge(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, 1, "No solution found", null));
+ 			}
+-			if (DEBUG)
+-				System.out.println("Unsatisfiable !"); //$NON-NLS-1$
+-			return new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, 1, "No solution found", null); //$NON-NLS-1$
+ 		} catch (FileNotFoundException e) {
+ 			//Ignore we are producing the input file
+ 			if (DEBUG)
+@@ -355,9 +377,9 @@ public class PBProjector {
+ 			if (DEBUG)
+ 				e.printStackTrace();
+ 		} catch (ContradictionException e) {
+-			return new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, 1, "No solution found because of a trivial contradiction", e); //$NON-NLS-1$
++			result.merge(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, 1, "No solution found because of a trivial contradiction", e));
+ 		} catch (TimeoutException e) {
+-			return new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, 1, "No solution found.", e); //$NON-NLS-1$
++			result.merge(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, 1, "No solution found.", e));
+ 		} catch (Exception e) {
+ 			e.printStackTrace();
+ 		} finally {
+@@ -367,12 +389,9 @@ public class PBProjector {
+ 			} catch (IOException e) {
+ 				//ignore
+ 			}
++			problemFile.delete();
+ 		}
+-		long stop = System.currentTimeMillis();
+-		if (DEBUG)
+-			System.out.println("Solver solution found: " + (stop - start)); //$NON-NLS-1$
+-		problemFile.delete();
+-		return new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, 1, "No solution found", null); //$NON-NLS-1$
++		return result;
+ 	}
+ 
+ 	private void backToIU(IProblem problem) {
+@@ -399,4 +418,5 @@ public class PBProjector {
+ 			printSolution(solution);
+ 		return solution;
+ 	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index 3673546..612eacb 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -12,6 +12,7 @@ import java.net.URL;
+ import java.util.*;
+ import java.util.Map.Entry;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+ import org.eclipse.equinox.internal.p2.resolution.ResolutionHelper;
+ import org.eclipse.equinox.internal.p2.rollback.FormerState;
+@@ -42,7 +43,7 @@ public class SimplePlanner implements IPlanner {
+ 		return profileRegistry.getProfile(profileId);
+ 	}
+ 
+-	private ProvisioningPlan generateProvisioningPlan(Collection fromState, Collection toState, List fromStateOrder, List newStateOrder, ProfileChangeRequest changeRequest) {
++	private ProvisioningPlan generateProvisioningPlan(IStatus status, Collection fromState, Collection toState, List fromStateOrder, List newStateOrder, ProfileChangeRequest changeRequest) {
+ 		InstallableUnitOperand[] iuOperands = generateOperations(fromState, toState, fromStateOrder, newStateOrder);
+ 		PropertyOperand[] propertyOperands = generatePropertyOperations(changeRequest);
+ 
+@@ -50,7 +51,9 @@ public class SimplePlanner implements IPlanner {
+ 		System.arraycopy(iuOperands, 0, operands, 0, iuOperands.length);
+ 		System.arraycopy(propertyOperands, 0, operands, iuOperands.length, propertyOperands.length);
+ 
+-		return new ProvisioningPlan(Status.OK_STATUS, operands);
++		if (status == null)
++			status = Status.OK_STATUS;
++		return new ProvisioningPlan(status, operands);
+ 	}
+ 
+ 	private PropertyOperand[] generatePropertyOperations(ProfileChangeRequest profileChangeRequest) {
+@@ -182,7 +185,7 @@ public class SimplePlanner implements IPlanner {
+ 			ResolutionHelper oldStateHelper = new ResolutionHelper(oldSelectionContext, null);
+ 			Collection oldState = oldStateHelper.attachCUs(oldIUs);
+ 			ProfileChangeRequest profileChangeRequest = generateChangeRequest(profile, profileSnapshot, newState);
+-			return generateProvisioningPlan(oldState, newState, oldStateHelper.getSorted(), newStateHelper.getSorted(), profileChangeRequest);
++			return generateProvisioningPlan(null, oldState, newState, oldStateHelper.getSorted(), newStateHelper.getSorted(), profileChangeRequest);
+ 		} finally {
+ 			sub.done();
+ 		}
+@@ -328,11 +331,13 @@ public class SimplePlanner implements IPlanner {
+ 			PBProjector pb = new PBProjector(new Picker(availableIUs, null), newSelectionContext);
+ 			pb.encode(allIUs, sub.newChild(ExpandWork / 4));
+ 			IStatus s = pb.invokeSolver(sub.newChild(ExpandWork / 4));
+-			if (!s.isOK()) {
++			if (s.getSeverity() == IStatus.ERROR) {
+ 				//We invoke the old resolver to get explanations for now
+ 				IStatus newStatus = new NewDependencyExpander(allIUs, null, availableIUs, newSelectionContext, false).expand(sub.newChild(ExpandWork / 4));
+ 				if (newStatus.isOK())
+ 					return new ProvisioningPlan(s);
++				//log the error from the new solver so it is not lost
++				LogHelper.log(s);
+ 				return new ProvisioningPlan(newStatus);
+ 			}
+ 			Collection newState = pb.extractSolution();
+@@ -343,7 +348,7 @@ public class SimplePlanner implements IPlanner {
+ 			ResolutionHelper oldStateHelper = new ResolutionHelper(createSelectionContext(profile.getProperties()), null);
+ 			Collection oldState = oldStateHelper.attachCUs(profile.query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+ 
+-			return generateProvisioningPlan(oldState, newState, oldStateHelper.getSorted(), newStateHelper.getSorted(), profileChangeRequest);
++			return generateProvisioningPlan(s, oldState, newState, oldStateHelper.getSorted(), newStateHelper.getSorted(), profileChangeRequest);
+ 		} finally {
+ 			sub.done();
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.reconciler.dropins/META-INF/MANIFEST.MF
+index 3746432..bf78a29 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/META-INF/MANIFEST.MF
+@@ -8,7 +8,8 @@ Bundle-Version: 0.1.0.qualifier
+ Bundle-Activator: org.eclipse.equinox.internal.p2.reconciler.dropins.Activator
+ Bundle-RequiredExecutionEnvironment: J2SE-1.4,
+  CDC-1.1/Foundation-1.1
+-Import-Package: org.eclipse.equinox.internal.p2.update,
++Import-Package: org.eclipse.equinox.internal.p2.core.helpers,
++ org.eclipse.equinox.internal.p2.update,
+  org.eclipse.equinox.internal.provisional.configurator,
+  org.eclipse.equinox.internal.provisional.p2.artifact.repository,
+  org.eclipse.equinox.internal.provisional.p2.core,
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+index bddfb05..75be14b 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+@@ -14,6 +14,8 @@ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+ import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+@@ -138,7 +140,10 @@ public class Activator implements BundleActivator {
+ 			repositories.addAll(Arrays.asList(linksRepositories));
+ 
+ 		ProfileSynchronizer synchronizer = new ProfileSynchronizer(profile, repositories);
+-		synchronizer.synchronize(monitor);
++		IStatus result = synchronizer.synchronize(monitor);
++		if (!result.isOK())
++			LogHelper.log(result);
++
+ 	}
+ 
+ 	/*
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
+index 1088115..4397a14 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler.dropins/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
+@@ -15,6 +15,7 @@ import java.net.URL;
+ import java.util.*;
+ import java.util.Map.Entry;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.configurator.Configurator;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IFileArtifactRepository;
+@@ -69,23 +70,24 @@ public class ProfileSynchronizer {
+ 			return Status.OK_STATUS;
+ 
+ 		SubMonitor sub = SubMonitor.convert(monitor, 100);
+-		ProvisioningContext provisioningContext = new ProvisioningContext(new URL[0]);
+-
+-		ProvisioningPlan plan = createProvisioningPlan(request, provisioningContext, sub.newChild(50));
+-		if (!plan.getStatus().isOK())
+-			return plan.getStatus();
+-
+-		if (plan.getOperands().length == 0) {
++		try {
++			//create the provisioning plan
++			ProvisioningContext context = new ProvisioningContext(new URL[0]);
++			ProvisioningPlan plan = createProvisioningPlan(request, context, sub.newChild(50));
++			status = plan.getStatus();
++			if (status.getSeverity() == IStatus.ERROR || plan.getOperands().length == 0)
++				return status;
++
++			//invoke the engine to perform installs/uninstalls
++			IStatus engineResult = executePlan(plan, context, sub.newChild(50));
++			if (!engineResult.isOK())
++				return engineResult;
++
++			applyConfiguration();
++			return status;
++		} finally {
+ 			sub.done();
+-			return Status.OK_STATUS;
+ 		}
+-
+-		status = executePlan(plan, provisioningContext, sub.newChild(50));
+-		if (!status.isOK())
+-			return status;
+-
+-		applyConfiguration();
+-		return Status.OK_STATUS;
+ 	}
+ 
+ 	private IStatus synchronizeCacheExtensions() {
+@@ -237,8 +239,7 @@ public class ProfileSynchronizer {
+ 		try {
+ 			configurator.applyConfiguration();
+ 		} catch (IOException e) {
+-			// TODO unexpected -- log
+-			e.printStackTrace();
++			LogHelper.log(new Status(IStatus.ERROR, Activator.ID, "Unexpected failure applying configuration", e)); //$NON-NLS-1$
+ 		} finally {
+ 			context.ungetService(reference);
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.reconciler/META-INF/MANIFEST.MF
+index 3746432..bf78a29 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.reconciler/META-INF/MANIFEST.MF
+@@ -8,7 +8,8 @@ Bundle-Version: 0.1.0.qualifier
+ Bundle-Activator: org.eclipse.equinox.internal.p2.reconciler.dropins.Activator
+ Bundle-RequiredExecutionEnvironment: J2SE-1.4,
+  CDC-1.1/Foundation-1.1
+-Import-Package: org.eclipse.equinox.internal.p2.update,
++Import-Package: org.eclipse.equinox.internal.p2.core.helpers,
++ org.eclipse.equinox.internal.p2.update,
+  org.eclipse.equinox.internal.provisional.configurator,
+  org.eclipse.equinox.internal.provisional.p2.artifact.repository,
+  org.eclipse.equinox.internal.provisional.p2.core,
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+index bddfb05..75be14b 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/Activator.java
+@@ -14,6 +14,8 @@ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.*;
+ import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+@@ -138,7 +140,10 @@ public class Activator implements BundleActivator {
+ 			repositories.addAll(Arrays.asList(linksRepositories));
+ 
+ 		ProfileSynchronizer synchronizer = new ProfileSynchronizer(profile, repositories);
+-		synchronizer.synchronize(monitor);
++		IStatus result = synchronizer.synchronize(monitor);
++		if (!result.isOK())
++			LogHelper.log(result);
++
+ 	}
+ 
+ 	/*
+diff --git a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
+index 1088115..4397a14 100644
+--- a/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
++++ b/bundles/org.eclipse.equinox.p2.reconciler/src/org/eclipse/equinox/internal/p2/reconciler/dropins/ProfileSynchronizer.java
+@@ -15,6 +15,7 @@ import java.net.URL;
+ import java.util.*;
+ import java.util.Map.Entry;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.configurator.Configurator;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepository;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IFileArtifactRepository;
+@@ -69,23 +70,24 @@ public class ProfileSynchronizer {
+ 			return Status.OK_STATUS;
+ 
+ 		SubMonitor sub = SubMonitor.convert(monitor, 100);
+-		ProvisioningContext provisioningContext = new ProvisioningContext(new URL[0]);
+-
+-		ProvisioningPlan plan = createProvisioningPlan(request, provisioningContext, sub.newChild(50));
+-		if (!plan.getStatus().isOK())
+-			return plan.getStatus();
+-
+-		if (plan.getOperands().length == 0) {
++		try {
++			//create the provisioning plan
++			ProvisioningContext context = new ProvisioningContext(new URL[0]);
++			ProvisioningPlan plan = createProvisioningPlan(request, context, sub.newChild(50));
++			status = plan.getStatus();
++			if (status.getSeverity() == IStatus.ERROR || plan.getOperands().length == 0)
++				return status;
++
++			//invoke the engine to perform installs/uninstalls
++			IStatus engineResult = executePlan(plan, context, sub.newChild(50));
++			if (!engineResult.isOK())
++				return engineResult;
++
++			applyConfiguration();
++			return status;
++		} finally {
+ 			sub.done();
+-			return Status.OK_STATUS;
+ 		}
+-
+-		status = executePlan(plan, provisioningContext, sub.newChild(50));
+-		if (!status.isOK())
+-			return status;
+-
+-		applyConfiguration();
+-		return Status.OK_STATUS;
+ 	}
+ 
+ 	private IStatus synchronizeCacheExtensions() {
+@@ -237,8 +239,7 @@ public class ProfileSynchronizer {
+ 		try {
+ 			configurator.applyConfiguration();
+ 		} catch (IOException e) {
+-			// TODO unexpected -- log
+-			e.printStackTrace();
++			LogHelper.log(new Status(IStatus.ERROR, Activator.ID, "Unexpected failure applying configuration", e)); //$NON-NLS-1$
+ 		} finally {
+ 			context.ungetService(reference);
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/AutomatedDirectorTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/AutomatedDirectorTest.java
+index 4a76189..ef4d7cb 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/AutomatedDirectorTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/AutomatedDirectorTest.java
+@@ -153,6 +153,33 @@ public class AutomatedDirectorTest extends AbstractProvisioningTest {
+ 	}
+ 
+ 	/**
++	 * Tests installing an IU that has an unsatisfied platform filter
++	 */
++	public void testInstallPlatformFilterUnsatisfied() {
++		//The IU to install
++		IInstallableUnit toInstallIU = createIU("toInstall." + getName(), createFilter("osgi.os", "blort"), NO_PROVIDES);
++		IInstallableUnit[] allUnits = new IInstallableUnit[] {toInstallIU};
++		IInstallableUnit[] toInstallArray = new IInstallableUnit[] {toInstallIU};
++		createTestMetdataRepository(allUnits);
++
++		IProfile profile = createProfile("TestProfile." + getName());
++		IDirector director = createDirector();
++		ProfileChangeRequest request = new ProfileChangeRequest(profile);
++		request.addInstallableUnits(toInstallArray);
++		IStatus result = director.provision(request, null, null);
++		assertTrue("1.0", !result.isOK());
++
++		//try again with the filter satisfied
++		Map properties = new HashMap();
++		properties.put(IProfile.PROP_ENVIRONMENTS, "osgi.os=blort");
++		IProfile profile2 = createProfile("TestProfile2." + getName(), null, properties);
++		request = new ProfileChangeRequest(profile2);
++		request.addInstallableUnits(toInstallArray);
++		result = director.provision(request, null, null);
++		assertTrue("2.0", result.isOK());
++	}
++
++	/**
+ 	 * Simple test of installing an IU that has a required capability, and ensuring
+ 	 * that the IU providing the capability is installed.
+ 	 */

@@ -1,0 +1,201 @@
+commit 921a42dfe7a95a2bca82b0e07f930d898566b813
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Tue Oct 31 14:22:06 2017 +0100
+
+    Bug 526615: [assist] completing an anonymous allocation may garble the
+    file
+    
+    Change-Id: Iddc26273929fcb8075b16785fc3489a0d823fa99
+
+29	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/CompilationUnitTests.java
+4	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredElement.java
+27	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredType.java
+12	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredUnit.java
+4	4	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/SourceElementParser.java
+29	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/CommentRecorderParser.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/CompilationUnitTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/CompilationUnitTests.java
+index 15454c7..82e1053 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/CompilationUnitTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/CompilationUnitTests.java
+@@ -2610,4 +2610,33 @@ public void testBug495598_001() throws CoreException {
+ 		deleteFolder("/P/src/a");
+ 	}
+ }
++public void testBug526615() throws CoreException {
++	try {
++		createFolder("P/src/test1");
++		createFile("/P/src/test1/B.java",
++				"package test1;\n" +
++				"public abstract class B {}");
++	
++		StringBuffer buf= new StringBuffer();
++		buf.append("package test1;\n");
++		buf.append("/**\n");
++		buf.append(" * Lore ipsum dolor sit amet, consectetur adipisici elit,\n");
++		buf.append(" * sed eiusmod tempor incidunt ut labore et dolore magna aliqua.\n");
++		buf.append(" */\n");
++		buf.append("@SuppressWarnings({\"rawtypes\", \"unchecked\"})\n");
++		buf.append("public class A {\n");
++		buf.append("    B run= new B(\n");
++		buf.append("    static class C {}\n");
++		buf.append("}\n");
++		String contents= buf.toString();
++		createFile("/P/src/test1/A.java", contents);
++	
++		ICompilationUnit cuA= getCompilationUnit("/P/src/test1/A.java");
++		IType typeA = cuA.getTypes()[0];
++		ISourceRange rangeA = typeA.getSourceRange();
++		assertEquals("Start of type A", 15, rangeA.getOffset());
++	} finally {
++		deleteFolder("/P/src/test1");
++	}
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredElement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredElement.java
+index c1a1ac7..2899512 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredElement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredElement.java
+@@ -282,6 +282,10 @@ public int previousAvailableLineEnd(int position){
+ public int sourceEnd(){
+ 	return 0;
+ }
++public int getLastStart() {
++	ASTNode parseTree = parseTree();
++	return parseTree == null ? -1 : parseTree.sourceStart;
++}
+ protected String tabString(int tab) {
+ 	StringBuffer result = new StringBuffer();
+ 	for (int i = tab; i > 0; i--) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredType.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredType.java
+index ac5ef3e..7ef5122 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredType.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredType.java
+@@ -386,6 +386,33 @@ public int lastMemberEnd() {
+ 
+ 	return lastMemberEnd;
+ }
++@Override
++public int getLastStart() {
++	int lastMemberStart = this.typeDeclaration.bodyStart;
++
++	if (this.fieldCount > 0) {
++		FieldDeclaration lastField = this.fields[this.fieldCount - 1].fieldDeclaration;
++		if (lastMemberStart < lastField.declarationSourceStart && lastField.declarationSourceStart != 0) {
++			lastMemberStart = lastField.declarationSourceStart;
++		}
++	}
++
++	if (this.methodCount > 0) {
++		AbstractMethodDeclaration lastMethod = this.methods[this.methodCount - 1].methodDeclaration;
++		if (lastMemberStart < lastMethod.declarationSourceStart && lastMethod.declarationSourceStart != 0) {
++			lastMemberStart = lastMethod.declarationSourceStart;
++		}
++	}
++
++	if (this.memberTypeCount > 0) {
++		TypeDeclaration lastType = this.memberTypes[this.memberTypeCount - 1].typeDeclaration;
++		if (lastMemberStart < lastType.declarationSourceStart && lastType.declarationSourceStart != 0) {
++			lastMemberStart = lastType.declarationSourceStart;
++		}
++	}
++
++	return lastMemberStart;
++}
+ public char[] name(){
+ 	return this.typeDeclaration.name;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredUnit.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredUnit.java
+index 3fcbd03..2e8a7e0 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredUnit.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/parser/RecoveredUnit.java
+@@ -224,6 +224,18 @@ public void resetPendingModifiers() {
+ public int sourceEnd(){
+ 	return this.unitDeclaration.sourceEnd;
+ }
++@Override
++public int getLastStart() {
++	int lastTypeStart = -1;
++
++	if (this.typeCount > 0) {
++		TypeDeclaration lastType = this.types[this.typeCount - 1].typeDeclaration;
++		if (lastTypeStart < lastType.declarationSourceStart && lastType.declarationSourceStart != 0) {
++			lastTypeStart = lastType.declarationSourceStart;
++		}
++	}
++	return lastTypeStart;
++}
+ public String toString(int tab) {
+ 	StringBuffer result = new StringBuffer(tabString(tab));
+ 	result.append("Recovered unit: [\n"); //$NON-NLS-1$
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/SourceElementParser.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/SourceElementParser.java
+index e5fdf45..90c44c6 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/SourceElementParser.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/SourceElementParser.java
+@@ -127,15 +127,15 @@ public void addUnknownRef(NameReference nameRef) {
+ 	}
+ }
+ public void checkComment() {
++	int lastComment = getCommentPtr();
+ 	// discard obsolete comments while inside methods or fields initializer (see bug 74369)
+-	if (!(this.diet && this.dietInt==0) && this.scanner.commentPtr >= 0) {
++	if (!(this.diet && this.dietInt==0) && lastComment >= 0) {
+ 		flushCommentsDefinedPriorTo(this.endStatementPosition);
++		lastComment = getCommentPtr();
+ 	}
+ 
+-	int lastComment = this.scanner.commentPtr;
+-
+ 	if (this.modifiersSourceStart >= 0) {
+-		// eliminate comments located after modifierSourceStart if positionned
++		// eliminate comments located after modifierSourceStart if positioned
+ 		while (lastComment >= 0) {
+ 			int commentSourceStart = this.scanner.commentStarts[lastComment];
+ 			if (commentSourceStart < 0) commentSourceStart = -commentSourceStart;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/CommentRecorderParser.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/CommentRecorderParser.java
+index 0b1eb22..3eb9ba0 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/CommentRecorderParser.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/CommentRecorderParser.java
+@@ -151,7 +151,7 @@ public class CommentRecorderParser extends Parser {
+ 	 */
+ 	public int flushCommentsDefinedPriorTo(int position) {
+ 
+-		int lastCommentIndex = this.scanner.commentPtr;
++		int lastCommentIndex = getCommentPtr();
+ 		if (lastCommentIndex < 0) return position; // no comment
+ 
+ 		// compute the index of the first obsolete comment
+@@ -211,6 +211,34 @@ public class CommentRecorderParser extends Parser {
+ 		return position;
+ 	}
+ 
++	protected int getCommentPtr() {
++		int lastComment = this.scanner.commentPtr;
++		if (lastComment == -1 && this.currentElement != null) {
++			// during recovery reuse comments from initial scan ...
++			lastComment = this.commentPtr;
++			if (lastComment >= 0) {
++				// ... but ignore if not suitable ...
++				if (lastComment >= this.scanner.commentStarts.length) {
++					return -1;
++				} else {
++					int start = this.scanner.commentStarts[lastComment];
++					// ... unsuitable if:
++					//     - unknown to the scanner (start == 0)
++					//     - line comment (start < 0)
++					if (start <= 0)
++						return -1;
++					//     - past the current position, or start of previous recovered element
++					int currentStart = this.currentElement.getLastStart();
++					if (currentStart == -1)
++						currentStart = this.scanner.currentPosition;
++					if (start > currentStart)
++						return -1;
++				}
++			}
++		}
++		return lastComment;
++	}
++
+ 	/*
+ 	 * Build a n*2 matrix of comments positions.
+ 	 * For each position, 0 is for start position and 1 for end position of the comment.

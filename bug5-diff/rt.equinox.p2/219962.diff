@@ -1,0 +1,649 @@
+commit 0ef048fe6da0bb2f594ecdad389ecf9410097dd7
+Author: Pascal Rapicault <prapicau>
+Date:   Thu Feb 28 01:11:03 2008 +0000
+
+    Bug 219962 - [prov] InstallableUnitFragment is a weird construct
+
+35	33	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
+1	1	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/Generator.java
+8	6	bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/MetadataGeneratorHelper.java
+52	30	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataParser.java
+13	3	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataWriter.java
+1	4	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/XMLConstants.java
+15	23	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/InstallableUnitFragment.java
+1	7	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/IInstallableUnitFragment.java
+2	2	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/MetadataFactory.java
+12	19	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
+1	15	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentMethodTest.java
+16	13	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
+index a513d9d..12c2221 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/resolution/ResolutionHelper.java
+@@ -121,47 +121,49 @@ public class ResolutionHelper {
+ 			// For now we will select just one fragment by preferring a fragment that matches the host
+ 
+ 			IInstallableUnit hostIU = ((StateMetadataMap) bds[i].getUserObject()).getUnit();
+-			IInstallableUnitFragment selectedFragment = null;
++			ArrayList applicableFragments = new ArrayList();
+ 			for (int k = 0; k < potentialIUFragments.length; k++) {
+ 				IInstallableUnit dependentIU = ((StateMetadataMap) potentialIUFragments[k].getUserObject()).getUnit();
+-				if (hostIU.equals(dependentIU))
++				if (hostIU.equals(dependentIU) || !dependentIU.isFragment())
+ 					continue;
+ 
+-				if (dependentIU.isFragment()) {
+-					IInstallableUnitFragment potentialFragment = (IInstallableUnitFragment) dependentIU;
+-
+-					if (potentialFragment.getHostId() == null) {
+-						// Check to make sure the host meets the requirements of the fragment
+-						RequiredCapability fragmentRequiredCapabilities[] = potentialFragment.getRequiredCapabilities();
+-						if (fragmentRequiredCapabilities != null) {
+-							ProvidedCapability hostCapabilities[] = hostIU.getProvidedCapabilities();
+-							boolean matchedCapability = false;
+-							for (int l = 0; l < fragmentRequiredCapabilities.length; l++) {
+-								RequiredCapability nextRequiredCapability = fragmentRequiredCapabilities[l];
+-								for (int m = 0; m < hostCapabilities.length; m++) {
+-									if (hostCapabilities[m].isSatisfiedBy(nextRequiredCapability)) {
+-										matchedCapability = true;
+-										break;
+-									}
+-
+-								}
+-							}
+-							if (!matchedCapability) {
+-								break;
+-							}
++				IInstallableUnitFragment potentialFragment = (IInstallableUnitFragment) dependentIU;
++
++				// Check to make sure the host meets the requirements of the fragment
++				RequiredCapability reqsFromFragment[] = potentialFragment.getHost();
++				ProvidedCapability hostCapabilities[] = hostIU.getProvidedCapabilities();
++				boolean match = true;
++				boolean requirementMatched = false;
++				for (int l = 0; l < reqsFromFragment.length && match == true; l++) {
++					requirementMatched = false;
++					for (int m = 0; m < hostCapabilities.length; m++) {
++						if (hostCapabilities[m].isSatisfiedBy(reqsFromFragment[l])) {
++							requirementMatched = true;
++							break;
+ 						}
+-
+-						// default fragment - we'll mark it selected but keep looking for a fragment that matches the host
+-						selectedFragment = potentialFragment;
+-					} else if (potentialFragment.getHostId().equals(hostIU.getId()) && potentialFragment.getHostVersionRange().isIncluded(hostIU.getVersion())) {
+-						// matches host - we're done
+-						selectedFragment = potentialFragment;
++					}
++					if (requirementMatched == false) {
++						match = false;
+ 						break;
+-					} // otherwise keep looking
++					}
++
++				}
++				if (match) {
++					applicableFragments.add(potentialFragment);
++				}
++			}
++
++			IInstallableUnitFragment theFragment = null;
++			int specificityLevel = 0;
++			for (Iterator iterator = applicableFragments.iterator(); iterator.hasNext();) {
++				IInstallableUnitFragment fragment = (IInstallableUnitFragment) iterator.next();
++				if (fragment.getHost().length > specificityLevel) {
++					theFragment = fragment;
++					specificityLevel = fragment.getHost().length;
+ 				}
+ 			}
+-			if (selectedFragment != null)
+-				fragmentBindings.put(hostIU, selectedFragment);
++			if (theFragment != null)
++				fragmentBindings.put(hostIU, theFragment);
+ 		}
+ 		//build the collection of resolved IUs
+ 		Collection result = new HashSet(toAttach.size());
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/Generator.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/Generator.java
+index 5b047f9..fb1a7c3 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/Generator.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/Generator.java
+@@ -619,7 +619,7 @@ public class Generator {
+ 		cu.setId(configUnitId);
+ 		cu.setVersion(launcherVersion);
+ 		cu.setFilter(filter);
+-		cu.setHost(launcherId, new VersionRange(launcherVersion, true, launcherVersion, true));
++		cu.setHost(new RequiredCapability[] {MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, launcherId, new VersionRange(launcherVersion, true, launcherVersion, true), null, false, false)});
+ 		cu.setProperty(IInstallableUnit.PROP_TYPE_FRAGMENT, Boolean.TRUE.toString());
+ 		//TODO bug 218890, would like the fragment to provide the launcher capability as well, but can't right now.
+ 		cu.setCapabilities(new ProvidedCapability[] {MetadataGeneratorHelper.createSelfCapability(configUnitId, launcherVersion)});
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/MetadataGeneratorHelper.java b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/MetadataGeneratorHelper.java
+index 377533a..b62684c 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/MetadataGeneratorHelper.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.generator/src/org/eclipse/equinox/internal/provisional/p2/metadata/generator/MetadataGeneratorHelper.java
+@@ -131,7 +131,9 @@ public class MetadataGeneratorHelper {
+ 		cu.setVersion(iuVersion);
+ 
+ 		//Indicate the IU to which this CU apply
+-		cu.setHost(iuId, new VersionRange(iuVersion, true, versionMax, true));
++		cu.setHost(new RequiredCapability[] { //
++				MetadataFactory.createRequiredCapability(CAPABILITY_NS_OSGI_BUNDLE, iuId, new VersionRange(iuVersion, true, versionMax, true), null, false, false), // 
++						MetadataFactory.createRequiredCapability(NAMESPACE_ECLIPSE_TYPE, TYPE_ECLIPSE_BUNDLE, new VersionRange(new Version(1, 0, 0), true, new Version(2, 0, 0), false), null, false, false)});
+ 
+ 		//Adds capabilities for fragment, self, and describing the flavor supported
+ 		cu.setProperty(IInstallableUnit.PROP_TYPE_FRAGMENT, Boolean.TRUE.toString());
+@@ -309,7 +311,7 @@ public class MetadataGeneratorHelper {
+ 
+ 		// Create a required capability on bundles
+ 		RequiredCapability[] reqs = new RequiredCapability[] {MetadataFactory.createRequiredCapability(NAMESPACE_ECLIPSE_TYPE, TYPE_ECLIPSE_BUNDLE, VersionRange.emptyRange, null, false, true)};
+-		cu.setRequiredCapabilities(reqs);
++		cu.setHost(reqs);
+ 		Map touchpointData = new HashMap();
+ 
+ 		touchpointData.put("install", "installBundle(bundle:${artifact})"); //$NON-NLS-1$ //$NON-NLS-2$
+@@ -342,7 +344,7 @@ public class MetadataGeneratorHelper {
+ 
+ 		// Create a required capability on features
+ 		RequiredCapability[] reqs = new RequiredCapability[] {MetadataFactory.createRequiredCapability(NAMESPACE_ECLIPSE_TYPE, TYPE_ECLIPSE_FEATURE, VersionRange.emptyRange, null, false, true)};
+-		cu.setRequiredCapabilities(reqs);
++		cu.setHost(reqs);
+ 
+ 		Map touchpointData = new HashMap();
+ 		touchpointData.put("install", "installFeature(feature:${artifact},featureId:default,featureVersion:default)"); //$NON-NLS-1$//$NON-NLS-2$
+@@ -365,7 +367,7 @@ public class MetadataGeneratorHelper {
+ 
+ 		// Create a required capability on source providers
+ 		RequiredCapability[] reqs = new RequiredCapability[] {MetadataFactory.createRequiredCapability(NAMESPACE_ECLIPSE_TYPE, TYPE_ECLIPSE_SOURCE, VersionRange.emptyRange, null, false, true)};
+-		cu.setRequiredCapabilities(reqs);
++		cu.setHost(reqs);
+ 		Map touchpointData = new HashMap();
+ 
+ 		touchpointData.put("install", "addSourceBundle(bundle:${artifact})"); //$NON-NLS-1$ //$NON-NLS-2$
+@@ -480,7 +482,7 @@ public class MetadataGeneratorHelper {
+ 		String configId = "config." + id;//$NON-NLS-1$
+ 		cu.setId(configId);
+ 		cu.setVersion(version);
+-		cu.setHost(id, new VersionRange(version, true, versionMax, true));
++		cu.setHost(new RequiredCapability[] {MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, id, new VersionRange(version, true, versionMax, true), null, false, false)});
+ 		cu.setProperty(IInstallableUnit.PROP_TYPE_FRAGMENT, Boolean.TRUE.toString());
+ 		cu.setCapabilities(new ProvidedCapability[] {createSelfCapability(configId, version)});
+ 		cu.setTouchpointType(TOUCHPOINT_NATIVE);
+@@ -546,7 +548,7 @@ public class MetadataGeneratorHelper {
+ 		String configUnitId = configurationFlavor + launcherId;
+ 		cu.setId(configUnitId);
+ 		cu.setVersion(LAUNCHER_VERSION);
+-		cu.setHost(launcherId, new VersionRange(LAUNCHER_VERSION, true, versionMax, true));
++		cu.setHost(new RequiredCapability[] {MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, launcherId, new VersionRange(LAUNCHER_VERSION, true, versionMax, true), null, false, false)});
+ 		cu.setProperty(IInstallableUnit.PROP_TYPE_FRAGMENT, Boolean.TRUE.toString());
+ 		cu.setCapabilities(new ProvidedCapability[] {createSelfCapability(configUnitId, LAUNCHER_VERSION)});
+ 		cu.setTouchpointType(TOUCHPOINT_NATIVE);
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataParser.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataParser.java
+index 82a54d1..72f27e3 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataParser.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataParser.java
+@@ -63,13 +63,14 @@ public abstract class MetadataParser extends XMLParser implements XMLConstants {
+ 	protected class InstallableUnitHandler extends AbstractHandler {
+ 
+ 		private final String[] required = new String[] {ID_ATTRIBUTE, VERSION_ATTRIBUTE};
+-		private final String[] optional = new String[] {SINGLETON_ATTRIBUTE, FRAGMENT_ATTRIBUTE, FRAGMENT_HOST_ID_ATTRIBUTE, FRAGMENT_HOST_RANGE_ATTRIBUTE};
++		private final String[] optional = new String[] {SINGLETON_ATTRIBUTE};
+ 
+ 		InstallableUnitDescription currentUnit = null;
+ 
+ 		private PropertiesHandler propertiesHandler = null;
+ 		private ProvidedCapabilitiesHandler providedCapabilitiesHandler = null;
+ 		private RequiredCapabilitiesHandler requiredCapabilitiesHandler = null;
++		private HostRequiredCapabilitiesHandler hostRequiredCapabilitiesHandler = null;
+ 		private TextHandler filterHandler = null;
+ 		private ArtifactsHandler artifactsHandler = null;
+ 		private TouchpointTypeHandler touchpointTypeHandler = null;
+@@ -78,39 +79,23 @@ public abstract class MetadataParser extends XMLParser implements XMLConstants {
+ 		private LicensesHandler licensesHandler = null;
+ 		private CopyrightHandler copyrightHandler = null;
+ 
++		private String id;
++		private Version version;
++		private boolean singleton;
++
++		private List units;
++
+ 		public InstallableUnitHandler(AbstractHandler parentHandler, Attributes attributes, List units) {
+ 			super(parentHandler, INSTALLABLE_UNIT_ELEMENT);
+ 			String[] values = parseAttributes(attributes, required, optional);
++			this.units = units;
+ 			//skip entire IU if the id is missing
+ 			if (values[0] == null)
+ 				return;
+-			Version version = checkVersion(INSTALLABLE_UNIT_ELEMENT, VERSION_ATTRIBUTE, values[1]);
+-			boolean singleton = checkBoolean(INSTALLABLE_UNIT_ELEMENT, SINGLETON_ATTRIBUTE, values[2], true).booleanValue();
+-			boolean isFragment = checkBoolean(INSTALLABLE_UNIT_ELEMENT, FRAGMENT_ATTRIBUTE, values[3], false).booleanValue();
+-			if (isFragment) {
+-				String hostId = values[4];
+-				// TODO: tooling default fragment does not have a host id
+-				if (hostId != null)
+-					checkRequiredAttribute(INSTALLABLE_UNIT_ELEMENT, FRAGMENT_HOST_ID_ATTRIBUTE, hostId);
+-				checkRequiredAttribute(INSTALLABLE_UNIT_ELEMENT, FRAGMENT_HOST_RANGE_ATTRIBUTE, values[5]);
+-				VersionRange hostRange = checkVersionRange(INSTALLABLE_UNIT_ELEMENT, FRAGMENT_HOST_RANGE_ATTRIBUTE, values[5]);
+-				currentUnit = new InstallableUnitFragmentDescription();
+-				currentUnit.setId(values[0]);
+-				currentUnit.setVersion(version);
+-				currentUnit.setSingleton(singleton);
+-				((InstallableUnitFragmentDescription) currentUnit).setHost(values[4], hostRange);
+-			} else {
+-				if (values[4] != null) {
+-					unexpectedAttribute(INSTALLABLE_UNIT_ELEMENT, FRAGMENT_HOST_ID_ATTRIBUTE, values[4]);
+-				} else if (values[5] != null) {
+-					unexpectedAttribute(INSTALLABLE_UNIT_ELEMENT, FRAGMENT_HOST_RANGE_ATTRIBUTE, values[4]);
+-				}
+-				currentUnit = new InstallableUnitDescription();
+-				currentUnit.setId(values[0]);
+-				currentUnit.setVersion(version);
+-				currentUnit.setSingleton(singleton);
+-			}
+-			units.add(currentUnit);
++
++			id = values[0];
++			version = checkVersion(INSTALLABLE_UNIT_ELEMENT, VERSION_ATTRIBUTE, values[1]);
++			singleton = checkBoolean(INSTALLABLE_UNIT_ELEMENT, SINGLETON_ATTRIBUTE, values[2], true).booleanValue();
+ 		}
+ 
+ 		public IInstallableUnit getInstallableUnit() {
+@@ -137,6 +122,12 @@ public abstract class MetadataParser extends XMLParser implements XMLConstants {
+ 				} else {
+ 					duplicateElement(this, name, attributes);
+ 				}
++			} else if (HOST_REQUIRED_CAPABILITIES_ELEMENT.equals(name)) {
++				if (hostRequiredCapabilitiesHandler == null) {
++					hostRequiredCapabilitiesHandler = new HostRequiredCapabilitiesHandler(this, attributes);
++				} else {
++					duplicateElement(this, name, attributes);
++				}
+ 			} else if (IU_FILTER_ELEMENT.equals(name)) {
+ 				if (filterHandler == null) {
+ 					filterHandler = new TextHandler(this, IU_FILTER_ELEMENT, attributes);
+@@ -182,7 +173,16 @@ public abstract class MetadataParser extends XMLParser implements XMLConstants {
+ 		}
+ 
+ 		protected void finished() {
+-			if (isValidXML() && currentUnit != null) {
++			if (isValidXML()) {
++				if (hostRequiredCapabilitiesHandler == null || hostRequiredCapabilitiesHandler.getHostRequiredCapabilities().length == 0) {
++					currentUnit = new InstallableUnitDescription();
++				} else {
++					currentUnit = new MetadataFactory.InstallableUnitFragmentDescription();
++					((InstallableUnitFragmentDescription) currentUnit).setHost(hostRequiredCapabilitiesHandler.getHostRequiredCapabilities());
++				}
++				currentUnit.setId(id);
++				currentUnit.setVersion(version);
++				currentUnit.setSingleton(singleton);
+ 				OrderedProperties properties = (propertiesHandler == null ? new OrderedProperties(0) : propertiesHandler.getProperties());
+ 				String updateFrom = null;
+ 				VersionRange updateRange = null;
+@@ -235,6 +235,7 @@ public abstract class MetadataParser extends XMLParser implements XMLConstants {
+ 					currentUnit.addTouchpointData(touchpointData[i]);
+ 				if (updateDescriptorHandler != null)
+ 					currentUnit.setUpdateDescriptor(updateDescriptorHandler.getUpdateDescriptor());
++				units.add(currentUnit);
+ 			}
+ 		}
+ 	}
+@@ -278,8 +279,29 @@ public abstract class MetadataParser extends XMLParser implements XMLConstants {
+ 		}
+ 	}
+ 
+-	protected class RequiredCapabilitiesHandler extends AbstractHandler {
++	protected class HostRequiredCapabilitiesHandler extends AbstractHandler {
++		private List requiredCapabilities;
++
++		public HostRequiredCapabilitiesHandler(AbstractHandler parentHandler, Attributes attributes) {
++			super(parentHandler, HOST_REQUIRED_CAPABILITIES_ELEMENT);
++			String size = parseOptionalAttribute(attributes, COLLECTION_SIZE_ATTRIBUTE);
++			requiredCapabilities = (size != null ? new ArrayList(new Integer(size).intValue()) : new ArrayList(4));
++		}
++
++		public RequiredCapability[] getHostRequiredCapabilities() {
++			return (RequiredCapability[]) requiredCapabilities.toArray(new RequiredCapability[requiredCapabilities.size()]);
++		}
++
++		public void startElement(String name, Attributes attributes) {
++			if (name.equals(REQUIRED_CAPABILITY_ELEMENT)) {
++				new RequiredCapabilityHandler(this, attributes, requiredCapabilities);
++			} else {
++				invalidElement(name, attributes);
++			}
++		}
++	}
+ 
++	protected class RequiredCapabilitiesHandler extends AbstractHandler {
+ 		private List requiredCapabilities;
+ 
+ 		public RequiredCapabilitiesHandler(AbstractHandler parentHandler, Attributes attributes) {
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataWriter.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataWriter.java
+index f4c7123..3d909e8 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataWriter.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/MetadataWriter.java
+@@ -46,12 +46,11 @@ public abstract class MetadataWriter extends XMLWriter implements XMLConstants {
+ 		attribute(ID_ATTRIBUTE, iu.getId());
+ 		attribute(VERSION_ATTRIBUTE, iu.getVersion());
+ 		attribute(SINGLETON_ATTRIBUTE, iu.isSingleton(), true);
+-		attribute(FRAGMENT_ATTRIBUTE, iu.isFragment(), false);
++		//		attribute(FRAGMENT_ATTRIBUTE, iu.isFragment(), false);
+ 
+ 		if (iu.isFragment() && iu instanceof IInstallableUnitFragment) {
+ 			IInstallableUnitFragment fragment = (IInstallableUnitFragment) iu;
+-			attribute(FRAGMENT_HOST_ID_ATTRIBUTE, fragment.getHostId());
+-			attribute(FRAGMENT_HOST_RANGE_ATTRIBUTE, fragment.getHostVersionRange());
++			writeHostRequiredCapabilities(fragment.getHost());
+ 		}
+ 
+ 		writeUpdateDescriptor(resolvedIU, resolvedIU.getUpdateDescriptor());
+@@ -69,6 +68,17 @@ public abstract class MetadataWriter extends XMLWriter implements XMLConstants {
+ 		end(INSTALLABLE_UNIT_ELEMENT);
+ 	}
+ 
++	protected void writeHostRequiredCapabilities(RequiredCapability[] capabilities) {
++		if (capabilities != null && capabilities.length > 0) {
++			start(HOST_REQUIRED_CAPABILITIES_ELEMENT);
++			attribute(COLLECTION_SIZE_ATTRIBUTE, capabilities.length);
++			for (int i = 0; i < capabilities.length; i++) {
++				writeRequiredCapability(capabilities[i]);
++			}
++			end(HOST_REQUIRED_CAPABILITIES_ELEMENT);
++		}
++	}
++
+ 	protected void writeProvidedCapabilities(ProvidedCapability[] capabilities) {
+ 		if (capabilities != null && capabilities.length > 0) {
+ 			start(PROVIDED_CAPABILITIES_ELEMENT);
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/XMLConstants.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/XMLConstants.java
+index 11e3a3c..5e7957a 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/XMLConstants.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/io/XMLConstants.java
+@@ -32,6 +32,7 @@ public interface XMLConstants extends org.eclipse.equinox.internal.p2.persistenc
+ 	public static final String ARTIFACT_KEYS_ELEMENT = "artifacts"; //$NON-NLS-1$
+ 	public static final String ARTIFACT_KEY_ELEMENT = "artifact"; //$NON-NLS-1$
+ 	public static final String REQUIRED_CAPABILITIES_ELEMENT = "requires"; //$NON-NLS-1$
++	public static final String HOST_REQUIRED_CAPABILITIES_ELEMENT = "hostRequirements"; //$NON-NLS-1$
+ 	public static final String REQUIRED_CAPABILITY_ELEMENT = "required"; //$NON-NLS-1$
+ 	public static final String PROVIDED_CAPABILITIES_ELEMENT = "provides"; //$NON-NLS-1$
+ 	public static final String PROVIDED_CAPABILITY_ELEMENT = "provided"; //$NON-NLS-1$
+@@ -44,10 +45,6 @@ public interface XMLConstants extends org.eclipse.equinox.internal.p2.persistenc
+ 	public static final String SINGLETON_ATTRIBUTE = "singleton"; //$NON-NLS-1$
+ 	public static final String FRAGMENT_ATTRIBUTE = "fragment"; //$NON-NLS-1$
+ 
+-	// Constants for attributes of a fragment installable unit element
+-	public static final String FRAGMENT_HOST_ID_ATTRIBUTE = "hostId"; //$NON-NLS-1$
+-	public static final String FRAGMENT_HOST_RANGE_ATTRIBUTE = "hostRange"; //$NON-NLS-1$
+-
+ 	// Constants for sub-elements of a required capability element
+ 	public static final String CAPABILITY_FILTER_ELEMENT = "filter"; //$NON-NLS-1$
+ 	public static final String CAPABILITY_SELECTORS_ELEMENT = "selectors"; //$NON-NLS-1$
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/InstallableUnitFragment.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/InstallableUnitFragment.java
+index 9270f41..7c8b725 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/InstallableUnitFragment.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/p2/metadata/InstallableUnitFragment.java
+@@ -10,45 +10,37 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.metadata;
+ 
+-import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+-import org.eclipse.osgi.service.resolver.VersionRange;
++import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnitFragment;
++import org.eclipse.equinox.internal.provisional.p2.metadata.RequiredCapability;
+ 
+ public class InstallableUnitFragment extends InstallableUnit implements IInstallableUnitFragment {
+ 
+-	//a host id of null is used for the default fragment
+-	private String hostId = null;
+-	private VersionRange hostRange = VersionRange.emptyRange;
++	private RequiredCapability[] hostRequirements;
+ 
+ 	public InstallableUnitFragment() {
+ 		super();
+ 	}
+ 
+-	public void setHost(String iuId, VersionRange versionRange) {
+-		if (versionRange == null)
+-			throw new IllegalArgumentException();
+-		hostId = iuId;
+-		hostRange = versionRange;
+-		if (hostId != null)
+-			addRequiredCapability(MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, iuId, versionRange, null, false, false));
++	public void setHost(RequiredCapability[] hostRequirements) {
++		if (hostRequirements == null)
++			return;
++		this.hostRequirements = hostRequirements;
++		addRequiredCapability(hostRequirements);
+ 	}
+ 
+-	public String getHostId() {
+-		return hostId;
+-	}
+-
+-	public VersionRange getHostVersionRange() {
+-		return hostRange;
+-	}
+-
+-	private void addRequiredCapability(RequiredCapability toAdd) {
++	private void addRequiredCapability(RequiredCapability[] toAdd) {
+ 		RequiredCapability[] current = super.getRequiredCapabilities();
+-		RequiredCapability[] result = new RequiredCapability[current.length + 1];
++		RequiredCapability[] result = new RequiredCapability[current.length + toAdd.length];
+ 		System.arraycopy(current, 0, result, 0, current.length);
+-		result[current.length] = toAdd;
++		System.arraycopy(toAdd, 0, result, current.length, toAdd.length);
+ 		setRequiredCapabilities(result);
+ 	}
+ 
+ 	public boolean isFragment() {
+ 		return true;
+ 	}
++
++	public RequiredCapability[] getHost() {
++		return hostRequirements;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/IInstallableUnitFragment.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/IInstallableUnitFragment.java
+index 0b04b9a..544de64 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/IInstallableUnitFragment.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/IInstallableUnitFragment.java
+@@ -8,12 +8,6 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.internal.provisional.p2.metadata;
+ 
+-import org.eclipse.osgi.service.resolver.VersionRange;
+-
+ public interface IInstallableUnitFragment extends IInstallableUnit {
+-
+-	public abstract String getHostId();
+-
+-	public abstract VersionRange getHostVersionRange();
+-
++	public RequiredCapability[] getHost();
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/MetadataFactory.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/MetadataFactory.java
+index 7de4513..b0836d7 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/MetadataFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/MetadataFactory.java
+@@ -99,8 +99,8 @@ public class MetadataFactory {
+ 	}
+ 
+ 	public static class InstallableUnitFragmentDescription extends InstallableUnitDescription {
+-		public void setHost(String hostId, VersionRange hostRange) {
+-			((InstallableUnitFragment) unit()).setHost(hostId, hostRange);
++		public void setHost(RequiredCapability[] hostRequirements) {
++			((InstallableUnitFragment) unit()).setHost(hostRequirements);
+ 		}
+ 
+ 		InstallableUnit unit() {
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
+index c78d9e4..702b0ca 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/AbstractProvisioningTest.java
+@@ -44,7 +44,7 @@ public class AbstractProvisioningTest extends TestCase {
+ 	protected static final ProvidedCapability[] NO_PROVIDES = new ProvidedCapability[0];
+ 	protected static final RequiredCapability[] NO_REQUIRES = new RequiredCapability[0];
+ 
+-	protected static final TouchpointData NO_TP_DATA = null;
++	protected static final TouchpointData NO_TP_DATA = MetadataFactory.createTouchpointData(new HashMap());
+ 
+ 	/**
+ 	 * Tracks the metadata repositories created by this test instance. The repositories
+@@ -179,7 +179,16 @@ public class AbstractProvisioningTest extends TestCase {
+ 	 *  fragment provided capabilities are added to the IU.
+ 	 */
+ 	public static IInstallableUnitFragment createBundleFragment(String name) {
+-		return createIUFragment(null, name, DEFAULT_VERSION, BUNDLE_REQUIREMENT, TOUCHPOINT_OSGI, NO_TP_DATA);
++		InstallableUnitFragmentDescription fragment = new InstallableUnitFragmentDescription();
++		fragment.setId(name);
++		fragment.setVersion(DEFAULT_VERSION);
++		fragment.setProperty(IInstallableUnit.PROP_TYPE_FRAGMENT, Boolean.TRUE.toString());
++		fragment.setTouchpointType(TOUCHPOINT_OSGI);
++		fragment.addTouchpointData(NO_TP_DATA);
++		fragment.setHost(BUNDLE_REQUIREMENT);
++		return MetadataFactory.createInstallableUnitFragment(fragment);
++
++		//		return createIUFragment(null, name, DEFAULT_VERSION, BUNDLE_REQUIREMENT, TOUCHPOINT_OSGI, NO_TP_DATA);
+ 	}
+ 
+ 	/**
+@@ -374,27 +383,11 @@ public class AbstractProvisioningTest extends TestCase {
+ 			fragment.addTouchpointData(tpData);
+ 		if (host != null) {
+ 			VersionRange hostRange = new VersionRange(host.getVersion(), true, host.getVersion(), true);
+-			fragment.setHost(host.getId(), hostRange);
++			fragment.setHost(new RequiredCapability[] {MetadataFactory.createRequiredCapability(IInstallableUnit.NAMESPACE_IU_ID, host.getId(), hostRange, null, false, false)});
+ 		}
+ 		return MetadataFactory.createInstallableUnitFragment(fragment);
+ 	}
+ 
+-	/**
+-	 * 	Create a basic InstallableUnitFragment with the given attributes. 
+-	 * The self and fragment provided capabilities are added to the IU.
+-	 */
+-	public static IInstallableUnitFragment createIUFragment(String name) {
+-		return createIUFragment(null, name, DEFAULT_VERSION, NO_REQUIRES, TouchpointType.NONE, NO_TP_DATA);
+-	}
+-
+-	/**
+-	 * 	Create a basic InstallableUnitFragment with the given attributes. 
+-	 * The self and fragment provided capabilities are added to the IU.
+-	 */
+-	public static IInstallableUnitFragment createIUFragment(String name, Version version) {
+-		return createIUFragment(null, name, version, NO_REQUIRES, TouchpointType.NONE, NO_TP_DATA);
+-	}
+-
+ 	public static IPlanner createPlanner() {
+ 		return (IPlanner) ServiceHelper.getService(TestActivator.getContext(), IPlanner.class.getName());
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentMethodTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentMethodTest.java
+index 04f54a1..3591a5f 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentMethodTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentMethodTest.java
+@@ -131,20 +131,6 @@ public class FragmentMethodTest extends TestCase {
+ 		}
+ 	}
+ 
+-	public void testDependencies() {
+-		RequiredCapability[] iuDependencies = iu1Deps;
+-		RequiredCapability[] initialFragmentDependencies = iu3Deps;
+-
+-		RequiredCapability[] mergedDependencies = iu1.getRequiredCapabilities();
+-		for (int i = 0; i < iuDependencies.length; i++) {
+-			FragmentTest.assertContains(mergedDependencies, iuDependencies[i]);
+-		}
+-		for (int i = 0; i < initialFragmentDependencies.length; i++) {
+-			FragmentTest.assertContains(mergedDependencies, initialFragmentDependencies[i]);
+-		}
+-		assertEquals("The fragment dependencies should not change", initialFragmentDependencies, iu3.getRequiredCapabilities(), false);
+-	}
+-
+ 	public void testProperties() {
+ 		assertNotNull("The property is missing", iu3.getProperty(PROP_FRAG));
+ 		assertNotNull("The property is missing", iu1.getProperty(PROP_IU));
+@@ -158,7 +144,7 @@ public class FragmentMethodTest extends TestCase {
+ 		iu.setTouchpointType(AbstractProvisioningTest.TOUCHPOINT_OSGI);
+ 		iu.setProperty(PROP_FRAG, "value");
+ 		RequiredCapability[] reqs = new RequiredCapability[] {MetadataFactory.createRequiredCapability("eclipse.touchpoint", "bundle", VersionRange.emptyRange, null, false, true), MetadataFactory.createRequiredCapability(TEST_REQUIRED, TEST_REQUIRED, VersionRange.emptyRange, null, true, false)};
+-		iu.setRequiredCapabilities(reqs);
++		iu.setHost(reqs);
+ 		ProvidedCapability[] cap = new ProvidedCapability[] {MetadataFactory.createProvidedCapability("testCapabilityInFragment", "testCapabilityInFragment", new Version(1, 0, 0))};
+ 		iu.setCapabilities(cap);
+ 		return MetadataFactory.createInstallableUnitFragment(iu);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentTest.java
+index 512d159..032ec0a 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/FragmentTest.java
+@@ -19,7 +19,8 @@ import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+ public class FragmentTest extends AbstractProvisioningTest {
+ 
+ 	public void testAssociation() {
+-		IInstallableUnit iu1 = createEclipseIU("ui.test1");
++		String ID = "ui.test1";
++		IInstallableUnit iu1 = createEclipseIU(ID);
+ 		IInstallableUnit iu2 = createBundleFragment("iuFragment.test1");
+ 		ResolutionHelper rh = new ResolutionHelper(new Hashtable(), null);
+ 		HashSet set = new HashSet();
+@@ -28,7 +29,7 @@ public class FragmentTest extends AbstractProvisioningTest {
+ 		Collection result = rh.attachCUs(set);
+ 		for (Iterator iterator = result.iterator(); iterator.hasNext();) {
+ 			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+-			if (iu.getId().equals("iu1.test1")) {
++			if (iu.getId().equals(ID)) {
+ 				assertEquals(iu.getFragments().length, 1);
+ 				assertEquals(iu.getFragments()[0].getId(), "iuFragment.test1");
+ 			}
+@@ -36,8 +37,10 @@ public class FragmentTest extends AbstractProvisioningTest {
+ 	}
+ 
+ 	public void testAssociation2() {
+-		IInstallableUnit iu1 = createEclipseIU("ui.test1");
+-		IInstallableUnit iu3 = createEclipseIU("ui.test3");
++		String ID1 = "ui.test1";
++		String ID3 = "ui.test3";
++		IInstallableUnit iu1 = createEclipseIU(ID1);
++		IInstallableUnit iu3 = createEclipseIU(ID3);
+ 		IInstallableUnit iu2 = createBundleFragment("iuFragment.test1");
+ 		ResolutionHelper rh = new ResolutionHelper(new Hashtable(), null);
+ 		HashSet set = new HashSet();
+@@ -47,11 +50,11 @@ public class FragmentTest extends AbstractProvisioningTest {
+ 		Collection result = rh.attachCUs(set);
+ 		for (Iterator iterator = result.iterator(); iterator.hasNext();) {
+ 			IInstallableUnit iu = (IInstallableUnit) iterator.next();
+-			if (iu.getId().equals("iu1.test1")) {
++			if (iu.getId().equals(ID1)) {
+ 				assertEquals(iu.getFragments().length, 1);
+ 				assertEquals(iu.getFragments()[0].getId(), "iuFragment.test1");
+ 			}
+-			if (iu.getId().equals("iu1.test3")) {
++			if (iu.getId().equals(ID3)) {
+ 				assertEquals(iu.getFragments().length, 1);
+ 				assertEquals(iu.getFragments()[0].getId(), "iuFragment.test1");
+ 			}
+@@ -60,9 +63,9 @@ public class FragmentTest extends AbstractProvisioningTest {
+ 
+ 	public void testTouchpointData() {
+ 		assertEquals(createIUWithTouchpointData().getTouchpointData().length, 1);
+-		assertEquals(createIUFragmentWithTouchpointData().getTouchpointData().length, 1);
++		assertEquals(createBundleFragment("iuFragment.test1").getTouchpointData().length, 1);
+ 		IInstallableUnit iu1 = createIUWithTouchpointData();
+-		IInstallableUnit iu2 = createIUFragmentWithTouchpointData();
++		IInstallableUnit iu2 = createBundleFragment("iuFragment.test1");
+ 		ResolutionHelper rh = new ResolutionHelper(new Hashtable(), null);
+ 		HashSet set = new HashSet();
+ 		set.add(iu1);
+@@ -115,9 +118,9 @@ public class FragmentTest extends AbstractProvisioningTest {
+ 		return createEclipseIU("ui.test1", DEFAULT_VERSION, NO_REQUIRES, data);
+ 	}
+ 
+-	private IInstallableUnit createIUFragmentWithTouchpointData() {
+-		TouchpointData data = MetadataFactory.createTouchpointData(new HashMap());
+-		IInstallableUnitFragment unit = createBundleFragment("iuFragment.test1", DEFAULT_VERSION, data);
+-		return unit;
+-	}
++	//	private IInstallableUnit createIUFragmentWithTouchpointData() {
++	//		TouchpointData data = MetadataFactory.createTouchpointData(new HashMap());
++	//		IInstallableUnitFragment unit = createBundleFragment("iuFragment.test1");
++	//		return unit;
++	//	}
+ }

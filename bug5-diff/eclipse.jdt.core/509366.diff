@@ -1,0 +1,172 @@
+commit b8ee42129a4212c7fdf14becaa0361498ce32716
+Author: Jay Arthanareeswaran <jarthana@in.ibm.com>
+Date:   Fri Dec 16 23:50:53 2016 +0530
+
+    Bug 509366 - [9] Unable to find correct source file for module-info from
+    JRT
+    
+    Change-Id: I0d20e5193dc4ba0c8a3cee88daee9d5e0935ab84
+    Signed-off-by: Jay Arthanareeswaran <jarthana@in.ibm.com>
+
+1	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
+13	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JrtPackageFragmentRoot.java
+2	5	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+index 9cc093c..875f3ba 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+@@ -19,7 +19,6 @@ import java.util.ArrayList;
+ import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+ 
+ @SuppressWarnings({ "rawtypes", "unchecked" })
+ public class BinaryModule extends BinaryMember implements IModuleDescription {
+@@ -58,7 +57,7 @@ public class BinaryModule extends BinaryMember implements IModuleDescription {
+ 	}
+ 	@Override
+ 	public int getFlags() throws JavaModelException {
+-		ClassFileReader info = (ClassFileReader) getElementInfo();
++		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
+ 		return info.getModifiers();
+ 	}
+ 	public String getKey(boolean forceOpen) throws JavaModelException {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
+index 0108317..5a4e706 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
+@@ -277,7 +277,7 @@ private void generateModuleInfos(ClassFile classFile, ClassFileReader info, Hash
+ 		}
+ 		moduleInfo.usedServices = modDecl.uses();
+ 		setModule(handle);
+-		newElements.put(handle, info);
++		newElements.put(handle, moduleInfo);
+ 	}
+ }
+ private void generateServiceInfos(BinaryModule parentHandle, HashMap newElements, char[] serviceName, char[][] implNames, ArrayList requiresHandles) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JrtPackageFragmentRoot.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JrtPackageFragmentRoot.java
+index 0adca12..ca732a7 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JrtPackageFragmentRoot.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JrtPackageFragmentRoot.java
+@@ -22,6 +22,7 @@ import java.util.ArrayList;
+ import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.IStatus;
++import org.eclipse.jdt.core.IClasspathEntry;
+ import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+@@ -92,6 +93,18 @@ public class JrtPackageFragmentRoot extends JarPackageFragmentRoot implements IM
+ 		((JarPackageFragmentRootInfo) info).rawPackageInfo = rawPackageInfo;
+ 		return true;
+ 	}
++	SourceMapper createSourceMapper(IPath sourcePath, IPath rootPath) throws JavaModelException {
++		IClasspathEntry entry = ((JavaProject) getParent()).getClasspathEntryFor(getPath());
++		String encoding = (entry== null) ? null : ((ClasspathEntry) entry).getSourceAttachmentEncoding();
++		IModule mod = getModule();
++		String modName = mod == null ? null : new String(mod.name());
++		SourceMapper mapper = new SourceMapper(
++			sourcePath,
++			rootPath == null ? modName : rootPath.toOSString(),
++			getJavaProject().getOptions(true),// cannot use workspace options if external jar is 1.5 jar and workspace options are 1.4 options
++			encoding);
++		return mapper;
++	}
+ 	public boolean equals(Object o) {
+ 		if (this == o)
+ 			return true;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+index 97132af..3e30af5 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+@@ -42,7 +42,6 @@ import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.ast.ASTNode;
+ import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
+-import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+ import org.eclipse.jdt.internal.compiler.env.AccessRestriction;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+@@ -1137,11 +1136,9 @@ public class NameLookup implements SuffixConstants {
+ 		if (moduleDesc != null) {
+ 			try {
+ 				if (moduleDesc instanceof BinaryModule) {
+-					ClassFileReader info = (ClassFileReader)((BinaryModule) moduleDesc).getElementInfo();
+-					return info.getModuleDeclaration();
++					return (ModuleDescriptionInfo)((BinaryModule) moduleDesc).getElementInfo();
+ 				} else if (moduleDesc instanceof SourceModule) {
+-					ModuleDescriptionInfo info = (ModuleDescriptionInfo)((SourceModule) moduleDesc).getElementInfo();
+-					return info;
++					return(ModuleDescriptionInfo)((SourceModule) moduleDesc).getElementInfo();
+ 				} else {
+ 					return new ModuleEnvironment.AutoModule(moduleDesc.getElementName().toCharArray());
+ 				}
+commit d09e55b77ff59114e067c33d9efacf3d4bf13d16
+Author: Jay Arthanareeswaran <jarthana@in.ibm.com>
+Date:   Fri Feb 17 10:00:13 2017 +0530
+
+    Bug 509366 - [9] Unable to find correct source file for module-info from
+    JRT
+    
+    Fix bug about incorrect source being opened for module info from JRT.
+    
+    Change-Id: I87f16aa87dd1413fed3e7518b8a174a9737b232c
+    Signed-off-by: Jay Arthanareeswaran <jarthana@in.ibm.com>
+
+3	5	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SelectionRequestor.java
+5	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SelectionRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SelectionRequestor.java
+index 145c260..0917ce1 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SelectionRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SelectionRequestor.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2016 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -918,10 +918,8 @@ public IJavaElement[] getElements() {
+ 	return this.elements;
+ }
+ protected IModuleDescription resolveModule(char[] moduleName) {
+-	if (this.openable instanceof CompilationUnit) {
+-		// Do what's needed. Question is, how are we going to look up for modules somewhere else in a workspace?
+-		// The question is esp. when the usecase is about completing on a module name in a requires clause.
+-		Answer answer = this.nameLookup.findModule(new String(moduleName));
++	Answer answer = this.nameLookup.findModule(new String(moduleName));
++	if (answer != null) {
+ 		return answer.module;
+ 	}
+ 	return null;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
+index 0cca1c1..0b55153 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2016 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -288,6 +288,7 @@ public class SourceMapper
+ 			// use no encoding
+ 		}
+ 		if (rootPath != null) {
++			this.rootPath = rootPath;
+ 			this.rootPaths = new ArrayList();
+ 			this.rootPaths.add(rootPath);
+ 		}
+@@ -1085,6 +1086,9 @@ public class SourceMapper
+ 
+ 			if (this.rootPath != null) {
+ 				source = getSourceForRootPath(this.rootPath, name);
++				if (source == null) {
++					source = getSourceForRootPath("", name); //$NON-NLS-1$
++				}
+ 			}
+ 	
+ 			if (source == null) {

@@ -1,0 +1,299 @@
+commit 78a9467360cf559ee158a8d9e96f2b42eceac774
+Author: Susan Franklin <sfranklin>
+Date:   Wed Apr 16 17:00:01 2008 +0000
+
+    Bug 227042 - [ui] - preventing multiple provisioning operations from running
+
+2	7	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/RemoveColocatedRepositoryAction.java
+10	3	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/UpdateAndInstallDialog.java
+23	3	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvisioningOperationRunner.java
+15	5	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProvisioningAction.java
+5	15	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UninstallAction.java
+5	17	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/RemoveColocatedRepositoryAction.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/RemoveColocatedRepositoryAction.java
+index a08a222..41f1721 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/RemoveColocatedRepositoryAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/RemoveColocatedRepositoryAction.java
+@@ -19,7 +19,6 @@ import org.eclipse.equinox.internal.provisional.p2.ui.actions.ProvisioningAction
+ import org.eclipse.equinox.internal.provisional.p2.ui.model.MetadataRepositoryElement;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.RemoveColocatedRepositoryOperation;
+ import org.eclipse.jface.viewers.ISelectionProvider;
+-import org.eclipse.jface.viewers.IStructuredSelection;
+ import org.eclipse.swt.widgets.Shell;
+ 
+ public class RemoveColocatedRepositoryAction extends ProvisioningAction {
+@@ -43,11 +42,7 @@ public class RemoveColocatedRepositoryAction extends ProvisioningAction {
+ 		return (URL[]) urls.toArray(new URL[urls.size()]);
+ 	}
+ 
+-	/*
+-	 * (non-Javadoc)
+-	 * @see org.eclipse.equinox.internal.provisional.p2.ui.actions.ProvisioningAction#structuredSelectionChanged(org.eclipse.jface.viewers.IStructuredSelection)
+-	 */
+-	protected void structuredSelectionChanged(IStructuredSelection selection) {
+-		setEnabled(getSelectedURLs(selection.toArray()).length > 0);
++	protected void checkEnablement(Object[] selectionArray) {
++		setEnabled(getSelectedURLs(selectionArray).length > 0);
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/UpdateAndInstallDialog.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/UpdateAndInstallDialog.java
+index 7cc0ef2..ea72b7e 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/UpdateAndInstallDialog.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/UpdateAndInstallDialog.java
+@@ -228,15 +228,18 @@ public class UpdateAndInstallDialog extends TrayDialog implements IViewMenuProvi
+ 	void checkProgressIndicator(String jobName) {
+ 		if (progressIndicator.isDisposed())
+ 			return;
+-		if (ProvisioningOperationRunner.getScheduledJobs().length == 0)
+-			progressIndicator.done();
+-		else
++		if (ProvisioningOperationRunner.hasScheduledOperations())
+ 			progressIndicator.beginAnimatedTask();
++		else
++			progressIndicator.done();
+ 		if (jobName == null)
+ 			progressLabel.setText(""); //$NON-NLS-1$
+ 		else
+ 			progressLabel.setText(NLS.bind(ProvSDKMessages.UpdateAndInstallDialog_OperationInProgress, jobName));
+ 		progressLabel.getParent().layout(true);
++		// These may have changed because the status of scheduled provisioning jobs changed
++		validateAvailableIUButtons();
++		validateInstalledIUButtons();
+ 	}
+ 
+ 	/*
+@@ -529,8 +532,12 @@ public class UpdateAndInstallDialog extends TrayDialog implements IViewMenuProvi
+ 	}
+ 
+ 	private void updateEnablement(Button button) {
++		// At this point the action's enablement is correct for its
++		// selection.  Now we want to double check other conditions.
+ 		IAction action = getButtonAction(button);
+ 		if (action != null) {
++			if (action instanceof ProvisioningAction)
++				((ProvisioningAction) action).checkEnablement();
+ 			button.setEnabled(action.isEnabled());
+ 		}
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvisioningOperationRunner.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvisioningOperationRunner.java
+index 7f8e2cd..d1a978f 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvisioningOperationRunner.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ProvisioningOperationRunner.java
+@@ -22,11 +22,13 @@ import org.eclipse.equinox.internal.p2.ui.ProvUIActivator;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.p2.ui.dialogs.ApplyProfileChangesDialog;
+ import org.eclipse.equinox.internal.provisional.configurator.Configurator;
++import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProfileModificationOperation;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningOperation;
+ import org.eclipse.osgi.util.NLS;
+ import org.eclipse.swt.widgets.Shell;
+ import org.eclipse.ui.IWorkbenchWindow;
+ import org.eclipse.ui.PlatformUI;
++import org.eclipse.ui.progress.IProgressConstants;
+ import org.eclipse.ui.progress.WorkbenchJob;
+ import org.eclipse.ui.statushandlers.StatusManager;
+ 
+@@ -40,6 +42,8 @@ import org.eclipse.ui.statushandlers.StatusManager;
+  */
+ public class ProvisioningOperationRunner {
+ 
++	private static final String PROPERTY_PREFIX = "org.eclipse.equinox.p2.ui"; //$NON-NLS-1$
++	private static final QualifiedName OPERATION_KEY = new QualifiedName(PROPERTY_PREFIX, "operationKey"); //$NON-NLS-1$
+ 	static HashSet scheduledJobs = new HashSet();
+ 	static boolean restartRequested = false;
+ 	static boolean restartRequired = false;
+@@ -120,6 +124,8 @@ public class ProvisioningOperationRunner {
+ 			job.setPriority(Job.SHORT);
+ 		}
+ 		job.setUser(op.isUser());
++		job.setProperty(OPERATION_KEY, op);
++		job.setProperty(IProgressConstants.ICON_PROPERTY, ProvUIImages.getImageDescriptor(ProvUIImages.IMG_PROFILE));
+ 		scheduledJobs.add(job);
+ 		job.addJobChangeListener(new JobChangeAdapter() {
+ 			public void done(IJobChangeEvent event) {
+@@ -137,7 +143,7 @@ public class ProvisioningOperationRunner {
+ 	}
+ 
+ 	public static void requestRestart(boolean force) {
+-		if (isRunningOperations()) {
++		if (hasScheduledOperations()) {
+ 			restartRequested = true;
+ 			restartRequired = restartRequired || force;
+ 			return;
+@@ -164,10 +170,23 @@ public class ProvisioningOperationRunner {
+ 		});
+ 	}
+ 
+-	private static boolean isRunningOperations() {
++	public static boolean hasScheduledOperations() {
+ 		return !scheduledJobs.isEmpty();
+ 	}
+ 
++	public static boolean hasScheduledOperationsFor(String profileId) {
++		Job[] jobs = getScheduledJobs();
++		for (int i = 0; i < jobs.length; i++) {
++			Object op = jobs[i].getProperty(OPERATION_KEY);
++			if (op instanceof ProfileModificationOperation) {
++				String id = ((ProfileModificationOperation) op).getProfileId();
++				if (profileId.equals(id))
++					return true;
++			}
++		}
++		return false;
++	}
++
+ 	public static void addJobChangeListener(IJobChangeListener listener) {
+ 		jobListeners.add(listener);
+ 		Job[] jobs = getScheduledJobs();
+@@ -182,7 +201,8 @@ public class ProvisioningOperationRunner {
+ 			jobs[i].removeJobChangeListener(listener);
+ 	}
+ 
+-	public static Job[] getScheduledJobs() {
++	private static Job[] getScheduledJobs() {
+ 		return (Job[]) scheduledJobs.toArray(new Job[scheduledJobs.size()]);
+ 	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProvisioningAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProvisioningAction.java
+index 6e508e6..66158d7 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProvisioningAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProvisioningAction.java
+@@ -47,17 +47,27 @@ public abstract class ProvisioningAction extends SelectionProviderAction {
+ 	public final void selectionChanged(IStructuredSelection selection) {
+ 		ISelection providerSelection = getSelectionProvider().getSelection();
+ 		if (providerSelection instanceof IStructuredSelection) {
+-			structuredSelectionChanged((IStructuredSelection) providerSelection);
++			checkEnablement(((IStructuredSelection) providerSelection).toArray());
+ 		} else {
+ 			// shouldn't really happen, but a provider could decide to de-structure the selection
+ 			selectionChanged(providerSelection);
+ 		}
+ 	}
+ 
+-	/*
+-	 * Hook in subclasses.
++	protected void checkEnablement(Object[] selections) {
++		// Default is to nothing
++	}
++
++	/**
++	 * Recheck the enablement.  Called by clients when some condition outside of
++	 * the action that may effect its enablement should be changed.
+ 	 */
+-	protected void structuredSelectionChanged(IStructuredSelection selection) {
+-		// Default is do nothing.
++	public final void checkEnablement() {
++		ISelection selection = getSelection();
++		if (selection instanceof IStructuredSelection) {
++			checkEnablement(((IStructuredSelection) selection).toArray());
++		} else {
++			selectionChanged(selection);
++		}
+ 	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UninstallAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UninstallAction.java
+index cb1ea53..80a46b4 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UninstallAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UninstallAction.java
+@@ -25,7 +25,6 @@ import org.eclipse.equinox.internal.provisional.p2.ui.model.InstalledIUElement;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningUtil;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.Policies;
+ import org.eclipse.jface.viewers.ISelectionProvider;
+-import org.eclipse.jface.viewers.IStructuredSelection;
+ import org.eclipse.jface.wizard.WizardDialog;
+ import org.eclipse.swt.widgets.Shell;
+ 
+@@ -36,33 +35,24 @@ public class UninstallAction extends ProfileModificationAction {
+ 		setToolTipText(ProvUI.UNINSTALL_COMMAND_TOOLTIP);
+ 	}
+ 
+-	/*
+-	 * (non-Javadoc)
+-	 *  Overridden to enable only on selections of installed IU's with the same parent
+-	 * @see org.eclipse.equinox.internal.provisional.p2.ui.actions.ProvisioningAction#structuredSelectionChanged(org.eclipse.jface.viewers.IStructuredSelection)
+-	 */
+-	protected void structuredSelectionChanged(IStructuredSelection selection) {
+-		Object[] selectionArray = selection.toArray();
++	protected boolean isEnabledFor(Object[] selectionArray) {
+ 		Object parent = null;
+ 		if (selectionArray.length > 0) {
+-			setEnabled(true);
+ 			for (int i = 0; i < selectionArray.length; i++) {
+ 				if (selectionArray[i] instanceof InstalledIUElement) {
+ 					InstalledIUElement element = (InstalledIUElement) selectionArray[i];
+ 					if (parent == null) {
+ 						parent = element.getParent(null);
+ 					} else if (parent != element.getParent(null)) {
+-						setEnabled(false);
+-						break;
++						return false;
+ 					}
+ 				} else {
+-					setEnabled(false);
+-					break;
++					return false;
+ 				}
+ 			}
+-		} else {
+-			setEnabled(false);
++			return true;
+ 		}
++		return false;
+ 	}
+ 
+ 	protected String getTaskName() {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
+index 6a2adad..18e2616 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
+@@ -30,7 +30,6 @@ import org.eclipse.equinox.internal.provisional.p2.ui.policy.Policies;
+ import org.eclipse.equinox.internal.provisional.p2.ui.query.ElementQueryDescriptor;
+ import org.eclipse.equinox.internal.provisional.p2.updatechecker.UpdateEvent;
+ import org.eclipse.jface.viewers.ISelectionProvider;
+-import org.eclipse.jface.viewers.IStructuredSelection;
+ import org.eclipse.jface.wizard.WizardDialog;
+ import org.eclipse.swt.widgets.Shell;
+ 
+@@ -99,35 +98,24 @@ public class UpdateAction extends ProfileModificationAction {
+ 		return plan;
+ 	}
+ 
+-	/*
+-	 *  Overridden to enable only on selections of installed IU's with the same parent
+-	 * (non-Javadoc)
+-	 * @see org.eclipse.equinox.internal.provisional.p2.ui.actions.ProvisioningAction#structuredSelectionChanged(org.eclipse.jface.viewers.IStructuredSelection)
+-	 */
+-	protected void structuredSelectionChanged(IStructuredSelection selection) {
+-		// Check the selection of the selection provider, not this one.
+-		// This is a bit of a cheat...we know that some client selection providers are reinterpreting the selection.
+-		Object[] selectionArray = getStructuredSelection().toArray();
++	protected boolean isEnabledFor(Object[] selectionArray) {
+ 		Object parent = null;
+ 		if (selectionArray.length > 0) {
+-			setEnabled(true);
+ 			for (int i = 0; i < selectionArray.length; i++) {
+ 				if (selectionArray[i] instanceof InstalledIUElement) {
+ 					InstalledIUElement element = (InstalledIUElement) selectionArray[i];
+ 					if (parent == null) {
+ 						parent = element.getParent(null);
+ 					} else if (parent != element.getParent(null)) {
+-						setEnabled(false);
+-						break;
++						return false;
+ 					}
+ 				} else {
+-					setEnabled(false);
+-					break;
++					return false;
+ 				}
+ 			}
+-		} else {
+-			setEnabled(false);
++			return true;
+ 		}
++		return false;
+ 	}
+ 
+ 	protected String getTaskName() {

@@ -1,0 +1,513 @@
+commit 2fcf9baa76e556a3da92b035f0128a6e02bc5bb5
+Author: Todor Boev <rinsvind@gmail.com>
+Date:   Fri May 5 17:03:05 2017 +0300
+
+    Bug 486279 - Added a utility method to search for BundleInfo
+    
+    Added a utility method to search for BundleInfo entries by name/version
+    rather than by Object.equals()
+    
+    Change-Id: Ib31c8672834e7beaa274d68e20065acef9a31f11
+    Signed-off-by: Todor Boev <rinsvind@gmail.com>
+
+18	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+index 52d27b2..0f803cc 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+@@ -22,6 +22,7 @@ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.internal.p2.core.helpers.*;
+ import org.eclipse.equinox.internal.p2.metadata.IRequiredCapability;
++import org.eclipse.equinox.internal.provisional.frameworkadmin.ConfigData;
+ import org.eclipse.equinox.p2.core.*;
+ import org.eclipse.equinox.p2.engine.IProfile;
+ import org.eclipse.equinox.p2.metadata.*;
+@@ -206,6 +207,23 @@ public class Util {
+ 		return bundleInfo;
+ 	}
+ 
++	public static BundleInfo findBundleInfo(ConfigData config, IInstallableUnit unit) {
++		// Construct a partial BundleInfo from the IU capabilities.
++		BundleInfo bundleInfo = Util.createBundleInfo(null, unit);
++
++		// Find the actual fully populated BundleInfo used by the runtime.
++		BundleInfo[] bundles = config.getBundles();
++		for (BundleInfo bundle : bundles) {
++			// Can't use BundleInfol.equals(), because bundleInfo is only partially populated.
++			if (bundleInfo.getSymbolicName().equals(bundle.getSymbolicName())
++					&& bundleInfo.getVersion().equals(bundle.getVersion())) {
++				return bundle;
++			}
++		}
++
++		return null;
++	}
++
+ 	private static String getFragmentHost(IInstallableUnit unit, String fragmentName) {
+ 		Collection<IRequirement> requires = unit.getRequirements();
+ 		for (IRequirement iRequirement : requires) {
+commit 7b36283c02a7eb00fdd874dc6e6216f4036caa4c
+Author: Todor Boev <rinsvind@gmail.com>
+Date:   Fri May 5 17:08:36 2017 +0300
+
+    Bug 486279 - Refactored MarkStartedAction
+    
+    Refactored MarkStartedAction to relay on Util.findBundleInfo() to find
+    the entry in bundles.info, rather than to try to re-construct the
+    BundleInfo from other data and use Object.equals()
+    
+    Change-Id: Idcdbcb9b37d41cc7c956a1b5df935f883976f0f6
+    Signed-off-by: Todor Boev <rinsvind@gmail.com>
+
+18	48	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/MarkStartedAction.java
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/MarkStartedAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/MarkStartedAction.java
+index d6bde28..0b1814c 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/MarkStartedAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/MarkStartedAction.java
+@@ -10,8 +10,6 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
+ 
+-import java.io.File;
+-import java.util.Collection;
+ import java.util.Map;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.Status;
+@@ -19,10 +17,7 @@ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.EclipseTouchpoint;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
+ import org.eclipse.equinox.internal.provisional.frameworkadmin.Manipulator;
+-import org.eclipse.equinox.p2.core.IProvisioningAgent;
+-import org.eclipse.equinox.p2.engine.IProfile;
+ import org.eclipse.equinox.p2.engine.spi.ProvisioningAction;
+-import org.eclipse.equinox.p2.metadata.IArtifactKey;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.util.NLS;
+ 
+@@ -30,70 +25,45 @@ public class MarkStartedAction extends ProvisioningAction {
+ 	public static final String ID = "markStarted"; //$NON-NLS-1$
+ 
+ 	public IStatus execute(Map<String, Object> parameters) {
+-		IProvisioningAgent agent = (IProvisioningAgent) parameters.get(ActionConstants.PARM_AGENT);
+-		IProfile profile = (IProfile) parameters.get(ActionConstants.PARM_PROFILE);
+ 		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
+ 		IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
+ 		String started = (String) parameters.get(ActionConstants.PARM_STARTED);
+-		if (started == null)
++		if (started == null) {
+ 			return Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_STARTED, ID));
++		}
+ 
+-		Collection<IArtifactKey> artifacts = iu.getArtifacts();
+-		if (artifacts == null || artifacts.isEmpty())
+-			return Util.createError(NLS.bind(Messages.iu_contains_no_arifacts, iu));
+-
+-		IArtifactKey artifactKey = artifacts.iterator().next();
+-
+-		// the bundleFile might be null here, that's OK.
+-		File bundleFile = Util.getArtifactFile(agent, artifactKey, profile);
+-
+-		BundleInfo bundleInfo = Util.createBundleInfo(bundleFile, iu);
+-		if (bundleInfo == null)
++		// Changes to this object will be reflected in the backing runtime configuration store
++		BundleInfo bundleInfo = Util.findBundleInfo(manipulator.getConfigData(), iu);
++		if (bundleInfo == null) {
+ 			return Util.createError(NLS.bind(Messages.failed_bundleinfo, iu));
++		}
+ 
+-		if (bundleInfo.getFragmentHost() != null)
++		// Bundle fragments are not started
++		if (bundleInfo.getFragmentHost() != null) {
+ 			return Status.OK_STATUS;
+-
+-		BundleInfo[] bundles = manipulator.getConfigData().getBundles();
+-		for (int i = 0; i < bundles.length; i++) {
+-			if (bundles[i].equals(bundleInfo)) {
+-				getMemento().put(ActionConstants.PARM_PREVIOUS_STARTED, Boolean.valueOf(bundles[i].isMarkedAsStarted()));
+-				bundles[i].setMarkedAsStarted(Boolean.parseBoolean(started));
+-				break;
+-			}
+ 		}
++
++		getMemento().put(ActionConstants.PARM_PREVIOUS_STARTED, new Boolean(bundleInfo.isMarkedAsStarted()));
++		bundleInfo.setMarkedAsStarted(Boolean.valueOf(started).booleanValue());
+ 		return Status.OK_STATUS;
+ 	}
+ 
+ 	public IStatus undo(Map<String, Object> parameters) {
+-		IProvisioningAgent agent = (IProvisioningAgent) parameters.get(ActionConstants.PARM_AGENT);
+ 		Boolean previousStarted = (Boolean) getMemento().get(ActionConstants.PARM_PREVIOUS_STARTED);
+-		if (previousStarted == null)
++		if (previousStarted == null) {
+ 			return Status.OK_STATUS;
++		}
+ 
+-		IProfile profile = (IProfile) parameters.get(ActionConstants.PARM_PROFILE);
+ 		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
+ 		IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
+ 
+-		Collection<IArtifactKey> artifacts = iu.getArtifacts();
+-		if (artifacts == null || artifacts.isEmpty())
+-			return Util.createError(NLS.bind(Messages.iu_contains_no_arifacts, iu));
+-
+-		IArtifactKey artifactKey = artifacts.iterator().next();
+-		// the bundleFile might be null here, that's OK.
+-		File bundleFile = Util.getArtifactFile(agent, artifactKey, profile);
+-
+-		BundleInfo bundleInfo = Util.createBundleInfo(bundleFile, iu);
+-		if (bundleInfo == null)
++		// Changes to this object will be reflected in the backing runtime configuration store
++		BundleInfo bundleInfo = Util.findBundleInfo(manipulator.getConfigData(), iu);
++		if (bundleInfo == null) {
+ 			return Util.createError(NLS.bind(Messages.failed_bundleinfo, iu));
+-
+-		BundleInfo[] bundles = manipulator.getConfigData().getBundles();
+-		for (int i = 0; i < bundles.length; i++) {
+-			if (bundles[i].equals(bundleInfo)) {
+-				bundles[i].setMarkedAsStarted(previousStarted.booleanValue());
+-				break;
+-			}
+ 		}
++
++		bundleInfo.setMarkedAsStarted(previousStarted.booleanValue());
+ 		return Status.OK_STATUS;
+ 	}
+ }
+commit 26f5272312c172e0c957f4bbdb4adff894490e2f
+Author: Todor Boev <rinsvind@gmail.com>
+Date:   Fri May 5 17:16:44 2017 +0300
+
+    Bug 486279 - Refactored SetStarLevelAction
+    
+    Refactored SetStarLevelAction to relay on Util.findBundleInfo() to find
+    the entry in bundles.info, rather than to try to re-construct the
+    BundleInfo from other data and use Object.equals()
+    
+    Change-Id: Ifc6e2e0378105630acb03089ab41ed23481158a8
+    Signed-off-by: Todor Boev <rinsvind@gmail.com>
+
+20	51	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetStartLevelAction.java
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetStartLevelAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetStartLevelAction.java
+index ea9b24a..e575e95 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetStartLevelAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetStartLevelAction.java
+@@ -10,8 +10,6 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
+ 
+-import java.io.File;
+-import java.util.Collection;
+ import java.util.Map;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.Status;
+@@ -19,10 +17,7 @@ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.EclipseTouchpoint;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
+ import org.eclipse.equinox.internal.provisional.frameworkadmin.Manipulator;
+-import org.eclipse.equinox.p2.core.IProvisioningAgent;
+-import org.eclipse.equinox.p2.engine.IProfile;
+ import org.eclipse.equinox.p2.engine.spi.ProvisioningAction;
+-import org.eclipse.equinox.p2.metadata.IArtifactKey;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.util.NLS;
+ 
+@@ -30,73 +25,47 @@ public class SetStartLevelAction extends ProvisioningAction {
+ 	public static final String ID = "setStartLevel"; //$NON-NLS-1$
+ 
+ 	public IStatus execute(Map<String, Object> parameters) {
+-		IProvisioningAgent agent = (IProvisioningAgent) parameters.get(ActionConstants.PARM_AGENT);
+-		IProfile profile = (IProfile) parameters.get(ActionConstants.PARM_PROFILE);
+ 		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
+ 		IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
+ 		String startLevel = (String) parameters.get(ActionConstants.PARM_START_LEVEL);
+-		if (startLevel == null)
++		if (startLevel == null) {
+ 			return Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_START_LEVEL, ID));
++		}
+ 
+-		Collection<IArtifactKey> artifacts = iu.getArtifacts();
+-		if (artifacts == null || artifacts.isEmpty())
+-			return Util.createError(NLS.bind(Messages.iu_contains_no_arifacts, iu));
+-
+-		IArtifactKey artifactKey = artifacts.iterator().next();
+-		// the bundleFile might be null here, that's OK.
+-		File bundleFile = Util.getArtifactFile(agent, artifactKey, profile);
+-
+-		BundleInfo bundleInfo = Util.createBundleInfo(bundleFile, iu);
++		// Changes to this object will be reflected in the backing runtime configuration store
++		BundleInfo bundleInfo = Util.findBundleInfo(manipulator.getConfigData(), iu);
+ 		if (bundleInfo == null)
+ 			return Util.createError(NLS.bind(Messages.failed_bundleinfo, iu));
+ 
+-		if (bundleInfo.getFragmentHost() != null)
++		// Bundle fragments are not started
++		if (bundleInfo.getFragmentHost() != null) {
+ 			return Status.OK_STATUS;
++		}
+ 
+-		BundleInfo[] bundles = manipulator.getConfigData().getBundles();
+-		for (int i = 0; i < bundles.length; i++) {
+-			if (bundles[i].equals(bundleInfo)) {
+-				getMemento().put(ActionConstants.PARM_PREVIOUS_START_LEVEL, Integer.valueOf(bundles[i].getStartLevel()));
+-				try {
+-					bundles[i].setStartLevel(Integer.parseInt(startLevel));
+-				} catch (NumberFormatException e) {
+-					return Util.createError(NLS.bind(Messages.error_parsing_startlevel, startLevel, bundles[i].getSymbolicName()), e);
+-				}
+-				break;
+-			}
++		getMemento().put(ActionConstants.PARM_PREVIOUS_START_LEVEL, new Integer(bundleInfo.getStartLevel()));
++		try {
++			bundleInfo.setStartLevel(Integer.parseInt(startLevel));
++			return Status.OK_STATUS;
++		} catch (NumberFormatException e) {
++			return Util.createError(NLS.bind(Messages.error_parsing_startlevel, startLevel, bundleInfo.getSymbolicName()), e);
+ 		}
+-		return Status.OK_STATUS;
+ 	}
+ 
+ 	public IStatus undo(Map<String, Object> parameters) {
+-		IProvisioningAgent agent = (IProvisioningAgent) parameters.get(ActionConstants.PARM_AGENT);
+ 		Integer previousStartLevel = (Integer) getMemento().get(ActionConstants.PARM_PREVIOUS_START_LEVEL);
+-		if (previousStartLevel == null)
++		if (previousStartLevel == null) {
+ 			return Status.OK_STATUS;
+-
+-		IProfile profile = (IProfile) parameters.get(ActionConstants.PARM_PROFILE);
++		}
+ 		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
+ 		IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
+ 
+-		Collection<IArtifactKey> artifacts = iu.getArtifacts();
+-		if (artifacts == null || artifacts.isEmpty())
+-			return Util.createError(NLS.bind(Messages.iu_contains_no_arifacts, iu));
+-
+-		IArtifactKey artifactKey = artifacts.iterator().next();
+-		// the bundleFile might be null here, that's OK.
+-		File bundleFile = Util.getArtifactFile(agent, artifactKey, profile);
+-
+-		BundleInfo bundleInfo = Util.createBundleInfo(bundleFile, iu);
+-		if (bundleInfo == null)
++		// Changes to this object will be reflected in the backing runtime configuration store
++		BundleInfo bundleInfo = Util.findBundleInfo(manipulator.getConfigData(), iu);
++		if (bundleInfo == null) {
+ 			return Util.createError(NLS.bind(Messages.failed_bundleinfo, iu));
+-
+-		BundleInfo[] bundles = manipulator.getConfigData().getBundles();
+-		for (int i = 0; i < bundles.length; i++) {
+-			if (bundles[i].equals(bundleInfo)) {
+-				bundles[i].setStartLevel(previousStartLevel.intValue());
+-				break;
+-			}
+ 		}
++
++		bundleInfo.setStartLevel(previousStartLevel.intValue());
+ 		return Status.OK_STATUS;
+ 	}
+ }
+commit 61831a9c11d659850dea2a43d1e8bcfcea4d12a8
+Author: Todor Boev <rinsvind@gmail.com>
+Date:   Fri May 5 17:31:12 2017 +0300
+
+    Bug 486279 - Changed missing entry status to warning
+    
+    Converted the errors caused by missing entries in bundles.info to
+    warnings. This keeps the actions backward compatible. For some of the
+    actions is makes sense as well. E.g. uninstall should be idempotent
+    
+    Refactored UninstallBundleAction to relay on Util.findBundleInfo() to
+    find the entry in bundles.info, rather than to try to re-construct the
+    BundleInfo from other data and use Object.equals()
+    
+    Change-Id: I902a5b209b1ff6a764e6c8f0569926c97ed8b3c5
+    Signed-off-by: Todor Boev <rinsvind@gmail.com>
+
+8	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+1	1	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/InstallBundleAction.java
+2	2	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/MarkStartedAction.java
+2	1	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/Messages.java
+4	3	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetStartLevelAction.java
+6	27	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/UninstallBundleAction.java
+2	1	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/messages.properties
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+index 0f803cc..ba7a969 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+@@ -344,6 +344,14 @@ public class Util {
+ 		return new Status(IStatus.ERROR, Activator.ID, message, e);
+ 	}
+ 
++	public static IStatus createWarning(String message) {
++		return createWarning(message, null);
++	}
++
++	public static IStatus createWarning(String message, Exception e) {
++		return new Status(IStatus.WARNING, Activator.ID, message, e);
++	}
++
+ 	public static File getLauncherConfigLocation(IProfile profile) {
+ 		String launcherConfig = profile.getProperty(IProfile.PROP_LAUNCHER_CONFIGURATION);
+ 		return launcherConfig == null ? null : new File(launcherConfig);
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/InstallBundleAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/InstallBundleAction.java
+index 4a2ecfe..040e4db 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/InstallBundleAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/InstallBundleAction.java
+@@ -71,7 +71,7 @@ public class InstallBundleAction extends ProvisioningAction {
+ 
+ 		BundleInfo bundleInfo = Util.createBundleInfo(bundleFile, iu);
+ 		if (bundleInfo == null)
+-			return Util.createError(NLS.bind(Messages.failed_bundleinfo, iu));
++			return Util.createError(NLS.bind(Messages.failed_create_bundleinfo, iu));
+ 		manipulator.getConfigData().addBundle(bundleInfo);
+ 
+ 		return Status.OK_STATUS;
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/MarkStartedAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/MarkStartedAction.java
+index 0b1814c..e0f69eb 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/MarkStartedAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/MarkStartedAction.java
+@@ -35,7 +35,7 @@ public class MarkStartedAction extends ProvisioningAction {
+ 		// Changes to this object will be reflected in the backing runtime configuration store
+ 		BundleInfo bundleInfo = Util.findBundleInfo(manipulator.getConfigData(), iu);
+ 		if (bundleInfo == null) {
+-			return Util.createError(NLS.bind(Messages.failed_bundleinfo, iu));
++			return Util.createWarning(NLS.bind(Messages.failed_find_bundleinfo, iu));
+ 		}
+ 
+ 		// Bundle fragments are not started
+@@ -60,7 +60,7 @@ public class MarkStartedAction extends ProvisioningAction {
+ 		// Changes to this object will be reflected in the backing runtime configuration store
+ 		BundleInfo bundleInfo = Util.findBundleInfo(manipulator.getConfigData(), iu);
+ 		if (bundleInfo == null) {
+-			return Util.createError(NLS.bind(Messages.failed_bundleinfo, iu));
++			return Util.createWarning(NLS.bind(Messages.failed_find_bundleinfo, iu));
+ 		}
+ 
+ 		bundleInfo.setMarkedAsStarted(previousStarted.booleanValue());
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/Messages.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/Messages.java
+index 7e8bddf..83097d5 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/Messages.java
+@@ -19,7 +19,8 @@ public class Messages extends NLS {
+ 	public static String iu_contains_no_arifacts;
+ 	public static String no_matching_artifact;
+ 	public static String missing_manifest;
+-	public static String failed_bundleinfo;
++	public static String failed_create_bundleinfo;
++	public static String failed_find_bundleinfo;
+ 	public static String cannot_configure_source_bundle;
+ 	public static String error_parsing_startlevel;
+ 	public static String artifact_not_directory;
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetStartLevelAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetStartLevelAction.java
+index e575e95..ae9c58b 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetStartLevelAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetStartLevelAction.java
+@@ -34,8 +34,9 @@ public class SetStartLevelAction extends ProvisioningAction {
+ 
+ 		// Changes to this object will be reflected in the backing runtime configuration store
+ 		BundleInfo bundleInfo = Util.findBundleInfo(manipulator.getConfigData(), iu);
+-		if (bundleInfo == null)
+-			return Util.createError(NLS.bind(Messages.failed_bundleinfo, iu));
++		if (bundleInfo == null) {
++			return Util.createWarning(NLS.bind(Messages.failed_find_bundleinfo, iu));
++		}
+ 
+ 		// Bundle fragments are not started
+ 		if (bundleInfo.getFragmentHost() != null) {
+@@ -62,7 +63,7 @@ public class SetStartLevelAction extends ProvisioningAction {
+ 		// Changes to this object will be reflected in the backing runtime configuration store
+ 		BundleInfo bundleInfo = Util.findBundleInfo(manipulator.getConfigData(), iu);
+ 		if (bundleInfo == null) {
+-			return Util.createError(NLS.bind(Messages.failed_bundleinfo, iu));
++			return Util.createWarning(NLS.bind(Messages.failed_find_bundleinfo, iu));
+ 		}
+ 
+ 		bundleInfo.setStartLevel(previousStartLevel.intValue());
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/UninstallBundleAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/UninstallBundleAction.java
+index a20aae9..d652d42 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/UninstallBundleAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/UninstallBundleAction.java
+@@ -8,8 +8,6 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
+ 
+-import java.io.File;
+-import java.util.Collection;
+ import java.util.Map;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.Status;
+@@ -17,10 +15,7 @@ import org.eclipse.equinox.frameworkadmin.BundleInfo;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.EclipseTouchpoint;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
+ import org.eclipse.equinox.internal.provisional.frameworkadmin.Manipulator;
+-import org.eclipse.equinox.p2.core.IProvisioningAgent;
+-import org.eclipse.equinox.p2.engine.IProfile;
+ import org.eclipse.equinox.p2.engine.spi.ProvisioningAction;
+-import org.eclipse.equinox.p2.metadata.IArtifactKey;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.query.QueryUtil;
+ import org.eclipse.osgi.util.NLS;
+@@ -37,13 +32,12 @@ public class UninstallBundleAction extends ProvisioningAction {
+ 	}
+ 
+ 	public static IStatus uninstallBundle(Map<String, Object> parameters) {
+-		IProvisioningAgent agent = (IProvisioningAgent) parameters.get(ActionConstants.PARM_AGENT);
+-		IProfile profile = (IProfile) parameters.get(ActionConstants.PARM_PROFILE);
+ 		IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
+ 		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
+ 		String bundleId = (String) parameters.get(ActionConstants.PARM_BUNDLE);
+-		if (bundleId == null)
++		if (bundleId == null) {
+ 			return Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_BUNDLE, ID));
++		}
+ 
+ 		//TODO: eventually remove this. What is a fragment doing here??
+ 		if (QueryUtil.isFragment(iu)) {
+@@ -51,28 +45,13 @@ public class UninstallBundleAction extends ProvisioningAction {
+ 			return Status.OK_STATUS;
+ 		}
+ 
+-		Collection<IArtifactKey> artifacts = iu.getArtifacts();
+-		if (artifacts == null || artifacts.isEmpty())
+-			return Util.createError(NLS.bind(Messages.iu_contains_no_arifacts, iu));
+-
+-		IArtifactKey artifactKey = null;
+-		for (IArtifactKey candidate : artifacts) {
+-			if (candidate.toString().equals(bundleId)) {
+-				artifactKey = candidate;
+-				break;
+-			}
++		// Changes to this object will be reflected in the backing runtime configuration store
++		BundleInfo bundleInfo = Util.findBundleInfo(manipulator.getConfigData(), iu);
++		if (bundleInfo == null) {
++			return Util.createWarning(NLS.bind(Messages.failed_find_bundleinfo, iu));
+ 		}
+-		if (artifactKey == null)
+-			throw new IllegalArgumentException(NLS.bind(Messages.no_matching_artifact, bundleId));
+ 
+-		// the bundleFile might be null here, that's OK.
+-		File bundleFile = Util.getArtifactFile(agent, artifactKey, profile);
+-
+-		BundleInfo bundleInfo = Util.createBundleInfo(bundleFile, iu);
+-		if (bundleInfo == null)
+-			return Util.createError(NLS.bind(Messages.failed_bundleinfo, iu));
+ 		manipulator.getConfigData().removeBundle(bundleInfo);
+-
+ 		return Status.OK_STATUS;
+ 	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/messages.properties b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/messages.properties
+index 74c1907..af38f9b 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/messages.properties
+@@ -15,7 +15,8 @@ parameter_not_set=The \"{0}\" parameter was not set in the \"{1}\" action.
+ iu_contains_no_arifacts=Installable unit contains no artifacts: {0}.
+ no_matching_artifact=No matching artifact found for: {0}.
+ missing_manifest=The manifest is missing for: {0}.
+-failed_bundleinfo=Failed to create bundleInfo for: {0}.
++failed_create_bundleinfo=Failed to create bundleInfo for: {0}.
++failed_find_bundleinfo=Failed to find a configured bundleInfo for: {0}.
+ cannot_configure_source_bundle=Cannot configure {0} as a source bundle.
+ error_parsing_startlevel=Error parsing start level: {0} for bundle: {1}.
+ no_bundle_pool=No bundle pool defined for profile: {0}.

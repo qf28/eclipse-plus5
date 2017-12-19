@@ -1,0 +1,337 @@
+commit b6bc90c50286b74cfcc0b4c67c3ded3be552505d
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Feb 15 13:21:16 2014 +0100
+
+    Bug 428019 - [1.8][compiler] Type inference failure with nested generic
+    invocation.
+
+26	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+28	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
+2	23	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+12	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/IntersectionCastTypeBinding.java
+49	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+5	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
+16	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeVariableBinding.java
+18	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/WildcardBinding.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+index e6f7a52..ffd521f 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+@@ -23,7 +23,7 @@ import junit.framework.Test;
+ public class GenericsRegressionTest_1_8 extends AbstractRegressionTest {
+ 
+ static {
+-//	TESTS_NAMES = new String[] { "testBug424195_comment2" };
++//	TESTS_NAMES = new String[] { "testBug428019" };
+ //	TESTS_NUMBERS = new int[] { 40, 41, 43, 45, 63, 64 };
+ //	TESTS_RANGE = new int[] { 11, -1 };
+ }
+@@ -2094,4 +2094,29 @@ public void testBug426836() {
+ 			"}\n"
+ 		} );
+ }
++public void testBug428019() {
++    runConformTest(
++        new String[] {
++            "X.java",
++            "final public class X {\n" + 
++            "  static class Obj {}\n" + 
++            "  static class Dial<T> {}\n" + 
++            "\n" + 
++            "  <T> void put(Class<T> clazz, T data) {\n" + 
++            "  }\n" + 
++            "\n" + 
++            "  static <T> Dial<T> wrap(Dial<T> dl) {\n" + 
++            "	  return null;\n" + 
++            "  }\n" + 
++            "\n" + 
++            "  static void foo(Dial<? super Obj> dial, X context) {\n" + 
++            "    context.put(Dial.class, wrap(dial));\n" + 
++            "  }\n" + 
++            "  \n" + 
++            "  public static void main(String[] args) {\n" + 
++            "	X.foo(new Dial<Obj>(), new X());\n" + 
++            "  }\n" + 
++            "}\n"
++        });
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
+index ae70b62..58ed4cc 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
+@@ -23,6 +23,7 @@
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
+  *								Bug 425460 - [1.8] [inference] Type not inferred on stream.toArray
+  *								Bug 426792 - [1.8][inference][impl] generify new type inference engine
++ *								Bug 428019 - [1.8][compiler] Type inference failure with nested generic invocation.
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -288,6 +289,33 @@ public boolean isCompatibleWith(TypeBinding otherType, Scope captureScope) {
+ 	return false;
+ }
+ 
++@Override
++public boolean isSubtypeOf(TypeBinding otherType) {
++	if (equalsEquals(this, otherType))
++		return true;
++
++	switch (otherType.kind()) {
++		case Binding.ARRAY_TYPE :
++			ArrayBinding otherArray = (ArrayBinding) otherType;
++			if (otherArray.leafComponentType.isBaseType())
++				return false; // relying on the fact that all equal arrays are identical
++			if (this.dimensions == otherArray.dimensions)
++				return this.leafComponentType.isSubtypeOf(otherArray.leafComponentType);
++			if (this.dimensions < otherArray.dimensions)
++				return false; // cannot assign 'String[]' into 'Object[][]' but can assign 'byte[][]' into 'Object[]'
++			break;
++		case Binding.BASE_TYPE :
++			return false;
++	}
++	switch (otherType.leafComponentType().id) {
++	    case TypeIds.T_JavaLangObject :
++	    case TypeIds.T_JavaLangCloneable :
++	    case TypeIds.T_JavaIoSerializable :
++	        return true;
++	}
++	return false;
++}
++
+ public boolean isProperType(boolean admitCapture18) {
+ 	return this.leafComponentType.isProperType(admitCapture18);
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+index 9214d44..e600593 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+@@ -213,13 +213,8 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 			case Binding.TYPE:
+ 			case Binding.RAW_TYPE:
+ 				{
+-					if (subCandidate instanceof ReferenceBinding) {
+-						if (hasSuperType((ReferenceBinding) subCandidate, (ReferenceBinding) superCandidate))
+-							return TRUE;
+-					} else if (subCandidate.isArrayType()) { // arrays have exactly one super type that is a class or interface:
+-						if (TypeBinding.equalsEquals(superCandidate, scope.getJavaLangObject())) // java.lang.Object
+-							return TRUE;
+-					}
++					if (subCandidate.isSubtypeOf(superCandidate))
++						return TRUE;
+ 					return FALSE;
+ 				}
+ 			case Binding.PARAMETERIZED_TYPE:
+@@ -311,22 +306,6 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 		return null;
+ 	}
+ 
+-	private boolean hasSuperType(ReferenceBinding sub, ReferenceBinding superType) {
+-		if (TypeBinding.equalsEquals(sub, superType))
+-			return true;
+-		if (sub.id == TypeIds.T_JavaLangObject)
+-			return false;
+-		if (hasSuperType(sub.superclass(), superType))
+-			return true;
+-		ReferenceBinding[] superInterfaces = sub.superInterfaces();
+-		if (superInterfaces != null) {
+-			for (int i=0, l=superInterfaces.length; i<l; i++)
+-				if (hasSuperType(superInterfaces[i], superType))
+-					return true;
+-		}
+-		return false;
+-	}
+-
+ 	boolean addConstraintsFromTypeParamters(TypeBinding subCandidate, ParameterizedTypeBinding ca, List<ConstraintFormula> constraints) {
+ 		TypeBinding[] ai = ca.arguments;								// C<A1,A2,...>
+ 		if (ai == null)
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/IntersectionCastTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/IntersectionCastTypeBinding.java
+index a5e062c..2722c94 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/IntersectionCastTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/IntersectionCastTypeBinding.java
+@@ -15,6 +15,7 @@
+  *							Bug 423504 - [1.8] Implement "18.5.3 Functional Interface Parameterization Inference"
+  *							Bug 426676 - [1.8][compiler] Wrong generic method type inferred from lambda expression
+  *							Bug 426542 - [1.8] Most specific method not picked when one method has intersection type as type parameter
++ *							Bug 428019 - [1.8][compiler] Type inference failure with nested generic invocation.
+  *     Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 405104 - [1.8][compiler][codegen] Implement support for serializeable lambdas
+  *******************************************************************************/
+@@ -164,6 +165,17 @@ public class IntersectionCastTypeBinding extends ReferenceBinding {
+ 		}
+ 		return false;
+ 	}
++	
++	@Override
++	public boolean isSubtypeOf(TypeBinding other) {
++		if (TypeBinding.equalsEquals(this, other))
++			return true;
++		for (int i = 0; i < this.intersectingTypes.length; i++) {
++			if (this.intersectingTypes[i].isSubtypeOf(other))
++				return true;
++		}
++		return false;
++	}
+ 
+ 	public char[] qualifiedSourceName() {
+ 		StringBuffer qualifiedSourceName = new StringBuffer(16);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+index ad016ce..8d28355 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+@@ -30,6 +30,7 @@
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
+  *								Bug 423504 - [1.8] Implement "18.5.3 Functional Interface Parameterization Inference"
+  *								Bug 426792 - [1.8][inference][impl] generify new type inference engine
++ *								Bug 428019 - [1.8][compiler] Type inference failure with nested generic invocation.
+  *      Jesper S Moller - Contributions for
+  *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *								bug 412153 - [1.8][compiler] Check validity of annotations which may be repeatable
+@@ -1307,6 +1308,54 @@ private boolean isCompatibleWith0(TypeBinding otherType, /*@Nullable*/ Scope cap
+ 	}
+ }
+ 
++public boolean isSubtypeOf(TypeBinding other) {
++	if (isSubTypeOfRTL(other))
++		return true;
++	// TODO: if this has wildcards, perform capture before the next call:
++	TypeBinding candidate = findSuperTypeOriginatingFrom(other);
++	if (candidate == null)
++		return false;
++	if (TypeBinding.equalsEquals(candidate, other))
++		return true;
++	
++	// T<Ai...> <: T#RAW:
++	if (other.isRawType() && TypeBinding.equalsEquals(candidate.erasure(), other.erasure()))
++		return true;
++	
++	TypeBinding[] sis = other.typeArguments();
++	TypeBinding[] tis = candidate.typeArguments();
++	if (tis == null || sis == null)
++		return false;
++	if (sis.length != tis.length)
++		return false;
++	for (int i = 0; i < sis.length; i++) {
++		if (!tis[i].isTypeArgumentContainedBy(sis[i]))
++			return false;
++	}
++	return true;
++}
++
++protected boolean isSubTypeOfRTL(TypeBinding other) {
++	if (TypeBinding.equalsEquals(this, other))
++		return true;
++	if (other instanceof CaptureBinding) {
++		// for this one kind we must first unwrap the rhs:
++		TypeBinding lower = ((CaptureBinding) other).lowerBound;
++		return (lower != null && isSubtypeOf(lower));
++	}
++	if (other instanceof ReferenceBinding) {
++		TypeBinding[] intersecting = ((ReferenceBinding) other).getIntersectingTypes();
++		if (intersecting != null) {
++			for (int i = 0; i < intersecting.length; i++) {
++				if (!isSubtypeOf(intersecting[i]))
++					return false;
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
+ /**
+  * Answer true if the receiver has default visibility
+  */
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
+index 1ea2b1f..3b1d3a4 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBinding.java
+@@ -26,6 +26,7 @@
+  *								Bug 426764 - [1.8] Presence of conditional expression as method argument confuses compiler
+  *								Bug 423505 - [1.8] Implement "18.5.4 More Specific Method Inference"
+  *								Bug 427626 - [1.8] StackOverflow while typing new ArrayList<String>().toArray( and asking for code completion
++ *								Bug 428019 - [1.8][compiler] Type inference failure with nested generic invocation.
+  *      Jesper S Moller <jesper@selskabet.org> -  Contributions for
+  *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *******************************************************************************/
+@@ -1538,6 +1539,10 @@ public boolean sIsMoreSpecific(TypeBinding s, TypeBinding t, Scope scope) {
+ 	return s.isCompatibleWith(t, scope) && !s.needsUncheckedConversion(t);
+ }
+ 
++public boolean isSubtypeOf(TypeBinding right) {
++	return isCompatibleWith(right);
++}
++
+ public MethodBinding[] getMethods(char[] selector) {
+ 	return Binding.NO_METHODS;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeVariableBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeVariableBinding.java
+index 74dae9a..6b0bf2a 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeVariableBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeVariableBinding.java
+@@ -22,6 +22,7 @@
+  *								Bug 417295 - [1.8[[null] Massage type annotated null analysis to gel well with deep encoded type bindings.
+  *								Bug 400874 - [1.8][compiler] Inference infrastructure should evolve to meet JLS8 18.x (Part G of JSR335 spec)
+  *								Bug 426792 - [1.8][inference][impl] generify new type inference engine
++ *								Bug 428019 - [1.8][compiler] Type inference failure with nested generic invocation.
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -458,6 +459,21 @@ public class TypeVariableBinding extends ReferenceBinding {
+ 		return true;
+ 	}
+ 
++	@Override
++	public boolean isSubtypeOf(TypeBinding other) {
++		if (isSubTypeOfRTL(other))
++			return true;
++		if (this.firstBound != null && this.firstBound.isSubtypeOf(other))
++			return true;
++		if (this.superclass != null && this.superclass.isSubtypeOf(other))
++			return true;
++		if (this.superInterfaces != null)
++			for (int i = 0, l = this.superInterfaces.length; i < l; i++)
++		   		if (this.superInterfaces[i].isSubtypeOf(other))
++					return true;
++		return other.id == TypeIds.T_JavaLangObject;
++	}
++
+ 	// to prevent infinite recursion when inspecting recursive generics:
+ 	boolean inRecursiveFunction = false;
+ 	
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/WildcardBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/WildcardBinding.java
+index 9a5030f..aa7f280 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/WildcardBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/WildcardBinding.java
+@@ -20,6 +20,7 @@
+  *								Bug 423504 - [1.8] Implement "18.5.3 Functional Interface Parameterization Inference"
+  *								Bug 426676 - [1.8][compiler] Wrong generic method type inferred from lambda expression
+  *								Bug 427411 - [1.8][generics] JDT reports type mismatch when using method that returns generic type
++ *								Bug 428019 - [1.8][compiler] Type inference failure with nested generic invocation.
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -542,6 +543,23 @@ public class WildcardBinding extends ReferenceBinding {
+     	return this.otherBounds != null;
+     }
+ 
++    @Override
++    public ReferenceBinding[] getIntersectingTypes() {
++    	if (isIntersectionType()) {
++    		ReferenceBinding[] allBounds = new ReferenceBinding[this.otherBounds.length+1];
++    		try {
++    			allBounds[0] = (ReferenceBinding) this.bound;
++    			System.arraycopy(this.otherBounds, 0, allBounds, 1, this.otherBounds.length);
++    		} catch (ClassCastException cce) {
++    			return null;
++    		} catch (ArrayStoreException ase) {
++    			return null;
++    		}
++    		return allBounds;
++    	}
++    	return null;
++    }
++
+ 	public boolean isHierarchyConnected() {
+ 		return this.superclass != null && this.superInterfaces != null;
+ 	}

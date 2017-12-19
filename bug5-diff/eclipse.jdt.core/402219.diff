@@ -1,0 +1,411 @@
+commit 16151d07e4904ee08ac48f6566d670b6d78a3084
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Sun Mar 3 15:26:58 2013 +0530
+
+    Fixed Bug 402219 - [1.8][compiler] Compile time errors in lambda during
+    hypothetical type check should render candidate method inapplicable.
+
+62	2	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+4	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AbstractMethodDeclaration.java
+9	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompilationUnitDeclaration.java
+25	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+47	35	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+4	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeDeclaration.java
+7	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/ReferenceContext.java
+11	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemHandler.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+index 02dd7d9..d537799 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+@@ -5779,8 +5779,11 @@ public void test401939c() {
+ 				"----------\n" + 
+ 				"1. ERROR in X.java (at line 8)\n" + 
+ 				"	goo((x) -> { if (x) return null; });\n" + 
+-				"	                 ^\n" + 
+-				"Type mismatch: cannot convert from String to boolean\n" + 
++				"	^^^\n" + 
++				"The method goo(I) in the type X is not applicable for the arguments ((<no type> x) -> {\n" + 
++				"  if (x)\n" + 
++				"      return null;\n" + 
++				"})\n" + 
+ 				"----------\n" + 
+ 				"2. ERROR in X.java (at line 9)\n" + 
+ 				"	goo((x) -> {});\n" + 
+@@ -5852,6 +5855,63 @@ public void test401939f() {
+ 				"}\n",			},
+ 				"");
+ }
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=402219, [1.8][compiler] Compile time errors in lambda during hypothetical type check should render candidate method inapplicable.
++public void test402219() {
++	this.runNegativeTest(
++			new String[] {
++				"X.java",
++				"interface I {\n" +
++				"	String foo(String s1, String s2);\n" +
++				"}\n" +
++				"interface J {\n" +
++				"	X foo(X x1, X x2);\n" +
++				"}\n" +
++				"public class X { \n" +
++				"	void goo(I i) {}\n" +
++				"	void goo(J j) {}\n" +
++				"    public static void main(String [] args) {\n" +
++				"		new X().goo((p1, p2) -> p1 = p1 + p2);\n" +
++				"    }\n" +
++				"    Zork z;\n" +
++				"}\n",			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 13)\n" + 
++			"	Zork z;\n" + 
++			"	^^^^\n" + 
++			"Zork cannot be resolved to a type\n" + 
++			"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=402219, [1.8][compiler] Compile time errors in lambda during hypothetical type check should render candidate method inapplicable.
++public void test402219a() {
++	Map options = getCompilerOptions();
++	options.put(CompilerOptions.OPTION_ReportUndocumentedEmptyBlock, CompilerOptions.ERROR);
++	this.runNegativeTest(
++			new String[] {
++				"X.java",
++				"interface I {\n" +
++				"	void foo(String s1, String s2);\n" +
++				"}\n" +
++				"interface J {\n" +
++				"	X foo(X x1, X x2);\n" +
++				"}\n" +
++				"public class X { \n" +
++				"	void goo(I i) {/* */}\n" +
++				"	void goo(J j) {/* */}\n" +
++				"    public static void main(String [] args) {\n" +
++				"		new X().goo((p1, p2) -> {});\n" +
++				"    }\n" +
++				"}\n",			},
++				"----------\n" + 
++				"1. ERROR in X.java (at line 11)\n" + 
++				"	new X().goo((p1, p2) -> {});\n" + 
++				"	                        ^^\n" + 
++				"Empty block should be documented\n" + 
++				"----------\n",
++			null,
++			false,
++			options);
++}
++
+ public static Class testClass() {
+ 	return NegativeLambdaExpressionsTest.class;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AbstractMethodDeclaration.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AbstractMethodDeclaration.java
+index 453c532..43cf56e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AbstractMethodDeclaration.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AbstractMethodDeclaration.java
+@@ -602,6 +602,10 @@ public abstract class AbstractMethodDeclaration
+ 	public void tagAsHavingErrors() {
+ 		this.ignoreFurtherInvestigation = true;
+ 	}
++	
++	public void tagAsHavingIgnoredMandatoryErrors(int problemId) {
++		// Not reachable. No silently ignored errors for this context;
++	}
+ 
+ 	public void traverse(
+ 		ASTVisitor visitor,
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompilationUnitDeclaration.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompilationUnitDeclaration.java
+index 6f85571..10106db 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompilationUnitDeclaration.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompilationUnitDeclaration.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann  - Contribution for bug 295551
+@@ -672,6 +676,10 @@ public void tagAsHavingErrors() {
+ 	this.ignoreFurtherInvestigation = true;
+ }
+ 
++public void tagAsHavingIgnoredMandatoryErrors(int problemId) {
++	// Not reachable. No silently ignored errors for this context;
++}
++
+ public void traverse(ASTVisitor visitor, CompilationUnitScope unitScope) {
+ 	if (this.ignoreFurtherInvestigation)
+ 		return;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+index 8a5e300..39311ec 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FunctionalExpression.java
+@@ -17,6 +17,7 @@
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+ import org.eclipse.jdt.core.compiler.CategorizedProblem;
++import org.eclipse.jdt.core.compiler.IProblem;
+ import org.eclipse.jdt.internal.compiler.CompilationResult;
+ import org.eclipse.jdt.internal.compiler.DefaultErrorHandlingPolicies;
+ import org.eclipse.jdt.internal.compiler.IErrorHandlingPolicy;
+@@ -223,4 +224,28 @@ public abstract class FunctionalExpression extends Expression implements Problem
+ 			}
+ 		}
+ 	}
++	
++	protected boolean shapeAnalysisComplete() {
++		return true;
++	}
++	
++	public void tagAsHavingIgnoredMandatoryErrors(int problemId) {
++		// 15.27.3 requires exception throw related errors to not influence congruence. Also don't abort shape analysis.
++		if (shapeAnalysisComplete()) {
++			switch (problemId) {
++				case IProblem.UnhandledExceptionOnAutoClose:
++				case IProblem.UnhandledExceptionInDefaultConstructor:
++				case IProblem.UnhandledException:
++					return;
++				default: 
++					throw new IncongruentLambdaException();
++			}
++		}
++	}
++
++	
++}
++
++class IncongruentLambdaException extends RuntimeException {
++	private static final long serialVersionUID = 4145723509219836114L;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 1e45f22..96af0e2 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -51,7 +51,7 @@ public class LambdaExpression extends FunctionalExpression {
+ 	MethodScope scope;
+ 	protected boolean voidCompatible = true;
+ 	protected boolean valueCompatible = false;
+-	protected boolean shapeAnalysisComplete = true;
++	protected boolean shapeAnalysisComplete = false;
+ 	
+ 	public LambdaExpression(CompilationResult compilationResult, Argument [] arguments, Statement body) {
+ 		super(compilationResult);
+@@ -119,6 +119,8 @@ public class LambdaExpression extends FunctionalExpression {
+ 							Statement ultimateStatement = statementsLength == 0 ? null : statements[statementsLength - 1];
+ 							LambdaExpression.this.valueCompatible = ultimateStatement instanceof ThrowStatement;
+ 							LambdaExpression.this.shapeAnalysisComplete = LambdaExpression.this.valueCompatible;
++						} else {
++							LambdaExpression.this.shapeAnalysisComplete = true;
+ 						}
+ 					}
+ 				};
+@@ -127,6 +129,7 @@ public class LambdaExpression extends FunctionalExpression {
+ 				Expression expression = (Expression) this.body;
+ 				this.voidCompatible = expression.statementExpression();
+ 				this.valueCompatible = true;
++				this.shapeAnalysisComplete = true;
+ 			}	
+ 			return new PolyTypeBinding(this);
+ 		}
+@@ -419,6 +422,10 @@ public class LambdaExpression extends FunctionalExpression {
+ 			visitor.endVisit(this, blockScope);
+ 	}
+ 	
++	protected boolean shapeAnalysisComplete() {
++		return this.shapeAnalysisComplete;
++	}
++	
+ 	public boolean isCompatibleWith(TypeBinding left, Scope someScope) {
+ 		
+ 		final MethodBinding sam = left.getSingleAbstractMethod(this.enclosingScope);
+@@ -428,21 +435,28 @@ public class LambdaExpression extends FunctionalExpression {
+ 		if (sam.parameters.length != this.arguments.length)
+ 			return false;
+ 		
+-		if (this.shapeAnalysisComplete && squarePegInRoundHole(sam))
+-			return false;
+-		
+ 		IErrorHandlingPolicy oldPolicy = this.scope.problemReporter().switchErrorHandlingPolicy(silentErrorHandlingPolicy);
++
+ 		try {
++			if (this.shapeAnalysisComplete) {
++				if (squarePegInRoundHole(sam))
++					return false;
++			} else {
++				LambdaExpression copy = copy();
++				copy.setExpressionContext(this.expressionContext);
++				copy.setExpectedType(left);
++				copy.resolveType(this.enclosingScope);
++				this.valueCompatible = copy.valueCompatible = copy.doesNotCompleteNormally();
++				this.shapeAnalysisComplete = copy.shapeAnalysisComplete = true;
++				if (squarePegInRoundHole(sam))
++					return false;
++			}
++		
+ 			LambdaExpression copy = copy();
+ 			copy.setExpressionContext(this.expressionContext);
+ 			copy.setExpectedType(left);
+ 			copy.resolveType(this.enclosingScope);
+-			if (!this.shapeAnalysisComplete) {
+-				this.valueCompatible = copy.doesNotCompleteNormally();
+-				this.shapeAnalysisComplete = true;
+-				if (squarePegInRoundHole(sam))
+-					return false;
+-			}
++			
+ 			if (!argumentsTypeElided()) {
+ 				for (int i = 0, length = sam.parameters.length; i < length; i++) {
+ 					TypeBinding argumentType = copy.arguments[i].binding.type;
+@@ -451,26 +465,25 @@ public class LambdaExpression extends FunctionalExpression {
+ 				}
+ 			}
+ 
+-			try {
+-				final TypeBinding returnType = sam.returnType;
+-				if (this.body instanceof Block) {
+-					ASTVisitor visitor = new ASTVisitor() {
+-						public boolean visit(ReturnStatement returnStatement, BlockScope blockScope) {
+-							Expression expression = returnStatement.expression;
+-							if (expression != null && !expression.isAssignmentCompatible(returnType, blockScope))
+-								throw new NoncongruentLambdaException();
+-							return false;
+-						}
+-					};
+-					copy.body.traverse(visitor, copy.scope);
+-				} else {
+-					Expression expression = (Expression) copy.body;
+-					if (!expression.isAssignmentCompatible(returnType, copy.scope))
+-						throw new NoncongruentLambdaException();
+-				}
+-			} catch (NoncongruentLambdaException e) {
+-				return false;
++			final TypeBinding returnType = sam.returnType;
++			if (this.body instanceof Block) {
++				ASTVisitor visitor = new ASTVisitor() {
++					public boolean visit(ReturnStatement returnStatement, BlockScope blockScope) {
++						Expression expression = returnStatement.expression;
++						if (expression != null && !expression.isAssignmentCompatible(returnType, blockScope))
++							throw new IncongruentLambdaException();
++						return false;
++					}
++				};
++				copy.body.traverse(visitor, copy.scope);
++			} else {
++				Expression expression = (Expression) copy.body;
++				if (!expression.isAssignmentCompatible(returnType, copy.scope))
++					throw new IncongruentLambdaException();
+ 			}
++			 
++		} catch (IncongruentLambdaException e) {
++			return false;
+ 		} finally {
+ 			this.scope.problemReporter().switchErrorHandlingPolicy(oldPolicy);
+ 		}
+@@ -491,12 +504,11 @@ public class LambdaExpression extends FunctionalExpression {
+ 	LambdaExpression copy() {
+ 		final Parser parser = new Parser(this.scope.problemReporter(), false);
+ 		final char[] source = this.compilationResult.getCompilationUnit().getContents();
+-		return (LambdaExpression) parser.parseExpression(source, this.sourceStart, this.sourceEnd - this.sourceStart + 1, 
++		LambdaExpression copy =  (LambdaExpression) parser.parseExpression(source, this.sourceStart, this.sourceEnd - this.sourceStart + 1, 
+ 										this.scope.referenceCompilationUnit(), false /* record line separators */);
++		copy.valueCompatible = this.valueCompatible;
++		copy.voidCompatible = this.voidCompatible;
++		copy.shapeAnalysisComplete = this.shapeAnalysisComplete;
++		return copy;
+ 	}
+ }
+-
+-class NoncongruentLambdaException extends RuntimeException {
+-	private static final long serialVersionUID = 4145723509219836114L;
+-}
+-
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeDeclaration.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeDeclaration.java
+index 772f589..cf58c07 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeDeclaration.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeDeclaration.java
+@@ -1313,6 +1313,10 @@ public void tagAsHavingErrors() {
+ 	this.ignoreFurtherInvestigation = true;
+ }
+ 
++public void tagAsHavingIgnoredMandatoryErrors(int problemId) {
++	// Not reachable. No silently ignored errors for this context;
++}
++
+ /**
+  *	Iteration for a package member type
+  *
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/ReferenceContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/ReferenceContext.java
+index 6c93b26..69879f4 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/ReferenceContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/ReferenceContext.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2012 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *******************************************************************************/
+@@ -31,5 +35,7 @@ public interface ReferenceContext {
+ 	boolean hasErrors();
+ 
+ 	void tagAsHavingErrors();
++	
++	void tagAsHavingIgnoredMandatoryErrors(int problemId);
+ 
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemHandler.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemHandler.java
+index 2d51b8f..a8a2fcc 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemHandler.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemHandler.java
+@@ -118,9 +118,17 @@ public void handle(
+ 	ReferenceContext referenceContext,
+ 	CompilationResult unitResult) {
+ 
+-	if (severity == ProblemSeverities.Ignore || this.policy.ignoreAllErrors())
++	if (severity == ProblemSeverities.Ignore)
+ 		return;
+ 
++	 boolean mandatory = (severity & (ProblemSeverities.Error | ProblemSeverities.Optional)) == ProblemSeverities.Error;
++	 if (this.policy.ignoreAllErrors()) { 
++		 // Error is not to be exposed, but clients may need still notification as to whether there are silently-ignored-errors.
++		 if (mandatory)
++			 referenceContext.tagAsHavingIgnoredMandatoryErrors(problemId);
++		 return;
++	 }
++
+ 	if ((severity & ProblemSeverities.Optional) != 0 && problemId != IProblem.Task  && !this.options.ignoreSourceFolderWarningOption) {
+ 		ICompilationUnit cu = unitResult.getCompilationUnit();
+ 		try{
+@@ -166,7 +174,6 @@ public void handle(
+ 
+ 	switch (severity & ProblemSeverities.Error) {
+ 		case ProblemSeverities.Error :
+-			boolean mandatory = ((severity & ProblemSeverities.Optional) == 0);
+ 			record(problem, unitResult, referenceContext, mandatory);
+ 			if ((severity & ProblemSeverities.Fatal) != 0) {
+ 				// don't abort or tag as error if the error is suppressed
+@@ -213,8 +220,8 @@ public void handle(
+ 		referenceContext,
+ 		unitResult);
+ }
+-public void record(CategorizedProblem problem, CompilationResult unitResult, ReferenceContext referenceContext, boolean optionalError) {
+-	unitResult.record(problem, referenceContext, optionalError);
++public void record(CategorizedProblem problem, CompilationResult unitResult, ReferenceContext referenceContext, boolean mandatoryError) {
++	unitResult.record(problem, referenceContext, mandatoryError);
+ }
+ /** @return old policy. */
+ public IErrorHandlingPolicy switchErrorHandlingPolicy(IErrorHandlingPolicy newPolicy) {

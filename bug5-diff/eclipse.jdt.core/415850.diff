@@ -1,0 +1,761 @@
+commit 37207b2312332e7eb9b138e12e2db23f9f9da53e
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Mon Aug 26 11:33:59 2013 +0200
+
+    Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations
+    enabled
+
+29	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+94	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Annotation.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+8	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+5	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ImplicitNullAnnotationVerifier.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java
+3	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+index b5c14a2..9f43d2a 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+@@ -6306,4 +6306,33 @@ public void testBug413460() {
+ 		"Null type mismatch: required \'@NonNull String\' but the provided value is null\n" + 
+ 		"----------\n");
+ }
++
++// missing type in constructor declaration must not cause NPE in QAE#resolveType(..)
++public void testBug415850_a() {
++	this.runNegativeTest(
++			new String[] {
++				"X.java", //-----------------------------------------------------------------------
++				"public class X {\n" +
++				"	void foo(X1 x1) {\n" +
++				"		Object o = new X1(x1){};\n" +
++				"	}\n" +
++				"}\n",
++				"X1.java", //-----------------------------------------------------------------------
++				"public class X1 {\n" +
++				"	public X1(Zork z) {}\n" +
++				"}\n"
++			},
++			"----------\n" +
++			"1. ERROR in X.java (at line 3)\n" +
++			"	Object o = new X1(x1){};\n" +
++			"	               ^^^^^^\n" +
++			"The constructor X1(Zork) refers to the missing type Zork\n" +
++			"----------\n" +
++			"----------\n" +
++			"1. ERROR in X1.java (at line 2)\n" +
++			"	public X1(Zork z) {}\n" +
++			"	          ^^^^\n" +
++			"Zork cannot be resolved to a type\n" +
++			"----------\n");
++}
+ }
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+index d433ecf..3986e88 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+@@ -29,7 +29,7 @@ public class NullTypeAnnotationTest extends AbstractNullAnnotationTest {
+ 	// Static initializer to specify tests subset using TESTS_* static variables
+ 	// All specified tests which do not belong to the class are skipped...
+ 	static {
+-//			TESTS_NAMES = new String[] { "testUnsupportedLocation" };
++//			TESTS_NAMES = new String[] { "testBug415850_01" };
+ //			TESTS_NUMBERS = new int[] { 561 };
+ //			TESTS_RANGE = new int[] { 1, 2049 };
+ 	}
+@@ -1618,4 +1618,97 @@ public class NullTypeAnnotationTest extends AbstractNullAnnotationTest {
+ 			"The nullness annotation \'NonNull\' is not applicable at this location\n" + 
+ 			"----------\n");
+ 	}
++	
++	// missing return type should not cause NPE
++	public void testBug415850_01() {
++		runNegativeTestWithLibs(
++			new String[] {
++				"X.java",
++				"import org.eclipse.jdt.annotation.*;\n" +
++				"public class X {\n" +
++				"	@NonNull foo() {}\n" +
++				"}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 3)\n" + 
++			"	@NonNull foo() {}\n" + 
++			"	         ^^^^^\n" + 
++			"Return type for the method is missing\n" + 
++			"----------\n");
++	}
++	
++	// enum constant inside raw type: initialization must be recognized as conform to the implicitly @NonNull declaration 
++	public void testBug415850_02(){
++		runConformTestWithLibs(
++			new String[] {
++				"Callable.java",
++				"interface Callable<T> {\n" +
++				"	public enum Result {\n" +
++				"		GOOD, BAD\n" +
++				"	};\n" +
++				"	public Result call(T arg);\n" +
++				"}\n"
++			},
++			getCompilerOptions(),
++			"");
++	}
++
++	// when mapping 1st parameter to method receiver, avoid AIOOBE in ReferenceExpression#resolveType(..)
++	public void testBug415850_03() throws Exception {
++		Map options = getCompilerOptions();
++		options.put(JavaCore.COMPILER_PB_DEPRECATION, JavaCore.IGNORE);
++		runConformTestWithLibs(
++			new String[] {
++				"X.java",
++				"import java.lang.annotation.*;\n" +
++				"import java.util.Date;\n" +
++				"import static java.lang.annotation.ElementType.*; \n" +
++				"@Target(TYPE_USE)\n" +
++				"@interface Vernal {}\n" +
++				"interface I {\n" +
++				"	int f(Date d);\n" +
++				"}\n" +
++				"class X {\n" +
++				"	static void monitorTemperature(Object myObject) {\n" +
++				"		I i = @Vernal Date::getDay;\n" +
++				"	}\n" +
++				"}\n",
++			},
++			options,
++			"");
++	}
++
++	// ensure annotation type has super types connected, to avoid NPE in ImplicitNullAnnotationVerifier.collectOverriddenMethods(..)
++	public void testBug415850_04() throws Exception {
++		runConformTestWithLibs(
++			new String[] {
++				"X.java",
++				"public class X implements @B @C('i') J { }",
++				"B.java",
++				"import java.lang.annotation.Target;\n" + 
++				"import static java.lang.annotation.ElementType.*;\n" + 
++				"import java.lang.annotation.Retention;\n" + 
++				"import static java.lang.annotation.RetentionPolicy.*;\n" + 
++				"@Target(TYPE_USE)\n" + 
++				"@Retention(CLASS)\n" + 
++				"@interface B {\n" + 
++				"	int value() default -1;\n" + 
++				"}",
++				"C.java",
++				"import java.lang.annotation.Target;\n" + 
++				"import static java.lang.annotation.ElementType.*;\n" + 
++				"import java.lang.annotation.Retention;\n" + 
++				"import static java.lang.annotation.RetentionPolicy.*;\n" + 
++				"@Target(TYPE_USE)\n" + 
++				"@Retention(RUNTIME)\n" + 
++				"@interface C {\n" + 
++				"	char value() default '-';\n" + 
++				"}\n",
++				"J.java",
++				"interface J {}\n"
++			},
++			getCompilerOptions(),
++			"");
++	}
++
+ }
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Annotation.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Annotation.java
+index c49b4f6..23599c3 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Annotation.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Annotation.java
+@@ -18,6 +18,7 @@
+  *								Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
+  *								Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099
+  *								Bug 392238 - [1.8][compiler][null] Detect semantically invalid null type annotations
++ *								Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 383624 - [1.8][compiler] Revive code generation support for type annotations (from Olivier's work)
+  *                          Bug 409517 - [1.8][compiler] Type annotation problems on more elaborate array references
+@@ -1147,7 +1148,7 @@ public abstract class Annotation extends Expression {
+ 		return this.resolvedType;
+ 	}
+ 	private boolean isTypeUseCompatible(TypeReference reference, Scope scope) {
+-		if (!(reference instanceof SingleTypeReference)) {
++		if (reference != null && !(reference instanceof SingleTypeReference)) {
+ 			Binding binding = scope.getPackage(reference.getTypeName());
+ 			// In case of ProblemReferenceBinding, don't report additional error
+ 			if (binding instanceof PackageBinding) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+index a186116..9f67155 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+@@ -21,6 +21,7 @@
+  *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *								bug 395977 - [compiler][resource] Resource leak warning behavior possibly incorrect for anonymous inner class
+  *								bug 403147 - [compiler][null] FUP of bug 400761: consolidate interaction between unboxing, NPE, and deferred checking
++ *								Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *     Jesper S Moller <jesper@selskabet.org> - Contributions for
+  *								bug 378674 - "The method can be declared as static" is wrong
+  *     Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+@@ -276,7 +277,7 @@ public class QualifiedAllocationExpression extends AllocationExpression {
+ 			return super.resolveType(scope);
+ 		}
+ 		TypeBinding result=resolveTypeForQualifiedAllocationExpression(scope);
+-		if(result != null) {
++		if(result != null && this.binding != null) {
+ 			final CompilerOptions compilerOptions = scope.compilerOptions();
+ 			if (compilerOptions.isAnnotationBasedNullAnalysisEnabled && (this.binding.tagBits & TagBits.IsNullnessKnown) == 0) {
+ 				new ImplicitNullAnnotationVerifier(compilerOptions.inheritNullAnnotations)
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+index 4268c66..dc2309d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+@@ -17,7 +17,8 @@
+  *	   Stephan Herrmann - Contribution for
+  *							bug 402028 - [1.8][compiler] null analysis for reference expressions 
+  *							bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super via I.super.m() syntax
+- *							Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis 
++ *							Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
++ *							Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contribution for
+  *                          Bug 383624 - [1.8][compiler] Revive code generation support for type annotations (from Olivier's work)
+  *******************************************************************************/
+@@ -351,6 +352,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+     	}
+ 
+         MethodBinding anotherMethod = null;
++        int paramOffset = 0;
+         if (!this.haveReceiver && isMethodReference && parametersLength > 0) {
+         	final TypeBinding potentialReceiver = descriptorParameters[0];
+         	if (potentialReceiver.isCompatibleWith(this.receiverType, scope)) {
+@@ -369,6 +371,7 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         		anotherMethod = scope.getMethod(typeToSearch, this.selector, parameters, this);
+         		anotherMethodDepth = this.depth;
+         		this.depth = 0;
++        		paramOffset = 1; // 0 is receiver, real parameters start at 1
+         	}
+         	if (anotherMethod != null && anotherMethod.isValidBinding() && anotherMethod.isStatic()) {
+         		scope.problemReporter().methodMustBeAccessedStatically(this, anotherMethod);
+@@ -442,20 +445,20 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         	scope.problemReporter().unhandledException(methodExceptions[i], this);
+         }
+         if (scope.compilerOptions().isAnnotationBasedNullAnalysisEnabled) {
+-        	int len = this.descriptor.parameters.length;
++        	int len = this.binding.parameters.length;
+     		for (int i = 0; i < len; i++) {
+-    			long declared = this.descriptor.parameters[i].tagBits & TagBits.AnnotationNullMASK;
++    			long declared = this.descriptor.parameters[i+paramOffset].tagBits & TagBits.AnnotationNullMASK;
+     			long implemented = this.binding.parameters[i].tagBits & TagBits.AnnotationNullMASK;
+     			if (declared == TagBits.AnnotationNullable) { // promise to accept null
+     				if (implemented != TagBits.AnnotationNullable) {
+     					char[][] requiredAnnot = implemented == 0L ? null : scope.environment().getNonNullAnnotationName();
+-    					scope.problemReporter().parameterLackingNullableAnnotation(this, this.descriptor, i, 
++    					scope.problemReporter().parameterLackingNullableAnnotation(this, this.descriptor, i, paramOffset, 
+     							scope.environment().getNullableAnnotationName(),
+     							requiredAnnot, this.binding.parameters[i]);
+     				}
+     			} else if (declared == 0L) {
+     				if (implemented == TagBits.AnnotationNonNull) {
+-    					scope.problemReporter().parameterRequiresNonnull(this, this.descriptor, i,
++    					scope.problemReporter().parameterRequiresNonnull(this, this.descriptor, i+paramOffset,
+     							scope.environment().getNonNullAnnotationName(), this.binding.parameters[i]);
+     				}
+     			}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ImplicitNullAnnotationVerifier.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ImplicitNullAnnotationVerifier.java
+index e596cbc..db31b95 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ImplicitNullAnnotationVerifier.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ImplicitNullAnnotationVerifier.java
+@@ -84,6 +84,11 @@ public class ImplicitNullAnnotationVerifier {
+ 			if (isInstanceMethod) {
+ 				List superMethodList = new ArrayList();
+ 				
++				// need super types connected:
++				if (currentType instanceof SourceTypeBinding && !currentType.isHierarchyConnected() && !currentType.isAnonymousType()) {
++					((SourceTypeBinding) currentType).scope.connectTypeHierarchy();
++				}
++
+ 				int paramLen = currentMethod.parameters.length;
+ 				findAllOverriddenMethods(currentMethod.original(), currentMethod.selector, paramLen,
+ 								currentType, new HashSet(), superMethodList);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+index 571b944..0e64d2d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+@@ -21,6 +21,7 @@
+  *								Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099
+  *								Bug 412076 - [compiler] @NonNullByDefault doesn't work for varargs parameter when in generic interface
+  *								Bug 403216 - [1.8][null] TypeReference#captureTypeAnnotations treats type annotations as type argument annotations
++ *								Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -789,7 +790,7 @@ public class ParameterizedTypeBinding extends ReferenceBinding implements Substi
+ 	public boolean isAnnotatedTypeWithoutArguments() {
+ 		if (this.arguments != null)
+ 			return false;
+-		if (this.enclosingType instanceof ParameterizedTypeBinding)
++		if (this.enclosingType != null && this.enclosingType.isParameterizedType())
+ 			return this.enclosingType.isAnnotatedTypeWithoutArguments();
+ 		return true;
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java
+index 685c1a0..e120808 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java
+@@ -29,6 +29,7 @@
+  *								Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
+  *								Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099
+  *								Bug 392238 - [1.8][compiler][null] Detect semantically invalid null type annotations
++ *								Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -1723,7 +1724,7 @@ public MethodBinding resolveTypesFor(MethodBinding method) {
+ 	}
+ 	CompilerOptions compilerOptions = this.scope.compilerOptions();
+ 	if (compilerOptions.isAnnotationBasedNullAnalysisEnabled) {
+-		if (!method.isConstructor()) {
++		if (!method.isConstructor() && method.returnType != null) {
+ 			long nullTagBits = method.tagBits & TagBits.AnnotationNullMASK;
+ 			TypeReference returnTypeRef = ((MethodDeclaration)methodDecl).returnType;
+ 			if (compilerOptions.sourceLevel < ClassFileConstants.JDK1_8) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index d4bc805..e7a61ec 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -41,6 +41,7 @@
+  *								Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
+  *								Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099
+  *								Bug 415291 - [1.8][null] differentiate type incompatibilities due to null annotations
++ *								Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *      Jesper S Moller <jesper@selskabet.org> -  Contributions for
+  *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+@@ -8991,7 +8992,7 @@ public void illegalReturnRedefinition(AbstractMethodDeclaration abstractMethodDe
+ 		sourceStart,
+ 		methodDecl.returnType.sourceEnd);
+ }
+-public void parameterLackingNullableAnnotation(ReferenceExpression location, MethodBinding descriptorMethod, int idx,
++public void parameterLackingNullableAnnotation(ReferenceExpression location, MethodBinding descriptorMethod, int idx, int paramOffset,
+ 				char[][] providedAnnotationName, char/*@Nullable*/[][] requiredAnnotationName, TypeBinding requiredType) {
+ 	StringBuffer requiredPrefix = new StringBuffer(); 
+ 	StringBuffer requiredShortPrefix = new StringBuffer(); 
+@@ -8999,7 +9000,7 @@ public void parameterLackingNullableAnnotation(ReferenceExpression location, Met
+ 		requiredPrefix.append('@').append(CharOperation.toString(requiredAnnotationName)).append(' ');
+ 		requiredShortPrefix.append('@').append(requiredAnnotationName[requiredAnnotationName.length-1]).append(' ');
+ 	}
+-	TypeBinding provided = descriptorMethod.parameters[idx];
++	TypeBinding provided = descriptorMethod.parameters[idx+paramOffset];
+ 	StringBuffer methodSignature = new StringBuffer();
+ 	methodSignature
+ 		.append(descriptorMethod.declaringClass.readableName())
+commit 1829731a70d63f049379e6ceb23edadc61e7b589
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Mon Aug 26 17:11:33 2013 +0200
+
+    Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations
+    enabled
+
+47	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+34	3	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+7	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
+27	12	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
+2	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+index 9f43d2a..f91f625 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullAnnotationTest.java
+@@ -22,6 +22,7 @@ import junit.framework.Test;
+ 
+ import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
++import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ 
+ // see bug 186342 - [compiler][null] Using annotations for null checking
+ public class NullAnnotationTest extends AbstractNullAnnotationTest {
+@@ -6335,4 +6336,50 @@ public void testBug415850_a() {
+ 			"Zork cannot be resolved to a type\n" +
+ 			"----------\n");
+ }
++
++// avoid NPE in BinaryTypeBinding.getField(..) due to recursive dependency enum->package-info->annotation->enum 
++public void testBug415850_b() {
++	runConformTestWithLibs(
++		new String[] {
++			"p/package-info.java",
++			"@p.Annot(state=p.MyEnum.BROKEN)\n" + 
++			"package p;",
++			"p/Annot.java",
++			"package p;\n" + 
++			"@Annot(state=MyEnum.KO)\n" + 
++			"public @interface Annot {\n" + 
++			"	MyEnum state() default MyEnum.KO;\n" + 
++			"}",
++			"p/MyEnum.java",
++			"package p;\n" + 
++			"@Annot(state=MyEnum.KO)\n" + 
++			"public enum MyEnum {\n" + 
++			"	WORKS, OK, KO, BROKEN, ;\n" + 
++			"}",
++			"test180/Test.java",
++			"package test180;\n" +
++			"import p.MyEnum;\n" + 
++			"import p.Annot;\n" + 
++			"@Annot(state=MyEnum.OK)\n" + 
++			"public class Test {}",
++		},
++		getCompilerOptions(),
++		""
++	);
++	Map options = getCompilerOptions();
++	options.put(CompilerOptions.OPTION_Process_Annotations, CompilerOptions.ENABLED);
++	runConformTestWithLibs(
++		new String[] {
++			"X.java",
++			"import test180.Test;\n" +
++			"public class X {\n" + 
++			"	public static void main(String[] args) {\n" + 
++			"		System.out.println(Test.class);\n" + 
++			"	}\n" + 
++			"}"
++		},
++		options,
++		"",
++		"class test180.Test");
++}
+ }
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+index 3986e88..dcb7175 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+@@ -1158,7 +1158,7 @@ public class NullTypeAnnotationTest extends AbstractNullAnnotationTest {
+ //					"import java.util.*;\n" +
+ 					"public class Y1 {\n" +
+ 					"	void test(X1 x) {\n" +
+-					"		Object @NonNull[][] a = new Object[0][];\n" +
++					"		Object @NonNull[][] a = new Object[0][];\n" + // unsafe
+ 					"		x.arrays(a)[0] = null;\n" + // illegal
+ 					"		x.nesting(null, null);\n" + // 1st null is illegal
+ //					"		x.wildcard2(new ArrayList<@NonNull Object>());\n" +
+@@ -1172,12 +1172,17 @@ public class NullTypeAnnotationTest extends AbstractNullAnnotationTest {
+ //				"	   ^^^^^^^^^^^^^^^^\n" + 
+ //				"Incompatible type argument ...\n" + 
+ //				"----------\n" + 
+-				"1. ERROR in Y1.java (at line 6)\n" + 
++				"1. WARNING in Y1.java (at line 5)\n" + 
++				"	Object @NonNull[][] a = new Object[0][];\n" + 
++				"	                        ^^^^^^^^^^^^^^^\n" + 
++				"Null type safety (type annotations): The expression of type \'Object[][]\' needs unchecked conversion to conform to \'Object @NonNull[] []\'\n" + 
++				"----------\n" + 
++				"2. ERROR in Y1.java (at line 6)\n" + 
+ 				"	x.arrays(a)[0] = null;\n" + 
+ 				"	^^^^^^^^^^^^^^\n" + 
+ 				"Null type mismatch: required \'Object @NonNull[]\' but the provided value is null\n" +
+ 				"----------\n" + 
+-				"2. ERROR in Y1.java (at line 7)\n" + 
++				"3. ERROR in Y1.java (at line 7)\n" + 
+ 				"	x.nesting(null, null);\n" + 
+ 				"	          ^^^^\n" + 
+ 				"Null type mismatch: required \'X1.@NonNull Inner\' but the provided value is null\n" + 
+@@ -1711,4 +1716,30 @@ public class NullTypeAnnotationTest extends AbstractNullAnnotationTest {
+ 			"");
+ 	}
+ 
++	// don't let type annotations on array dimensions spoil type compatibility
++	public void testBug415850_05() {
++		runNegativeTestWithLibs(
++			new String[]{
++				"X.java",
++				"import java.lang.annotation.Target;\n" +
++				"import static java.lang.annotation.ElementType.*;\n" +
++				"public class X {\n" +
++				"	public void foo() {\n" +
++				"		int @Marker [][][] i = new @Marker int @Marker [2] @Marker [@Marker bar()] @Marker [];\n" +
++				"	}\n" +
++				"	public int bar() {\n" +
++				"		return 2;\n" +
++				"	}\n" +
++				"}\n" +
++				"@Target (java.lang.annotation.ElementType.TYPE_USE)\n" +
++				"@interface Marker {}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 5)\n" + 
++			"	int @Marker [][][] i = new @Marker int @Marker [2] @Marker [@Marker bar()] @Marker [];\n" + 
++			"	                                                            ^^^^^^^\n" + 
++			"Syntax error, type annotations are illegal here\n" + 
++			"----------\n"); 
++	}
++
+ }
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
+index 1dfced1..43e87fd 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ArrayBinding.java
+@@ -17,6 +17,7 @@
+  *								bug 392384 - [1.8][compiler][null] Restore nullness info from type annotations in class files
+  *								Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
+  *								Bug 415291 - [1.8][null] differentiate type incompatibilities due to null annotations
++ *								Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -199,6 +200,10 @@ public int hashCode() {
+ /* Answer true if the receiver type can be assigned to the argument type (right)
+ */
+ public boolean isCompatibleWith(TypeBinding otherType, Scope captureScope) {
++	otherType = otherType.unannotated(); // for now consider un-annotated type as compatible to type with any type annotations
++	if ((this.tagBits & TagBits.HasNullTypeAnnotation) != 0)
++		return unannotated().isCompatibleWith(otherType, captureScope);
++
+ 	if (this == otherType)
+ 		return true;
+ 
+@@ -334,6 +339,8 @@ public String toString() {
+ 	return this.leafComponentType != null ? debugName() : "NULL TYPE ARRAY"; //$NON-NLS-1$
+ }
+ public TypeBinding unannotated() {
++	if (this.nullTagBitsPerDimension == null)
++		return this;
+ 	return this.environment.createArrayType(this.leafComponentType, this.dimensions);
+ }
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
+index 9cc478e..2f42249 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
+@@ -24,6 +24,7 @@
+  *								bug 392384 - [1.8][compiler][null] Restore nullness info from type annotations in class files
+  *								Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
+  *								Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099
++ *								Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -53,6 +54,8 @@ null is NOT a valid value for a non-public field... it just means the field is n
+ 
+ public class BinaryTypeBinding extends ReferenceBinding {
+ 
++	private static final IBinaryMethod[] NO_BINARY_METHODS = new IBinaryMethod[0];
++
+ 	// all of these fields are ONLY guaranteed to be initialized if accessed using their public accessor method
+ 	protected ReferenceBinding superclass;
+ 	protected ReferenceBinding enclosingType;
+@@ -388,8 +391,9 @@ void cachePartsFrom(IBinaryType binaryType, boolean needFieldsAndMethods) {
+ 		}
+ 
+ 		if (needFieldsAndMethods) {
+-			createFields(binaryType.getFields(), sourceLevel, missingTypeNames);
+-			createMethods(binaryType.getMethods(), sourceLevel, missingTypeNames);
++			IBinaryField[] iFields = binaryType.getFields();
++			createFields(iFields, sourceLevel, missingTypeNames);
++			IBinaryMethod[] iMethods = createMethods(binaryType.getMethods(), sourceLevel, missingTypeNames);
+ 			boolean isViewedAsDeprecated = isViewedAsDeprecated();
+ 			if (isViewedAsDeprecated) {
+ 				for (int i = 0, max = this.fields.length; i < max; i++) {
+@@ -405,6 +409,19 @@ void cachePartsFrom(IBinaryType binaryType, boolean needFieldsAndMethods) {
+ 					}
+ 				}
+ 			}
++			if (this.environment.globalOptions.isAnnotationBasedNullAnalysisEnabled) {
++				// need annotations on the type before processing null annotations on members respecting any @NonNullByDefault:
++				scanTypeForNullDefaultAnnotation(binaryType, this.fPackage, this);
++
++				if (iFields != null) {
++					for (int i = 0; i < iFields.length; i++)
++						scanFieldForNullAnnotation(iFields[i], this.fields[i]);
++				}
++				if (iMethods != null) {
++					for (int i = 0; i < iMethods.length; i++)
++						scanMethodForNullAnnotation(iMethods[i], this.methods[i]);
++				}
++			}
+ 		}
+ 		if (this.environment.globalOptions.storeAnnotations)
+ 			setAnnotations(createAnnotations(binaryType.getAnnotations(), this.environment, missingTypeNames));
+@@ -463,12 +480,6 @@ private void createFields(IBinaryField[] iFields, long sourceLevel, char[][][] m
+ 					this.fields[i].setAnnotations(createAnnotations(binaryField.getAnnotations(), this.environment, missingTypeNames));
+ 				}
+ 			}
+-			if (this.environment.globalOptions.isAnnotationBasedNullAnalysisEnabled) {
+-				for (int i = 0; i <size; i++) {
+-					IBinaryField binaryField = iFields[i];
+-					scanFieldForNullAnnotation(binaryField, this.fields[i]);
+-				}
+-			}
+ 		}
+ 	}
+ }
+@@ -640,15 +651,15 @@ private MethodBinding createMethod(IBinaryMethod method, long sourceLevel, char[
+ 	for (int i = 0, length = typeVars.length; i < length; i++)
+ 		typeVars[i].declaringElement = result;
+ 
+-	scanMethodForNullAnnotation(method, result);
+-
+ 	return result;
+ }
+ 
+ /**
+  * Create method bindings for binary type, filtering out <clinit> and synthetics
++ * As some iMethods may be ignored in this process we return the matching array of those
++ * iMethods for which MethodBindings have been created; indices match those in this.methods.
+  */
+-private void createMethods(IBinaryMethod[] iMethods, long sourceLevel, char[][][] missingTypeNames) {
++private IBinaryMethod[] createMethods(IBinaryMethod[] iMethods, long sourceLevel, char[][][] missingTypeNames) {
+ 	int total = 0, initialTotal = 0, iClinit = -1;
+ 	int[] toSkip = null;
+ 	if (iMethods != null) {
+@@ -675,7 +686,7 @@ private void createMethods(IBinaryMethod[] iMethods, long sourceLevel, char[][][
+ 	}
+ 	if (total == 0) {
+ 		this.methods = Binding.NO_METHODS;
+-		return;
++		return NO_BINARY_METHODS;
+ 	}
+ 
+ 	boolean hasRestrictedAccess = hasRestrictedAccess();
+@@ -687,15 +698,19 @@ private void createMethods(IBinaryMethod[] iMethods, long sourceLevel, char[][][
+ 				method.modifiers |= ExtraCompilerModifiers.AccRestrictedAccess;
+ 			this.methods[i] = method;
+ 		}
++		return iMethods;
+ 	} else {
++		IBinaryMethod[] mappedBinaryMethods = new IBinaryMethod[total];
+ 		for (int i = 0, index = 0; i < initialTotal; i++) {
+ 			if (iClinit != i && (toSkip == null || toSkip[i] != -1)) {
+ 				MethodBinding method = createMethod(iMethods[i], sourceLevel, missingTypeNames);
+ 				if (hasRestrictedAccess)
+ 					method.modifiers |= ExtraCompilerModifiers.AccRestrictedAccess;
++				mappedBinaryMethods[index] = iMethods[i];
+ 				this.methods[index++] = method;
+ 			}
+ 		}
++		return mappedBinaryMethods;
+ 	}
+ }
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+index 2b8dc4b..b55016e 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+@@ -21,6 +21,7 @@
+  *								Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis
+  *								Bug 415291 - [1.8][null] differentiate type incompatibilities due to null annotations
+  *								Bug 392238 - [1.8][compiler][null] Detect semantically invalid null type annotations
++ *								Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -678,7 +679,7 @@ public ArrayBinding createArrayType(TypeBinding leafComponentType, int dimension
+ 		if (currentBinding == null) // no matching array, but space left
+ 			return arrayBindings[index] = new ArrayBinding(leafComponentType, dimensionCount, this, nullTagBitsPerDimension);
+ 		if (currentBinding.leafComponentType == leafComponentType
+-				&& (nullTagBitsPerDimension == null || Arrays.equals(currentBinding.nullTagBitsPerDimension, nullTagBitsPerDimension)))
++				&& Arrays.equals(currentBinding.nullTagBitsPerDimension, nullTagBitsPerDimension))
+ 			return currentBinding;
+ 	}
+ 
+@@ -753,9 +754,6 @@ public BinaryTypeBinding createBinaryTypeFrom(IBinaryType binaryType, PackageBin
+ 	}
+ 	packageBinding.addType(binaryBinding);
+ 	setAccessRestriction(binaryBinding, accessRestriction);
+-	// need type annotations before processing methods (for @NonNullByDefault)
+-	if (this.globalOptions.isAnnotationBasedNullAnalysisEnabled)
+-		binaryBinding.scanTypeForNullDefaultAnnotation(binaryType, packageBinding, binaryBinding);
+ 	binaryBinding.cachePartsFrom(binaryType, needFieldsAndMethods);
+ 	return binaryBinding;
+ }
+commit 365e7f87646ce6e1751b8c49284326393484178c
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Mon Aug 26 22:43:24 2013 +0200
+
+    Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations
+    enabled
+
+22	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+17	10	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeReference.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+index dcb7175..6d4d46f 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+@@ -1742,4 +1742,26 @@ public class NullTypeAnnotationTest extends AbstractNullAnnotationTest {
+ 			"----------\n"); 
+ 	}
+ 
++	// don't let type annotations on array dimensions spoil type compatibility
++	// case without any error
++	public void testBug415850_06() {
++		runConformTestWithLibs(
++			new String[]{
++				"X.java",
++				"import java.lang.annotation.Target;\n" +
++				"public class X {\n" +
++				"	public void foo() {\n" +
++				"		int @Marker [][][] i = new @Marker int @Marker [2] @Marker [bar()] @Marker [];\n" +
++				"	}\n" +
++				"	public int bar() {\n" +
++				"		return 2;\n" +
++				"	}\n" +
++				"}\n" +
++				"@Target (java.lang.annotation.ElementType.TYPE_USE)\n" +
++				"@interface Marker {}\n"
++			},
++			getCompilerOptions(),
++			""); 
++	}
++
+ }
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeReference.java
+index 3f70869..65eec85 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeReference.java
+@@ -16,6 +16,7 @@
+  *								bug 392862 - [1.8][compiler][null] Evaluate null annotations on array types
+  *								bug 392384 - [1.8][compiler][null] Restore nullness info from type annotations in class files
+  *								Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099
++ *								Bug 415850 - [1.8] Ensure RunJDTCoreTests can cope with null annotations enabled
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 383624 - [1.8][compiler] Revive code generation support for type annotations (from Olivier's work)
+  *                          Bug 409236 - [1.8][compiler] Type annotations on intersection cast types dropped by code generator
+@@ -570,13 +571,16 @@ protected void resolveAnnotations(Scope scope) {
+ 							for (int j=0; j<len; j++) {
+ 								Binding recipient = currentAnnotations[j].recipient;
+ 								if (recipient instanceof Annotation.TypeUseBinding) {
+-									if (isArrayReference) {
+-										if (tagBitsPerDimension == null)
+-											tagBitsPerDimension = new long[dimensions+1]; // each dimension plus leaf component type at last position
+-										// @NonNull Foo [][][] means the leaf component type is @NonNull:
+-										tagBitsPerDimension[dimensions] = ((Annotation.TypeUseBinding)recipient).tagBits & TagBits.AnnotationNullMASK;
+-									} else {
+-										tagBits |= ((Annotation.TypeUseBinding)recipient).tagBits & TagBits.AnnotationNullMASK;
++									long nullTagBits = ((Annotation.TypeUseBinding)recipient).tagBits & TagBits.AnnotationNullMASK;
++									if (nullTagBits != 0) {
++										if (isArrayReference) {
++											if (tagBitsPerDimension == null)
++												tagBitsPerDimension = new long[dimensions+1]; // each dimension plus leaf component type at last position
++											// @NonNull Foo [][][] means the leaf component type is @NonNull:
++											tagBitsPerDimension[dimensions] = nullTagBits;
++										} else {
++											tagBits |= nullTagBits;
++										}
+ 									}
+ 								}
+ 							}
+@@ -595,9 +599,12 @@ protected void resolveAnnotations(Scope scope) {
+ 							for (int j=0; j<len; j++) {
+ 								Binding recipient = dimensionAnnotations[j].recipient;
+ 								if (recipient instanceof Annotation.TypeUseBinding) {
+-									if (tagBitsPerDimension == null)
+-										tagBitsPerDimension = new long[dimensions+1];
+-									tagBitsPerDimension[i] = ((Annotation.TypeUseBinding)recipient).tagBits & TagBits.AnnotationNullMASK;
++									long nullTagBits = ((Annotation.TypeUseBinding)recipient).tagBits & TagBits.AnnotationNullMASK;
++									if (nullTagBits != 0) {
++										if (tagBitsPerDimension == null)
++											tagBitsPerDimension = new long[dimensions+1];
++										tagBitsPerDimension[i] = nullTagBits;
++									}
+ 								}
+ 							}
+ 						}

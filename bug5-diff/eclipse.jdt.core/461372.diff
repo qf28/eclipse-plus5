@@ -1,0 +1,988 @@
+commit de9c3f2925c8aee3e58d42a318a524b205f29c40
+Author: Manoj Palat <manpalat@in.ibm.com>
+Date:   Thu Mar 5 06:05:44 2015 +0530
+
+    First set of changes for Bug 461372 [1.9][search] Support modular run
+    time images in JDT search
+
+8	1	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
+31	1	org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+7	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+1	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+72	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
+7	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+6	2	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchDocument.java
+352	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJimageFileToIndex.java
+19	5	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+3	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+17	14	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
+index 8c882fd..43b8524 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2010 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -150,6 +150,13 @@ public interface IClasspathEntry {
+ 	int CPE_CONTAINER = 5;
+ 
+ 	/**
++	 * Entry kind constant describing a jrt - jimage 
++	 *
++	 * @since 3.11
++	 */
++	int CPE_JIMAGE = 6;
++
++	/**
+ 	 * Returns whether the access rules of the project's exported entries should be combined with this entry's access rules.
+ 	 * Returns true for container entries.
+ 	 * Returns false otherwise.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+index 2c0c02c..3e1da49 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -4739,6 +4739,36 @@ public final class JavaCore extends Plugin {
+ 	}
+ 
+ 	/**
++	 * Creates and returns a new classpath entry of kind <code>CPE_JIMAGE</code> for the jimage
++	 * identified by the given absolute path. 
++	 * <p>
++	 *
++	 * @param path the path to the jimage
++	 * @return a new jimage classpath entry
++	 * @since 3.11
++	 */
++	public static IClasspathEntry newJimageEntry(
++			IPath path) {
++
++		if (path == null) throw new ClasspathEntry.AssertionFailedException("Jimage path cannot be null"); //$NON-NLS-1$
++		boolean hasDotDot = ClasspathEntry.hasDotDot(path);
++		if (!hasDotDot && !path.isAbsolute()) throw new ClasspathEntry.AssertionFailedException("Path for IClasspathEntry must be absolute: " + path); //$NON-NLS-1$
++		return new ClasspathEntry(
++			IPackageFragmentRoot.K_BINARY,
++			IClasspathEntry.CPE_JIMAGE,
++			hasDotDot ? path : JavaProject.canonicalizedPath(path),
++			ClasspathEntry.INCLUDE_ALL, // inclusion patterns
++			ClasspathEntry.EXCLUDE_NONE, // exclusion patterns
++			null,//sourceAttachmentPath,
++			null,//sourceAttachmentRootPath,
++			null, // specific output folder
++			true,//isExported,
++			null,//accessRules,
++			false, // no access rules to combine
++			null //extraAttributes
++			);
++	}
++	/**
+ 	 * Creates and returns a new non-exported classpath entry of kind <code>CPE_PROJECT</code>
+ 	 * for the project identified by the given absolute path.
+ 	 * <p>
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+index f0c68a5..2fbda1f 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JarPackageFragmentRoot.java
+@@ -308,6 +308,13 @@ public class JarPackageFragmentRoot extends PackageFragmentRoot {
+ 	public boolean isReadOnly() {
+ 		return true;
+ 	}
++	/**
++	 * return true if jimage
++	 */
++	public boolean isJimage() {
++		return this.isJimage;
++	}
++
+ 
+ 	/**
+ 	 * Returns whether the corresponding resource or associated file exists
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+index 1ef42d7..b8c4999 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+@@ -1444,6 +1444,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	public static boolean CP_RESOLVE_VERBOSE_ADVANCED = false;
+ 	public static boolean CP_RESOLVE_VERBOSE_FAILURE = false;
+ 	public static boolean ZIP_ACCESS_VERBOSE = false;
++	public static boolean JIMAGE_ACCESS_VERBOSE = false;
+ 	
+ 	/**
+ 	 * A cache of opened zip files per thread.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
+index 6154ee8..2673fc3 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -12,7 +12,10 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
++import java.io.File;
+ import java.io.IOException;
++import java.nio.file.FileVisitResult;
++import java.nio.file.attribute.BasicFileAttributes;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Comparator;
+@@ -62,6 +65,7 @@ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.problem.DefaultProblemFactory;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.compiler.util.Util;
++import org.eclipse.jdt.internal.compiler.util.Util.JimageVisitor;
+ import org.eclipse.jdt.internal.core.util.ReferenceInfoAdapter;
+ 
+ /**
+@@ -453,6 +457,57 @@ public class SourceMapper
+ 		return -1;
+ 	}
+ 
++	class JimagePackageNamesAdderVisitor implements JimageVisitor<java.nio.file.Path> {
++
++		public final HashSet firstLevelPackageNames;
++		final IPackageFragmentRoot root;
++		public String sourceLevel = null;
++		public String complianceLevel = null;
++		public boolean containsADefaultPackage;
++		public boolean containsJavaSource;
++
++		JimagePackageNamesAdderVisitor(HashSet firstLevelPackageNames, String sourceLevel, String complianceLevel,
++				boolean containsADefaultPackage, boolean containsJavaSource, IPackageFragmentRoot root) {
++			this.firstLevelPackageNames = firstLevelPackageNames;
++			this.root = root;
++			this.sourceLevel = sourceLevel;
++			this.complianceLevel = complianceLevel;
++			this.containsADefaultPackage = containsADefaultPackage;
++			this.containsJavaSource = containsJavaSource;
++		}
++		
++		@Override
++		public FileVisitResult visitPackage(java.nio.file.Path dir, BasicFileAttributes attrs) throws IOException {
++			return FileVisitResult.CONTINUE;
++		}
++		
++		@Override
++		public FileVisitResult visitFile(java.nio.file.Path file, BasicFileAttributes attrs) throws IOException {
++			String entryName = file.toString();
++			if (Util.isClassFileName(entryName)) {
++				int index = entryName.indexOf('/');
++				if (index != -1) {
++					String firstLevelPackageName = entryName.substring(0, index);
++					if (!this.firstLevelPackageNames.contains(firstLevelPackageName)) {
++						if (this.sourceLevel == null) {
++							IJavaProject project = this.root.getJavaProject();
++							this.sourceLevel = project.getOption(JavaCore.COMPILER_SOURCE, true);
++							this.complianceLevel = project.getOption(JavaCore.COMPILER_COMPLIANCE, true);
++						}
++						IStatus status = JavaConventions.validatePackageName(firstLevelPackageName, this.sourceLevel, this.complianceLevel);
++						if (status.isOK() || status.getSeverity() == IStatus.WARNING) {
++							this.firstLevelPackageNames.add(firstLevelPackageName);
++						}
++					}
++				} else {
++					this.containsADefaultPackage = true;
++				}
++			} else if (!this.containsJavaSource && org.eclipse.jdt.internal.core.util.Util.isJavaLikeFileName(entryName)) {
++				this.containsJavaSource = true;
++			}
++			return FileVisitResult.CONTINUE;
++		}
++	}
+ 	private synchronized void computeAllRootPaths(IType type) {
+ 		if (this.areRootPathsComputed) {
+ 			return;
+@@ -471,7 +526,22 @@ public class SourceMapper
+ 
+ 		String sourceLevel = null;
+ 		String complianceLevel = null;
+-		if (root.isArchive()) {
++		boolean isJimage = root instanceof JarPackageFragmentRoot ?
++				((JarPackageFragmentRoot) root).isJimage() : false;
++		if (isJimage) {
++			try {
++				JimagePackageNamesAdderVisitor jimagePackageNamesAdderVisitor = new JimagePackageNamesAdderVisitor(firstLevelPackageNames, 
++						sourceLevel, complianceLevel, containsADefaultPackage, containsJavaSource, root);
++				org.eclipse.jdt.internal.compiler.util.Util.walkModuleImage(new File(root.toString()), jimagePackageNamesAdderVisitor);
++				sourceLevel = jimagePackageNamesAdderVisitor.sourceLevel;
++				complianceLevel = jimagePackageNamesAdderVisitor.complianceLevel;
++				containsADefaultPackage = jimagePackageNamesAdderVisitor.containsADefaultPackage;
++				containsJavaSource = jimagePackageNamesAdderVisitor.containsJavaSource;
++			} catch (JavaModelException e) {
++				// TODO Auto-generated catch block
++				e.printStackTrace();
++			}
++		} else if (root.isArchive()) {
+ 			JavaModelManager manager = JavaModelManager.getJavaModelManager();
+ 			ZipFile zip = null;
+ 			try {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+index 6d4f8b4..a115dce 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ClasspathJar.java
+@@ -156,13 +156,19 @@ ClasspathJar(String zipFilename, long lastModified, AccessRuleSet accessRuleSet,
+ }
+ 
+ public ClasspathJar(ZipFile zipFile, AccessRuleSet accessRuleSet, IPath externalAnnotationPath) {
+-	this.zipFilename = zipFile.getName();
++	this(zipFile.getName(), accessRuleSet, externalAnnotationPath);
+ 	this.zipFile = zipFile;
++}
++
++public ClasspathJar(String fileName, AccessRuleSet accessRuleSet, IPath externalAnnotationPath) {
++	this.zipFilename = fileName;
+ 	this.closeZipFileAtEnd = false;
+ 	this.knownPackageNames = null;
+ 	this.accessRuleSet = accessRuleSet;
+ 	if (externalAnnotationPath != null)
+ 		this.externalAnnotationPath = externalAnnotationPath.toString();
++	this.isJimage = JavaModelManager.isJimage(fileName);
++
+ }
+ 
+ public void cleanup() {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchDocument.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchDocument.java
+index f5f3311..d7f0a58 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchDocument.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchDocument.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2009 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -32,7 +32,11 @@ public class JavaSearchDocument extends SearchDocument {
+ 		super(documentPath, participant);
+ 	}
+ 	public JavaSearchDocument(java.util.zip.ZipEntry zipEntry, IPath zipFilePath, byte[] contents, SearchParticipant participant) {
+-		super(zipFilePath + IJavaSearchScope.JAR_FILE_ENTRY_SEPARATOR + zipEntry.getName(), participant);
++		this(zipFilePath + IJavaSearchScope.JAR_FILE_ENTRY_SEPARATOR + zipEntry.getName(), contents, participant);
++	}
++
++	public JavaSearchDocument(String documentPath, byte[] contents, SearchParticipant participant) {
++		super(documentPath, participant);
+ 		this.byteContents = contents;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJimageFileToIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJimageFileToIndex.java
+new file mode 100644
+index 0000000..c002388
+--- /dev/null
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJimageFileToIndex.java
+@@ -0,0 +1,352 @@
++/*******************************************************************************
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core.search.indexing;
++
++import java.io.File;
++import java.io.IOException;
++import java.net.URI;
++import java.nio.file.FileVisitResult;
++import java.nio.file.attribute.BasicFileAttributes;
++
++import org.eclipse.core.resources.IFile;
++import org.eclipse.core.runtime.CoreException;
++import org.eclipse.core.runtime.IPath;
++import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.core.runtime.Path;
++import org.eclipse.jdt.core.JavaModelException;
++import org.eclipse.jdt.core.compiler.InvalidInputException;
++import org.eclipse.jdt.core.search.IJavaSearchScope;
++import org.eclipse.jdt.core.search.SearchEngine;
++import org.eclipse.jdt.core.search.SearchParticipant;
++import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
++import org.eclipse.jdt.internal.compiler.parser.Scanner;
++import org.eclipse.jdt.internal.compiler.parser.TerminalTokens;
++import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
++import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
++import org.eclipse.jdt.internal.compiler.util.Util;
++import org.eclipse.jdt.internal.core.JavaModelManager;
++import org.eclipse.jdt.internal.core.index.Index;
++import org.eclipse.jdt.internal.core.index.IndexLocation;
++import org.eclipse.jdt.internal.core.search.JavaSearchDocument;
++import org.eclipse.jdt.internal.core.search.processing.JobManager;
++
++public class AddJimageFileToIndex extends IndexRequest {
++
++	IFile resource;
++	Scanner scanner;
++	private IndexLocation indexFileURL;
++	private final boolean forceIndexUpdate;
++	static final char JAR_SEPARATOR = IJavaSearchScope.JAR_FILE_ENTRY_SEPARATOR.charAt(0);
++	
++	enum FILE_INDEX_STATE {
++		EXISTS,
++		DELETED
++	}
++
++
++	public AddJimageFileToIndex(IFile resource, IndexLocation indexFile, IndexManager manager) {
++		this(resource, indexFile, manager, false);
++	}
++	public AddJimageFileToIndex(IFile resource, IndexLocation indexFile, IndexManager manager, final boolean updateIndex) {
++		super(resource.getFullPath(), manager);
++		this.resource = resource;
++		this.indexFileURL = indexFile;
++		this.forceIndexUpdate = updateIndex;
++	}
++	public AddJimageFileToIndex(IPath jimagePath, IndexLocation indexFile, IndexManager manager) {
++		this(jimagePath, indexFile, manager, false);
++	}
++	public AddJimageFileToIndex(IPath jimagePath, IndexLocation indexFile, IndexManager manager, final boolean updateIndex) {
++		// external JAR scenario - no resource
++		super(jimagePath, manager);
++		this.indexFileURL = indexFile;
++		this.forceIndexUpdate = updateIndex;
++	}
++	public boolean equals(Object o) {
++		if (o instanceof AddJimageFileToIndex) {
++			if (this.resource != null)
++				return this.resource.equals(((AddJimageFileToIndex) o).resource);
++			if (this.containerPath != null)
++				return this.containerPath.equals(((AddJimageFileToIndex) o).containerPath);
++		}
++		return false;
++	}
++	public int hashCode() {
++		if (this.resource != null)
++			return this.resource.hashCode();
++		if (this.containerPath != null)
++			return this.containerPath.hashCode();
++		return -1;
++	}
++	
++	private class JimageTraverser implements org.eclipse.jdt.internal.compiler.util.Util.JimageVisitor<java.nio.file.Path> {
++		
++		SimpleLookupTable indexedFileNames;
++		public JimageTraverser() {
++		}
++		public JimageTraverser(SimpleLookupTable indexedFileNames) {
++			this.indexedFileNames = indexedFileNames;
++		}
++
++		@Override
++		public FileVisitResult visitPackage(java.nio.file.Path dir, BasicFileAttributes attrs)
++				throws IOException {
++			return FileVisitResult.CONTINUE;
++		}
++
++		@Override
++		public FileVisitResult visitFile(java.nio.file.Path path, BasicFileAttributes attrs)
++				throws IOException {
++			String name = path.getFileName().toString();
++			if (Util.isClassFileName(name) && 
++					isValidPackageNameForClass(name)) {
++				this.indexedFileNames.put(name, FILE_INDEX_STATE.EXISTS);
++			}
++			return FileVisitResult.CONTINUE;
++		}
++	}
++	
++	private class JimageIndexer extends JimageTraverser {
++		final SearchParticipant participant;
++		final IPath indexPath;
++		final IndexManager indexManager;
++		final IPath container;
++		final Index index;
++
++		public JimageIndexer(SearchParticipant participant, Index index, IPath container, IndexManager indexManager) {
++			this.participant = (participant != null) ? participant : SearchEngine.getDefaultSearchParticipant();
++			this.index = index;
++			IndexLocation indexLocation = index.getIndexLocation();
++			this.indexPath = indexLocation != null ? new Path(indexLocation.getCanonicalFilePath()) : null;
++			this.container = container;
++			this.indexManager = indexManager;
++		}
++
++		public FileVisitResult visitFile(java.nio.file.Path path, BasicFileAttributes attrs)
++				throws IOException {
++			String name = path.getFileName().toString();
++			if (Util.isClassFileName(name) && 
++					isValidPackageNameForClass(name)) {
++				try {
++					String fullPath = path.toString();
++					final byte[] classFileBytes = Util.getClassfileContent(fullPath);
++					String docFullPath =  this.container.toString() + JAR_SEPARATOR + fullPath;
++					JavaSearchDocument entryDocument = new JavaSearchDocument(docFullPath, classFileBytes, this.participant);
++					this.indexManager.indexDocument(entryDocument, this.participant, this.index, this.indexPath);
++				} catch (IOException e) {
++					e.printStackTrace();
++				}
++			}
++			return FileVisitResult.CONTINUE;
++		}
++	}
++
++	public boolean execute(IProgressMonitor progressMonitor) {
++
++		if (this.isCancelled || progressMonitor != null && progressMonitor.isCanceled()) return true;
++
++		if (hasPreBuiltIndex()) {
++			boolean added = this.manager.addIndex(this.containerPath, this.indexFileURL);
++			if (added) return true;	
++			this.indexFileURL = null;
++		}
++
++		try {
++			// if index is already cached, then do not perform any check
++			// MUST reset the IndexManager if a jar file is changed
++			if (this.manager.getIndexForUpdate(this.containerPath, false, /*do not reuse index file*/ false /*do not create if none*/) != null) {
++				if (JobManager.VERBOSE)
++					org.eclipse.jdt.internal.core.util.Util.verbose("-> no indexing required (index already exists) for " + this.containerPath); //$NON-NLS-1$
++				return true;
++			}
++
++			final Index index = this.manager.getIndexForUpdate(this.containerPath, true, /*reuse index file*/ true /*create if none*/);
++			if (index == null) {
++				if (JobManager.VERBOSE)
++					org.eclipse.jdt.internal.core.util.Util.verbose("-> index could not be created for " + this.containerPath); //$NON-NLS-1$
++				return true;
++			}
++			index.separator = JAR_SEPARATOR;
++			ReadWriteMonitor monitor = index.monitor;
++			if (monitor == null) {
++				if (JobManager.VERBOSE)
++					org.eclipse.jdt.internal.core.util.Util.verbose("-> index for " + this.containerPath + " just got deleted"); //$NON-NLS-1$//$NON-NLS-2$
++				return true; // index got deleted since acquired
++			}
++			try {
++				final String fileName;
++				final IPath container;
++				monitor.enterWrite(); // ask permission to write
++
++				if (this.resource != null) {
++					URI location = this.resource.getLocationURI();
++					if (location == null) return false;
++					if (JavaModelManager.JIMAGE_ACCESS_VERBOSE)
++						System.out.println("(" + Thread.currentThread() + ") [AddJimageFileToIndex.execute()] Creating ZipFile on " + location.getPath()); //$NON-NLS-1$	//$NON-NLS-2$
++					File file = null;
++					try {
++						file = org.eclipse.jdt.internal.core.util.Util.toLocalFile(location, progressMonitor);
++					} catch (CoreException e) {
++						if (JobManager.VERBOSE) {
++							org.eclipse.jdt.internal.core.util.Util.verbose("-> failed to index " + location.getPath() + " because of the following exception:"); //$NON-NLS-1$ //$NON-NLS-2$
++							e.printStackTrace();
++						}
++					}
++					if (file == null) {
++						if (JobManager.VERBOSE)
++							org.eclipse.jdt.internal.core.util.Util.verbose("-> failed to index " + location.getPath() + " because the file could not be fetched"); //$NON-NLS-1$ //$NON-NLS-2$
++						return false;
++					}
++					fileName = file.getAbsolutePath();
++					container =  this.resource.getFullPath().makeRelative();
++					// absolute path relative to the workspace
++				} else {
++					
++					fileName = this.containerPath.toOSString();
++					container = this.containerPath;
++				}
++
++
++				if (JobManager.VERBOSE)
++					org.eclipse.jdt.internal.core.util.Util.verbose("-> indexing " + fileName); //$NON-NLS-1$
++				long initialTime = System.currentTimeMillis();
++				String[] paths = index.queryDocumentNames(""); // all file names //$NON-NLS-1$
++				if (paths != null) {
++					int max = paths.length;
++					/* check integrity of the existing index file
++					 * if the length is equal to 0, we want to index the whole jimage again
++					 * If not, then we want to check that there is no missing entry, if
++					 * one entry is missing then we recreate the index
++					 */
++					
++					final SimpleLookupTable indexedFileNames = new SimpleLookupTable(max == 0 ? 33 : max + 11);
++					for (int i = 0; i < max; i++)
++						indexedFileNames.put(paths[i], FILE_INDEX_STATE.DELETED);
++					
++					org.eclipse.jdt.internal.compiler.util.Util.walkModuleImage(new File(fileName), 
++							new JimageTraverser(indexedFileNames));
++
++					boolean needToReindex = indexedFileNames.elementSize != max; // a new file was added
++					if (!needToReindex) {
++						Object[] valueTable = indexedFileNames.valueTable;
++						for (int i = 0, l = valueTable.length; i < l; i++) {
++							if (valueTable[i] == FILE_INDEX_STATE.DELETED) {
++								needToReindex = true; // a file was deleted so re-index
++								break;
++							}
++						}
++						if (!needToReindex) {
++							if (JobManager.VERBOSE)
++								org.eclipse.jdt.internal.core.util.Util.verbose("-> no indexing required (index is consistent with library) for " //$NON-NLS-1$
++								+ fileName + " (" //$NON-NLS-1$
++								+ (System.currentTimeMillis() - initialTime) + "ms)"); //$NON-NLS-1$
++							this.manager.saveIndex(index); // to ensure its placed into the saved state
++							return true;
++						}
++					}
++				}
++
++				// Index the jimage for the first time or reindex the jimage in case the previous index file has been corrupted
++				// index already existed: recreate it so that we forget about previous entries
++				if (!this.manager.resetIndex(this.containerPath)) {
++					// failed to recreate index, see 73330
++					this.manager.removeIndex(this.containerPath);
++					return false;
++				}
++				
++				
++				org.eclipse.jdt.internal.compiler.util.Util.walkModuleImage(new File(fileName), 
++						new JimageIndexer(SearchEngine.getDefaultSearchParticipant(), index, container, this.manager));
++
++				if(this.forceIndexUpdate) {
++					this.manager.savePreBuiltIndex(index);
++				}
++				else {
++					this.manager.saveIndex(index);
++				}
++				if (JobManager.VERBOSE)
++					org.eclipse.jdt.internal.core.util.Util.verbose("-> done indexing of " //$NON-NLS-1$
++						+ fileName + " (" //$NON-NLS-1$
++						+ (System.currentTimeMillis() - initialTime) + "ms)"); //$NON-NLS-1$
++			} finally {
++				monitor.exitWrite();
++			}
++		} catch (JavaModelException | IOException e ) {
++			if (JobManager.VERBOSE) {
++				org.eclipse.jdt.internal.core.util.Util.verbose("-> failed to index " + this.containerPath + " because of the following exception:"); //$NON-NLS-1$ //$NON-NLS-2$
++				e.printStackTrace();
++			}
++			this.manager.removeIndex(this.containerPath);
++			return false;
++		}
++		return true;
++	}
++	public String getJobFamily() {
++		if (this.resource != null)
++			return super.getJobFamily();
++		return this.containerPath.toOSString(); // external jar
++	}	
++	private boolean isIdentifier() throws InvalidInputException {
++		switch(this.scanner.scanIdentifier()) {
++			// assert and enum will not be recognized as java identifiers 
++			// in 1.7 mode, which are in 1.3.
++			case TerminalTokens.TokenNameIdentifier:
++			case TerminalTokens.TokenNameassert:
++			case TerminalTokens.TokenNameenum:
++				return true;
++			default:
++				return false;
++		}
++	}
++	boolean isValidPackageNameForClass(String className) {
++		char[] classNameArray = className.toCharArray();
++		// use 1.7 as the source level as there are more valid identifiers in 1.7 mode
++		// https://bugs.eclipse.org/bugs/show_bug.cgi?id=376673
++		if (this.scanner == null)
++			this.scanner = new Scanner(false /* comment */, true /* whitespace */, false /* nls */,
++					ClassFileConstants.JDK1_7/* sourceLevel */, null/* taskTag */, null/* taskPriorities */, true /* taskCaseSensitive */);
++		
++		this.scanner.setSource(classNameArray); 
++		this.scanner.eofPosition = classNameArray.length - SuffixConstants.SUFFIX_CLASS.length;
++		try {
++			if (isIdentifier()) {
++				while (this.scanner.eofPosition > this.scanner.currentPosition) {
++					if (this.scanner.getNextChar() != '/' || this.scanner.eofPosition <= this.scanner.currentPosition) {
++						return false;
++					}
++					if (!isIdentifier()) return false;
++				}
++				return true;
++			}
++		} catch (InvalidInputException e) {
++			// invalid class name
++		}
++		return false;
++	}
++	protected Integer updatedIndexState() {
++
++		Integer updateState = null;
++		if(hasPreBuiltIndex()) {
++			updateState = IndexManager.REUSE_STATE;
++		}
++		else {
++			updateState = IndexManager.REBUILDING_STATE;
++		}
++		return updateState;
++	}
++	public String toString() {
++		return "indexing " + this.containerPath.toString(); //$NON-NLS-1$
++	}
++
++	protected boolean hasPreBuiltIndex() {
++		return !this.forceIndexUpdate && (this.indexFileURL != null && this.indexFileURL.exists());
++	}
++}
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+index 543549d..93afbf7 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -29,6 +29,7 @@ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.compiler.problem.DefaultProblemFactory;
+ import org.eclipse.jdt.internal.compiler.util.SimpleLookupTable;
+ import org.eclipse.jdt.internal.compiler.util.SimpleSet;
++import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+ import org.eclipse.jdt.internal.core.*;
+ import org.eclipse.jdt.internal.core.index.*;
+ import org.eclipse.jdt.internal.core.search.BasicSearchEngine;
+@@ -553,6 +554,15 @@ public void indexLibrary(IPath path, IProject requestingProject, URL indexURL) {
+ 	this.indexLibrary(path, requestingProject, indexURL, false);
+ }
+ 
++private IndexRequest getRequest(Object target, IPath jPath, IndexLocation indexFile, IndexManager manager, boolean updateIndex) {
++	return isJimage(((File) target).getName()) ? new AddJimageFileToIndex(jPath, indexFile, this, updateIndex) :
++		new AddJarFileToIndex(jPath, indexFile, this, updateIndex);
++}
++
++private boolean isJimage(String fileName) {
++	return fileName != null && 
++			fileName.substring(fileName.lastIndexOf('.') + 1, fileName.length()).equals(SuffixConstants.EXTENSION_jimage);
++}
+ /**
+  * Trigger addition of a library to an index
+  * Note: the actual operation is performed in background
+@@ -579,9 +589,11 @@ public void indexLibrary(IPath path, IProject requestingProject, URL indexURL, f
+ 	IndexRequest request = null;
+ 	Object target = JavaModel.getTarget(path, true);
+ 	if (target instanceof IFile) {
+-		request = new AddJarFileToIndex((IFile) target, indexFile, this, forceIndexUpdate);
++		request = isJimage(((IFile) target).getFullPath().toOSString()) ? 
++				new AddJimageFileToIndex((IFile) target, indexFile, this, forceIndexUpdate) :
++					new AddJarFileToIndex((IFile) target, indexFile, this, forceIndexUpdate);
+ 	} else if (target instanceof File) {
+-		request = new AddJarFileToIndex(path, indexFile, this, forceIndexUpdate);
++		request = getRequest(target, path, indexFile, this, forceIndexUpdate);
+ 	} else if (target instanceof IContainer) {
+ 		request = new IndexBinaryFolder((IContainer) target, this);
+ 	} else {
+@@ -685,9 +697,11 @@ private void rebuildIndex(IndexLocation indexLocation, IPath containerPath, fina
+ 	} else if (target instanceof IFolder) {
+ 		request = new IndexBinaryFolder((IFolder) target, this);
+ 	} else if (target instanceof IFile) {
+-		request = new AddJarFileToIndex((IFile) target, null, this, updateIndex);
++		request = isJimage(((IFile) target).getFullPath().toOSString()) ? 
++				new AddJimageFileToIndex((IFile) target, null, this, updateIndex) :
++					new AddJarFileToIndex((IFile) target, null, this, updateIndex);
+ 	} else if (target instanceof File) {
+-		request = new AddJarFileToIndex(containerPath, null, this, updateIndex);
++		request = getRequest(target, containerPath, null, this, updateIndex);
+ 	}
+ 	if (request != null)
+ 		request(request);
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+index 2126a1c..f7a4ff1 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+@@ -101,7 +101,9 @@ private ClasspathLocation mapToClassPathLocation( JavaModelManager manager, Pack
+ 	try {
+ 		if (root.isArchive()) {
+ 			ClasspathEntry rawClasspathEntry = (ClasspathEntry) root.getRawClasspathEntry();
+-			cp = new ClasspathJar(manager.getZipFile(path), rawClasspathEntry.getAccessRuleSet(), ClasspathEntry.getExternalAnnotationPath(rawClasspathEntry, ((IJavaProject)root.getParent()).getProject(), true));
++			cp = JavaModelManager.isJimage(path) ? 
++					new ClasspathJar(path.toOSString(), rawClasspathEntry.getAccessRuleSet(), ClasspathEntry.getExternalAnnotationPath(rawClasspathEntry, ((IJavaProject)root.getParent()).getProject(), true)) :
++			new ClasspathJar(manager.getZipFile(path), rawClasspathEntry.getAccessRuleSet(), ClasspathEntry.getExternalAnnotationPath(rawClasspathEntry, ((IJavaProject)root.getParent()).getProject(), true));
+ 		} else {
+ 			Object target = JavaModel.getTarget(path, true);
+ 			if (target != null) 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+index a5647e0..e8f2ea5 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+@@ -246,24 +246,27 @@ public static ClassFileReader classFileReader(IType type) {
+ 		if (!root.isArchive())
+ 			return Util.newClassFileReader(((JavaElement) type).resource());
+ 
+-		ZipFile zipFile = null;
+-		try {
+-			IPath zipPath = root.getPath();
+-			if (JavaModelManager.ZIP_ACCESS_VERBOSE)
+-				System.out.println("(" + Thread.currentThread() + ") [MatchLocator.classFileReader()] Creating ZipFile on " + zipPath); //$NON-NLS-1$	//$NON-NLS-2$
+-			zipFile = manager.getZipFile(zipPath);
++		String rootPath = root.getPath().toOSString();
++		if (org.eclipse.jdt.internal.compiler.util.Util.archiveFormat(rootPath) == org.eclipse.jdt.internal.compiler.util.Util.JIMAGE_FILE) {
+ 			String classFileName = classFile.getElementName();
+ 			String path = Util.concatWith(pkg.names, classFileName, '/');
+-			return ClassFileReader.read(zipFile, path);
+-		} finally {
+-			manager.closeZipFile(zipFile);
++			return ClassFileReader.readFromJimage(rootPath, path);
++		} else {
++			ZipFile zipFile = null;
++			try {
++				IPath zipPath = root.getPath();
++				if (JavaModelManager.ZIP_ACCESS_VERBOSE)
++					System.out.println("(" + Thread.currentThread() + ") [MatchLocator.classFileReader()] Creating ZipFile on " + zipPath); //$NON-NLS-1$	//$NON-NLS-2$
++				zipFile = manager.getZipFile(zipPath);
++				String classFileName = classFile.getElementName();
++				String path = Util.concatWith(pkg.names, classFileName, '/');
++				return ClassFileReader.read(zipFile, path);
++			} finally {
++				manager.closeZipFile(zipFile);
++			}
+ 		}
+-	} catch (ClassFormatException e) {
++	} catch (ClassFormatException | CoreException | IOException e) {
+ 		// invalid class file: return null
+-	} catch (CoreException e) {
+-		// cannot read class file: return null
+-	} catch (IOException e) {
+-		// cannot read class file: return null
+ 	}
+ 	return null;
+ }
+commit 6cab122d66ec8a5daeae1d70c86e089e1e82d650
+Author: Manoj Palat <manpalat@in.ibm.com>
+Date:   Wed Mar 11 14:17:32 2015 +0530
+
+    CR comments for Bug 461372 [1.9][search] Support modular run
+    time images in JDT search
+
+5	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileConstants.java
+4	0	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
+4	0	org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+4	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
+4	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchDocument.java
+4	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJimageFileToIndex.java
+4	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+4	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+4	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileConstants.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileConstants.java
+index 1a3cbbc..28377f5 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileConstants.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ClassFileConstants.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2015 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Jesper S Moller - Contributions for
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
+index 43b8524..8f7769e 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
+@@ -5,6 +5,10 @@
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *******************************************************************************/
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+index 3e1da49..daac9c0 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+@@ -5,6 +5,10 @@
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     IBM Corporation - added the following constants:
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
+index 2673fc3..a220764 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceMapper.java
+@@ -5,6 +5,10 @@
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Kelly Campbell <kellyc@google.com> - Hangs in SourceMapper during java proposals - https://bugs.eclipse.org/bugs/show_bug.cgi?id=281575
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchDocument.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchDocument.java
+index d7f0a58..5e7fd06 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchDocument.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/JavaSearchDocument.java
+@@ -5,6 +5,10 @@
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *******************************************************************************/
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJimageFileToIndex.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJimageFileToIndex.java
+index c002388..6bf40f1 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJimageFileToIndex.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/AddJimageFileToIndex.java
+@@ -5,6 +5,10 @@
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *******************************************************************************/
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+index 93afbf7..5773d8b 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/IndexManager.java
+@@ -5,6 +5,10 @@
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *******************************************************************************/
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+index f7a4ff1..fe5a05e 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/JavaSearchNameEnvironment.java
+@@ -5,6 +5,10 @@
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann - Contribution for
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+index e8f2ea5..b1cbf33 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/matching/MatchLocator.java
+@@ -5,6 +5,10 @@
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann - Contribution for
+commit 3162fd8151ad8dd9058d9c84d95cbd5d77df4ca9
+Author: Jay Arthanareeswaran <jarthana@in.ibm.com>
+Date:   Mon Jun 22 12:14:52 2015 +0530
+
+    Bug 461372 - Removing unused APIs.
+
+0	7	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
+0	30	org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
+index 8f7769e..2946d65 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathEntry.java
+@@ -154,13 +154,6 @@ public interface IClasspathEntry {
+ 	int CPE_CONTAINER = 5;
+ 
+ 	/**
+-	 * Entry kind constant describing a jrt - jimage 
+-	 *
+-	 * @since 3.11
+-	 */
+-	int CPE_JIMAGE = 6;
+-
+-	/**
+ 	 * Returns whether the access rules of the project's exported entries should be combined with this entry's access rules.
+ 	 * Returns true for container entries.
+ 	 * Returns false otherwise.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+index f9b47b9..5f52f30 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+@@ -4749,36 +4749,6 @@ public final class JavaCore extends Plugin {
+ 	}
+ 
+ 	/**
+-	 * Creates and returns a new classpath entry of kind <code>CPE_JIMAGE</code> for the jimage
+-	 * identified by the given absolute path. 
+-	 * <p>
+-	 *
+-	 * @param path the path to the jimage
+-	 * @return a new jimage classpath entry
+-	 * @since 3.11
+-	 */
+-	public static IClasspathEntry newJimageEntry(
+-			IPath path) {
+-
+-		if (path == null) throw new ClasspathEntry.AssertionFailedException("Jimage path cannot be null"); //$NON-NLS-1$
+-		boolean hasDotDot = ClasspathEntry.hasDotDot(path);
+-		if (!hasDotDot && !path.isAbsolute()) throw new ClasspathEntry.AssertionFailedException("Path for IClasspathEntry must be absolute: " + path); //$NON-NLS-1$
+-		return new ClasspathEntry(
+-			IPackageFragmentRoot.K_BINARY,
+-			IClasspathEntry.CPE_JIMAGE,
+-			hasDotDot ? path : JavaProject.canonicalizedPath(path),
+-			ClasspathEntry.INCLUDE_ALL, // inclusion patterns
+-			ClasspathEntry.EXCLUDE_NONE, // exclusion patterns
+-			null,//sourceAttachmentPath,
+-			null,//sourceAttachmentRootPath,
+-			null, // specific output folder
+-			true,//isExported,
+-			null,//accessRules,
+-			false, // no access rules to combine
+-			null //extraAttributes
+-			);
+-	}
+-	/**
+ 	 * Creates and returns a new non-exported classpath entry of kind <code>CPE_PROJECT</code>
+ 	 * for the project identified by the given absolute path.
+ 	 * <p>

@@ -1,0 +1,303 @@
+commit aa2ac8661de653e0cd8b2e94e0f7b013078019a8
+Author: Stefan Xenos <sxenos@gmail.com>
+Date:   Wed Jun 15 07:57:43 2016 -0700
+
+    Bug 496142 - Reduce the maximum time write locks are held
+    
+    Delete each NdResourceFile in pieces rather than in an atomic
+    call to delete().
+    
+    Change-Id: I8b9347d119404ca10d5f147ab44ca84bed2a7cbf
+    Signed-off-by: Stefan Xenos <sxenos@gmail.com>
+
+28	6	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+21	12	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/field/FieldManyToOne.java
+60	17	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+12	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+8	0	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdTreeNode.java
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+index 4d74bc6..1bd1e55 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/Nd.java
+@@ -35,6 +35,7 @@ public class Nd {
+ 	private static final int LONG_WRITE_LOCK_REPORT_THRESHOLD = 1000;
+ 	private static final int LONG_READ_LOCK_WAIT_REPORT_THRESHOLD = 1000;
+ 	public static boolean sDEBUG_LOCKS= false;
++	public static boolean DEBUG_DUPLICATE_DELETIONS = false;
+ 
+ 	private final int currentVersion;
+ 	private final int maxVersion;
+@@ -99,7 +100,7 @@ public class Nd {
+ 	private Set<LocalPath> changes = new HashSet<>();
+ 
+ 	private final NdNodeTypeRegistry<NdNode> fNodeTypeRegistry;
+-	private HashMap<Long, Throwable> pendingDeletions = new HashMap<>();
++	private HashMap<Long, Object> pendingDeletions = new HashMap<>();
+ 
+ 	private IReader fReader = new IReader() {
+ 		@Override
+@@ -137,15 +138,30 @@ public class Nd {
+ 	}
+ 
+ 	public void scheduleDeletion(long addressOfNodeToDelete) {
++		if (this.pendingDeletions.containsKey(addressOfNodeToDelete)) {
++			logDoubleDeletion(addressOfNodeToDelete);
++			return;
++		}
++
++		Object data = Boolean.TRUE;
++		if (DEBUG_DUPLICATE_DELETIONS) {
++			data = new RuntimeException();
++		}
++		this.pendingDeletions.put(addressOfNodeToDelete, data);
++	}
++
++	protected void logDoubleDeletion(long addressOfNodeToDelete) {
+ 		// Sometimes an object can be scheduled for deletion twice, if it is created and then discarded shortly
+ 		// afterward during indexing. This may indicate an inefficiency in the indexer but is not necessarily
+ 		// a bug.
+-		if (this.pendingDeletions.containsKey(addressOfNodeToDelete)) {
+-			Package.log("Database object queued for deletion twice", new RuntimeException()); //$NON-NLS-1$
+-			Package.log("Earlier deletion stack was this:", this.pendingDeletions.get(addressOfNodeToDelete)); //$NON-NLS-1$
+-			return;
++		// If you're debugging issues related to duplicate deletions, set DEBUG_DUPLICATE_DELETIONS to true
++		Package.log("Database object queued for deletion twice", new RuntimeException()); //$NON-NLS-1$
++		Object earlierData = this.pendingDeletions.get(addressOfNodeToDelete);
++		if (earlierData instanceof RuntimeException) {
++			RuntimeException exception = (RuntimeException) earlierData;
++
++			Package.log("Data associated with earlier deletion stack was:", exception); //$NON-NLS-1$
+ 		}
+-		this.pendingDeletions.put(addressOfNodeToDelete, new RuntimeException());
+ 	}
+ 
+ 	/**
+@@ -603,6 +619,12 @@ public class Nd {
+ 
+ 		// Free up its memory
+ 		getDB().free(address, (short)(Database.POOL_FIRST_NODE_TYPE + nodeType));
++
++		// If this node was in the list of pending deletions, remove it since it's now been deleted
++		if (this.pendingDeletions.containsKey(address)) {
++			logDoubleDeletion(address);
++			this.pendingDeletions.remove(address);
++		}
+ 	}
+ 
+ 	public NdNodeTypeRegistry<NdNode> getTypeRegistry() {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/field/FieldManyToOne.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/field/FieldManyToOne.java
+index 34d81cb..55f5982 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/field/FieldManyToOne.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/field/FieldManyToOne.java
+@@ -113,12 +113,28 @@ public class FieldManyToOne<T extends NdNode> implements IDestructableField, IFi
+ 		if (this.backPointer == null) {
+ 			throw new IllegalStateException("FieldNodePointer must be associated with a FieldBackPointer"); //$NON-NLS-1$
+ 		}
+-
++		
+ 		long oldTargetAddress = TARGET.get(nd, fieldStart);
+ 		if (oldTargetAddress == newTargetAddress) {
+ 			return;
+ 		}
+ 
++		detachFromOldTarget(nd, address, oldTargetAddress);
++
++		TARGET.put(nd, fieldStart, newTargetAddress);
++		if (newTargetAddress != 0) {
++			// Note that newValue is the address of the backpointer list and record (the address of the struct
++			// containing the forward pointer) is the value being inserted into the list.
++			BACKPOINTER_INDEX.put(nd, fieldStart, this.backPointer.add(nd, newTargetAddress, address));
++		} else {
++			if (this.pointsToOwner) {
++				nd.scheduleDeletion(address);
++			}
++		}
++	}
++
++	protected void detachFromOldTarget(Nd nd, long address, long oldTargetAddress) {
++		long fieldStart = address + this.offset;
+ 		if (oldTargetAddress != 0) {
+ 			int oldIndex = BACKPOINTER_INDEX.get(nd, fieldStart);
+ 
+@@ -133,16 +149,6 @@ public class FieldManyToOne<T extends NdNode> implements IDestructableField, IFi
+ 				nd.scheduleDeletion(oldTargetAddress);
+ 			}
+ 		}
+-		TARGET.put(nd, fieldStart, newTargetAddress);
+-		if (newTargetAddress != 0) {
+-			// Note that newValue is the address of the backpointer list and record (the address of the struct
+-			// containing the forward pointer) is the value being inserted into the list.
+-			BACKPOINTER_INDEX.put(nd, fieldStart, this.backPointer.add(nd, newTargetAddress, address));
+-		} else {
+-			if (this.pointsToOwner) {
+-				nd.scheduleDeletion(address);
+-			}
+-		}
+ 	}
+ 
+ 	/**
+@@ -157,7 +163,10 @@ public class FieldManyToOne<T extends NdNode> implements IDestructableField, IFi
+ 
+ 	@Override
+ 	public void destruct(Nd nd, long address) {
+-		put(nd, address, 0);
++		long fieldStart = address + this.offset;
++		long oldTargetAddress = TARGET.get(nd, fieldStart);
++		detachFromOldTarget(nd, address, oldTargetAddress);
++		TARGET.put(nd, fieldStart, 0);
+ 	}
+ 
+ 	void clearedByBackPointer(Nd nd, long address) {
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+index cb6f641..47d6719 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/indexer/Indexer.java
+@@ -305,14 +305,7 @@ public final class Indexer {
+ 
+ 		SubMonitor deleteMonitor = subMonitor.split(1).setWorkRemaining(garbage.size());
+ 		for (NdResourceFile next : garbage) {
+-			this.nd.acquireWriteLock(deleteMonitor.split(1));
+-			try {
+-				if (next.isInIndex()) {
+-					next.delete();
+-				}
+-			} finally {
+-				this.nd.releaseWriteLock();
+-			}
++			deleteResource(next, deleteMonitor.split(1));
+ 		}
+ 
+ 		SubMonitor updateMonitor = subMonitor.split(1).setWorkRemaining(needsUpdate.size());
+@@ -330,6 +323,54 @@ public final class Indexer {
+ 		return result;
+ 	}
+ 
++	/**
++	 * Performs a non-atomic delete of the given resource file. First, it marks the file as being invalid
++	 * (by clearing out its timestamp). Then it deletes the children of the resource file, one child at a time.
++	 * Once all the children are deleted, the resource itself is deleted. The result on the database is exactly
++	 * the same as if the caller had called toDelete.delete(), but doing it this way ensures that a write lock
++	 * will never be held for a nontrivial amount of time.
++	 */
++	protected void deleteResource(NdResourceFile toDelete, IProgressMonitor monitor) {
++		SubMonitor deletionMonitor = SubMonitor.convert(monitor, 10);
++
++		this.nd.acquireWriteLock(deletionMonitor.split(1));
++		try {
++			if (toDelete.isInIndex()) {
++				toDelete.markAsInvalid();
++			}
++		} finally {
++			this.nd.releaseWriteLock();
++		}
++
++		for (;;) {
++			this.nd.acquireWriteLock(deletionMonitor.split(1));
++			try {
++				if (!toDelete.isInIndex()) {
++					break;
++				}
++		
++				int numChildren = toDelete.getBindingCount();
++				deletionMonitor.setWorkRemaining(numChildren + 1);
++				if (numChildren == 0) {
++					break;
++				}
++
++				toDelete.getBinding(numChildren - 1).delete();
++			} finally {
++				this.nd.releaseWriteLock();
++			}
++		}
++
++		this.nd.acquireWriteLock(deletionMonitor.split(1));
++		try {
++			if (toDelete.isInIndex()) {
++				toDelete.delete();
++			}
++		} finally {
++			this.nd.releaseWriteLock();
++		}
++	}
++
+ 	private Map<IPath, List<IJavaElement>> removeDuplicatePaths(List<IJavaElement> allIndexables) {
+ 		Map<IPath, List<IJavaElement>> paths = new HashMap<>();
+ 
+@@ -426,26 +467,28 @@ public final class Indexer {
+ 		if (DEBUG) {
+ 			Package.logInfo("rescanning " + thePath.toString()); //$NON-NLS-1$
+ 		}
+-		int result = addElement(resourceFile, element, subMonitor.split(90));
++		int result = addElement(resourceFile, element, subMonitor.split(50));
+ 
++		List<NdResourceFile> allResourcesWithThisPath = Collections.emptyList();
+ 		// Now update the timestamp and delete all older versions of this resource that exist in the index
+-		this.nd.acquireWriteLock(subMonitor.split(5));
++		this.nd.acquireWriteLock(subMonitor.split(1));
+ 		try {
+ 			if (resourceFile.isInIndex()) {
+ 				resourceFile.setFingerprint(fingerprint);
+ 				this.nd.markPathAsModified(resourceFile.getLocalFile());
+-				List<NdResourceFile> resourceFiles = javaIndex.findResourcesWithPath(pathString);
+-
+-				for (NdResourceFile next : resourceFiles) {
+-					if (!next.equals(resourceFile)) {
+-						next.delete();
+-					}
+-				}
++				allResourcesWithThisPath = javaIndex.findResourcesWithPath(pathString);
+ 			}
+ 		} finally {
+ 			this.nd.releaseWriteLock();
+ 		}
+ 
++		SubMonitor deletionMonitor = subMonitor.split(40).setWorkRemaining(allResourcesWithThisPath.size() - 1);
++		for (NdResourceFile next : allResourcesWithThisPath) {
++			if (!next.equals(resourceFile)) {
++				deleteResource(next, deletionMonitor.split(1));
++			}
++		}
++
+ 		return result;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+index caeed42..7c745ea 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdResourceFile.java
+@@ -242,4 +242,16 @@ public class NdResourceFile extends NdTreeNode {
+ 		}
+ 		return LocalPath.createFileSystem(new Path(getLocation().getString()));
+ 	}
++
++	public void markAsInvalid() {
++		TIME_LAST_SCANNED.put(getNd(), this.address, 0);
++	}
++
++	public int getBindingCount() {
++		return ALL_NODES.size(getNd(), this.address);
++	}
++
++	public NdBinding getBinding(int index) {
++		return ALL_NODES.get(getNd(), this.address, index);
++	}
+ }
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdTreeNode.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdTreeNode.java
+index 044577d..6c582e3 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdTreeNode.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/nd/java/NdTreeNode.java
+@@ -48,6 +48,14 @@ public abstract class NdTreeNode extends NdNode {
+ 		PARENT.put(nd, this.address, parent == null ? 0 : parent.address);
+ 	}
+ 
++	public int getChildrenCount() {
++		return CHILDREN.size(getNd(), this.address);
++	}
++
++	public NdTreeNode getChild(int index) {
++		return CHILDREN.get(getNd(), this.address, index);
++	}
++
+ 	/**
+ 	 * Returns the closest ancestor of the given type, or null if none. Note that
+ 	 * this looks for an exact match. It will not return subtypes of the given type.

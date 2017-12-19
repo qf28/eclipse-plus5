@@ -1,0 +1,370 @@
+commit ea3d3a1bd602d8d8c1f8acd5930dd39d45436e6c
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Tue Sep 5 13:24:41 2017 +0200
+
+    Bug 521847: [9] NPE in ModuleBinding.UnNamedModule.canAccess()
+    
+    Change-Id: I75567675289782dc5b3b97abd4c14ebb66587247
+
+16	2	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
+24	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ResolveTests9.java
+35	19	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BasicCompilationUnit.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModularClassFile.java
+5	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+4	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
+index 6711dca..fe60b5f 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
+@@ -74,6 +74,18 @@ public abstract class AbstractJavaModelTests extends SuiteOfTestCases {
+ 	protected boolean displayName = false;
+ 	protected String endChar = ",";
+ 
++	protected static boolean isJRE9 = false;
++	static {
++		String javaVersion = System.getProperty("java.version");
++		if (javaVersion.length() > 3) {
++			javaVersion = javaVersion.substring(0, 3);
++		}
++		long jdkLevel = CompilerOptions.versionToJdkLevel(javaVersion);
++		if (jdkLevel >= ClassFileConstants.JDK9) {
++			isJRE9 = true;
++		}
++	}
++
+ 	/**
+ 	 * Internal synonym for constant AST.JSL9
+ 	 * to alleviate deprecation warnings once AST.JLS9 is deprecated in future.
+@@ -1295,8 +1307,10 @@ public abstract class AbstractJavaModelTests extends SuiteOfTestCases {
+ 		return createJava9Project(name, new String[]{"src"});
+ 	}
+ 	protected IJavaProject createJava9Project(String name, String[] srcFolders) throws CoreException {
+-		String bootModPath = System.getProperty("java.home") + File.separator +"/lib/jrt-fs.jar";
+-		IClasspathEntry jrtEntry = JavaCore.newLibraryEntry(new Path(bootModPath), null, null, null, null, false);
++		String javaHome = System.getProperty("java.home") + File.separator;
++		Path bootModPath = new Path(javaHome +"/lib/jrt-fs.jar");
++		Path sourceAttachment = new Path(javaHome +"/lib/src.zip");
++		IClasspathEntry jrtEntry = JavaCore.newLibraryEntry(bootModPath, sourceAttachment, null, null, null, false);
+ 		IJavaProject project = this.createJavaProject(name, srcFolders, new String[0],
+ 				new String[0], "bin", "9");
+ 		IClasspathEntry[] old = project.getRawClasspath();
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ResolveTests9.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ResolveTests9.java
+index 1825d2d..c54be85 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ResolveTests9.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ResolveTests9.java
+@@ -16,15 +16,18 @@
+ package org.eclipse.jdt.core.tests.model;
+ 
+ import java.io.File;
++import java.io.IOException;
+ 
+ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.resources.IFolder;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.Path;
++import org.eclipse.jdt.core.IClassFile;
+ import org.eclipse.jdt.core.IClasspathEntry;
+ import org.eclipse.jdt.core.ICompilationUnit;
+ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.IJavaProject;
++import org.eclipse.jdt.core.IType;
+ import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.WorkingCopyOwner;
+@@ -218,4 +221,25 @@ public class ResolveTests9 extends AbstractJavaModelTests {
+ 				deleteResource(modInfo);
+ 		}
+ 	}
++
++	public void testClassFileInModule1() throws CoreException, IOException {
++		if (!isJRE9) {
++			System.err.println("Test "+getName()+" requires a JRE 9");
++			return;
++		}
++		IJavaProject javaProject = createJava9Project("Test");
++		try {
++			IType type = javaProject.findType("java.util.zip.ZipFile");
++			IClassFile classFile = type.getClassFile();
++			String contents = classFile.getBuffer().getContents();
++			int start = contents.indexOf("this(");
++			IJavaElement[] selected = classFile.codeSelect(start, 4);
++			assertElementsEqual(
++					"Unexpected elements",
++					"ZipFile(java.io.File, int) [in ZipFile [in ZipFile.class [in java.util.zip [in <module:java.base>]]]]",
++					selected);
++		} finally {
++			deleteProject(javaProject);
++		}
++	}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BasicCompilationUnit.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BasicCompilationUnit.java
+index d2ed32f..3af8467 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BasicCompilationUnit.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BasicCompilationUnit.java
+@@ -24,6 +24,7 @@ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IModularClassFile;
+ import org.eclipse.jdt.core.IModuleDescription;
++import org.eclipse.jdt.core.IPackageFragmentRoot;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+ import org.eclipse.jdt.internal.compiler.util.Util;
+@@ -47,12 +48,16 @@ public class BasicCompilationUnit implements ICompilationUnit {
+ 	protected char[] moduleName;
+ 	protected String encoding;
+ 
+-public BasicCompilationUnit(char[] contents, char[][] packageName, String fileName) {
++private BasicCompilationUnit(char[] contents, char[][] packageName, String fileName) {
+ 	this.contents = contents;
+ 	this.fileName = fileName.toCharArray();
+ 	this.packageName = packageName;
+ }
+ 
++/**
++ * @deprecated Should pass a javaElement via {@link BasicCompilationUnit#BasicCompilationUnit(char[], char[][], String, IJavaElement)}.
++ */
++@Deprecated
+ public BasicCompilationUnit(char[] contents, char[][] packageName, String fileName, String encoding) {
+ 	this(contents, packageName, fileName);
+ 	this.encoding = encoding;
+@@ -75,30 +80,41 @@ private void initAttributes(IJavaElement javaElement) {
+ 	if (javaElement != null) {
+ 		try {
+ 				IModuleDescription module = null;
+-				IJavaProject javaProject = javaElement.getJavaProject();
+-
+-				switch (javaElement.getElementType()) {
+-					case IJavaElement.CLASS_FILE:
+-						if (javaElement instanceof IModularClassFile)
+-							module = ((IModularClassFile) javaElement).getModule();
+-						else
+-							module = ((ClassFile) javaElement).getPackageFragmentRoot().getModuleDescription();
+-						break;
+-					case IJavaElement.COMPILATION_UNIT:
+-						IFile file = (IFile) javaElement.getResource();
+-						if (file != null) {
+-							this.encoding = file.getCharset();
+-						}
+-						break;
+-					default:
+-						break;
++
++				search: while (javaElement != null) {
++					switch (javaElement.getElementType()) {
++						case IJavaElement.JAVA_PROJECT:
++							module = ((IJavaProject) javaElement).getModuleDescription();
++							break search;
++						case IJavaElement.PACKAGE_FRAGMENT_ROOT:
++							module = ((IPackageFragmentRoot) javaElement).getModuleDescription();
++							break search;
++						case IJavaElement.CLASS_FILE:
++							if (javaElement instanceof IModularClassFile) {
++								module = ((IModularClassFile) javaElement).getModule();
++								break search;
++							}
++							break;
++						case IJavaElement.COMPILATION_UNIT:
++							IFile file = (IFile) javaElement.getResource();
++							if (file != null) {
++								this.encoding = file.getCharset();
++							}
++							module = ((org.eclipse.jdt.core.ICompilationUnit) javaElement).getModule();
++							if (module != null)
++								break search;
++							break;
++						default:
++							break;
++					}
++					javaElement = javaElement.getParent();
+ 				}
+ 
+ 				if (module != null) {
+ 					this.moduleName = module.getElementName().toCharArray();
+ 				}
+ 				if (this.encoding == null) {
+-					IProject project = (IProject) javaProject.getResource();
++					IProject project = javaElement.getJavaProject().getProject();
+ 					if (project != null) {
+ 						this.encoding = project.getDefaultCharset();
+ 					}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+index 0a0dd29..be23fd5 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFile.java
+@@ -117,7 +117,7 @@ public IJavaElement[] codeSelect(int offset, int length, WorkingCopyOwner owner)
+ 	char[] contents;
+ 	if (buffer != null && (contents = buffer.getCharacters()) != null) {
+ 	    BinaryType type = (BinaryType) getType();
+-		BasicCompilationUnit cu = new BasicCompilationUnit(contents, null, type.sourceFileName((IBinaryType) type.getElementInfo()));
++		BasicCompilationUnit cu = new BasicCompilationUnit(contents, null, type.sourceFileName((IBinaryType) type.getElementInfo()), this);
+ 		return super.codeSelect(cu, offset, length, owner);
+ 	} else {
+ 		//has no associated souce
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModularClassFile.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModularClassFile.java
+index 167624f..7d8cdcd 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModularClassFile.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModularClassFile.java
+@@ -91,7 +91,7 @@ public class ModularClassFile extends AbstractClassFile implements IModularClass
+ 		IBuffer buffer = getBuffer();
+ 		char[] contents;
+ 		if (buffer != null && (contents = buffer.getCharacters()) != null) {
+-			BasicCompilationUnit cu = new BasicCompilationUnit(contents, null, TypeConstants.MODULE_INFO_FILE_NAME_STRING);
++			BasicCompilationUnit cu = new BasicCompilationUnit(contents, null, TypeConstants.MODULE_INFO_FILE_NAME_STRING, this);
+ 			return super.codeSelect(cu, offset, length, owner);
+ 		} else {
+ 			// has no associated source
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+index a9a1e06..0ae3b22 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+@@ -130,7 +130,11 @@ public class SearchableEnvironment
+ 		if (this.owner != null) {
+ 			String source = this.owner.findSource(typeName, packageName);
+ 			if (source != null) {
+-				ICompilationUnit cu = new BasicCompilationUnit(source.toCharArray(), CharOperation.splitOn('.', packageName.toCharArray()), typeName + Util.defaultJavaExtension());
++				ICompilationUnit cu = new BasicCompilationUnit(
++						source.toCharArray(),
++						CharOperation.splitOn('.', packageName.toCharArray()),
++						typeName + Util.defaultJavaExtension(),
++						moduleContext);
+ 				return new NameEnvironmentAnswer(cu, null);
+ 			}
+ 		}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+index dfe03ac..bf33cb5 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+@@ -124,7 +124,10 @@ public class ModuleUtil {
+ 							String pack = fragment.getElementName();
+ 							for (ICompilationUnit iUnit : units) {
+ 								org.eclipse.jdt.internal.compiler.env.ICompilationUnit sourceFile = 
+-										new BasicCompilationUnit(iUnit.getSource().toCharArray(), CharOperation.splitOn('.', pack.toCharArray()), iUnit.getPath().toOSString());
++										new BasicCompilationUnit(iUnit.getSource().toCharArray(),
++												CharOperation.splitOn('.', pack.toCharArray()),
++												iUnit.getPath().toOSString(),
++												iUnit);
+ 								toCompile.add(sourceFile);
+ 							}
+ 						}
+commit 5868e44fb4163075f677d883e30f1db88724fc89
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Tue Sep 5 19:44:07 2017 +0200
+
+    Bug 521847: [9] NPE in ModuleBinding.UnNamedModule.canAccess()
+    
+    
+    Change-Id: If59dbbca55bd51b24993e06304fa5f01f0999b33
+
+62	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ResolveTests9.java
+1	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ResolveTests9.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ResolveTests9.java
+index c54be85..5f4713a 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ResolveTests9.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ResolveTests9.java
+@@ -20,12 +20,17 @@ import java.io.IOException;
+ 
+ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.resources.IFolder;
++import org.eclipse.core.resources.IMarker;
++import org.eclipse.core.resources.IResource;
++import org.eclipse.core.resources.IncrementalProjectBuilder;
+ import org.eclipse.core.runtime.CoreException;
+ import org.eclipse.core.runtime.Path;
+ import org.eclipse.jdt.core.IClassFile;
++import org.eclipse.jdt.core.IClasspathAttribute;
+ import org.eclipse.jdt.core.IClasspathEntry;
+ import org.eclipse.jdt.core.ICompilationUnit;
+ import org.eclipse.jdt.core.IJavaElement;
++import org.eclipse.jdt.core.IJavaModelMarker;
+ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IType;
+ import org.eclipse.jdt.core.JavaCore;
+@@ -242,4 +247,61 @@ public class ResolveTests9 extends AbstractJavaModelTests {
+ 			deleteProject(javaProject);
+ 		}
+ 	}
++
++	public void testUnnamedNamedConflict() throws CoreException, IOException {
++		if (!isJRE9) {
++			System.err.println("Test "+getName()+" requires a JRE 9");
++			return;
++		}
++		IJavaProject mod = null;
++		IJavaProject test = null;
++		try {
++			mod = createJava9Project("mod");
++			createFolder("mod/src/p1/p2");
++			createFile("mod/src/p1/p2/C.java", "package p1.p2;\n public class C {}\n");
++			createFile("mod/src/module-info.java",
++					"module mod {\n" +
++					"	exports p1.p2;\n" +
++					"}\n");
++			mod.getProject().build(IncrementalProjectBuilder.FULL_BUILD, null);
++
++			test = createJava9Project("Test");
++			IClasspathAttribute[] attributes = { JavaCore.newClasspathAttribute(IClasspathAttribute.MODULE, "true") };
++			addClasspathEntry(test, JavaCore.newProjectEntry(new Path("/mod"), null, false, attributes, false));
++			createFolder("Test/src/p1/p2");
++			createFile("Test/src/p1/p2/C1.java", "package p1.p2;\n public class C1 {}\n");
++			String source =
++					"package q;\n" +
++					"public class Main {\n" +
++					"	p1.p2.C c;\n" +
++					"	p1.p2.C1 c1;\n" +
++					"}\n";
++			createFolder("Test/src/q");
++			createFile("Test/src/q/Main.java", source);
++			test.getProject().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = test.getProject().findMarkers(IJavaModelMarker.JAVA_MODEL_PROBLEM_MARKER, true, IResource.DEPTH_INFINITE);
++			sortMarkers(markers);
++			assertMarkers("Unexpected markers", "The package p1.p2 conflicts with a package accessible from another module: mod", markers);
++
++			ICompilationUnit unit = getCompilationUnit("Test/src/q/Main.java");
++
++			// test that we can select both types despite the package conflict:
++			int start = source.indexOf("C c");
++			IJavaElement[] selected = unit.codeSelect(start, 2);
++			assertElementsEqual(
++					"Unexpected elements",
++					"C [in C.java [in p1.p2 [in src [in mod]]]]",
++					selected);
++
++			start = source.indexOf("C1");
++			selected = unit.codeSelect(start, 2);
++			assertElementsEqual(
++					"Unexpected elements",
++					"C1 [in C1.java [in p1.p2 [in src [in Test]]]]",
++					selected);
++		} finally {
++			deleteProject(test);
++			deleteProject(mod);
++		}
++	}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+index 929b5e4..2e6f107 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+@@ -358,6 +358,7 @@ private ReferenceBinding combine(ReferenceBinding one, ReferenceBinding two, Mod
+ 	if (two == null) return one;
+ 	if (!clientModule.canAccess(one.fPackage)) return two;
+ 	if (!clientModule.canAccess(two.fPackage)) return one;
++	if (one == two) return one; //$IDENTITY-COMPARISON$
+ 	return new ProblemReferenceBinding(one.compoundName, one, ProblemReasons.Ambiguous); // TODO(SHMOD): use a new problem ID
+ }
+ /** Collect answers from the oracle concerning the given clientModule (if present) and each of a set of other modules. */
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+index c4c02ef..82ac6d6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/PackageBinding.java
+@@ -227,7 +227,7 @@ public Binding getTypeOrPackage(char[] name, ModuleBinding mod) {
+ 			return new ProblemReferenceBinding(new char[][]{name}, referenceBinding, ProblemReasons.InternalNameProvided);
+ 		}
+ 		boolean isSameModule = (this instanceof SplitPackageBinding) ? referenceBinding.module() == mod : this.enclosingModule == mod;
+-		if (!isSameModule && !mod.canAccess(referenceBinding.fPackage)) {
++		if (!isSameModule && referenceBinding.isValidBinding() && !mod.canAccess(referenceBinding.fPackage)) {
+ 			problemBinding = new ProblemReferenceBinding(referenceBinding.compoundName, referenceBinding, ProblemReasons.NotAccessible);
+ 			break lookForType0;
+ 		}

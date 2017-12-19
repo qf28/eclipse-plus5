@@ -1,0 +1,1109 @@
+commit a9de2ccc0ebee0d6d5f8da9b1131a69df83b3fb7
+Author: Simon Kaegi <skaegi>
+Date:   Mon Oct 19 02:39:08 2009 +0000
+
+    Bug 275404 - [engine] Consistent handling of @artifact in actions/touchpoints
+
+1	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+26	21	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
+7	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/InstallableUnitPhase.java
+8	6	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
+112	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/AddProgramArgumentActionTest.java
+78	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/ChmodActionTest.java
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/EclipseTouchpointTest.java
+45	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/LinkActionTest.java
+57	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/RemoveProgramArgumentActionTest.java
+58	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/SetProgramPropertyActionTest.java
+11	7	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+1	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Messages.java
+14	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+1	1	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ActionConstants.java
+4	23	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddProgramArgumentAction.java
+2	21	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ChmodAction.java
+2	21	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/LinkAction.java
+2	21	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetProgramPropertyAction.java
+1	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/messages.properties
+24	3	bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/NativeTouchpoint.java
+1	1	bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/ActionConstants.java
+6	18	bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/CopyAction.java
+6	18	bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/UnzipAction.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+index 09f7a29..dcec620 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Engine.java
+@@ -63,7 +63,7 @@ public class Engine implements IEngine {
+ 			if (result.matches(IStatus.ERROR | IStatus.CANCEL)) {
+ 				if (DebugHelper.DEBUG_ENGINE)
+ 					DebugHelper.debug(ENGINE, "Rolling back engine operation for profile=" + profile.getProfileId() + ". Reason was: " + result.toString()); //$NON-NLS-1$ //$NON-NLS-2$
+-				IStatus status = session.rollback(monitor, result.getSeverity());
++				IStatus status = session.rollback(actionManager, monitor, result.getSeverity());
+ 				if (status.matches(IStatus.ERROR))
+ 					LogHelper.log(status);
+ 				eventBus.publishEvent(new RollbackOperationEvent(profile, phaseSet, operands, this, result));
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
+index fa8814f..cfc97cb 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/EngineSession.java
+@@ -109,7 +109,7 @@ public class EngineSession {
+ 		return status;
+ 	}
+ 
+-	IStatus rollback(IProgressMonitor monitor, int severity) {
++	IStatus rollback(ActionManager actionManager, IProgressMonitor monitor, int severity) {
+ 		if (severity == IStatus.CANCEL)
+ 			monitor.subTask(Messages.rollingback_cancel);
+ 
+@@ -120,7 +120,7 @@ public class EngineSession {
+ 
+ 		if (currentPhaseActive) {
+ 			try {
+-				IStatus result = rollBackPhase(currentPhase, currentActionRecords);
++				IStatus result = rollBackPhase(currentPhase, currentActionRecords, actionManager);
+ 				if (!result.isOK())
+ 					status.add(result);
+ 			} catch (RuntimeException e) {
+@@ -142,7 +142,7 @@ public class EngineSession {
+ 			Phase phase = (Phase) pair[0];
+ 			List actionRecords = (List) pair[1];
+ 			try {
+-				final IStatus result = rollBackPhase(phase, actionRecords);
++				final IStatus result = rollBackPhase(phase, actionRecords, actionManager);
+ 				if (!result.isOK())
+ 					status.add(result);
+ 			} catch (RuntimeException e) {
+@@ -180,27 +180,32 @@ public class EngineSession {
+ 		return status;
+ 	}
+ 
+-	private IStatus rollBackPhase(Phase phase, List actionRecords) {
++	private IStatus rollBackPhase(Phase phase, List actionRecords, ActionManager actionManager) {
+ 		MultiStatus result = new MultiStatus(EngineActivator.ID, IStatus.OK, null, null);
+-
+-		if (!currentPhaseActive)
+-			phase.prePerform(result, this, profile, context, new NullProgressMonitor());
+-
+-		for (ListIterator it = actionRecords.listIterator(actionRecords.size()); it.hasPrevious();) {
+-			ActionsRecord record = (ActionsRecord) it.previous();
+-			ProvisioningAction[] actions = (ProvisioningAction[]) record.actions.toArray(new ProvisioningAction[record.actions.size()]);
+-			try {
+-				phase.undo(result, this, profile, record.operand, actions, context);
+-			} catch (RuntimeException e) {
+-				// "phase.undo" calls user code and might throw an unchecked exception
+-				// we catch the error here to gather information on where the problem occurred.
+-				result.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.phase_undo_operand_error, phase.getClass().getName(), record.operand), e));
+-			} catch (LinkageError e) {
+-				// Catch linkage errors as these are generally recoverable but let other Errors propagate (see bug 222001)
+-				result.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.phase_undo_operand_error, phase.getClass().getName(), record.operand), e));
++		try {
++			phase.actionManager = actionManager;
++
++			if (!currentPhaseActive)
++				phase.prePerform(result, this, profile, context, new NullProgressMonitor());
++
++			for (ListIterator it = actionRecords.listIterator(actionRecords.size()); it.hasPrevious();) {
++				ActionsRecord record = (ActionsRecord) it.previous();
++				ProvisioningAction[] actions = (ProvisioningAction[]) record.actions.toArray(new ProvisioningAction[record.actions.size()]);
++				try {
++					phase.undo(result, this, profile, record.operand, actions, context);
++				} catch (RuntimeException e) {
++					// "phase.undo" calls user code and might throw an unchecked exception
++					// we catch the error here to gather information on where the problem occurred.
++					result.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.phase_undo_operand_error, phase.getClass().getName(), record.operand), e));
++				} catch (LinkageError e) {
++					// Catch linkage errors as these are generally recoverable but let other Errors propagate (see bug 222001)
++					result.add(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.phase_undo_operand_error, phase.getClass().getName(), record.operand), e));
++				}
+ 			}
++			phase.postPerform(result, profile, context, new NullProgressMonitor());
++		} finally {
++			phase.actionManager = null;
+ 		}
+-		phase.postPerform(result, profile, context, new NullProgressMonitor());
+ 		return result;
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/InstallableUnitPhase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/InstallableUnitPhase.java
+index 2d76e36..8a109f0 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/InstallableUnitPhase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/InstallableUnitPhase.java
+@@ -39,6 +39,13 @@ public abstract class InstallableUnitPhase extends Phase {
+ 		InstallableUnitOperand iuOperand = (InstallableUnitOperand) operand;
+ 		MultiStatus status = new MultiStatus(EngineActivator.ID, IStatus.OK, null, null);
+ 		mergeStatus(status, initializeOperand(profile, iuOperand, parameters, monitor));
++		IInstallableUnit unit = (IInstallableUnit) parameters.get(PARM_IU);
++		if (unit != null) {
++			Touchpoint touchpoint = getActionManager().getTouchpointPoint(unit.getTouchpointType());
++			if (touchpoint != null) {
++				mergeStatus(status, initializeTouchpointParameters(profile, iuOperand, touchpoint, monitor));
++			}
++		}
+ 		mergeStatus(status, super.initializeOperand(profile, operand, parameters, monitor));
+ 		return status;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
+index b58afd3..4599fab 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/Phase.java
+@@ -104,13 +104,15 @@ public abstract class Phase {
+ 
+ 			session.recordOperandStart(operand);
+ 			ProvisioningAction[] actions = getActions(operand);
+-			Map tempOperandParameters = new HashMap(phaseParameters);
+-			tempOperandParameters.put(PARM_OPERAND, operand);
+-			mergeStatus(status, initializeOperand(profile, operand, tempOperandParameters, subMonitor));
+-			if (status.matches(IStatus.ERROR | IStatus.CANCEL))
++			operandParameters = new HashMap(phaseParameters);
++			operandParameters.put(PARM_OPERAND, operand);
++			mergeStatus(status, initializeOperand(profile, operand, operandParameters, subMonitor));
++			if (status.matches(IStatus.ERROR | IStatus.CANCEL)) {
++				operandParameters = null;
+ 				return;
++			}
+ 
+-			operandParameters = Collections.unmodifiableMap(tempOperandParameters);
++			operandParameters = Collections.unmodifiableMap(operandParameters);
+ 			if (actions != null) {
+ 				for (int j = 0; j < actions.length; j++) {
+ 					ProvisioningAction action = actions[j];
+@@ -160,7 +162,7 @@ public abstract class Phase {
+ 		}
+ 	}
+ 
+-	private IStatus initializeTouchpointParameters(IProfile profile, Operand operand, Touchpoint touchpoint, IProgressMonitor monitor) {
++	IStatus initializeTouchpointParameters(IProfile profile, Operand operand, Touchpoint touchpoint, IProgressMonitor monitor) {
+ 		if (touchpointToTouchpointOperandParameters.containsKey(touchpoint))
+ 			return Status.OK_STATUS;
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/AddProgramArgumentActionTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/AddProgramArgumentActionTest.java
+index a5834db..3653f75 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/AddProgramArgumentActionTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/AddProgramArgumentActionTest.java
+@@ -89,6 +89,7 @@ public class AddProgramArgumentActionTest extends AbstractProvisioningTest {
+ 		touchpoint.initializePhase(null, profile, "test", parameters);
+ 		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
+ 		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
+ 		touchpoint.initializeOperand(profile, operand, parameters);
+ 		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
+ 		assertNotNull(manipulator);
+@@ -140,6 +141,7 @@ public class AddProgramArgumentActionTest extends AbstractProvisioningTest {
+ 		touchpoint.initializePhase(null, profile, "test", parameters);
+ 		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
+ 		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
+ 		touchpoint.initializeOperand(profile, operand, parameters);
+ 		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
+ 		assertNotNull(manipulator);
+@@ -171,4 +173,114 @@ public class AddProgramArgumentActionTest extends AbstractProvisioningTest {
+ 		assertFalse(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
+ 	}
+ 
++	public void testExecuteUndoWithArtifactLocation() {
++		Properties profileProperties = new Properties();
++		File installFolder = getTempFolder();
++		profileProperties.setProperty(IProfile.PROP_INSTALL_FOLDER, installFolder.toString());
++		profileProperties.setProperty(IProfile.PROP_CACHE, installFolder.toString());
++		IProfile profile = createProfile("test", null, profileProperties);
++
++		IFileArtifactRepository bundlePool = Util.getBundlePoolRepository(profile);
++		File osgiSource = getTestData("1.0", "/testData/eclipseTouchpoint/bundles/org.eclipse.osgi_3.4.2.R34x_v20080826-1230.jar");
++		File targetPlugins = new File(installFolder, "plugins");
++		assertTrue(targetPlugins.mkdir());
++		File osgiTarget = new File(targetPlugins, "org.eclipse.osgi_3.4.2.R34x_v20080826-1230.jar");
++		copy("2.0", osgiSource, osgiTarget);
++
++		BundleDescription bundleDescription = BundlesAction.createBundleDescription(osgiTarget);
++		IArtifactKey key = BundlesAction.createBundleArtifactKey(bundleDescription.getSymbolicName(), bundleDescription.getVersion().toString());
++		IArtifactDescriptor descriptor = PublisherHelper.createArtifactDescriptor(key, osgiTarget);
++		IInstallableUnit iu = createBundleIU(bundleDescription, osgiTarget.isDirectory(), key);
++		bundlePool.addDescriptor(descriptor);
++
++		Map parameters = new HashMap();
++		parameters.put(ActionConstants.PARM_PROFILE, profile);
++		EclipseTouchpoint touchpoint = new EclipseTouchpoint();
++		touchpoint.initializePhase(null, profile, "test", parameters);
++		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
++		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
++		touchpoint.initializeOperand(profile, operand, parameters);
++		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
++		assertNotNull(manipulator);
++
++		String programArg = "-somekey";
++		Map keyParameters = new HashMap(parameters);
++		keyParameters.put(ActionConstants.PARM_PROGRAM_ARG, programArg);
++
++		programArg = (String) parameters.get("artifact.location");
++		String resolvedArtifact = osgiTarget.getAbsolutePath();
++		assertFalse(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
++		parameters.put(ActionConstants.PARM_PROGRAM_ARG, programArg);
++		parameters = Collections.unmodifiableMap(parameters);
++
++		AddProgramArgumentAction artifactAction = new AddProgramArgumentAction();
++		AddProgramArgumentAction keyAction = new AddProgramArgumentAction();
++
++		keyAction.execute(keyParameters);
++		artifactAction.execute(parameters);
++		assertTrue(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
++		artifactAction.undo(parameters);
++		keyAction.undo(keyParameters);
++		assertFalse(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
++	}
++
++	public void testExecuteUndoWithArtifactLocationByProgramArgValue() {
++		Properties profileProperties = new Properties();
++		File installFolder = getTempFolder();
++		profileProperties.setProperty(IProfile.PROP_INSTALL_FOLDER, installFolder.toString());
++		profileProperties.setProperty(IProfile.PROP_CACHE, installFolder.toString());
++		IProfile profile = createProfile("test", null, profileProperties);
++
++		IFileArtifactRepository bundlePool = Util.getBundlePoolRepository(profile);
++		File osgiSource = getTestData("1.0", "/testData/eclipseTouchpoint/bundles/org.eclipse.osgi_3.4.2.R34x_v20080826-1230.jar");
++		File targetPlugins = new File(installFolder, "plugins");
++		assertTrue(targetPlugins.mkdir());
++		File osgiTarget = new File(targetPlugins, "org.eclipse.osgi_3.4.2.R34x_v20080826-1230.jar");
++		copy("2.0", osgiSource, osgiTarget);
++
++		BundleDescription bundleDescription = BundlesAction.createBundleDescription(osgiTarget);
++		IArtifactKey key = BundlesAction.createBundleArtifactKey(bundleDescription.getSymbolicName(), bundleDescription.getVersion().toString());
++		IArtifactDescriptor descriptor = PublisherHelper.createArtifactDescriptor(key, osgiTarget);
++		IInstallableUnit iu = createBundleIU(bundleDescription, osgiTarget.isDirectory(), key);
++		bundlePool.addDescriptor(descriptor);
++
++		Map parameters = new HashMap();
++		parameters.put(ActionConstants.PARM_PROFILE, profile);
++		EclipseTouchpoint touchpoint = new EclipseTouchpoint();
++		touchpoint.initializePhase(null, profile, "test", parameters);
++		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
++		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
++		touchpoint.initializeOperand(profile, operand, parameters);
++		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
++		assertNotNull(manipulator);
++
++		String programArg = "-somekey";
++		String programArgValue = (String) parameters.get("artifact.location");
++		Map keyParameters = new HashMap(parameters);
++		keyParameters.put(ActionConstants.PARM_PROGRAM_ARG, programArg);
++		keyParameters.put(ActionConstants.PARM_PROGRAM_ARG_VALUE, programArgValue);
++
++		programArg = "@artifact";
++		programArgValue = "@ignore";
++		String resolvedArtifact = osgiTarget.getAbsolutePath();
++		assertFalse(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
++
++		parameters.put(ActionConstants.PARM_PROGRAM_ARG, programArg);
++		parameters.put(ActionConstants.PARM_PROGRAM_ARG_VALUE, programArgValue);
++		parameters = Collections.unmodifiableMap(parameters);
++
++		AddProgramArgumentAction artifactAction = new AddProgramArgumentAction();
++		AddProgramArgumentAction keyAction = new AddProgramArgumentAction();
++
++		keyAction.execute(keyParameters);
++		artifactAction.execute(parameters);
++		assertTrue(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
++		assertEquals(2, Arrays.asList(manipulator.getLauncherData().getProgramArgs()).size());
++		artifactAction.undo(parameters);
++		keyAction.undo(keyParameters);
++		assertFalse(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
++	}
++
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/ChmodActionTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/ChmodActionTest.java
+index 1cdb740..2674d9c 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/ChmodActionTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/ChmodActionTest.java
+@@ -129,6 +129,7 @@ public class ChmodActionTest extends AbstractProvisioningTest {
+ 		touchpoint.initializePhase(null, profile, "test", parameters);
+ 		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
+ 		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
+ 		touchpoint.initializeOperand(profile, operand, parameters);
+ 
+ 		parameters.put(ActionConstants.PARM_TARGET_DIR, "@artifact");
+@@ -179,4 +180,81 @@ public class ChmodActionTest extends AbstractProvisioningTest {
+ 		action.undo(xparameters);
+ 	}
+ 
++	public void testExecuteUndoWithArtifactLocation() {
++		Properties profileProperties = new Properties();
++		File installFolder = getTempFolder();
++		profileProperties.setProperty(IProfile.PROP_INSTALL_FOLDER, installFolder.toString());
++		profileProperties.setProperty(IProfile.PROP_CACHE, installFolder.toString());
++		IProfile profile = createProfile("test", null, profileProperties);
++
++		IFileArtifactRepository bundlePool = Util.getBundlePoolRepository(profile);
++		File dirBundleSource = getTestData("1.0", "/testData/eclipseTouchpoint/bundles/directoryBased_1.0.0");
++		File targetPlugins = new File(installFolder, "plugins");
++		assertTrue(targetPlugins.mkdir());
++		File dirBundleTarget = new File(targetPlugins, "directoryBased_1.0.0");
++		copy("2.0", dirBundleSource, dirBundleTarget);
++
++		BundleDescription bundleDescription = BundlesAction.createBundleDescription(dirBundleTarget);
++		IArtifactKey key = BundlesAction.createBundleArtifactKey(bundleDescription.getSymbolicName(), bundleDescription.getVersion().toString());
++		IArtifactDescriptor descriptor = PublisherHelper.createArtifactDescriptor(key, dirBundleTarget);
++		IInstallableUnit iu = createBundleIU(bundleDescription, dirBundleTarget.isDirectory(), key);
++		bundlePool.addDescriptor(descriptor);
++
++		Map parameters = new HashMap();
++		parameters.put(ActionConstants.PARM_PROFILE, profile);
++		EclipseTouchpoint touchpoint = new EclipseTouchpoint();
++		touchpoint.initializePhase(null, profile, "test", parameters);
++		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
++		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
++		touchpoint.initializeOperand(profile, operand, parameters);
++
++		parameters.put(ActionConstants.PARM_TARGET_DIR, parameters.get("artifact.location"));
++		parameters.put(ActionConstants.PARM_TARGET_FILE, "plugin.xml");
++		parameters.put(ActionConstants.PARM_PERMISSIONS, "+x");
++		Map xparameters = Collections.unmodifiableMap(parameters);
++
++		// TODO: We need a way to verify
++		// one idea is to run an executable here (or chmod with -w, -r and then test that files are unreadable
++		// and unwriteable. But, that would make this test fail on non UN*X.
++		// This is currently just going through the paces to check for any runtime exceptions
++		ChmodAction action = new ChmodAction();
++		action.execute(xparameters);
++		// does nothing so should not alter parameters
++		action.undo(xparameters);
++
++		// make a recursive run as well...
++		action = new ChmodAction();
++		parameters.put(ActionConstants.PARM_OPTIONS, "-R"); // recursive
++		parameters.put(ActionConstants.PARM_TARGET_DIR, parameters.get("artifact.location"));
++		parameters.put(ActionConstants.PARM_TARGET_FILE, "..");
++
++		xparameters = Collections.unmodifiableMap(parameters);
++
++		action.execute(xparameters);
++		action.undo(xparameters);
++
++		// and one with two parameters
++		action = new ChmodAction();
++		parameters.put(ActionConstants.PARM_OPTIONS, "-R -H"); // recursive, modify symlinks (follow link).
++		parameters.put(ActionConstants.PARM_TARGET_DIR, parameters.get("artifact.location"));
++		parameters.put(ActionConstants.PARM_TARGET_FILE, "..");
++		parameters.put(ActionConstants.PARM_PERMISSIONS, "700");
++
++		xparameters = Collections.unmodifiableMap(parameters);
++		action.execute(xparameters);
++		action.undo(xparameters);
++
++		// and check one that should fail
++		action = new ChmodAction();
++		parameters.put(ActionConstants.PARM_TARGET_DIR, parameters.get("artifact.location"));
++		parameters.put(ActionConstants.PARM_TARGET_FILE, "JimmyHoffa");
++		parameters.put(ActionConstants.PARM_PERMISSIONS, "700");
++
++		xparameters = Collections.unmodifiableMap(parameters);
++		IStatus result = action.execute(xparameters);
++		assertFalse("Missing file should result in error", result.isOK());
++		action.undo(xparameters);
++	}
++
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/EclipseTouchpointTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/EclipseTouchpointTest.java
+index db1c4c1..ee708da 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/EclipseTouchpointTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/EclipseTouchpointTest.java
+@@ -147,7 +147,7 @@ public class EclipseTouchpointTest extends AbstractProvisioningTest {
+ 		IInstallableUnit iu = bundleIUs[0];
+ 		assertTrue(Boolean.valueOf(iu.getProperty(IInstallableUnit.PROP_PARTIAL_IU)).booleanValue());
+ 		EclipseTouchpoint touchpoint = new EclipseTouchpoint();
+-		IInstallableUnit fullIU = touchpoint.prepareIU(iu, profile);
++		IInstallableUnit fullIU = touchpoint.prepareIU(iu, key, profile);
+ 		assertFalse(Boolean.valueOf(fullIU.getProperty(IInstallableUnit.PROP_PARTIAL_IU)).booleanValue());
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/LinkActionTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/LinkActionTest.java
+index 6e221fc..a500d09 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/LinkActionTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/LinkActionTest.java
+@@ -93,6 +93,7 @@ public class LinkActionTest extends AbstractProvisioningTest {
+ 		touchpoint.initializePhase(null, profile, "test", parameters);
+ 		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
+ 		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
+ 		touchpoint.initializeOperand(profile, operand, parameters);
+ 
+ 		parameters.put(ActionConstants.PARM_TARGET_DIR, "@artifact");
+@@ -108,4 +109,48 @@ public class LinkActionTest extends AbstractProvisioningTest {
+ 		// does nothing so should not alter parameters
+ 		action.undo(parameters);
+ 	}
++
++	public void testExecuteUndoWithArtifactLocation() {
++		Properties profileProperties = new Properties();
++		File installFolder = getTempFolder();
++		profileProperties.setProperty(IProfile.PROP_INSTALL_FOLDER, installFolder.toString());
++		profileProperties.setProperty(IProfile.PROP_CACHE, installFolder.toString());
++		IProfile profile = createProfile("test", null, profileProperties);
++
++		IFileArtifactRepository bundlePool = Util.getBundlePoolRepository(profile);
++		File dirBundleSource = getTestData("1.0", "/testData/eclipseTouchpoint/bundles/directoryBased_1.0.0");
++		File targetPlugins = new File(installFolder, "plugins");
++		assertTrue(targetPlugins.mkdir());
++		File dirBundleTarget = new File(targetPlugins, "directoryBased_1.0.0");
++		copy("2.0", dirBundleSource, dirBundleTarget);
++
++		BundleDescription bundleDescription = BundlesAction.createBundleDescription(dirBundleTarget);
++		IArtifactKey key = BundlesAction.createBundleArtifactKey(bundleDescription.getSymbolicName(), bundleDescription.getVersion().toString());
++		ArtifactDescriptor descriptor = (ArtifactDescriptor) PublisherHelper.createArtifactDescriptor(key, dirBundleTarget);
++		descriptor.setProperty("artifact.folder", Boolean.TRUE.toString());
++		IInstallableUnit iu = createBundleIU(bundleDescription, dirBundleTarget.isDirectory(), key);
++		bundlePool.addDescriptor(descriptor);
++
++		Map parameters = new HashMap();
++		parameters.put(ActionConstants.PARM_PROFILE, profile);
++		EclipseTouchpoint touchpoint = new EclipseTouchpoint();
++		touchpoint.initializePhase(null, profile, "test", parameters);
++		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
++		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
++		touchpoint.initializeOperand(profile, operand, parameters);
++
++		parameters.put(ActionConstants.PARM_TARGET_DIR, parameters.get("artifact.location"));
++		parameters.put(ActionConstants.PARM_LINK_NAME, "plugin.xml.link");
++		parameters.put(ActionConstants.PARM_LINK_TARGET, "plugin.xml");
++		parameters = Collections.unmodifiableMap(parameters);
++
++		// TODO: We need a way to verify
++		// one idea is to run an executable here
++		// This is currently just going through the paces to check for any runtime exceptions
++		LinkAction action = new LinkAction();
++		action.execute(parameters);
++		// does nothing so should not alter parameters
++		action.undo(parameters);
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/RemoveProgramArgumentActionTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/RemoveProgramArgumentActionTest.java
+index a57aa99..61fe448 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/RemoveProgramArgumentActionTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/RemoveProgramArgumentActionTest.java
+@@ -91,6 +91,7 @@ public class RemoveProgramArgumentActionTest extends AbstractProvisioningTest {
+ 		touchpoint.initializePhase(null, profile, "test", parameters);
+ 		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
+ 		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
+ 		touchpoint.initializeOperand(profile, operand, parameters);
+ 		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
+ 		assertNotNull(manipulator);
+@@ -118,4 +119,60 @@ public class RemoveProgramArgumentActionTest extends AbstractProvisioningTest {
+ 		keyAction.undo(keyParameters);
+ 		assertTrue(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
+ 	}
++	
++	public void testExecuteUndoWithArtifactLocation() {
++		Properties profileProperties = new Properties();
++		File installFolder = getTempFolder();
++		profileProperties.setProperty(IProfile.PROP_INSTALL_FOLDER, installFolder.toString());
++		profileProperties.setProperty(IProfile.PROP_CACHE, installFolder.toString());
++		IProfile profile = createProfile("test", null, profileProperties);
++
++		IFileArtifactRepository bundlePool = Util.getBundlePoolRepository(profile);
++		File osgiSource = getTestData("1.0", "/testData/eclipseTouchpoint/bundles/org.eclipse.osgi_3.4.2.R34x_v20080826-1230.jar");
++		File targetPlugins = new File(installFolder, "plugins");
++		assertTrue(targetPlugins.mkdir());
++		File osgiTarget = new File(targetPlugins, "org.eclipse.osgi_3.4.2.R34x_v20080826-1230.jar");
++		copy("2.0", osgiSource, osgiTarget);
++
++		BundleDescription bundleDescription = BundlesAction.createBundleDescription(osgiTarget);
++		IArtifactKey key = BundlesAction.createBundleArtifactKey(bundleDescription.getSymbolicName(), bundleDescription.getVersion().toString());
++		IArtifactDescriptor descriptor = PublisherHelper.createArtifactDescriptor(key, osgiTarget);
++		IInstallableUnit iu = createBundleIU(bundleDescription, osgiTarget.isDirectory(), key);
++		bundlePool.addDescriptor(descriptor);
++
++		Map parameters = new HashMap();
++		parameters.put(ActionConstants.PARM_PROFILE, profile);
++		EclipseTouchpoint touchpoint = new EclipseTouchpoint();
++		touchpoint.initializePhase(null, profile, "test", parameters);
++		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
++		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
++		touchpoint.initializeOperand(profile, operand, parameters);
++		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
++		assertNotNull(manipulator);
++
++		String programArg = "-somekey";
++		Map keyParameters = new HashMap(parameters);
++		keyParameters.put(ActionConstants.PARM_PROGRAM_ARG, programArg);
++		manipulator.getLauncherData().addProgramArg(programArg);
++
++		programArg = (String) parameters.get("artifact.location");
++		String resolvedArtifact = osgiTarget.getAbsolutePath();
++
++		manipulator.getLauncherData().addProgramArg(resolvedArtifact);
++		assertTrue(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
++		parameters.put(ActionConstants.PARM_PROGRAM_ARG, programArg);
++		parameters = Collections.unmodifiableMap(parameters);
++
++		RemoveProgramArgumentAction artifactAction = new RemoveProgramArgumentAction();
++		RemoveProgramArgumentAction keyAction = new RemoveProgramArgumentAction();
++
++		keyAction.execute(keyParameters);
++		artifactAction.execute(parameters);
++		assertFalse(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
++		artifactAction.undo(parameters);
++		keyAction.undo(keyParameters);
++		assertTrue(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
++	}
++
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/SetProgramPropertyActionTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/SetProgramPropertyActionTest.java
+index c975e35..d8fe777 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/SetProgramPropertyActionTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/touchpoint/eclipse/SetProgramPropertyActionTest.java
+@@ -91,6 +91,7 @@ public class SetProgramPropertyActionTest extends AbstractProvisioningTest {
+ 		touchpoint.initializePhase(null, profile, "test", parameters);
+ 		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
+ 		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
+ 		touchpoint.initializeOperand(profile, operand, parameters);
+ 		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
+ 		assertNotNull(manipulator);
+@@ -119,4 +120,61 @@ public class SetProgramPropertyActionTest extends AbstractProvisioningTest {
+ 		action.undo(parameters);
+ 		assertTrue(manipulator.getConfigData().getProperty("test").equals(resolvedArtifact));
+ 	}
++
++	public void testExecuteUndoWithArtifactLocation() {
++		Properties profileProperties = new Properties();
++		File installFolder = getTempFolder();
++		profileProperties.setProperty(IProfile.PROP_INSTALL_FOLDER, installFolder.toString());
++		profileProperties.setProperty(IProfile.PROP_CACHE, installFolder.toString());
++		IProfile profile = createProfile("test", null, profileProperties);
++
++		IFileArtifactRepository bundlePool = Util.getBundlePoolRepository(profile);
++		File osgiSource = getTestData("1.0", "/testData/eclipseTouchpoint/bundles/org.eclipse.osgi_3.4.2.R34x_v20080826-1230.jar");
++		File targetPlugins = new File(installFolder, "plugins");
++		assertTrue(targetPlugins.mkdir());
++		File osgiTarget = new File(targetPlugins, "org.eclipse.osgi_3.4.2.R34x_v20080826-1230.jar");
++		copy("2.0", osgiSource, osgiTarget);
++
++		BundleDescription bundleDescription = BundlesAction.createBundleDescription(osgiTarget);
++		IArtifactKey key = BundlesAction.createBundleArtifactKey(bundleDescription.getSymbolicName(), bundleDescription.getVersion().toString());
++		IArtifactDescriptor descriptor = PublisherHelper.createArtifactDescriptor(key, osgiTarget);
++		IInstallableUnit iu = createBundleIU(bundleDescription, osgiTarget.isDirectory(), key);
++		bundlePool.addDescriptor(descriptor);
++
++		Map parameters = new HashMap();
++		parameters.put(ActionConstants.PARM_PROFILE, profile);
++		EclipseTouchpoint touchpoint = new EclipseTouchpoint();
++		touchpoint.initializePhase(null, profile, "test", parameters);
++		InstallableUnitOperand operand = new InstallableUnitOperand(null, iu);
++		parameters.put("iu", operand.second());
++		parameters.put("artifact", key);
++		touchpoint.initializeOperand(profile, operand, parameters);
++		Manipulator manipulator = (Manipulator) parameters.get(EclipseTouchpoint.PARM_MANIPULATOR);
++		assertNotNull(manipulator);
++
++		String resolvedArtifact = osgiTarget.getAbsolutePath();
++		assertFalse(Arrays.asList(manipulator.getLauncherData().getProgramArgs()).contains(resolvedArtifact));
++		parameters.put(ActionConstants.PARM_PROP_NAME, "test");
++		parameters.put(ActionConstants.PARM_PROP_VALUE, parameters.get("artifact.location"));
++
++		parameters = Collections.unmodifiableMap(parameters);
++
++		SetProgramPropertyAction action = new SetProgramPropertyAction();
++
++		action.execute(parameters);
++		assertTrue(manipulator.getConfigData().getProperty("test").equals(resolvedArtifact));
++		action.undo(parameters);
++		assertFalse(manipulator.getConfigData().getProperties().containsKey("test"));
++
++		action.execute(parameters);
++		assertTrue(manipulator.getConfigData().getProperty("test").equals(resolvedArtifact));
++		parameters = new HashMap(parameters);
++		parameters.remove(ActionConstants.PARM_PROP_VALUE);
++		parameters = Collections.unmodifiableMap(parameters);
++		action.execute(parameters);
++		assertFalse(manipulator.getConfigData().getProperties().containsKey("test"));
++		action.undo(parameters);
++		assertTrue(manipulator.getConfigData().getProperty("test").equals(resolvedArtifact));
++	}
++
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+index e280bc9..8cf88ba 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+@@ -31,6 +31,8 @@ public class EclipseTouchpoint extends Touchpoint {
+ 	public static final String PARM_PLATFORM_CONFIGURATION = "platformConfiguration"; //$NON-NLS-1$
+ 	public static final String PARM_SOURCE_BUNDLES = "sourceBundles"; //$NON-NLS-1$
+ 	public static final String PARM_IU = "iu"; //$NON-NLS-1$
++	public static final String PARM_ARTIFACT = "artifact"; //$NON-NLS-1$
++	public static final String PARM_ARTIFACT_LOCATION = "artifact.location"; //$NON-NLS-1$
+ 
+ 	private static final String NATIVE_TOUCHPOINT_ID = "org.eclipse.equinox.p2.touchpoint.natives"; //$NON-NLS-1$
+ 	private static List NATIVE_ACTIONS = Arrays.asList(new String[] {"mkdir", "rmdir"}); //$NON-NLS-1$//$NON-NLS-2$
+@@ -173,17 +175,24 @@ public class EclipseTouchpoint extends Touchpoint {
+ 
+ 	public IStatus initializeOperand(IProfile profile, Operand operand, Map parameters) {
+ 		IInstallableUnit iu = (IInstallableUnit) parameters.get(PARM_IU);
++		IArtifactKey artifactKey = (IArtifactKey) parameters.get(PARM_ARTIFACT);
+ 		if (iu != null && Boolean.valueOf(iu.getProperty(IInstallableUnit.PROP_PARTIAL_IU)).booleanValue()) {
+-			IInstallableUnit preparedIU = prepareIU(iu, profile);
++			IInstallableUnit preparedIU = prepareIU(iu, artifactKey, profile);
+ 			if (preparedIU == null)
+ 				return Util.createError(NLS.bind(Messages.failed_prepareIU, iu));
+ 
+ 			parameters.put(PARM_IU, preparedIU);
+ 		}
++
++		if (!parameters.containsKey(PARM_ARTIFACT_LOCATION) && artifactKey != null) {
++			File fileLocation = Util.getArtifactFile(artifactKey, profile);
++			if (fileLocation != null && fileLocation.exists())
++				parameters.put(PARM_ARTIFACT_LOCATION, fileLocation.getAbsolutePath());
++		}
+ 		return Status.OK_STATUS;
+ 	}
+ 
+-	public IInstallableUnit prepareIU(IInstallableUnit iu, IProfile profile) {
++	public IInstallableUnit prepareIU(IInstallableUnit iu, IArtifactKey artifactKey, IProfile profile) {
+ 		IInstallableUnit preparedIU = getPreparedIU(profile, iu);
+ 		if (preparedIU != null)
+ 			return preparedIU;
+@@ -199,11 +208,6 @@ public class EclipseTouchpoint extends Touchpoint {
+ 		}
+ 
+ 		if (c != null) {
+-			IArtifactKey[] artifacts = iu.getArtifacts();
+-			if (artifacts == null || artifacts.length == 0)
+-				return iu;
+-
+-			IArtifactKey artifactKey = artifacts[0];
+ 			if (artifactKey == null)
+ 				return iu;
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Messages.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Messages.java
+index 686719b..22f91b5 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Messages.java
+@@ -24,6 +24,7 @@ public class Messages extends NLS {
+ 	public static String error_parsing_configuration;
+ 	public static String publisher_not_available;
+ 	public static String artifact_write_unsupported;
++	public static String iu_contains_no_arifacts;
+ 	public static String artifact_file_not_found;
+ 	public static String artifact_retrieval_unsupported;
+ 	public static String bundle_pool_not_writeable;
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+index bbe7cd3..6878421 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/Util.java
+@@ -327,4 +327,18 @@ public class Util {
+ 		String launcherConfig = profile.getProperty(IProfile.PROP_LAUNCHER_CONFIGURATION);
+ 		return launcherConfig == null ? null : new File(launcherConfig);
+ 	}
++
++	public static String resolveArtifactParam(Map parameters) throws CoreException {
++		String artifactLocation = (String) parameters.get(EclipseTouchpoint.PARM_ARTIFACT_LOCATION);
++		if (artifactLocation != null)
++			return artifactLocation;
++
++		IArtifactKey artifactKey = (IArtifactKey) parameters.get(EclipseTouchpoint.PARM_ARTIFACT);
++		if (artifactKey == null) {
++			IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
++			throw new CoreException(Util.createError(NLS.bind(Messages.iu_contains_no_arifacts, iu)));
++		}
++
++		throw new CoreException(Util.createError(NLS.bind(Messages.artifact_file_not_found, artifactKey)));
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ActionConstants.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ActionConstants.java
+index ab9e869..78a56eb 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ActionConstants.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ActionConstants.java
+@@ -10,7 +10,7 @@ package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
+ 
+ public class ActionConstants {
+ 
+-	public static final String PARM_ARTIFACT = "@artifact"; //$NON-NLS-1$
++	public static final String PARM_AT_ARTIFACT = "@artifact"; //$NON-NLS-1$
+ 	public static final String PARM_ARTIFACT_FILES = "artifactFiles"; //$NON-NLS-1$
+ 	public static final String PARM_ARTIFACT_REQUESTS = "artifactRequests"; //$NON-NLS-1$
+ 	public static final String PARM_BUNDLE = "bundle"; //$NON-NLS-1$
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddProgramArgumentAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddProgramArgumentAction.java
+index efaa3b3..7672437 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddProgramArgumentAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddProgramArgumentAction.java
+@@ -10,16 +10,12 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
+ 
+-import java.io.File;
+ import java.util.Map;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.EclipseTouchpoint;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
+ import org.eclipse.equinox.internal.provisional.frameworkadmin.Manipulator;
+-import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.util.NLS;
+ 
+ public class AddProgramArgumentAction extends ProvisioningAction {
+@@ -35,9 +31,9 @@ public class AddProgramArgumentAction extends ProvisioningAction {
+ 		if (ActionConstants.PARM_IGNORE.equals(programArgValue))
+ 			return Status.OK_STATUS;
+ 
+-		if (programArg.equals(ActionConstants.PARM_ARTIFACT)) {
++		if (programArg.equals(ActionConstants.PARM_AT_ARTIFACT)) {
+ 			try {
+-				programArg = resolveArtifactParam(parameters);
++				programArg = Util.resolveArtifactParam(parameters);
+ 			} catch (CoreException e) {
+ 				return e.getStatus();
+ 			}
+@@ -45,9 +41,9 @@ public class AddProgramArgumentAction extends ProvisioningAction {
+ 		manipulator.getLauncherData().addProgramArg(programArg);
+ 
+ 		if (programArgValue != null) {
+-			if (programArgValue.equals(ActionConstants.PARM_ARTIFACT)) {
++			if (programArgValue.equals(ActionConstants.PARM_AT_ARTIFACT)) {
+ 				try {
+-					programArgValue = resolveArtifactParam(parameters);
++					programArgValue = Util.resolveArtifactParam(parameters);
+ 				} catch (CoreException e) {
+ 					return e.getStatus();
+ 				}
+@@ -72,19 +68,4 @@ public class AddProgramArgumentAction extends ProvisioningAction {
+ 			manipulator.getLauncherData().removeProgramArg(programArg);
+ 		return Status.OK_STATUS;
+ 	}
+-
+-	private static String resolveArtifactParam(Map parameters) throws CoreException {
+-		IProfile profile = (IProfile) parameters.get(ActionConstants.PARM_PROFILE);
+-		IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
+-		IArtifactKey[] artifacts = iu.getArtifacts();
+-		if (artifacts == null || artifacts.length == 0)
+-			throw new CoreException(Util.createError(NLS.bind(Messages.iu_contains_no_arifacts, iu)));
+-
+-		IArtifactKey artifactKey = artifacts[0];
+-
+-		File fileLocation = Util.getArtifactFile(artifactKey, profile);
+-		if (fileLocation == null || !fileLocation.exists())
+-			throw new CoreException(Util.createError(NLS.bind(Messages.artifact_file_not_found, artifactKey)));
+-		return fileLocation.getAbsolutePath();
+-	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ChmodAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ChmodAction.java
+index f5557b5..0aaeb67 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ChmodAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/ChmodAction.java
+@@ -16,12 +16,8 @@ import java.io.*;
+ import java.util.ArrayList;
+ import java.util.Map;
+ import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.touchpoint.eclipse.EclipseTouchpoint;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
+-import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.util.NLS;
+ 
+ // This basically a copy of the chmod action in the native touchpoint only it provides @artifact support.
+@@ -33,9 +29,9 @@ public class ChmodAction extends ProvisioningAction {
+ 		String targetDir = (String) parameters.get(ActionConstants.PARM_TARGET_DIR);
+ 		if (targetDir == null)
+ 			return Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_TARGET_DIR, ACTION_CHMOD));
+-		if (targetDir.equals(ActionConstants.PARM_ARTIFACT)) {
++		if (targetDir.equals(ActionConstants.PARM_AT_ARTIFACT)) {
+ 			try {
+-				targetDir = resolveArtifactParam(parameters);
++				targetDir = Util.resolveArtifactParam(parameters);
+ 			} catch (CoreException e) {
+ 				return e.getStatus();
+ 			}
+@@ -132,19 +128,4 @@ public class ChmodAction extends ProvisioningAction {
+ 			}
+ 		}
+ 	}
+-
+-	private static String resolveArtifactParam(Map parameters) throws CoreException {
+-		IProfile profile = (IProfile) parameters.get(ActionConstants.PARM_PROFILE);
+-		IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
+-		IArtifactKey[] artifacts = iu.getArtifacts();
+-		if (artifacts == null || artifacts.length == 0)
+-			throw new CoreException(Util.createError(NLS.bind(Messages.iu_contains_no_arifacts, iu)));
+-
+-		IArtifactKey artifactKey = artifacts[0];
+-
+-		File fileLocation = Util.getArtifactFile(artifactKey, profile);
+-		if (fileLocation == null || !fileLocation.exists())
+-			throw new CoreException(Util.createError(NLS.bind(Messages.artifact_file_not_found, artifactKey)));
+-		return fileLocation.getAbsolutePath();
+-	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/LinkAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/LinkAction.java
+index e18ef9b..13b8600 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/LinkAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/LinkAction.java
+@@ -13,12 +13,8 @@ package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
+ import java.io.*;
+ import java.util.Map;
+ import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.touchpoint.eclipse.EclipseTouchpoint;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
+-import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.util.NLS;
+ 
+ //This is basically a copy of the ln action in the native touchpoint only it provides @artifact support and does not support the backup store.
+@@ -31,9 +27,9 @@ public class LinkAction extends ProvisioningAction {
+ 		if (targetDir == null)
+ 			return Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_TARGET_DIR, ID));
+ 
+-		if (targetDir.equals(ActionConstants.PARM_ARTIFACT)) {
++		if (targetDir.equals(ActionConstants.PARM_AT_ARTIFACT)) {
+ 			try {
+-				targetDir = resolveArtifactParam(parameters);
++				targetDir = Util.resolveArtifactParam(parameters);
+ 			} catch (CoreException e) {
+ 				return e.getStatus();
+ 			}
+@@ -104,19 +100,4 @@ public class LinkAction extends ProvisioningAction {
+ 			}
+ 		}
+ 	}
+-
+-	private static String resolveArtifactParam(Map parameters) throws CoreException {
+-		IProfile profile = (IProfile) parameters.get(ActionConstants.PARM_PROFILE);
+-		IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
+-		IArtifactKey[] artifacts = iu.getArtifacts();
+-		if (artifacts == null || artifacts.length == 0)
+-			throw new CoreException(Util.createError(NLS.bind(Messages.iu_contains_no_arifacts, iu)));
+-
+-		IArtifactKey artifactKey = artifacts[0];
+-
+-		File fileLocation = Util.getArtifactFile(artifactKey, profile);
+-		if (fileLocation == null || !fileLocation.exists())
+-			throw new CoreException(Util.createError(NLS.bind(Messages.artifact_file_not_found, artifactKey)));
+-		return fileLocation.getAbsolutePath();
+-	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetProgramPropertyAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetProgramPropertyAction.java
+index cdc72ce..7d31fbc 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetProgramPropertyAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/SetProgramPropertyAction.java
+@@ -10,16 +10,12 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
+ 
+-import java.io.File;
+ import java.util.Map;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.EclipseTouchpoint;
+ import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
+ import org.eclipse.equinox.internal.provisional.frameworkadmin.Manipulator;
+-import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.util.NLS;
+ 
+ public class SetProgramPropertyAction extends ProvisioningAction {
+@@ -31,9 +27,9 @@ public class SetProgramPropertyAction extends ProvisioningAction {
+ 		if (propName == null)
+ 			return Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_PROP_NAME, ID));
+ 		String propValue = (String) parameters.get(ActionConstants.PARM_PROP_VALUE);
+-		if (propValue != null && propValue.equals(ActionConstants.PARM_ARTIFACT)) {
++		if (propValue != null && propValue.equals(ActionConstants.PARM_AT_ARTIFACT)) {
+ 			try {
+-				propValue = resolveArtifactParam(parameters);
++				propValue = Util.resolveArtifactParam(parameters);
+ 			} catch (CoreException e) {
+ 				return e.getStatus();
+ 			}
+@@ -53,19 +49,4 @@ public class SetProgramPropertyAction extends ProvisioningAction {
+ 		manipulator.getConfigData().setProperty(propName, previousValue);
+ 		return Status.OK_STATUS;
+ 	}
+-
+-	private static String resolveArtifactParam(Map parameters) throws CoreException {
+-		IProfile profile = (IProfile) parameters.get(ActionConstants.PARM_PROFILE);
+-		IInstallableUnit iu = (IInstallableUnit) parameters.get(EclipseTouchpoint.PARM_IU);
+-		IArtifactKey[] artifacts = iu.getArtifacts();
+-		if (artifacts == null || artifacts.length == 0)
+-			throw new CoreException(Util.createError(NLS.bind(Messages.iu_contains_no_arifacts, iu)));
+-
+-		IArtifactKey artifactKey = artifacts[0];
+-
+-		File fileLocation = Util.getArtifactFile(artifactKey, profile);
+-		if (fileLocation == null || !fileLocation.exists())
+-			throw new CoreException(Util.createError(NLS.bind(Messages.artifact_file_not_found, artifactKey)));
+-		return fileLocation.getAbsolutePath();
+-	}
+ }
+\ No newline at end of file
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/messages.properties b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/messages.properties
+index 36436a3..81f1ab0 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/messages.properties
+@@ -27,3 +27,4 @@ parent_dir_features=Parent directory should be "features": {0}.
+ platform_config_unavailable=Platform configuration not available.
+ unexpected_prepareiu_error=Unexpected state: prepareIU
+ error_validating_profile=Error validating profile {0}.
++iu_contains_no_arifacts=Installable unit contains no artifacts: {0}.
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/NativeTouchpoint.java b/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/NativeTouchpoint.java
+index 33db8ff..fe9b9cd 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/NativeTouchpoint.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/NativeTouchpoint.java
+@@ -10,23 +10,44 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.touchpoint.natives;
+ 
++import java.io.File;
+ import java.io.IOException;
+ import java.util.Map;
+ import java.util.WeakHashMap;
+ import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+-import org.eclipse.equinox.internal.provisional.p2.engine.Touchpoint;
++import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IFileArtifactRepository;
++import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.engine.*;
++import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
+ import org.eclipse.osgi.util.NLS;
+ 
+ public class NativeTouchpoint extends Touchpoint {
+ 
+ 	public static final String PARM_BACKUP = "backup"; //$NON-NLS-1$
+ 
++	public static final String PARM_ARTIFACT = "artifact"; //$NON-NLS-1$
++
++	public static final String PARM_ARTIFACT_LOCATION = "artifact.location"; //$NON-NLS-1$
++
+ 	private static Map backups = new WeakHashMap();
+ 
++	public IStatus initializeOperand(IProfile profile, Operand operand, Map parameters) {
++		IArtifactKey artifactKey = (IArtifactKey) parameters.get(PARM_ARTIFACT);
++		if (!parameters.containsKey(PARM_ARTIFACT_LOCATION) && artifactKey != null) {
++			try {
++				IFileArtifactRepository downloadCache = Util.getDownloadCacheRepo();
++				File fileLocation = downloadCache.getArtifactFile(artifactKey);
++				if (fileLocation != null && fileLocation.exists())
++					parameters.put(PARM_ARTIFACT_LOCATION, fileLocation.getAbsolutePath());
++			} catch (ProvisionException e) {
++				return e.getStatus();
++			}
++		}
++		return Status.OK_STATUS;
++	}
++
+ 	public IStatus initializePhase(IProgressMonitor monitor, IProfile profile, String phaseId, Map touchpointParameters) {
+ 		touchpointParameters.put(PARM_BACKUP, getBackupStore(profile));
+-
+ 		return null;
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/ActionConstants.java b/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/ActionConstants.java
+index 146aa6e..39cb3b3 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/ActionConstants.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/ActionConstants.java
+@@ -20,7 +20,7 @@ public class ActionConstants {
+ 	public static final String PARM_SOURCE = "source"; //$NON-NLS-1$
+ 	public static final String PARM_IU = "iu"; //$NON-NLS-1$
+ 	public static final String PIPE = "|"; //$NON-NLS-1$
+-	public static final String PARM_ARTIFACT = "@artifact"; //$NON-NLS-1$
++	public static final String PARM_AT_ARTIFACT = "@artifact"; //$NON-NLS-1$
+ 	public static final String PARM_ARTIFACT_REQUESTS = "artifactRequests"; //$NON-NLS-1$
+ 	public static final String PARM_OPERAND = "operand"; //$NON-NLS-1$
+ 	public static final String PARM_PROFILE = "profile"; //$NON-NLS-1$
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/CopyAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/CopyAction.java
+index c94c668..6e9b039 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/CopyAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/CopyAction.java
+@@ -17,8 +17,6 @@ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.Status;
+ import org.eclipse.equinox.internal.p2.engine.Profile;
+ import org.eclipse.equinox.internal.p2.touchpoint.natives.*;
+-import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IFileArtifactRepository;
+-import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+@@ -61,23 +59,13 @@ public class CopyAction extends ProvisioningAction {
+ 		IInstallableUnit iu = (IInstallableUnit) parameters.get(ActionConstants.PARM_IU);
+ 
+ 		String originalSource = source;
+-		if (source.equals(ActionConstants.PARM_ARTIFACT)) {
+-			//TODO: fix wherever this occurs -- investigate as this is probably not desired
+-			if (iu.getArtifacts() == null || iu.getArtifacts().length == 0)
+-				return Status.OK_STATUS;
+-
+-			IArtifactKey artifactKey = iu.getArtifacts()[0];
+-
+-			IFileArtifactRepository downloadCache;
+-			try {
+-				downloadCache = Util.getDownloadCacheRepo();
+-			} catch (ProvisionException e) {
+-				return e.getStatus();
+-			}
+-			File fileLocation = downloadCache.getArtifactFile(artifactKey);
+-			if ((fileLocation == null) || !fileLocation.exists())
++		if (source.equals(ActionConstants.PARM_AT_ARTIFACT)) {
++			String artifactLocation = (String) parameters.get(NativeTouchpoint.PARM_ARTIFACT_LOCATION);
++			if (artifactLocation == null) {
++				IArtifactKey artifactKey = (IArtifactKey) parameters.get(NativeTouchpoint.PARM_ARTIFACT);
+ 				return Util.createError(NLS.bind(Messages.artifact_not_available, artifactKey));
+-			source = fileLocation.getAbsolutePath();
++			}
++			source = artifactLocation;
+ 		}
+ 
+ 		File sourceFile = new File(source);
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/UnzipAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/UnzipAction.java
+index f255bf4..9c1c18f 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/UnzipAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.natives/src/org/eclipse/equinox/internal/p2/touchpoint/natives/actions/UnzipAction.java
+@@ -16,8 +16,6 @@ import java.util.Map;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.engine.Profile;
+ import org.eclipse.equinox.internal.p2.touchpoint.natives.*;
+-import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IFileArtifactRepository;
+-import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IArtifactKey;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+@@ -55,23 +53,13 @@ public class UnzipAction extends ProvisioningAction {
+ 		IInstallableUnit iu = (IInstallableUnit) parameters.get(ActionConstants.PARM_IU);
+ 		Profile profile = (Profile) parameters.get(ActionConstants.PARM_PROFILE);
+ 
+-		if (source.equals(ActionConstants.PARM_ARTIFACT)) {
+-			//TODO: fix wherever this occurs -- investigate as this is probably not desired
+-			if (iu.getArtifacts() == null || iu.getArtifacts().length == 0)
+-				return Status.OK_STATUS;
+-
+-			IArtifactKey artifactKey = iu.getArtifacts()[0];
+-
+-			IFileArtifactRepository downloadCache;
+-			try {
+-				downloadCache = Util.getDownloadCacheRepo();
+-			} catch (ProvisionException e) {
+-				return e.getStatus();
+-			}
+-			File fileLocation = downloadCache.getArtifactFile(artifactKey);
+-			if ((fileLocation == null) || !fileLocation.exists())
++		if (source.equals(ActionConstants.PARM_AT_ARTIFACT)) {
++			String artifactLocation = (String) parameters.get(NativeTouchpoint.PARM_ARTIFACT_LOCATION);
++			if (artifactLocation == null) {
++				IArtifactKey artifactKey = (IArtifactKey) parameters.get(NativeTouchpoint.PARM_ARTIFACT);
+ 				return Util.createError(NLS.bind(Messages.artifact_not_available, artifactKey));
+-			source = fileLocation.getAbsolutePath();
++			}
++			source = artifactLocation;
+ 		}
+ 		IBackupStore store = restoreable ? (IBackupStore) parameters.get(NativeTouchpoint.PARM_BACKUP) : null;
+ 		File[] unzippedFiles = unzip(source, target, store);

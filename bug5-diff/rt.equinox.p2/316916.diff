@@ -1,0 +1,306 @@
+commit a42e7400572fbce148e9474109e0b8368e645556
+Author: DJ Houghton <dj>
+Date:   Fri Feb 4 20:32:26 2011 +0000
+
+    Bug 316916 - [repository] loading children of a composite repo is not covered by progress monitors
+
+2	2	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+14	10	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepository.java
+5	4	bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepositoryFactory.java
+12	7	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepository.java
+6	6	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepositoryFactory.java
+2	2	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+5	6	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+index 5b74e16..e75e6b4 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/ArtifactRepositoryManager.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- *  Copyright (c) 2007, 2010 IBM Corporation and others.
++ *  Copyright (c) 2007, 2011 IBM Corporation and others.
+  *  All rights reserved. This program and the accompanying materials
+  *  are made available under the terms of the Eclipse Public License v1.0
+  *  which accompanies this distribution, and is available at
+@@ -66,7 +66,7 @@ public class ArtifactRepositoryManager extends AbstractRepositoryManager<IArtifa
+ 		if (factory == null)
+ 			return null;
+ 		factory.setAgent(agent);
+-		return factory.load(location, flags, monitor.newChild(10));
++		return factory.load(location, flags, monitor);
+ 	}
+ 
+ 	protected String getBundleId() {
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepository.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepository.java
+index 516aeab..1b0d770 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepository.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepository.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2010 IBM Corporation and others.
++ * Copyright (c) 2008, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -83,11 +83,12 @@ public class CompositeArtifactRepository extends AbstractArtifactRepository impl
+ 	/**
+ 	 * This is only called by the parser when loading a repository.
+ 	 */
+-	CompositeArtifactRepository(IArtifactRepositoryManager manager, CompositeRepositoryState state) {
++	CompositeArtifactRepository(IArtifactRepositoryManager manager, CompositeRepositoryState state, IProgressMonitor monitor) {
+ 		super(manager.getAgent(), state.getName(), state.getType(), state.getVersion(), state.getLocation(), state.getDescription(), state.getProvider(), state.getProperties());
+ 		this.manager = manager;
+-		for (int i = 0; i < state.getChildren().length; i++)
+-			addChild(state.getChildren()[i], false);
++		SubMonitor sub = SubMonitor.convert(monitor, 100 * state.getChildren().length);
++		for (URI child : state.getChildren())
++			addChild(child, false, sub.newChild(100));
+ 	}
+ 
+ 	/**
+@@ -143,18 +144,21 @@ public class CompositeArtifactRepository extends AbstractArtifactRepository impl
+ 	}
+ 
+ 	public void addChild(URI childURI) {
+-		addChild(childURI, true);
++		addChild(childURI, true, null);
+ 	}
+ 
+-	private void addChild(URI childURI, boolean save) {
++	private void addChild(URI childURI, boolean save, IProgressMonitor monitor) {
++		SubMonitor sub = SubMonitor.convert(monitor);
+ 		URI absolute = URIUtil.makeAbsolute(childURI, getLocation());
+-		if (childrenURIs.contains(childURI) || childrenURIs.contains(absolute))
++		if (childrenURIs.contains(childURI) || childrenURIs.contains(absolute)) {
++			sub.done();
+ 			return;
++		}
+ 		childrenURIs.add(childURI);
+ 		if (save)
+ 			save();
+ 		try {
+-			IArtifactRepository repo = load(childURI);
++			IArtifactRepository repo = load(childURI, sub);
+ 			loadedRepos.add(new ChildInfo(repo));
+ 		} catch (ProvisionException e) {
+ 			LogHelper.log(e);
+@@ -445,11 +449,11 @@ public class CompositeArtifactRepository extends AbstractArtifactRepository impl
+ 		}
+ 	}
+ 
+-	private IArtifactRepository load(URI repoURI) throws ProvisionException {
++	private IArtifactRepository load(URI repoURI, IProgressMonitor monitor) throws ProvisionException {
+ 		// make sure we are dealing with an absolute location
+ 		repoURI = URIUtil.makeAbsolute(repoURI, getLocation());
+ 		boolean loaded = getManager().contains(repoURI);
+-		IArtifactRepository repo = getManager().loadRepository(repoURI, null);
++		IArtifactRepository repo = getManager().loadRepository(repoURI, monitor);
+ 		if (!loaded) {
+ 			//set enabled to false so repositories do not get polled twice
+ 			getManager().setEnabled(repoURI, false);
+diff --git a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepositoryFactory.java
+index 180ed01..78b8be2 100644
+--- a/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.artifact.repository/src/org/eclipse/equinox/internal/p2/artifact/repository/CompositeArtifactRepositoryFactory.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2010 IBM Corporation and others.
++ * Copyright (c) 2008, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -88,7 +88,7 @@ public class CompositeArtifactRepositoryFactory extends ArtifactRepositoryFactor
+ 			if (!PROTOCOL_FILE.equals(location.getScheme()) && (flags & IRepositoryManager.REPOSITORY_HINT_MODIFIABLE) > 0)
+ 				return null;
+ 
+-			File localFile = getLocalFile(location, sub.newChild(300));
++			File localFile = getLocalFile(location, sub.newChild(100));
+ 			InputStream inStream = new BufferedInputStream(new FileInputStream(localFile));
+ 			JarInputStream jarStream = null;
+ 			try {
+@@ -106,13 +106,14 @@ public class CompositeArtifactRepositoryFactory extends ArtifactRepositoryFactor
+ 						throw new IOException(NLS.bind(Messages.io_invalidLocation, location.getPath()));
+ 				}
+ 				//parse the repository descriptor file
+-				sub.setWorkRemaining(100);
++				sub.setWorkRemaining(300);
+ 				InputStream descriptorStream = jarStream != null ? jarStream : inStream;
+ 				CompositeRepositoryIO io = new CompositeRepositoryIO();
+ 				CompositeRepositoryState resultState = io.read(localFile.toURL(), descriptorStream, CompositeArtifactRepository.PI_REPOSITORY_TYPE, sub.newChild(100));
+ 				if (resultState.getLocation() == null)
+ 					resultState.setLocation(location);
+-				CompositeArtifactRepository result = new CompositeArtifactRepository(getManager(), resultState);
++				// Spending half the time in creating the repo is due to the loading of the children that happens during that period
++				CompositeArtifactRepository result = new CompositeArtifactRepository(getManager(), resultState, sub.newChild(200));
+ 				if (Tracing.DEBUG_METADATA_PARSING) {
+ 					time += System.currentTimeMillis();
+ 					Tracing.debug(debugMsg + "time (ms): " + time); //$NON-NLS-1$ 
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepository.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepository.java
+index 8ad7d02..ab01e4b 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepository.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepository.java
+@@ -99,11 +99,12 @@ public class CompositeMetadataRepository extends AbstractMetadataRepository impl
+ 	/*
+ 	 * This is only called by the parser when loading a repository.
+ 	 */
+-	CompositeMetadataRepository(IMetadataRepositoryManager manager, CompositeRepositoryState state) {
++	CompositeMetadataRepository(IMetadataRepositoryManager manager, CompositeRepositoryState state, IProgressMonitor monitor) {
+ 		super(manager.getAgent(), state.getName(), state.getType(), state.getVersion(), state.getLocation(), state.getDescription(), state.getProvider(), state.getProperties());
+ 		this.manager = manager;
+-		for (int i = 0; i < state.getChildren().length; i++)
+-			addChild(state.getChildren()[i], false);
++		SubMonitor sub = SubMonitor.convert(monitor, 100 * state.getChildren().length);
++		for (URI child : state.getChildren())
++			addChild(child, false, sub.newChild(100));
+ 	}
+ 
+ 	/*
+@@ -140,17 +141,21 @@ public class CompositeMetadataRepository extends AbstractMetadataRepository impl
+ 		}
+ 	}
+ 
+-	private void addChild(URI childURI, boolean save) {
++	private void addChild(URI childURI, boolean save, IProgressMonitor monitor) {
++		SubMonitor sub = SubMonitor.convert(monitor);
+ 		URI absolute = URIUtil.makeAbsolute(childURI, getLocation());
+-		if (childrenURIs.contains(childURI) || childrenURIs.contains(absolute))
++		if (childrenURIs.contains(childURI) || childrenURIs.contains(absolute)) {
++			sub.done();
+ 			return;
++
++		}
+ 		// always add the URI to the list of child URIs (even if we can't load it later)
+ 		childrenURIs.add(childURI);
+ 		if (save)
+ 			save();
+ 		try {
+ 			boolean currentLoaded = getManager().contains(absolute);
+-			IMetadataRepository currentRepo = getManager().loadRepository(absolute, null);
++			IMetadataRepository currentRepo = getManager().loadRepository(absolute, sub);
+ 			if (!currentLoaded) {
+ 				//set enabled to false so repositories do not polled twice
+ 				getManager().setEnabled(absolute, false);
+@@ -170,7 +175,7 @@ public class CompositeMetadataRepository extends AbstractMetadataRepository impl
+ 	 * @see org.eclipse.equinox.p2.repository.ICompositeRepository#addChild(java.net.URI)
+ 	 */
+ 	public void addChild(URI childURI) {
+-		addChild(childURI, true);
++		addChild(childURI, true, null);
+ 	}
+ 
+ 	/* (non-Javadoc)
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepositoryFactory.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepositoryFactory.java
+index 0c5d3c3..ea0c053 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepositoryFactory.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/CompositeMetadataRepositoryFactory.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2009 IBM Corporation and others.
++ * Copyright (c) 2008, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -11,8 +11,6 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.metadata.repository;
+ 
+-import org.eclipse.equinox.internal.p2.repository.CacheManager;
+-
+ import java.io.*;
+ import java.net.URI;
+ import java.util.Map;
+@@ -22,6 +20,7 @@ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.Tracing;
+ import org.eclipse.equinox.internal.p2.persistence.CompositeRepositoryIO;
+ import org.eclipse.equinox.internal.p2.persistence.CompositeRepositoryState;
++import org.eclipse.equinox.internal.p2.repository.CacheManager;
+ import org.eclipse.equinox.p2.core.ProvisionException;
+ import org.eclipse.equinox.p2.repository.IRepositoryManager;
+ import org.eclipse.equinox.p2.repository.metadata.IMetadataRepository;
+@@ -96,7 +95,7 @@ public class CompositeMetadataRepositoryFactory extends MetadataRepositoryFactor
+ 			if (!PROTOCOL_FILE.equals(location.getScheme()) && (flags & IRepositoryManager.REPOSITORY_HINT_MODIFIABLE) > 0)
+ 				return null;
+ 
+-			File localFile = getLocalFile(location, sub.newChild(300));
++			File localFile = getLocalFile(location, sub.newChild(100));
+ 			InputStream inStream = new BufferedInputStream(new FileInputStream(localFile));
+ 			JarInputStream jarStream = null;
+ 			try {
+@@ -113,13 +112,14 @@ public class CompositeMetadataRepositoryFactory extends MetadataRepositoryFactor
+ 						throw new IOException(NLS.bind(Messages.repoMan_invalidLocation, location));
+ 				}
+ 				//parse the repository descriptor file
+-				sub.setWorkRemaining(100);
++				sub.setWorkRemaining(300);
+ 				InputStream descriptorStream = jarStream != null ? jarStream : inStream;
+ 				CompositeRepositoryIO io = new CompositeRepositoryIO();
+ 				CompositeRepositoryState resultState = io.read(localFile.toURL(), descriptorStream, CompositeMetadataRepository.PI_REPOSITORY_TYPE, sub.newChild(100));
+ 				if (resultState.getLocation() == null)
+ 					resultState.setLocation(location);
+-				CompositeMetadataRepository result = new CompositeMetadataRepository(getManager(), resultState);
++				// Spending half the time in creating the repo is due to the loading of the children that happens during that period
++				CompositeMetadataRepository result = new CompositeMetadataRepository(getManager(), resultState, sub.newChild(200));
+ 				if (Tracing.DEBUG_METADATA_PARSING) {
+ 					time += System.currentTimeMillis();
+ 					Tracing.debug(debugMsg + "time (ms): " + time); //$NON-NLS-1$ 
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+index e1afa91..b58f4bb 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007, 2010 IBM Corporation and others.
++ * Copyright (c) 2007, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -54,7 +54,7 @@ public class MetadataRepositoryManager extends AbstractRepositoryManager<IInstal
+ 		if (factory == null)
+ 			return null;
+ 		factory.setAgent(agent);
+-		return factory.load(location, flags, monitor.newChild(10));
++		return factory.load(location, flags, monitor);
+ 	}
+ 
+ 	protected String getBundleId() {
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
+index b8b17e0..2e1f20c 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2010 IBM Corporation and others.
++ * Copyright (c) 2008, 2011 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -623,13 +623,12 @@ public abstract class AbstractRepositoryManager<T> implements IRepositoryManager
+ 
+ 	protected IRepository<T> loadRepository(URI location, IProgressMonitor monitor, String type, int flags) throws ProvisionException {
+ 		checkValidLocation(location);
+-		if (monitor == null)
+-			monitor = new NullProgressMonitor();
++		SubMonitor sub = SubMonitor.convert(monitor, 100);
+ 		boolean added = false;
+ 		IRepository<T> result = null;
+ 
+ 		try {
+-			enterLoad(location, monitor);
++			enterLoad(location, sub.newChild(5));
+ 			result = basicGetRepository(location);
+ 			if (result != null)
+ 				return result;
+@@ -638,11 +637,11 @@ public abstract class AbstractRepositoryManager<T> implements IRepositoryManager
+ 			//add the repository first so that it will be enabled, but don't send add event until after the load
+ 			added = addRepository(location, true, false);
+ 
+-			LocationProperties indexFile = loadIndexFile(location, monitor);
++			LocationProperties indexFile = loadIndexFile(location, sub.newChild(15));
+ 			String[] preferredOrder = getPreferredRepositorySearchOrder(indexFile);
+ 			String[] suffixes = sortSuffixes(getAllSuffixes(), location, preferredOrder);
+ 
+-			SubMonitor sub = SubMonitor.convert(monitor, NLS.bind(Messages.repoMan_adding, location), suffixes.length * 100);
++			sub = SubMonitor.convert(sub, NLS.bind(Messages.repoMan_adding, location), suffixes.length * 100);
+ 			ProvisionException failure = null;
+ 			try {
+ 				for (int i = 0; i < suffixes.length; i++) {

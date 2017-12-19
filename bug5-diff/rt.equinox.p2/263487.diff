@@ -1,0 +1,182 @@
+commit 013c8def6717dff92895e16839a852557d038233
+Author: Henrik Lindberg <helindbe>
+Date:   Tue Apr 28 00:19:19 2009 +0000
+
+    Bug 263487 Prompting for username/password should show if info is already on record and allow editing
+    
+    Bug 273960 [transport] a previously saved password can not be removed
+
+10	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+12	1	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Credentials.java
+2	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+20	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UserValidationDialog.java
+2	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+24	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+index 6ec61c9..65df072 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/provisional/p2/core/IServiceUI.java
+@@ -52,6 +52,16 @@ public interface IServiceUI {
+ 	public AuthenticationInfo getUsernamePassword(String location);
+ 
+ 	/**
++	 * Opens a UI prompt for authentication details when cached or remembered details
++	 * where not accepted.
++	 * 
++	 * @param location  the location requiring login details
++	 * @param previousInfo - the previously used authentication details - may not be null.
++	 * @return The authentication result
++	 */
++	public AuthenticationInfo getUsernamePassword(String location, AuthenticationInfo previousInfo);
++
++	/**
+ 	 * Displays a list of certificates to the user.
+ 	 *  
+ 	 * @param certificates - a list of certificates to display to the user
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Credentials.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Credentials.java
+index 9f938b8..086c1cd 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Credentials.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Credentials.java
+@@ -134,7 +134,8 @@ public class Credentials {
+ 		IServiceUI adminUIService = (IServiceUI) ServiceHelper.getService(Activator.getContext(), IServiceUI.class.getName());
+ 		AuthenticationInfo loginDetails = null;
+ 		if (adminUIService != null)
+-			loginDetails = adminUIService.getUsernamePassword(host);
++			if (lastUsed != null)
++				loginDetails = lastUsed != null ? adminUIService.getUsernamePassword(host, lastUsed) : adminUIService.getUsernamePassword(host);
+ 		//null result means user canceled password dialog
+ 		if (loginDetails == null)
+ 			throw new UserCancelledException();
+@@ -152,6 +153,16 @@ public class Credentials {
+ 				throw RepositoryStatusHelper.internalError(e);
+ 			}
+ 		} else {
++			// if persisted earlier - the preference should be removed
++			if (securePreferences.nodeExists(nodeName)) {
++				prefNode = securePreferences.node(nodeName);
++				prefNode.removeNode();
++				try {
++					prefNode.flush();
++				} catch (IOException e) {
++					throw RepositoryStatusHelper.internalError(e);
++				}
++			}
+ 			saveInMemory(nodeName, loginDetails);
+ 		}
+ 		return loginDetails;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+index 59ac811..d0509a6 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+@@ -238,6 +238,8 @@ public class ProvUIMessages extends NLS {
+ 	public static String ProvUI_WarningTitle;
+ 	public static String ProvUIActivator_ExceptionDuringProfileChange;
+ 	public static String ProvUILicenseManager_ParsingError;
++	public static String ProvUIMessages_NotAccepted_EnterFor_0;
++	public static String ProvUIMessages_SavedNotAccepted_EnterFor_0;
+ 	public static String OptionalPlatformRestartMessage;
+ 	public static String IUViewQueryContext_NoCategorizedItemsDescription;
+ 	public static String QueriedElementWrapper_NoCategorizedItemsExplanation;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UserValidationDialog.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UserValidationDialog.java
+index b11b5ee..772e91c 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UserValidationDialog.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UserValidationDialog.java
+@@ -35,6 +35,11 @@ public class UserValidationDialog extends MessageDialog {
+ 		super(parentShell, titleMessage, titleImage, message, MessageDialog.QUESTION, buttonLabels, 0);
+ 	}
+ 
++	public UserValidationDialog(AuthenticationInfo lastUsed, Shell parentShell, String titleMessage, Image titleImage, String message, String[] buttonLabels) {
++		super(parentShell, titleMessage, titleImage, message, MessageDialog.WARNING, buttonLabels, 0);
++		result = lastUsed;
++	}
++
+ 	protected Control createDialogArea(Composite parent) {
+ 		Composite composite = (Composite) super.createDialogArea(parent);
+ 
+@@ -52,6 +57,7 @@ public class UserValidationDialog extends MessageDialog {
+ 		layoutData.widthHint = convertHorizontalDLUsToPixels(IDialogConstants.ENTRY_FIELD_WIDTH);
+ 		layoutData.horizontalAlignment = SWT.END;
+ 		username.setLayoutData(layoutData);
++		username.setText(getUserName());
+ 
+ 		label = new Label(fieldContainer, SWT.NONE);
+ 		label.setText(ProvUIMessages.UserValidationDialog_PasswordLabel);
+@@ -60,6 +66,7 @@ public class UserValidationDialog extends MessageDialog {
+ 		layoutData.widthHint = convertHorizontalDLUsToPixels(IDialogConstants.ENTRY_FIELD_WIDTH);
+ 		layoutData.horizontalAlignment = SWT.END;
+ 		password.setLayoutData(layoutData);
++		password.setText(getPassword());
+ 
+ 		Composite checkboxContainer = new Composite(composite, SWT.NONE);
+ 		layout = new GridLayout();
+@@ -69,6 +76,7 @@ public class UserValidationDialog extends MessageDialog {
+ 		checkboxContainer.setLayoutData(layoutData);
+ 		saveButton = new Button(checkboxContainer, SWT.CHECK);
+ 		saveButton.setText(ProvUIMessages.UserValidationDialog_SavePasswordButton);
++		saveButton.setSelection(saveResult());
+ 
+ 		username.setFocus();
+ 
+@@ -88,4 +96,16 @@ public class UserValidationDialog extends MessageDialog {
+ 	public AuthenticationInfo getResult() {
+ 		return result;
+ 	}
++
++	private String getUserName() {
++		return result != null ? result.getUserName() : ""; //$NON-NLS-1$
++	}
++
++	private String getPassword() {
++		return result != null ? result.getPassword() : ""; //$NON-NLS-1$
++	}
++
++	private boolean saveResult() {
++		return result != null ? result.saveResult() : false;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index 510c049..a9ee52c 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -202,6 +202,8 @@ ProvUI_VersionColumnTitle=Version
+ ProvUI_WarningTitle=Warning
+ ProvUIActivator_ExceptionDuringProfileChange=Exception while handling profile change event.
+ ProvUILicenseManager_ParsingError=Error parsing the accepted license registry
++ProvUIMessages_NotAccepted_EnterFor_0=Login details were not accepted. Please provide login details for {0}
++ProvUIMessages_SavedNotAccepted_EnterFor_0=Saved login details were not accepted. Please provide login details for {0}
+ 
+ OptionalPlatformRestartMessage = It is strongly recommended you restart {0} for the changes to take effect. \
+ For some add-ons, it may be possible to apply the changes you have made without restarting. \
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+index 5433221..4605cc4 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/ValidationDialogServiceUI.java
+@@ -89,4 +89,28 @@ public class ValidationDialogServiceUI implements IServiceUI {
+ 		}
+ 		return children;
+ 	}
++
++	public AuthenticationInfo getUsernamePassword(final String location, final AuthenticationInfo previousInfo) {
++
++		final AuthenticationInfo[] result = new AuthenticationInfo[1];
++		PlatformUI.getWorkbench().getDisplay().syncExec(new Runnable() {
++
++			public void run() {
++				Shell shell = ProvUI.getDefaultParentShell();
++				String[] buttonLabels = new String[] {ProvUIMessages.ServiceUI_OK, ProvUIMessages.ServiceUI_Cancel};
++				String message = null;
++				if (previousInfo.saveResult())
++					message = NLS.bind(ProvUIMessages.ProvUIMessages_SavedNotAccepted_EnterFor_0, location);
++				else
++					message = NLS.bind(ProvUIMessages.ProvUIMessages_NotAccepted_EnterFor_0, location);
++
++				UserValidationDialog dialog = new UserValidationDialog(previousInfo, shell, ProvUIMessages.ServiceUI_LoginRequired, null, message, buttonLabels);
++				if (dialog.open() == Window.OK) {
++					result[0] = dialog.getResult();
++				}
++			}
++
++		});
++		return result[0];
++	}
+ }

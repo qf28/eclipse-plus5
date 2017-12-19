@@ -1,0 +1,902 @@
+commit dd2d999bb92f1e106218a30e477eebe8f58b2e19
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Dec 14 22:12:05 2013 +0100
+
+    Bug 424053 - [1.8][compiler] Consolidate type inference
+    - better & deterministic readableName of CaptureBinding18
+      to fix regression in GenericRegressionTest.test366131b()
+
+36	12	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding18.java
+9	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding18.java
+index 1124d73..076c774 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding18.java
+@@ -20,9 +20,11 @@ package org.eclipse.jdt.internal.compiler.lookup;
+ public class CaptureBinding18 extends CaptureBinding {
+ 	
+ 	TypeBinding[] upperBounds;
++	private char[] originalName;
+ 
+-	public CaptureBinding18(ReferenceBinding contextType, char[] sourceName, int captureID, LookupEnvironment environment) {
++	public CaptureBinding18(ReferenceBinding contextType, char[] sourceName, char[] originalName, int captureID, LookupEnvironment environment) {
+ 		super(contextType, sourceName, 0, captureID, environment);
++		this.originalName = originalName;
+ 	}
+ 	
+ 	public boolean setUpperBounds(TypeBinding[] upperBounds, ReferenceBinding javaLangObject) {
+@@ -64,7 +66,7 @@ public class CaptureBinding18 extends CaptureBinding {
+ 	}
+ 
+ 	public TypeBinding clone(TypeBinding enclosingType) {
+-		return new CaptureBinding18(this.sourceType, this.sourceName, this.captureID, this.environment);
++		return new CaptureBinding18(this.sourceType, this.sourceName, this.originalName, this.captureID, this.environment);
+ 	}
+ 
+ 	public MethodBinding[] getMethods(char[] selector) {
+@@ -201,34 +203,56 @@ public class CaptureBinding18 extends CaptureBinding {
+ 	public boolean isProperType(boolean admitCapture18) {
+ 		return admitCapture18;
+ 	}
++
++	int recursionLevel = 0; // used to give a hint at recursive types without going into infinity
+ 	
+ 	public char[] readableName() {
+ 		if (this.lowerBound == null && this.firstBound != null) {
+-			if (!this.inRecursiveFunction) {
++			if (this.recursionLevel < 2) {
+ 				try {
+-					this.inRecursiveFunction = true;
++					this.recursionLevel ++;
++					if (this.upperBounds != null && this.upperBounds.length > 1) {
++						StringBuffer sb = new StringBuffer();
++						sb.append(this.upperBounds[0].readableName());
++						for (int i = 1; i < this.upperBounds.length; i++)
++							sb.append('&').append(this.upperBounds[i].readableName());
++						int len = sb.length();
++						char[] name = new char[len];
++						sb.getChars(0, len, name, 0);
++						return name;
++					}
+ 					return this.firstBound.readableName();
+ 				} finally {
+-					this.inRecursiveFunction = false;
++					this.recursionLevel--;
+ 				}
+-			} else {				
+-				return this.firstBound.erasure().readableName();
++			} else {
++				return this.originalName;
+ 			}
+ 		}
+ 		return super.readableName();
+ 	}
+-	
++
+ 	public char[] shortReadableName() {
+ 		if (this.lowerBound == null && this.firstBound != null) {
+-			if (!this.inRecursiveFunction) {
++			if (this.recursionLevel < 2) {
+ 				try {
+-					this.inRecursiveFunction = true;
++					this.recursionLevel++;
++					if (this.upperBounds != null && this.upperBounds.length > 1) {
++						StringBuffer sb = new StringBuffer();
++						sb.append(this.upperBounds[0].shortReadableName());
++						for (int i = 1; i < this.upperBounds.length; i++)
++							sb.append('&').append(this.upperBounds[i].shortReadableName());
++						int len = sb.length();
++						char[] name = new char[len];
++						sb.getChars(0, len, name, 0);
++						return name;
++					}
+ 					return this.firstBound.shortReadableName();
+ 				} finally {
+-					this.inRecursiveFunction = false;
++					this.recursionLevel--;
+ 				}
+ 			} else {
+-				return this.firstBound.erasure().shortReadableName();
++				return this.originalName;
+ 			}
+ 		}
+ 		return super.shortReadableName();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index dadad28..ce97fd4 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -16,6 +16,7 @@ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Comparator;
+ import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -545,7 +546,7 @@ public class InferenceContext18 {
+ 	/** For 18.4: "Let Z1, ..., Zn be fresh type variables" use capture bindings. */
+ 	private CaptureBinding18 freshCapture(InferenceVariable variable) {
+ 		char[] sourceName = CharOperation.concat("Z-".toCharArray(), variable.sourceName);
+-		return new CaptureBinding18(this.scope.enclosingSourceType(), sourceName, this.captureId++, this.environment);
++		return new CaptureBinding18(this.scope.enclosingSourceType(), sourceName, variable.typeParameter.shortReadableName(), this.captureId++, this.environment);
+ 	}
+ 	// === ===
+ 	
+@@ -557,6 +558,13 @@ public class InferenceContext18 {
+ 			TypeBinding[] glbs = Scope.greaterLowerBound(substitutedUpperBounds, this.scope, this.environment);
+ 			if (glbs == null)
+ 				return false;
++			// for deterministic results sort this array by id:
++			Arrays.sort(glbs, new Comparator() {
++				public int compare(Object o1, Object o2) {
++					int i1 = ((TypeBinding)o1).id, i2 = ((TypeBinding)o2).id; 
++					return (i1>i2 ? -1 : (i1==i2 ? 0 : 1));
++				}
++			});
+ 			if (!typeVariable.setUpperBounds(glbs, this.object))
+ 				return false;
+ 		}
+commit 9506194ecd38aa227915d4452e8097fba7bd6231
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sat Dec 14 22:46:31 2013 +0100
+
+    Bug 424053 - [1.8][compiler] Consolidate type inference
+    - fixed non-determinism affecting GTT.test0470 & test627
+
+2	4	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
+5	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
+10	6	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
+index 81ceca9..6c497c4 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
+@@ -45,7 +45,7 @@ public class GenericTypeTest extends AbstractComparableTest {
+ 	// All specified tests which does not belong to the class are skipped...
+ 	static {
+ //		TESTS_NAMES = new String[] { "test1031" };
+-//		TESTS_NUMBERS = new int[] { 593, 701, 746, 848, 953, 985, 1029, 1136, 1227, 1295, 1341 };
++//		TESTS_NUMBERS = new int[] { 470, 627 };
+ //		TESTS_RANGE = new int[] { 1097, -1 };
+ 	}
+ 	public static Test suite() {
+@@ -14381,7 +14381,6 @@ public class GenericTypeTest extends AbstractComparableTest {
+ 	}
+ 
+ 	//https://bugs.eclipse.org/bugs/show_bug.cgi?id=83225
+-	// FAIL ERRMSG: random order (intermittent)
+ 	public void test0470() {
+ 		this.runNegativeTest(
+ 			new String[] {
+@@ -19664,7 +19663,7 @@ public void test0617() {
+     		"Incompatible conditional operand types X.B<X.A> and X.C\n" +
+     		"----------\n");
+ 	}
+-	// FAIL ERRMSG (random order) (intermittent)
++
+ 	public void test0627() {
+ 	    this.runNegativeTest(
+             new String[] {
+@@ -28580,7 +28579,6 @@ public void test0880() {
+ 		"----------\n");
+ }
+ //https://bugs.eclipse.org/bugs/show_bug.cgi?id=121369 - variation
+-// FAIL ERRMSG (type display?)
+ public void test0881() {
+ 	this.runNegativeTest(
+ 		new String[] {
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+index 793926b..0b2064e 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+@@ -2723,7 +2723,11 @@ public void test366131b() {
+ 		"4. WARNING in X.java (at line 13)\n" + 
+ 		"	return castTo((Class) null).containsNC((Comparable) null);\n" + 
+ 		"	              ^^^^^^^^^^^^\n" + 
+-		"Type safety: The expression of type Class needs unchecked conversion to conform to Class<Number&Comparable<? super Number&Comparable<? super N>>>\n" + 
++		(this.complianceLevel < ClassFileConstants.JDK1_8 ?
++		"Type safety: The expression of type Class needs unchecked conversion to conform to Class<Number&Comparable<? super Number&Comparable<? super N>>>\n"
++		:
++		"Type safety: The expression of type Class needs unchecked conversion to conform to Class<Comparable<? super Comparable<? super N>&Number>&Number>\n"
++		) +
+ 		"----------\n" + 
+ 		"5. WARNING in X.java (at line 13)\n" + 
+ 		"	return castTo((Class) null).containsNC((Comparable) null);\n" + 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
+index 453aa27..6373784 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
+@@ -79,6 +79,7 @@ class BoundSet {
+ 				return Binding.NO_TYPES;
+ 			if (i < boundTypes.length)
+ 				System.arraycopy(boundTypes, 0, boundTypes=new TypeBinding[i], 0, i);
++			InferenceContext18.sortTypes(boundTypes);
+ 			return boundTypes;
+ 		}
+ 		// pre: this.subBounds != null
+@@ -105,6 +106,7 @@ class BoundSet {
+ 				return new TypeBinding[] { simpleUpper };
+ 			if (i < rights.length)
+ 				System.arraycopy(rights, 0, rights=new ReferenceBinding[i], 0, i);
++			InferenceContext18.sortTypes(rights);
+ 			return rights;
+ 		}
+ 		public boolean hasDependency(InferenceVariable beta) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index ce97fd4..2b1497a 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -559,18 +559,22 @@ public class InferenceContext18 {
+ 			if (glbs == null)
+ 				return false;
+ 			// for deterministic results sort this array by id:
+-			Arrays.sort(glbs, new Comparator() {
+-				public int compare(Object o1, Object o2) {
+-					int i1 = ((TypeBinding)o1).id, i2 = ((TypeBinding)o2).id; 
+-					return (i1>i2 ? -1 : (i1==i2 ? 0 : 1));
+-				}
+-			});
++			sortTypes(glbs);
+ 			if (!typeVariable.setUpperBounds(glbs, this.object))
+ 				return false;
+ 		}
+ 		return true;
+ 	}
+ 
++	static void sortTypes(TypeBinding[] types) {
++		Arrays.sort(types, new Comparator() {
++			public int compare(Object o1, Object o2) {
++				int i1 = ((TypeBinding)o1).id, i2 = ((TypeBinding)o2).id; 
++				return (i1<i2 ? -1 : (i1==i2 ? 0 : 1));
++			}
++		});
++	}
++
+ 	/** 
+ 	 * starting with our i'th inference variable collect all variables
+ 	 * reachable via dependencies (regardless of relation kind).
+commit 27a13e874a8de3a8e74e5e1ab65479e9dace8b8c
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sun Dec 15 00:21:32 2013 +0100
+
+    Bug 424053 - [1.8][compiler] Consolidate type inference
+    - restrict the bug mode to more closely follow javac behavior
+
+0	3	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
+11	11	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
+11	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+27	20	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+10	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+11	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBound.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
+index 6c497c4..f105fb1 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericTypeTest.java
+@@ -33569,7 +33569,6 @@ public void test1009() {
+ 		"----------\n");
+ }
+ //https://bugs.eclipse.org/bugs/show_bug.cgi?id=148061 - variation
+-// FAIL FIXME: javac rejects (correctly? how?), see http://mail.openjdk.java.net/pipermail/lambda-spec-experts/2013-December/000443.html
+ public void test1010() {
+ 	this.runNegativeTest(
+ 		new String[] {
+@@ -33925,7 +33924,6 @@ public void test1016() {
+ 		"----------\n");
+ }
+ //https://bugs.eclipse.org/bugs/show_bug.cgi?id=148061 - variation
+-// FAIL FIXME: javac rejects (correctly? how?), see http://mail.openjdk.java.net/pipermail/lambda-spec-experts/2013-December/000443.html
+ public void test1017() {
+ 	this.runNegativeTest(
+ 		new String[] {
+@@ -40101,7 +40099,6 @@ public void test1156() {
+ 	);
+ }
+ //https://bugs.eclipse.org/bugs/show_bug.cgi?id=202624
+-// FAIL FIXME: javac rejects (correctly? how?), see http://mail.openjdk.java.net/pipermail/lambda-spec-experts/2013-December/000443.html
+ public void test1157() {
+ 	this.runNegativeTest(
+ 		new String[] {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
+index 6373784..4bc811d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
+@@ -484,7 +484,7 @@ class BoundSet {
+ 		
+ 		// α = S and α = T imply ⟨S = T⟩
+ 		if (boundS.left == boundT.left) //$IDENTITY-COMPARISON$ InferenceVariable
+-			return new ConstraintTypeFormula(boundS.right, boundT.right, ReductionResult.SAME);
++			return new ConstraintTypeFormula(boundS.right, boundT.right, ReductionResult.SAME, boundS.isSoft||boundT.isSoft);
+ 
+ 		// match against more shapes:
+ 		ConstraintFormula newConstraint;
+@@ -505,7 +505,7 @@ class BoundSet {
+ 			InferenceVariable alpha = boundLeft.left;
+ 			TypeBinding left = boundRight.left; // no substitution since S inference variable and (S != α) per precondition
+ 			TypeBinding right = boundRight.right.substituteInferenceVariable(alpha, u);
+-			return new ConstraintTypeFormula(left, right, ReductionResult.SAME);
++			return new ConstraintTypeFormula(left, right, ReductionResult.SAME, boundLeft.isSoft||boundRight.isSoft);
+ 		}
+ 		return null;
+ 	}
+@@ -516,18 +516,18 @@ class BoundSet {
+ 		InferenceVariable alpha = boundS.left;
+ 		TypeBinding s = boundS.right;
+ 		if (alpha == boundT.left) //$IDENTITY-COMPARISON$ InferenceVariable
+-			return new ConstraintTypeFormula(s, boundT.right, boundT.relation);
++			return new ConstraintTypeFormula(s, boundT.right, boundT.relation, boundT.isSoft||boundS.isSoft);
+ 		if (alpha == boundT.right) //$IDENTITY-COMPARISON$ InferenceVariable
+-			return new ConstraintTypeFormula(boundT.right, s, boundT.relation);
++			return new ConstraintTypeFormula(boundT.right, s, boundT.relation, boundT.isSoft||boundS.isSoft);
+ 
+ 		if (boundS.right instanceof InferenceVariable) {
+ 			// reverse:
+ 			alpha = (InferenceVariable) boundS.right;
+ 			s = boundS.left;
+ 			if (alpha == boundT.left) //$IDENTITY-COMPARISON$ InferenceVariable
+-				return new ConstraintTypeFormula(s, boundT.right, boundT.relation);
++				return new ConstraintTypeFormula(s, boundT.right, boundT.relation, boundT.isSoft||boundS.isSoft);
+ 			if (alpha == boundT.right) //$IDENTITY-COMPARISON$ InferenceVariable
+-				return new ConstraintTypeFormula(boundT.right, s, boundT.relation);			
++				return new ConstraintTypeFormula(boundT.right, s, boundT.relation, boundT.isSoft||boundS.isSoft);			
+ 		}
+ 		
+ 		//  α = U and S <: T imply ⟨S[α:=U] <: T[α:=U]⟩ 
+@@ -535,7 +535,7 @@ class BoundSet {
+ 		if (u.isProperType(true)) {
+ 			TypeBinding left = (alpha == boundT.left) ? u : boundT.left; //$IDENTITY-COMPARISON$ InferenceVariable
+ 			TypeBinding right = boundT.right.substituteInferenceVariable(alpha, u);
+-			return new ConstraintTypeFormula(left, right, boundT.relation);
++			return new ConstraintTypeFormula(left, right, boundT.relation, boundT.isSoft||boundS.isSoft);
+ 		}
+ 		return null;
+ 	}
+@@ -545,13 +545,13 @@ class BoundSet {
+ 		InferenceVariable alpha = boundS.left;
+ 		if (alpha == boundT.left) //$IDENTITY-COMPARISON$ InferenceVariable
+ 			//  α >: S and α <: T imply ⟨S <: T⟩
+-			return new ConstraintTypeFormula(boundS.right, boundT.right, ReductionResult.SUBTYPE);
++			return new ConstraintTypeFormula(boundS.right, boundT.right, ReductionResult.SUBTYPE, boundT.isSoft||boundS.isSoft);
+ 		if (boundS.right instanceof InferenceVariable) {
+ 			// try reverse:
+ 			alpha = (InferenceVariable) boundS.right;
+ 			if (alpha == boundT.right) //$IDENTITY-COMPARISON$ InferenceVariable
+ 				// S :> α and T <: α  imply ⟨S :> T⟩
+-				return new ConstraintTypeFormula(boundS.left, boundT.left, ReductionResult.SUPERTYPE);
++				return new ConstraintTypeFormula(boundS.left, boundT.left, ReductionResult.SUPERTYPE, boundT.isSoft||boundS.isSoft);
+ 		}
+ 		return null;
+ 	}
+@@ -560,10 +560,10 @@ class BoundSet {
+ 		//  more permutations of: S <: α and α <: T imply ⟨S <: T⟩
+ 		if (boundS.left == boundT.right) //$IDENTITY-COMPARISON$ InferenceVariable
+ 			// came in as: α REL S and T REL α imply ⟨T REL S⟩ 
+-			return new ConstraintTypeFormula(boundT.left, boundS.right, boundS.relation);
++			return new ConstraintTypeFormula(boundT.left, boundS.right, boundS.relation, boundT.isSoft||boundS.isSoft);
+ 		if (boundS.right == boundT.left) //$IDENTITY-COMPARISON$ InferenceVariable
+ 			// came in as: S REL α and α REL T imply ⟨S REL T⟩ 
+-			return new ConstraintTypeFormula(boundS.left, boundT.right, boundS.relation);		
++			return new ConstraintTypeFormula(boundS.left, boundT.right, boundS.relation, boundT.isSoft||boundS.isSoft);		
+ 		return null;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+index f2ae872..61f8808 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+@@ -43,12 +43,20 @@ import org.eclipse.jdt.internal.compiler.lookup.InferenceContext18.InvocationRec
+ class ConstraintExpressionFormula extends ConstraintFormula {
+ 	Expression left;
+ 
++	// this flag contributes to the workaround controlled by InferenceContext18.ARGUMENT_CONSTRAINTS_ARE_SOFT:
++	boolean isSoft;
++
+ 	ConstraintExpressionFormula(Expression expression, TypeBinding type, int relation) {
+ 		this.left = expression;
+ 		this.right = type;
+ 		this.relation = relation;
+ 	}
+ 	
++	ConstraintExpressionFormula(Expression expression, TypeBinding type, int relation, boolean isSoft) {
++		this(expression, type, relation);
++		this.isSoft = isSoft;
++	}
++
+ 	public Object reduce(InferenceContext18 inferenceContext) throws InferenceFailureException {
+ 		// JLS 18.2.1
+ 		if (this.right.isProperType(true)) {
+@@ -68,7 +76,7 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 			TypeBinding exprType = this.left.resolvedType;
+ 			if (exprType == null || !exprType.isValidBinding())
+ 				return FALSE;
+-			return new ConstraintTypeFormula(exprType, this.right, COMPATIBLE);
++			return new ConstraintTypeFormula(exprType, this.right, COMPATIBLE, this.isSoft);
+ 		} else {
+ 			// shapes of poly expressions (18.2.1)
+ 			// - parenthesized expression : these are transparent in our AST
+@@ -97,8 +105,8 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 			} else if (this.left instanceof ConditionalExpression) {
+ 				ConditionalExpression conditional = (ConditionalExpression) this.left;
+ 				return new ConstraintFormula[] {
+-					new ConstraintExpressionFormula(conditional.valueIfTrue, this.right, this.relation),
+-					new ConstraintExpressionFormula(conditional.valueIfFalse, this.right, this.relation)
++					new ConstraintExpressionFormula(conditional.valueIfTrue, this.right, this.relation, this.isSoft),
++					new ConstraintExpressionFormula(conditional.valueIfFalse, this.right, this.relation, this.isSoft)
+ 				};
+ 			} else if (this.left instanceof LambdaExpression) {
+ 				LambdaExpression lambda = (LambdaExpression) this.left;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+index 1a7ac3a..477075f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+@@ -32,11 +32,18 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 
+ 	TypeBinding left;
+ 	
++	// this flag contributes to the workaround controlled by InferenceContext18.ARGUMENT_CONSTRAINTS_ARE_SOFT:
++	boolean isSoft;
++
+ 	public ConstraintTypeFormula(TypeBinding exprType, TypeBinding right, int relation) {
+ 		this.left = exprType;
+ 		this.right = right;
+ 		this.relation = relation;
+ 	}
++	public ConstraintTypeFormula(TypeBinding exprType, TypeBinding right, int relation, boolean isSoft) {
++		this(exprType, right, relation);
++		this.isSoft = isSoft;
++	}
+ 
+ 	// return: ReductionResult or ConstraintFormula[]
+ 	public Object reduce(InferenceContext18 inferenceContext) {
+@@ -50,11 +57,11 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 			}
+ 			if (this.left.isBaseType() && this.left != TypeBinding.NULL) {
+ 				TypeBinding sPrime = inferenceContext.environment.computeBoxingType(this.left);
+-				return new ConstraintTypeFormula(sPrime, this.right, COMPATIBLE);
++				return new ConstraintTypeFormula(sPrime, this.right, COMPATIBLE, this.isSoft);
+ 			}
+ 			if (this.right.isBaseType() && this.right != TypeBinding.NULL) {
+ 				TypeBinding tPrime = inferenceContext.environment.computeBoxingType(this.right);
+-				return new ConstraintTypeFormula(this.left, tPrime, COMPATIBLE);
++				return new ConstraintTypeFormula(this.left, tPrime, COMPATIBLE, this.isSoft);
+ 			}
+ 			switch (this.right.kind()) {
+ 			case Binding.ARRAY_TYPE:
+@@ -65,12 +72,12 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 				{																
+ 					//															  this.right = G<T1,T2,...> or G<T1,T2,...>[]k
+ 					TypeBinding gs = this.left.findSuperTypeOriginatingFrom(this.right);	// G<S1,S2,...> or G<S1,S2,...>[]k
+-					if (gs != null && gs.isRawType())
++					if (gs != null && gs.leafComponentType().isRawType())
+ 						return TRUE;
+ 					break;
+ 				}
+ 			}
+-			return new ConstraintTypeFormula(this.left, this.right, SUBTYPE);
++			return new ConstraintTypeFormula(this.left, this.right, SUBTYPE, this.isSoft);
+ 		case SUBTYPE:
+ 			// 18.2.3:
+ 			return reduceSubType(inferenceContext.scope, this.left, this.right);
+@@ -84,7 +91,7 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 			// 18.2.3:
+ 			if (this.right.kind() != Binding.WILDCARD_TYPE) { // "If T is a type" ... all alternatives require "wildcard"
+ 				if (this.left.kind() != Binding.WILDCARD_TYPE) {
+-					return new ConstraintTypeFormula(this.left, this.right, SAME);						
++					return new ConstraintTypeFormula(this.left, this.right, SAME, this.isSoft);						
+ 				} else {
+ 					return FALSE;
+ 				}
+@@ -94,22 +101,22 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 					return TRUE;
+ 				if (t.boundKind == Wildcard.EXTENDS) {
+ 					if (this.left.kind() != Binding.WILDCARD_TYPE) {
+-						return new ConstraintTypeFormula(this.left, t.bound, SUBTYPE);
++						return new ConstraintTypeFormula(this.left, t.bound, SUBTYPE, this.isSoft);
+ 					} else {
+ 						WildcardBinding s = (WildcardBinding) this.left;
+ 						if (s.boundKind == Wildcard.EXTENDS) {
+-							return new ConstraintTypeFormula(s.bound, t.bound, SUBTYPE);
++							return new ConstraintTypeFormula(s.bound, t.bound, SUBTYPE, this.isSoft);
+ 						} else {
+ 							return FALSE;
+ 						}
+ 					}
+ 				} else { // SUPER 
+ 					if (this.left.kind() != Binding.WILDCARD_TYPE) {
+-						return new ConstraintTypeFormula(t.bound, this.left, SUBTYPE);
++						return new ConstraintTypeFormula(t.bound, this.left, SUBTYPE, this.isSoft);
+ 					} else {
+ 						WildcardBinding s = (WildcardBinding) this.left;
+ 						if (s.boundKind == Wildcard.SUPER) {
+-							return new ConstraintTypeFormula(t.bound, s.bound, SUBTYPE);
++							return new ConstraintTypeFormula(t.bound, s.bound, SUBTYPE, this.isSoft);
+ 						} else {
+ 							return FALSE;
+ 						}
+@@ -131,7 +138,7 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 				if ((leftWC.boundKind == Wildcard.EXTENDS && rightWC.boundKind == Wildcard.EXTENDS)
+ 					||(leftWC.boundKind == Wildcard.SUPER && rightWC.boundKind == Wildcard.SUPER))
+ 				{
+-					return new ConstraintTypeFormula(leftWC.bound, rightWC.bound, SAME);
++					return new ConstraintTypeFormula(leftWC.bound, rightWC.bound, SAME, this.isSoft);
+ 				}						
+ 			}
+ 		} else {
+@@ -143,10 +150,10 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 					return FALSE;
+ 				}
+ 				if (this.left instanceof InferenceVariable) {
+-					return new TypeBound((InferenceVariable) this.left, this.right, SAME);
++					return new TypeBound((InferenceVariable) this.left, this.right, SAME, this.isSoft);
+ 				}
+ 				if (this.right instanceof InferenceVariable) {
+-					return new TypeBound((InferenceVariable) this.right, this.left, SAME);
++					return new TypeBound((InferenceVariable) this.right, this.left, SAME, this.isSoft);
+ 				}
+ 				if (TypeBinding.equalsEquals(this.left.original(), this.right.original())) {
+ 					TypeBinding[] leftParams = this.left.typeArguments();
+@@ -158,13 +165,13 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 					int len = leftParams.length;
+ 					ConstraintFormula[] constraints = new ConstraintFormula[len];
+ 					for (int i = 0; i < len; i++) {
+-						constraints[i] = new ConstraintTypeFormula(leftParams[i], rightParams[i], SAME);
++						constraints[i] = new ConstraintTypeFormula(leftParams[i], rightParams[i], SAME, this.isSoft);
+ 					}
+ 					return constraints;
+ 				}
+ 				if (this.left.isArrayType() && this.right.isArrayType() && this.left.dimensions() == this.right.dimensions()) {
+ 					// checking dimensions already now is an optimization over reducing one dim at a time
+-					return new ConstraintTypeFormula(this.left.leafComponentType(), this.right.leafComponentType(), SAME);
++					return new ConstraintTypeFormula(this.left.leafComponentType(), this.right.leafComponentType(), SAME, this.isSoft);
+ 				}
+ 				if (this.left.kind() == Binding.INTERSECTION_TYPE && this.right.kind() == Binding.INTERSECTION_TYPE) {
+ 					InferenceContext18.missingImplementation("Intersection type equality NYI");
+@@ -182,9 +189,9 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 			return FALSE;
+ 		}
+ 		if (subCandidate instanceof InferenceVariable)
+-			return new TypeBound((InferenceVariable)subCandidate, superCandidate, SUBTYPE);
++			return new TypeBound((InferenceVariable)subCandidate, superCandidate, SUBTYPE, this.isSoft);
+ 		if (superCandidate instanceof InferenceVariable)
+-			return new TypeBound((InferenceVariable)superCandidate, subCandidate, SUPERTYPE); // normalize to have variable on LHS
++			return new TypeBound((InferenceVariable)superCandidate, subCandidate, SUPERTYPE, this.isSoft); // normalize to have variable on LHS
+ 		if (subCandidate.id == TypeIds.T_null)
+ 			return TRUE;
+ 		switch (superCandidate.kind()) {
+@@ -253,7 +260,7 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 				}
+ 				TypeBinding sPrime = sPrimeArray.elementsType();
+ 				if (!tPrime.isBaseType() && !sPrime.isBaseType()) {
+-					return new ConstraintTypeFormula(sPrime, tPrime, SUBTYPE);
++					return new ConstraintTypeFormula(sPrime, tPrime, SUBTYPE, this.isSoft);
+ 				}
+ 				return TypeBinding.equalsEquals(tPrime, sPrime) ? TRUE : FALSE; // same primitive type?
+ 
+@@ -264,7 +271,7 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 					InferenceContext18.missingImplementation("NYI");
+ 				WildcardBinding variable = (WildcardBinding) superCandidate;
+ 				if (variable.boundKind == Wildcard.SUPER)
+-					return new ConstraintTypeFormula(subCandidate, variable.bound, SUBTYPE);
++					return new ConstraintTypeFormula(subCandidate, variable.bound, SUBTYPE, this.isSoft);
+ 				return FALSE;
+ 			case Binding.TYPE_PARAMETER:
+ 				// same as wildcard (but we don't have a lower bound any way)
+@@ -289,9 +296,9 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 			return false; // nothing here means we failed 
+ 		TypeBinding[] bi = ((ParameterizedTypeBinding) cb).arguments;
+ 		if (cb.isRawType() || bi.length == 0)
+-			return InferenceContext18.SIMULATE_BUG_JDK_8026527 ? true : false; // FALSE would conform to the spec 
++			return (this.isSoft && InferenceContext18.SIMULATE_BUG_JDK_8026527) ? true : false; // FALSE would conform to the spec 
+ 		for (int i = 0; i < ai.length; i++)
+-			constraints.add(new ConstraintTypeFormula(bi[i], ai[i], TYPE_ARGUMENT_CONTAINED));
++			constraints.add(new ConstraintTypeFormula(bi[i], ai[i], TYPE_ARGUMENT_CONTAINED, this.isSoft));
+ 		return true;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index 2b1497a..8d90a4d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -34,6 +34,13 @@ public class InferenceContext18 {
+ 
+ 	/** to conform with javac regarding https://bugs.openjdk.java.net/browse/JDK-8026527 */
+ 	static final boolean SIMULATE_BUG_JDK_8026527 = true;
++	/**
++	 * Detail flag to control the extent of {@link #SIMULATE_BUG_JDK_8026527}.
++	 * A setting of 'false' implements the advice from http://mail.openjdk.java.net/pipermail/lambda-spec-experts/2013-December/000447.html
++	 * i.e., raw types are not considered as compatible in constraints/bounds derived from invocation arguments,
++	 * but only for constraints derived from type variable bounds.
++	 */
++	static final boolean ARGUMENT_CONSTRAINTS_ARE_SOFT = false;
+ 
+ 	InferenceVariable[] inferenceVariables;
+ 	BoundSet currentBounds;
+@@ -124,14 +131,14 @@ public class InferenceContext18 {
+ 		for (int i = 0; i < len; i++) {
+ 			if (this.invocationArguments[i].isPertinentToApplicability(parameters[i], method)) {
+ 				TypeBinding thetaF = substitute(parameters[i]);
+-				this.initialConstraints[numConstraints++] = new ConstraintExpressionFormula(this.invocationArguments[i], thetaF, ReductionResult.COMPATIBLE);
++				this.initialConstraints[numConstraints++] = new ConstraintExpressionFormula(this.invocationArguments[i], thetaF, ReductionResult.COMPATIBLE, ARGUMENT_CONSTRAINTS_ARE_SOFT);
+ 			}
+ 		}
+ 		if (checkVararg && varArgsType instanceof ArrayBinding) {
+ 			TypeBinding thetaF = substitute(((ArrayBinding) varArgsType).elementsType());
+ 			for (int i = len; i < this.invocationArguments.length; i++) {
+ 				if (this.invocationArguments[i].isPertinentToApplicability(varArgsType, method)) {
+-					this.initialConstraints[numConstraints++] = new ConstraintExpressionFormula(this.invocationArguments[i], thetaF, ReductionResult.COMPATIBLE);
++					this.initialConstraints[numConstraints++] = new ConstraintExpressionFormula(this.invocationArguments[i], thetaF, ReductionResult.COMPATIBLE, ARGUMENT_CONSTRAINTS_ARE_SOFT);
+ 				}
+ 			}
+ 		}
+@@ -246,7 +253,7 @@ public class InferenceContext18 {
+ 					TypeBinding substF = substitute(fsi);
+ 					// For all i (1 ≤ i ≤ k), if ei is not pertinent to applicability, the set contains ⟨ei → θ Fi⟩.
+ 					if (!arguments[i].isPertinentToApplicability(fsi, method)) {
+-						c.add(new ConstraintExpressionFormula(arguments[i], substF, ReductionResult.COMPATIBLE));
++						c.add(new ConstraintExpressionFormula(arguments[i], substF, ReductionResult.COMPATIBLE, ARGUMENT_CONSTRAINTS_ARE_SOFT));
+ 					}
+ 					c.add(new ConstraintExceptionFormula(arguments[i], substF));
+ 				}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBound.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBound.java
+index f0db9cf..518efde 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBound.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeBound.java
+@@ -21,9 +21,12 @@ public class TypeBound extends ReductionResult {
+ 	
+ 	InferenceVariable left;
+ 	
++	// this flag contributes to the workaround controlled by InferenceContext18.ARGUMENT_CONSTRAINTS_ARE_SOFT:
++	boolean isSoft;
++	
+ 	static TypeBound createBoundOrDependency(InferenceContext18 context, TypeBinding type, InferenceVariable variable) {
+         // Part of JLS8 sect 18.1.3:
+-		return new TypeBound(variable, context.substitute(type), SUBTYPE);
++		return new TypeBound(variable, context.substitute(type), SUBTYPE, true);
+ 	}
+ 
+ 	/** Create a true type bound or a dependency. */
+@@ -32,6 +35,13 @@ public class TypeBound extends ReductionResult {
+ 		this.right = typeBinding;
+ 		this.relation = relation;
+ 	}
++	
++	TypeBound(InferenceVariable inferenceVariable, TypeBinding typeBinding, int relation, boolean isSoft) {
++		this.left = inferenceVariable;
++		this.right = typeBinding;
++		this.relation = relation;
++		this.isSoft = isSoft;
++	}
+ 
+ 
+ 	/** distinguish bounds from dependencies. */
+commit 0276eed6cea993041a2491b2454e2b5cdc10853a
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sun Dec 15 00:24:01 2013 +0100
+
+    Bug 424053 - [1.8][compiler] Consolidate type inference
+    - removed a left-over sysout
+
+0	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+index 61f8808..d2f393a 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+@@ -307,7 +307,6 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 			}
+ 
+ 			ConstraintTypeFormula newConstraint = new ConstraintTypeFormula(inferenceContext.substitute(returnType), targetType, COMPATIBLE);
+-System.out.println("INC: "+newConstraint);
+ 			if (!inferenceContext.reduceAndIncorporate(newConstraint))
+ 				return false;
+ 		}
+commit f98c9e376d07d0e65cfd307c772db2eeb92af6b9
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Tue Jan 7 14:39:11 2014 +0100
+
+    Bug 424053 - [1.8][compiler] Consolidate type inference
+    - correction in inference variable dependency handling
+    - doc change
+
+1	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+27	16	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
+45	25	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+index 0b2064e..65540d5 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+@@ -2526,7 +2526,7 @@ public void test347426c() {
+ 			"");
+ }
+ // https://bugs.eclipse.org/bugs/show_bug.cgi?id=283353
+-public void test283353() {
++public void _test283353() {
+ 	this.runConformTest(
+ 			new String[] {
+ 				"X.java",
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
+index fb8054f..d114889 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BoundSet.java
+@@ -307,6 +307,15 @@ class BoundSet {
+ 		return null;
+ 	}
+ 
++	public int numUninstantiatedVariables(InferenceVariable[] variables) {
++		int num = 0;
++		for (int i = 0; i < variables.length; i++) {
++			if (!isInstantiated(variables[i]))
++				num++;
++		}
++		return num;
++	}
++
+ 	/**
+ 	 * <b>JLS 18.3:</b> Try to infer new constraints from pairs of existing type bounds.
+ 	 * Each new constraint is first reduced and checked for TRUE or FALSE, which will
+@@ -392,10 +401,10 @@ class BoundSet {
+ 				ReferenceBinding g = (ReferenceBinding) gA.original();
+ 				TypeVariableBinding[] parameters = g.typeVariables();
+ 				for (int i = 0; i < parameters.length; i++) {
+-					// Where the bounds of Pi are Bi1, ..., Bim, for all j (1 ≤ j ≤ m), the bound αi <: Bij θ is immediately implied. 
++					// A set of bounds on α1, ..., αn, constructed from the declared bounds of P1, ..., Pn as described in 18.1.3, is immediately implied.
+ 					TypeVariableBinding pi = parameters[i];
+ 					InferenceVariable alpha = (InferenceVariable) gAlpha.arguments[i];
+-					addBounds(pi.getTypeBounds(alpha, context)); // θ is internally applied when creating each TypeBound
++					addBounds(pi.getTypeBounds(alpha, context));
+ 
+ 					TypeBinding ai = gA.arguments[i];
+ 					if (ai instanceof WildcardBinding) {
+@@ -606,31 +615,33 @@ class BoundSet {
+ 	 */
+ 	public boolean dependsOnResolutionOf(InferenceVariable alpha, InferenceVariable beta) {
+ 		Iterator captureIter = this.captures.entrySet().iterator();
++		boolean betaIsInCaptureLhs = false;
+ 		while (captureIter.hasNext()) { // TODO: optimization: consider separate index structure (by IV)
+ 			Map.Entry entry = (Entry) captureIter.next();
+ 			ParameterizedTypeBinding g = (ParameterizedTypeBinding) entry.getKey();
+ 			for (int i = 0; i < g.arguments.length; i++) {
+ 				if (g.arguments[i] == alpha) { //$IDENTITY-COMPARISON$ InferenceVariable
+-					for (int j = 0; j < g.arguments.length; j++) {
+-						TypeBinding aj = g.arguments[j];
+-						if (aj == beta) //$IDENTITY-COMPARISON$ InferenceVariable
+-							return true;
+-					}
++					// An inference variable α appearing on the left-hand side of a bound of the form G<..., α, ...> = capture(G<...>)
++					// depends on the resolution of every other inference variable mentioned in this bound (on both sides of the = sign).
+ 					ParameterizedTypeBinding captured = (ParameterizedTypeBinding) entry.getValue();
+ 					if (captured.mentionsAny(new TypeBinding[]{beta}, -1/*don't care about index*/))
+ 						return true;
+-					return false;
++					if (g.mentionsAny(new TypeBinding[]{beta}, i)) // exclude itself 
++						return true;
++				} else if (g.arguments[i] == beta) { //$IDENTITY-COMPARISON$ InferenceVariable
++					betaIsInCaptureLhs = true;
+ 				}
+ 			}
+ 		}
+-
+-		ThreeSets sets = (ThreeSets) this.boundsPerVariable.get(alpha);
+-		if (sets != null && sets.hasDependency(beta))
+-			return true;
+-		sets = (ThreeSets) this.boundsPerVariable.get(beta);
+-		if (sets != null && sets.hasDependency(alpha))
+-			return true;
+-
++		if (betaIsInCaptureLhs) { // swap α and β in the rule text to cover "then β depends on the resolution of α"
++			ThreeSets sets = (ThreeSets) this.boundsPerVariable.get(beta);
++			if (sets != null && sets.hasDependency(alpha))
++				return true;
++		} else {
++			ThreeSets sets = (ThreeSets) this.boundsPerVariable.get(alpha);
++			if (sets != null && sets.hasDependency(beta))
++				return true;
++		}
+ 		return false;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index 4971751..0941c0d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -599,15 +599,12 @@ public class InferenceContext18 {
+ 		// For this reason, resolve works on a temporary bound set, copied before any modification.
+ 		BoundSet tmpBoundSet = this.currentBounds;
+ 		if (this.inferenceVariables != null) {
+-			for (int i = 0; i < this.inferenceVariables.length; i++) {
+-				InferenceVariable currentVariable = this.inferenceVariables[i];
+-				if (this.currentBounds.isInstantiated(currentVariable)) continue;
+-				// find a minimal set of dependent variables:
+-				Set variableSet = new HashSet();
+-				int numUninstantiated = addDependencies(tmpBoundSet, variableSet, i);
++			// find a minimal set of dependent variables:
++			Set variableSet;
++			while ((variableSet = getSmallestVariableSet(tmpBoundSet)) != null) {
++				int oldNumUninstantiated = tmpBoundSet.numUninstantiatedVariables(this.inferenceVariables);
+ 				final int numVars = variableSet.size();
+-				
+-				if (numUninstantiated > 0 && numVars > 0) {
++				if (numVars > 0) {
+ 					final InferenceVariable[] variables = (InferenceVariable[]) variableSet.toArray(new InferenceVariable[numVars]);
+ 					if (!tmpBoundSet.hasCaptureBound(variableSet)) {
+ 						// try to instantiate this set of variables in a fresh copy of the bound set:
+@@ -674,7 +671,7 @@ public class InferenceContext18 {
+ 						InferenceVariable variable = variables[j];
+ 						CaptureBinding18 zsj = zs[j];
+ 						// add lower bounds:
+-						TypeBinding[] lowerBounds = tmpBoundSet.lowerBounds(variable, false/*onlyProper*/);
++						TypeBinding[] lowerBounds = tmpBoundSet.lowerBounds(variable, true/*onlyProper*/);
+ 						if (lowerBounds != Binding.NO_TYPES) {
+ 							lowerBounds = Scope.substitute(theta, lowerBounds);
+ 							TypeBinding lub = this.scope.lowerUpperBound(lowerBounds);
+@@ -694,8 +691,11 @@ public class InferenceContext18 {
+ 						// FIXME: remove capture bounds
+ 						tmpBoundSet.addBound(new TypeBound(variable, zsj, ReductionResult.SAME));
+ 					}
+-					if (tmpBoundSet.incorporate(this))
++					if (tmpBoundSet.incorporate(this)) {
++						if (tmpBoundSet.numUninstantiatedVariables(this.inferenceVariables) == oldNumUninstantiated)
++							return null; // abort because we made no progress
+ 						continue;
++					}
+ 					return null;
+ 				}
+ 			}
+@@ -738,24 +738,44 @@ public class InferenceContext18 {
+ 		});
+ 	}
+ 
+-	/** 
+-	 * starting with our i'th inference variable collect all variables
+-	 * reachable via dependencies (regardless of relation kind).
+-	 * @param variableSet collect all variables found into this set
+-	 * @param i seed index into {@link #inferenceVariables}.
+-	 * @return count of uninstantiated variables added to the set.
++	/**
++	 * Find the smallest set of uninstantiated inference variables not depending
++	 * on any uninstantiated variable outside the set.
+ 	 */
+-	private int addDependencies(BoundSet boundSet, Set variableSet, int i) {
+-		InferenceVariable currentVariable = this.inferenceVariables[i];
+-		if (boundSet.isInstantiated(currentVariable)) return 0;
+-		if (!variableSet.add(currentVariable)) return 1;
+-		int numUninstantiated = 1;
++	private Set getSmallestVariableSet(BoundSet bounds) {
++		int min = Integer.MAX_VALUE;
++		Set result = null;
++		for (int i = 0; i < this.inferenceVariables.length; i++) {
++			InferenceVariable currentVariable = this.inferenceVariables[i];
++			if (!bounds.isInstantiated(currentVariable)) {
++				Set set = new HashSet();
++				if (!addDependencies(bounds, set, currentVariable, min))
++					continue;
++				int cur = set.size();
++				if (cur == 1)
++					return set; // won't get smaller
++				if (cur < min) {
++					result = set;
++					min = cur;
++				}
++			}
++		}
++		return result;
++	}
++
++	private boolean addDependencies(BoundSet boundSet, Set variableSet, InferenceVariable currentVariable, int min) {
++		if (variableSet.size() >= min)
++			return false; // no improvement
++		if (boundSet.isInstantiated(currentVariable)) return true; // not added
++		if (!variableSet.add(currentVariable)) return true; // already present
+ 		for (int j = 0; j < this.inferenceVariables.length; j++) {
+-			if (i == j) continue;
+-			if (boundSet.dependsOnResolutionOf(currentVariable, this.inferenceVariables[j]))
+-				numUninstantiated += addDependencies(boundSet, variableSet, j);
++			InferenceVariable nextVariable = this.inferenceVariables[j];
++			if (nextVariable == currentVariable) continue; //$IDENTITY-COMPARISON$ Inference variables
++			if (boundSet.dependsOnResolutionOf(currentVariable, nextVariable))
++				if (!addDependencies(boundSet, variableSet, nextVariable, min))
++					return false; // abort traversal: no improvement
+ 		}
+-		return numUninstantiated;
++		return true;
+ 	}
+ 
+ 	private Object pickFromCycle(Set c) {

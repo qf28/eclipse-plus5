@@ -1,0 +1,140 @@
+commit df4a3da6e8d30ada6824d136133377b3a37cfebb
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Sun Nov 2 07:16:43 2014 +0530
+
+    Fixed Bug 448914 - [1.8][compiler] CaptureBinding18 clones don't share
+    type id.
+
+3	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+2	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding.java
+10	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding18.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+4	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+1	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeVariableBinding.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+index 4068ae0..6eb3f83 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Expression.java
+@@ -652,6 +652,9 @@ public void computeConversion(Scope scope, TypeBinding runtimeType, TypeBinding
+ 		TypeBinding boxedType = scope.environment().computeBoxingType(runtimeType);
+ 		if (TypeBinding.equalsEquals(boxedType, runtimeType)) // Object o = 12;
+ 			boxedType = compileTimeType;
++		if (boxedType.id >= TypeIds.T_LastWellKnownTypeId) {  // (Comparable & Serializable) 0
++			boxedType = compileTimeType;
++		}
+ 		this.implicitConversion = TypeIds.BOXING | (boxedType.id << 4) + compileTimeType.id;
+ 		scope.problemReporter().autoboxing(this, compileTimeType, scope.environment().computeBoxingType(boxedType));
+ 		return;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding.java
+index cd8365b..c4ad14f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding.java
+@@ -31,7 +31,7 @@ public class CaptureBinding extends TypeVariableBinding {
+ 	public int position;
+ 	public ASTNode cud; // to facilitate recaptures.
+ 
+-	public CaptureBinding(WildcardBinding wildcard, ReferenceBinding sourceType, int position, int captureID) {
++	public CaptureBinding(WildcardBinding wildcard, ReferenceBinding sourceType, int position, ASTNode cud, int captureID) {
+ 		super(TypeConstants.WILDCARD_CAPTURE_NAME_PREFIX, null, 0, wildcard.environment);
+ 		this.wildcard = wildcard;
+ 		this.modifiers = ClassFileConstants.AccPublic | ExtraCompilerModifiers.AccGenericSignature; // treat capture as public
+@@ -53,10 +53,6 @@ public class CaptureBinding extends TypeVariableBinding {
+ 			if (wildcard.hasNullTypeAnnotations())
+ 				this.tagBits |= TagBits.HasNullTypeAnnotation;
+ 		}
+-	}
+-	
+-	public CaptureBinding(WildcardBinding wildcard, ReferenceBinding sourceType, int position, ASTNode cud, int captureID) {
+-		this(wildcard, sourceType, position, captureID);
+ 		this.cud = cud;
+ 	}
+ 	
+@@ -77,6 +73,7 @@ public class CaptureBinding extends TypeVariableBinding {
+ 		this.captureID = prototype.captureID;
+ 		this.lowerBound = prototype.lowerBound;
+ 		this.tagBits |= (prototype.tagBits & TagBits.HasCapturedWildcard);
++		this.cud = prototype.cud;
+ 	}
+ 	
+ 	// Captures may get cloned and annotated during type inference.
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding18.java
+index e3a31d7..29718e5 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CaptureBinding18.java
+@@ -28,12 +28,10 @@ public class CaptureBinding18 extends CaptureBinding {
+ 	}
+ 	
+ 	private CaptureBinding18(CaptureBinding18 prototype) {
+-		this(prototype.sourceType, CharOperation.append(prototype.sourceName, '\''), prototype.originalName, prototype.position, prototype.captureID, prototype.environment);
++		super(prototype);
++		this.sourceName = CharOperation.append(prototype.sourceName, '\'');
++		this.originalName = prototype.originalName;
+ 		this.upperBounds = prototype.upperBounds;
+-		this.firstBound = prototype.firstBound;
+-		this.lowerBound = prototype.lowerBound;
+-		this.superInterfaces = prototype.superInterfaces;
+-		this.superclass = prototype.superclass;
+ 		this.prototype = prototype.prototype;		
+ 	}
+ 
+@@ -204,6 +202,11 @@ public class CaptureBinding18 extends CaptureBinding {
+ 					}
+ 				}
+ 			}
++			TypeBinding currentFirstBound = null;
++			if (this.firstBound != null) {
++				currentFirstBound = this.firstBound.substituteInferenceVariable(var, substituteType);
++				haveSubstitution |= TypeBinding.notEquals(this.firstBound, currentFirstBound);
++			}
+ 			if (haveSubstitution) {
+ 				final CaptureBinding18 newCapture = (CaptureBinding18) clone(enclosingType());
+ 				newCapture.tagBits = this.tagBits;
+@@ -221,6 +224,8 @@ public class CaptureBinding18 extends CaptureBinding {
+ 						return CaptureBinding18.this.environment;
+ 					}
+ 				};
++				if (currentFirstBound != null)
++					newCapture.firstBound = Scope.substitute(substitution, currentFirstBound);
+ 				newCapture.superclass = (ReferenceBinding) Scope.substitute(substitution, currentSuperclass);
+ 				newCapture.superInterfaces = Scope.substitute(substitution, currentSuperInterfaces);
+ 				newCapture.upperBounds = Scope.substitute(substitution, currentUpperBounds);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+index e8fcc22..ef8bb58 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ParameterizedTypeBinding.java
+@@ -156,7 +156,7 @@ public class ParameterizedTypeBinding extends ReferenceBinding implements Substi
+ 				else if (needUniqueCapture)
+ 					capturedArguments[i] = this.environment.createCapturedWildcard(wildcard, contextType, position, cud, compilationUnitScope.nextCaptureID());
+ 				else 
+-					capturedArguments[i] = new CaptureBinding(wildcard, contextType, position, compilationUnitScope.nextCaptureID());	
++					capturedArguments[i] = new CaptureBinding(wildcard, contextType, position, cud, compilationUnitScope.nextCaptureID());	
+ 			} else {
+ 				capturedArguments[i] = argument;
+ 			}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+index b87a421..f504308 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ReferenceBinding.java
+@@ -859,6 +859,10 @@ public void computeId() {
+ 	}
+ }
+ 
++public void computeId(LookupEnvironment environment) {
++	environment.getUnannotatedType(this);
++}
++
+ /**
+  * p.X<T extends Y & I, U extends Y> {} -> Lp/X<TT;TU;>;
+  */
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeVariableBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeVariableBinding.java
+index 15b6608..5630004 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeVariableBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeVariableBinding.java
+@@ -71,6 +71,7 @@ public class TypeVariableBinding extends ReferenceBinding {
+ 		this.tagBits |= TagBits.HasTypeVariable;
+ 		this.environment = environment;
+ 		this.typeBits = TypeIds.BitUninitialized;
++		computeId(environment);
+ 	}
+ 	
+ 	public TypeVariableBinding(TypeVariableBinding prototype) {

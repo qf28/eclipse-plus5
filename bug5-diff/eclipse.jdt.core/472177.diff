@@ -1,0 +1,284 @@
+commit 60d259d5b1e0ff710248aa3b7ae16581d3024e86
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sun Nov 1 21:29:52 2015 +0100
+
+    [Bug 472177] Massive increase in required memory for Java compilation
+    - experimental fix
+    
+    Change-Id: I19d5e394e2e7438df50d002f518276ffd6f5d6f6
+
+12	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+3	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompilationUnitDeclaration.java
+5	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+7	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+10	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+1	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+15	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
+7	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+index fc4bf02..1100add 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+@@ -170,6 +170,7 @@ public Expression enclosingInstance() {
+ }
+ 
+ public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean valueRequired) {
++	cleanUpInferenceContexts();
+ 	if (!valueRequired)
+ 		currentScope.problemReporter().unusedObjectAllocation(this);
+ 
+@@ -732,6 +733,17 @@ public InferenceContext18 getInferenceContext(ParameterizedMethodBinding method)
+ 		return null;
+ 	return (InferenceContext18) this.inferenceContexts.get(method);
+ }
++
++@Override
++public void cleanUpInferenceContexts() {
++	if (this.inferenceContexts == null)
++		return;
++	for (Object value : this.inferenceContexts.valueTable)
++		if (value != null)
++			((InferenceContext18) value).cleanUp();
++	this.inferenceContexts = null;
++}
++
+ //-- interface InvocationSite: --
+ public ExpressionContext getExpressionContext() {
+ 	return this.expressionContext;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompilationUnitDeclaration.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompilationUnitDeclaration.java
+index b33b395..8f9f460 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompilationUnitDeclaration.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/CompilationUnitDeclaration.java
+@@ -158,6 +158,9 @@ public void cleanUp() {
+ 	}
+ 
+ 	this.suppressWarningAnnotations = null;
++
++	if (this.scope != null)
++		this.scope.cleanUpInferenceContexts();
+ }
+ 
+ private void cleanUp(TypeDeclaration type) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+index 69f8036..a167f5d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+@@ -508,6 +508,11 @@ public class ExplicitConstructorCall extends Statement implements Invocation {
+ 		return null;
+ 	}
+ 	
++	@Override
++	public void cleanUpInferenceContexts() {
++		// Nothing to do.
++	}
++
+ 	public Expression[] arguments() {
+ 		return this.arguments;
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+index f77cd13..2f30eea 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+@@ -42,6 +42,8 @@ public interface Invocation extends InvocationSite {
+ 	 */
+ 	InferenceContext18 getInferenceContext(ParameterizedMethodBinding method);
+ 
++	void cleanUpInferenceContexts();
++
+ 	/** Record result against target type */
+ 	void registerResult(TypeBinding targetType, MethodBinding method);
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index a615681..2afe3d1 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -465,10 +465,14 @@ public class LambdaExpression extends FunctionalExpression implements IPolyExpre
+ 		if (targetType instanceof ReferenceBinding && targetType.isValidBinding()) {
+ 			ParameterizedTypeBinding withWildCards = InferenceContext18.parameterizedWithWildcard(targetType);
+ 			if (withWildCards != null) {
+-				if (!argumentTypesElided)
+-					return new InferenceContext18(blockScope).inferFunctionalInterfaceParameterization(this, blockScope, withWildCards);
+-				else
++				if (!argumentTypesElided) {
++					InferenceContext18 freshInferenceContext = new InferenceContext18(blockScope);
++					ReferenceBinding inferredType = freshInferenceContext.inferFunctionalInterfaceParameterization(this, blockScope, withWildCards);
++					freshInferenceContext.cleanUp();
++					return inferredType;
++				} else {
+ 					return findGroundTargetTypeForElidedLambda(blockScope, withWildCards);
++				}
+ 			}
+ 			return (ReferenceBinding) targetType;
+ 		}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index ba679d7..4814553 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -422,6 +422,7 @@ public void computeConversion(Scope scope, TypeBinding runtimeTimeType, TypeBind
+  * @param valueRequired boolean
+  */
+ public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean valueRequired) {
++	cleanUpInferenceContexts();
+ 	int pc = codeStream.position;
+ 	// generate receiver/enclosing instance access
+ 	MethodBinding codegenBinding = this.binding instanceof PolymorphicMethodBinding ? this.binding : this.binding.original();
+@@ -1072,6 +1073,15 @@ public InferenceContext18 getInferenceContext(ParameterizedMethodBinding method)
+ 		return null;
+ 	return (InferenceContext18) this.inferenceContexts.get(method);
+ }
++@Override
++public void cleanUpInferenceContexts() {
++	if (this.inferenceContexts == null)
++		return;
++	for (Object value : this.inferenceContexts.valueTable)
++		if (value != null)
++			((InferenceContext18) value).cleanUp();
++	this.inferenceContexts = null;
++}
+ public Expression[] arguments() {
+ 	return this.arguments;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+index 416812e..5e0b024 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+@@ -167,6 +167,7 @@ public class QualifiedAllocationExpression extends AllocationExpression {
+ 	}
+ 
+ 	public void generateCode(BlockScope currentScope, CodeStream codeStream, boolean valueRequired) {
++		cleanUpInferenceContexts();
+ 		if (!valueRequired)
+ 			currentScope.problemReporter().unusedObjectAllocation(this);
+ 		int pc = codeStream.position;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
+index da3f636..a3dfa1b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/CompilationUnitScope.java
+@@ -14,6 +14,8 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
++import java.util.ArrayList;
++
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.ast.*;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+@@ -57,6 +59,7 @@ public class CompilationUnitScope extends Scope {
+ 	private boolean skipCachingImports;
+ 
+ 	boolean connectingHierarchy;
++	private ArrayList<Invocation> inferredInvocations;
+ 
+ public CompilationUnitScope(CompilationUnitDeclaration unit, LookupEnvironment environment) {
+ 	super(COMPILATION_UNIT_SCOPE, null);
+@@ -972,4 +975,16 @@ public boolean hasDefaultNullnessFor(int location) {
+ 		return (this.fPackage.defaultNullness & location) != 0;
+ 	return false;
+ }
++public void registerInferredInvocation(Invocation invocation) {
++	if (this.inferredInvocations == null)
++		this.inferredInvocations = new ArrayList<>();
++	this.inferredInvocations.add(invocation);
++}
++public void cleanUpInferenceContexts() {
++	if (this.inferredInvocations == null)
++		return;
++	for (Invocation invocation : this.inferredInvocations)
++		invocation.cleanUpInferenceContexts();
++	this.inferredInvocations = null;
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index d3edfd9..df136de 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -211,6 +211,8 @@ public class InferenceContext18 {
+ 		this.invocationArguments = arguments;
+ 		this.currentInvocation = site;
+ 		this.outerContext = outerContext;
++		if (site instanceof Invocation)
++			scope.compilationUnitScope().registerInferredInvocation((Invocation) site);
+ 	}
+ 
+ 	public InferenceContext18(Scope scope) {
+@@ -1645,4 +1647,9 @@ public class InferenceContext18 {
+ 			}
+ 		}
+ 	}
++
++	public void cleanUp() {
++		this.b2 = null;
++		this.currentBounds = null;
++	}
+ }
+commit a036b4a3fd00fc7fc407f280733aceb58eed289d
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Tue Mar 15 18:30:54 2016 +0100
+
+    [Bug 472177] Massive increase in required memory for Java compilation
+    - polish
+    
+    Change-Id: Ie4a87db790f930a26150dc9cbaa20ceb8edd4f03
+
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+1	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+5	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+index 7960772..a7ac6a8 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+@@ -746,6 +746,8 @@ public void cleanUpInferenceContexts() {
+ 		if (value != null)
+ 			((InferenceContext18) value).cleanUp();
+ 	this.inferenceContexts = null;
++	this.outerInferenceContext = null;
++	this.solutionsPerTargetType = null;
+ }
+ 
+ //-- interface InvocationSite: --
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+index 2f30eea..89b10ee 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Invocation.java
+@@ -42,6 +42,7 @@ public interface Invocation extends InvocationSite {
+ 	 */
+ 	InferenceContext18 getInferenceContext(ParameterizedMethodBinding method);
+ 
++	/** Discard any state from type inference when compilation is done. */
+ 	void cleanUpInferenceContexts();
+ 
+ 	/** Record result against target type */
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+index 2d2908a..a8920eb 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LambdaExpression.java
+@@ -452,9 +452,11 @@ public class LambdaExpression extends FunctionalExpression implements IPolyExpre
+ 			if (withWildCards != null) {
+ 				if (!argumentTypesElided) {
+ 					InferenceContext18 freshInferenceContext = new InferenceContext18(blockScope);
+-					ReferenceBinding inferredType = freshInferenceContext.inferFunctionalInterfaceParameterization(this, blockScope, withWildCards);
+-					freshInferenceContext.cleanUp();
+-					return inferredType;
++					try {
++						return freshInferenceContext.inferFunctionalInterfaceParameterization(this, blockScope, withWildCards);
++					} finally {
++						freshInferenceContext.cleanUp();
++					}
+ 				} else {
+ 					return findGroundTargetTypeForElidedLambda(blockScope, withWildCards);
+ 				}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index 86b41d3..4c3d2bb 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -1095,6 +1095,8 @@ public void cleanUpInferenceContexts() {
+ 		if (value != null)
+ 			((InferenceContext18) value).cleanUp();
+ 	this.inferenceContexts = null;
++	this.outerInferenceContext = null;
++	this.solutionsPerTargetType = null;
+ }
+ public Expression[] arguments() {
+ 	return this.arguments;

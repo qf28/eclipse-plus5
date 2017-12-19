@@ -1,0 +1,293 @@
+commit ad064903deecf261d7df15fdde3720ba00c187a2
+Author: Pascal Rapicault <prapicau>
+Date:   Fri Oct 3 20:26:06 2008 +0000
+
+     Bug 232440 - Places where a few monitor.isCanceled checks might buy us a lot
+
+4	0	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
+9	0	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+4	2	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Slicer.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
+index f2d23bc..dcc4b2b 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
+@@ -88,6 +88,8 @@ public class Projector {
+ 				iusToEncode = iusToOrder.iterator();
+ 			}
+ 			while (iusToEncode.hasNext()) {
++				if (monitor.isCanceled())
++					throw new OperationCanceledException();
+ 				processIU((IInstallableUnit) iusToEncode.next());
+ 			}
+ 			createConstraintsForSingleton();
+@@ -622,6 +624,8 @@ public class Projector {
+ 	public IStatus invokeSolver(IProgressMonitor monitor) {
+ 		if (result.getSeverity() == IStatus.ERROR)
+ 			return result;
++		if (monitor.isCanceled())
++			return Status.CANCEL_STATUS;
+ 		IPBSolver solver = SolverFactory.newEclipseP2();
+ 		solver.setTimeoutOnConflicts(1000);
+ 		OPBEclipseReader2007 reader = new OPBEclipseReader2007(solver);
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index be2193b..8f9048c 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -193,6 +193,9 @@ public class SimplePlanner implements IPlanner {
+ 		SubMonitor sub = SubMonitor.convert(monitor, repositories.length * 200);
+ 		for (int i = 0; i < repositories.length; i++) {
+ 			try {
++				if (monitor.isCanceled())
++					throw new OperationCanceledException();
++
+ 				IMetadataRepository repository = repoMgr.loadRepository(repositories[i], sub.newChild(100));
+ 				Collector matches = repository.query(new InstallableUnitQuery(null, VersionRange.emptyRange), new Collector(), sub.newChild(100));
+ 				for (Iterator it = matches.iterator(); it.hasNext();) {
+@@ -241,6 +244,8 @@ public class SimplePlanner implements IPlanner {
+ 			Projector projector = new Projector(slice, newSelectionContext);
+ 			projector.encode(allIUs, sub.newChild(ExpandWork / 4));
+ 			IStatus s = projector.invokeSolver(sub.newChild(ExpandWork / 4));
++			if (s.getSeverity() == IStatus.CANCEL)
++				return new ProvisioningPlan(s);
+ 			if (s.getSeverity() == IStatus.ERROR) {
+ 				sub.setTaskName(Messages.Planner_NoSolution);
+ 				//log the error from the new solver so it is not lost
+@@ -268,6 +273,8 @@ public class SimplePlanner implements IPlanner {
+ 			Collection oldState = oldStateHelper.attachCUs(profile.query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+ 
+ 			return generateProvisioningPlan(s, oldState, newState, profileChangeRequest);
++		} catch (OperationCanceledException e) {
++			return new ProvisioningPlan(Status.CANCEL_STATUS);
+ 		} finally {
+ 			sub.done();
+ 		}
+@@ -381,6 +388,8 @@ public class SimplePlanner implements IPlanner {
+ 		SubMonitor sub = SubMonitor.convert(monitor, repositories.length * 200);
+ 		for (int i = 0; i < repositories.length; i++) {
+ 			try {
++				if (sub.isCanceled())
++					throw new OperationCanceledException();
+ 				IMetadataRepository repository = repoMgr.loadRepository(repositories[i], sub.newChild(100));
+ 				Collector matches = repository.query(new UpdateQuery(toUpdate), new Collector(), sub.newChild(100));
+ 				for (Iterator it = matches.iterator(); it.hasNext();) {
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Slicer.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Slicer.java
+index 617e390..4ec6a2c 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Slicer.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Slicer.java
+@@ -52,9 +52,11 @@ public class Slicer {
+ 			validateInput(ius);
+ 			considered = new HashSet(Arrays.asList(ius));
+ 			toProcess = new LinkedList(considered);
+-			while (!toProcess.isEmpty())
++			while (!toProcess.isEmpty()) {
++				if (monitor.isCanceled())
++					throw new OperationCanceledException();
+ 				processIU((IInstallableUnit) toProcess.removeFirst());
+-
++			}
+ 			if (DEBUG) {
+ 				long stop = System.currentTimeMillis();
+ 				System.out.println("Slicing complete: " + (stop - start)); //$NON-NLS-1$
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
+index 6a22b22..4f04ef7 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
+@@ -68,7 +68,7 @@ public class UpdateAction extends ProfileModificationAction {
+ 		for (int i = 0; i < ius.length; i++) {
+ 			UpdateEvent event = new UpdateEvent(targetProfileId, new IInstallableUnit[] {ius[i]});
+ 			ElementQueryDescriptor descriptor = getQueryProvider().getQueryDescriptor(event, IQueryProvider.AVAILABLE_UPDATES);
+-			Iterator iter = descriptor.queryable.query(descriptor.query, descriptor.collector, null).iterator();
++			Iterator iter = descriptor.queryable.query(descriptor.query, descriptor.collector, monitor).iterator();
+ 			if (iter.hasNext())
+ 				toBeUpdated.add(ius[i]);
+ 			ArrayList currentReplacements = new ArrayList();
+commit acd4e57a5a0b96d8b092a38440bf4dd03d86a7bb
+Author: Pascal Rapicault <prapicau>
+Date:   Fri Oct 3 20:31:39 2008 +0000
+
+     Bug 232440 - Places where a few monitor.isCanceled checks might buy us a lot
+
+2	0	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+index fed3fef..20355f7 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+@@ -130,6 +130,8 @@ public class MetadataRepositoryManager extends AbstractRepositoryManager impleme
+ 		SubMonitor sub = SubMonitor.convert(monitor, locations.length * 10);
+ 		for (int i = 0; i < locations.length; i++) {
+ 			try {
++				if (monitor.isCanceled())
++					throw new OperationCanceledException();
+ 				loadRepository(locations[i], sub.newChild(9)).query(query, collector, sub.newChild(1));
+ 			} catch (ProvisionException e) {
+ 				//ignore this repository for this query
+commit 4690375e97d84e918189431ef990d5ffc856ac1b
+Author: DJ Houghton <dj>
+Date:   Fri Oct 3 20:53:01 2008 +0000
+
+    Bug 232440 - Places where a few monitor.isCanceled checks might buy us a lot
+
+1	1	bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+1	1	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+1	1	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+diff --git a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+index 8d673ae..b814b3e 100644
+--- a/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
++++ b/bundles/org.eclipse.equinox.p2.console/src/org/eclipse/equinox/internal/p2/console/ProvisioningHelper.java
+@@ -164,7 +164,7 @@ public class ProvisioningHelper {
+ 		} else {
+ 			queryable = getMetadataRepository(location);
+ 		}
+-		return queryable.query(query, collector, null);
++		return queryable.query(query, collector, monitor);
+ 	}
+ 
+ 	public static URL[] getMetadataRepositories() {
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index 8f9048c..1817592 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -238,7 +238,7 @@ public class SimplePlanner implements IPlanner {
+ 			IInstallableUnit[] availableIUs = gatherAvailableInstallableUnits((IInstallableUnit[]) extraIUs.toArray(new IInstallableUnit[extraIUs.size()]), metadataRepositories, context, sub.newChild(ExpandWork / 4));
+ 
+ 			Slicer slicer = new Slicer(allIUs, availableIUs, newSelectionContext);
+-			IQueryable slice = slicer.slice(allIUs, monitor);
++			IQueryable slice = slicer.slice(allIUs, sub.newChild(ExpandWork / 4));
+ 			if (slice == null)
+ 				return new ProvisioningPlan(slicer.getStatus());
+ 			Projector projector = new Projector(slice, newSelectionContext);
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+index 20355f7..ad3deac 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryManager.java
+@@ -130,7 +130,7 @@ public class MetadataRepositoryManager extends AbstractRepositoryManager impleme
+ 		SubMonitor sub = SubMonitor.convert(monitor, locations.length * 10);
+ 		for (int i = 0; i < locations.length; i++) {
+ 			try {
+-				if (monitor.isCanceled())
++				if (sub.isCanceled())
+ 					throw new OperationCanceledException();
+ 				loadRepository(locations[i], sub.newChild(9)).query(query, collector, sub.newChild(1));
+ 			} catch (ProvisionException e) {
+commit d466d21aea759ac98ac85280400abce3699c5a58
+Author: Pascal Rapicault <prapicau>
+Date:   Sat Oct 4 01:45:36 2008 +0000
+
+     Bug 232440 - Places where a few monitor.isCanceled checks might buy us a lot
+
+5	3	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
+1	1	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+3	1	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Slicer.java
+9	6	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/query/QueryableProfileRegistry.java
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
+index dcc4b2b..97f963b 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Projector.java
+@@ -88,8 +88,10 @@ public class Projector {
+ 				iusToEncode = iusToOrder.iterator();
+ 			}
+ 			while (iusToEncode.hasNext()) {
+-				if (monitor.isCanceled())
++				if (monitor.isCanceled()) {
++					result.merge(Status.CANCEL_STATUS);
+ 					throw new OperationCanceledException();
++				}
+ 				processIU((IInstallableUnit) iusToEncode.next());
+ 			}
+ 			createConstraintsForSingleton();
+@@ -624,8 +626,6 @@ public class Projector {
+ 	public IStatus invokeSolver(IProgressMonitor monitor) {
+ 		if (result.getSeverity() == IStatus.ERROR)
+ 			return result;
+-		if (monitor.isCanceled())
+-			return Status.CANCEL_STATUS;
+ 		IPBSolver solver = SolverFactory.newEclipseP2();
+ 		solver.setTimeoutOnConflicts(1000);
+ 		OPBEclipseReader2007 reader = new OPBEclipseReader2007(solver);
+@@ -635,6 +635,8 @@ public class Projector {
+ 			System.out.println("Invoking solver: " + start); //$NON-NLS-1$
+ 		FileReader fr = null;
+ 		try {
++			if (monitor.isCanceled())
++				return Status.CANCEL_STATUS;
+ 			fr = new FileReader(problemFile);
+ 			IProblem problem = reader.parseInstance(fr);
+ 			if (problem.isSatisfiable()) {
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index 1817592..4f05b17 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -193,7 +193,7 @@ public class SimplePlanner implements IPlanner {
+ 		SubMonitor sub = SubMonitor.convert(monitor, repositories.length * 200);
+ 		for (int i = 0; i < repositories.length; i++) {
+ 			try {
+-				if (monitor.isCanceled())
++				if (sub.isCanceled())
+ 					throw new OperationCanceledException();
+ 
+ 				IMetadataRepository repository = repoMgr.loadRepository(repositories[i], sub.newChild(100));
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Slicer.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Slicer.java
+index 4ec6a2c..d4b6069 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Slicer.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/Slicer.java
+@@ -53,8 +53,10 @@ public class Slicer {
+ 			considered = new HashSet(Arrays.asList(ius));
+ 			toProcess = new LinkedList(considered);
+ 			while (!toProcess.isEmpty()) {
+-				if (monitor.isCanceled())
++				if (monitor.isCanceled()) {
++					result.merge(Status.CANCEL_STATUS);
+ 					throw new OperationCanceledException();
++				}
+ 				processIU((IInstallableUnit) toProcess.removeFirst());
+ 			}
+ 			if (DEBUG) {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/query/QueryableProfileRegistry.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/query/QueryableProfileRegistry.java
+index 837dee7..031b758 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/query/QueryableProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/query/QueryableProfileRegistry.java
+@@ -34,13 +34,16 @@ public class QueryableProfileRegistry implements IQueryable {
+ 		IProfile[] profiles = profileRegistry.getProfiles();
+ 		if (monitor == null)
+ 			monitor = new NullProgressMonitor();
+-		monitor.beginTask(ProvUIMessages.QueryableProfileRegistry_QueryProfileProgress, profiles.length);
+-		for (int i = 0; i < profiles.length; i++) {
+-			if (query.isMatch(profiles[i]))
+-				result.accept(profiles[i]);
+-			monitor.worked(1);
++		SubMonitor sub = SubMonitor.convert(monitor, ProvUIMessages.QueryableProfileRegistry_QueryProfileProgress, profiles.length);
++		try {
++			for (int i = 0; i < profiles.length; i++) {
++				if (query.isMatch(profiles[i]))
++					result.accept(profiles[i]);
++				sub.worked(1);
++			}
++		} finally {
++			sub.done();
+ 		}
+-		monitor.done();
+ 		return result;
+ 	}
+ }
+commit 6ee312fded370ee1db83d225be64c940dd577ce0
+Author: Susan Franklin <sfranklin>
+Date:   Mon Oct 13 21:47:54 2008 +0000
+
+    Bug 232440 - Places where a few monitor.isCanceled checks might buy us a lot
+
+2	1	bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
+diff --git a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
+index c3e1509..9c6080d 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
++++ b/bundles/org.eclipse.equinox.p2.metadata.repository/src/org/eclipse/equinox/internal/p2/metadata/repository/MetadataRepositoryIO.java
+@@ -195,7 +195,8 @@ public class MetadataRepositoryIO {
+ 					theRepository = repositoryHandler.getRepository();
+ 				}
+ 			} catch (SAXException e) {
+-				throw new IOException(e.getMessage());
++				if (!(e.getException() instanceof OperationCanceledException))
++					throw new IOException(e.getMessage());
+ 			} catch (ParserConfigurationException e) {
+ 				throw new IOException(e.getMessage());
+ 			} finally {

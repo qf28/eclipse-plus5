@@ -1,0 +1,713 @@
+commit f64be77fe6902710ca12f44bc62b60be6f36dd1b
+Author: John Arthorne <johna>
+Date:   Mon Feb 8 21:48:46 2010 +0000
+
+    Added workaround and todo for abug 300450
+
+9	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
+index 538a131..3366d25 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
+@@ -48,7 +48,15 @@ public class ProfilePreferences extends EclipsePreferences {
+ 			try {
+ 				doSave(agent);
+ 			} catch (BackingStoreException e) {
+-				LogHelper.log(new Status(IStatus.WARNING, EngineActivator.ID, "Exception saving profile preferences", e)); //$NON-NLS-1$
++				//TODO: This happens because the agent goes away before the engine bundle
++				//See bug 300450 for details
++				if (Tracing.DEBUG_PROFILE_PREFERENCES)
++					LogHelper.log(new Status(IStatus.WARNING, EngineActivator.ID, "Exception saving profile preferences", e)); //$NON-NLS-1$
++			} catch (RuntimeException e) {
++				//TODO: This happens because the agent goes away before the engine bundle
++				//See bug 300450 for details
++				if (Tracing.DEBUG_PROFILE_PREFERENCES)
++					LogHelper.log(new Status(IStatus.WARNING, EngineActivator.ID, "Exception saving profile preferences", e)); //$NON-NLS-1$
+ 			}
+ 			return Status.OK_STATUS;
+ 		}
+commit eeffd866d4fef7269d57d354e78a7d8ef58510e5
+Author: John Arthorne <johna>
+Date:   Tue Feb 9 18:37:41 2010 +0000
+
+    Bug 300450 -  Agent service lifecycle problems
+
+34	4	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/Activator.java
+16	5	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningAgent.java
+16	1	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningEventBus.java
+38	0	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/p2/core/spi/IAgentService.java
+2	6	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
+22	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+2	44	bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
+1	1	bundles/org.eclipse.equinox.p2.tests/All p2 Tests.launch
+1	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/ArtifactRepositoryManagerTest.java
+5	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/LocalMetadataRepositoryTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/Activator.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/Activator.java
+index bb304a5..eb48318 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/Activator.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- *  Copyright (c) 2007, 2009 IBM Corporation and others.
++ *  Copyright (c) 2007, 2010 IBM Corporation and others.
+  *  All rights reserved. This program and the accompanying materials
+  *  are made available under the terms of the Eclipse Public License v1.0
+  *  which accompanies this distribution, and is available at
+@@ -14,9 +14,9 @@ import java.io.File;
+ import java.net.*;
+ import java.util.Dictionary;
+ import java.util.Hashtable;
+-import org.eclipse.core.runtime.Path;
+-import org.eclipse.core.runtime.URIUtil;
+-import org.eclipse.equinox.p2.core.IAgentLocation;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
++import org.eclipse.equinox.p2.core.*;
+ import org.eclipse.osgi.framework.log.FrameworkLog;
+ import org.osgi.framework.*;
+ import org.osgi.util.tracker.ServiceTracker;
+@@ -44,7 +44,9 @@ public class Activator implements BundleActivator {
+ 	private static final String VAR_USER_DIR = "@user.dir"; //$NON-NLS-1$
+ 	private static final String VAR_USER_HOME = "@user.home"; //$NON-NLS-1$
+ 
++	private IProvisioningAgent agent;
+ 	private ServiceRegistration agentLocationRegistration = null;
++
+ 	ServiceTracker logTracker;
+ 
+ 	/**
+@@ -156,6 +158,25 @@ public class Activator implements BundleActivator {
+ 		return logTracker;
+ 	}
+ 
++	/**
++	 * Register the agent instance representing the currently running system.
++	 * This will be the "default" agent for anyone not specifically trying to manipulate
++	 * a different p2 agent location
++	 */
++	private void registerAgent() {
++		//no need to register an agent if there is no agent location
++		if (agentDataLocation == null)
++			return;
++		ServiceReference agentProviderRef = context.getServiceReference(IProvisioningAgentProvider.SERVICE_NAME);
++		IProvisioningAgentProvider provider = (IProvisioningAgentProvider) context.getService(agentProviderRef);
++		try {
++			agent = provider.createAgent(null);
++		} catch (Exception e) {
++			final String msg = "Unable to instantiate p2 agent at location " + agentDataLocation.getRootLocation(); //$NON-NLS-1$
++			LogHelper.log(new Status(IStatus.ERROR, ID, msg, e));
++		}
++	}
++
+ 	public void start(BundleContext aContext) throws Exception {
+ 		instance = this;
+ 		Activator.context = aContext;
+@@ -166,9 +187,11 @@ public class Activator implements BundleActivator {
+ 			locationProperties.put("type", PROP_AGENT_DATA_AREA); //$NON-NLS-1$
+ 			agentLocationRegistration = aContext.registerService(IAgentLocation.SERVICE_NAME, agentDataLocation, locationProperties);
+ 		}
++		registerAgent();
+ 	}
+ 
+ 	public void stop(BundleContext aContext) throws Exception {
++		unregisterAgent();
+ 		instance = null;
+ 		agentDataLocation = null;
+ 		if (agentLocationRegistration != null)
+@@ -179,4 +202,11 @@ public class Activator implements BundleActivator {
+ 		}
+ 		Activator.context = null;
+ 	}
++
++	private void unregisterAgent() {
++		if (agent != null) {
++			agent.stop();
++			agent = null;
++		}
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningAgent.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningAgent.java
+index c0fd265..9dadaf1 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningAgent.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningAgent.java
+@@ -14,6 +14,7 @@ import java.net.URI;
+ import java.util.*;
+ import org.eclipse.equinox.p2.core.IAgentLocation;
+ import org.eclipse.equinox.p2.core.IProvisioningAgent;
++import org.eclipse.equinox.p2.core.spi.IAgentService;
+ import org.eclipse.equinox.p2.core.spi.IAgentServiceFactory;
+ import org.osgi.framework.*;
+ 
+@@ -61,18 +62,20 @@ public class ProvisioningAgent implements IProvisioningAgent {
+ 			context.ungetService(refs[0]);
+ 		}
+ 		if (service != null)
+-			agentServices.put(serviceName, service);
++			registerService(serviceName, service);
+ 		return service;
+ 	}
+ 
+ 	private synchronized void checkRunning() {
+ 		if (stopped)
+-			throw new RuntimeException("Attempt to access stopped agent: " + this);
++			throw new RuntimeException("Attempt to access stopped agent: " + this); //$NON-NLS-1$
+ 	}
+ 
+ 	public void registerService(String serviceName, Object service) {
+ 		checkRunning();
+ 		agentServices.put(serviceName, service);
++		if (service instanceof IAgentService)
++			((IAgentService) service).start();
+ 	}
+ 
+ 	public void setBundleContext(BundleContext context) {
+@@ -91,7 +94,7 @@ public class ProvisioningAgent implements IProvisioningAgent {
+ 		} else {
+ 			agentLocation = new AgentLocation(location);
+ 		}
+-		agentServices.put(IAgentLocation.SERVICE_NAME, agentLocation);
++		registerService(IAgentLocation.SERVICE_NAME, agentLocation);
+ 	}
+ 
+ 	public void unregisterService(String serviceName, Object service) {
+@@ -102,11 +105,19 @@ public class ProvisioningAgent implements IProvisioningAgent {
+ 		synchronized (agentServices) {
+ 			if (agentServices.get(serviceName) == service)
+ 				agentServices.remove(serviceName);
++			if (service instanceof IAgentService)
++				((IAgentService) service).stop();
+ 		}
+ 	}
+ 
+-	public synchronized void stop() {
+-		stopped = true;
++	public void stop() {
++		for (Object service : agentServices.values()) {
++			if (service instanceof IAgentService)
++				((IAgentService) service).stop();
++		}
++		synchronized (this) {
++			stopped = true;
++		}
+ 		if (reg != null) {
+ 			reg.unregister();
+ 			reg = null;
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningEventBus.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningEventBus.java
+index 2bb8df9..eff6881 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningEventBus.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningEventBus.java
+@@ -15,12 +15,13 @@ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.Status;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.*;
++import org.eclipse.equinox.p2.core.spi.IAgentService;
+ import org.eclipse.osgi.framework.eventmgr.*;
+ 
+ /**
+  * Default implementation of the {@link IProvisioningEventBus} service.
+  */
+-public class ProvisioningEventBus implements EventDispatcher, IProvisioningEventBus {
++public class ProvisioningEventBus implements EventDispatcher, IProvisioningEventBus, IAgentService {
+ 	private final CopyOnWriteIdentityMap syncListeners = new CopyOnWriteIdentityMap();
+ 	private final CopyOnWriteIdentityMap asyncListeners = new CopyOnWriteIdentityMap();
+ 	private EventManager eventManager = new EventManager("Provisioning Event Dispatcher"); //$NON-NLS-1$
+@@ -137,4 +138,18 @@ public class ProvisioningEventBus implements EventDispatcher, IProvisioningEvent
+ 		if (interrupted)
+ 			Thread.currentThread().interrupt();
+ 	}
++
++	/*(non-Javadoc)
++	 * @see org.eclipse.equinox.p2.core.spi.IAgentService#start()
++	 */
++	public void start() {
++		//nothing to do
++	}
++
++	/*(non-Javadoc)
++	 * @see org.eclipse.equinox.p2.core.spi.IAgentService#stop()
++	 */
++	public void stop() {
++		close();
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/p2/core/spi/IAgentService.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/p2/core/spi/IAgentService.java
+new file mode 100644
+index 0000000..c8a69af
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/p2/core/spi/IAgentService.java
+@@ -0,0 +1,38 @@
++/*******************************************************************************
++ * Copyright (c) 2010 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.p2.core.spi;
++
++import org.eclipse.equinox.p2.core.IProvisioningAgent;
++
++/**
++ * Services created by {@link IAgentServiceFactory} objects can optionally implement
++ * this interface to participate in the agent lifecycle.
++ * @since 2.0
++ */
++public interface IAgentService {
++	/**
++	 * This method is invoked when a service is added to an agent. This can occur
++	 * either because a client looked up the service and it was lazily instantiated by
++	 * the agent, or because the service was registered manually via {@link IProvisioningAgent#registerService(String, Object)}.
++	 */
++	public void start();
++
++	/**
++	 * This method is invoked when a service is removed from an agent. This can occur
++	 * either because the agent was stopped, or because the service was manually
++	 * unregistered via {@link IProvisioningAgent#unregisterService(String, Object)}.
++	 * <p>
++	 * Services must not attempt to obtain further services from their agent while
++	 * stopping, as some required services may no longer be available.
++	 */
++	public void stop();
++
++}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
+index 3366d25..a148a61 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/ProfilePreferences.java
+@@ -48,15 +48,11 @@ public class ProfilePreferences extends EclipsePreferences {
+ 			try {
+ 				doSave(agent);
+ 			} catch (BackingStoreException e) {
+-				//TODO: This happens because the agent goes away before the engine bundle
+-				//See bug 300450 for details
+-				if (Tracing.DEBUG_PROFILE_PREFERENCES)
+-					LogHelper.log(new Status(IStatus.WARNING, EngineActivator.ID, "Exception saving profile preferences", e)); //$NON-NLS-1$
++				LogHelper.log(new Status(IStatus.WARNING, EngineActivator.ID, "Exception saving profile preferences", e)); //$NON-NLS-1$
+ 			} catch (RuntimeException e) {
+ 				//TODO: This happens because the agent goes away before the engine bundle
+ 				//See bug 300450 for details
+-				if (Tracing.DEBUG_PROFILE_PREFERENCES)
+-					LogHelper.log(new Status(IStatus.WARNING, EngineActivator.ID, "Exception saving profile preferences", e)); //$NON-NLS-1$
++				LogHelper.log(new Status(IStatus.WARNING, EngineActivator.ID, "Exception saving profile preferences", e)); //$NON-NLS-1$
+ 			}
+ 			return Status.OK_STATUS;
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index 2087e36..5eaffcc 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -17,10 +17,12 @@ import java.util.zip.GZIPInputStream;
+ import java.util.zip.GZIPOutputStream;
+ import javax.xml.parsers.ParserConfigurationException;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.jobs.Job;
+ import org.eclipse.equinox.internal.p2.core.helpers.*;
+ import org.eclipse.equinox.internal.p2.metadata.TranslationSupport;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+ import org.eclipse.equinox.p2.core.*;
++import org.eclipse.equinox.p2.core.spi.IAgentService;
+ import org.eclipse.equinox.p2.engine.*;
+ import org.eclipse.equinox.p2.metadata.*;
+ import org.eclipse.equinox.p2.metadata.query.InstallableUnitQuery;
+@@ -32,7 +34,7 @@ import org.osgi.framework.ServiceReference;
+ import org.xml.sax.InputSource;
+ import org.xml.sax.SAXException;
+ 
+-public class SimpleProfileRegistry implements IProfileRegistry {
++public class SimpleProfileRegistry implements IProfileRegistry, IAgentService {
+ 
+ 	private static final String PROFILE_REGISTRY = "profile registry"; //$NON-NLS-1$
+ 
+@@ -832,4 +834,23 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 			throw new IllegalStateException("Could not create profile data area " + profileDataArea.getAbsolutePath() + "for: " + id); //$NON-NLS-1$ //$NON-NLS-2$
+ 		return profileDataArea;
+ 	}
++
++	/*(non-Javadoc)
++	 * @see org.eclipse.equinox.p2.core.spi.IAgentService#start()
++	 */
++	public void start() {
++		//nothing to do
++	}
++
++	/*(non-Javadoc)
++	 * @see org.eclipse.equinox.p2.core.spi.IAgentService#stop()
++	 */
++	public void stop() {
++		try {
++			//ensure there are no more profile preference save jobs running
++			Job.getJobManager().join(ProfilePreferences.PROFILE_SAVE_JOB_FAMILY, null);
++		} catch (InterruptedException e) {
++			//ignore
++		}
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java b/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
+index 52a3f87..a382de4 100644
+--- a/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.exemplarysetup/src/org/eclipse/equinox/internal/p2/exemplarysetup/Activator.java
+@@ -11,51 +11,17 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.exemplarysetup;
+ 
+-import org.eclipse.core.runtime.IStatus;
+-import org.eclipse.core.runtime.Status;
+-import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.garbagecollector.GarbageCollector;
+-import org.eclipse.equinox.p2.core.*;
+-import org.osgi.framework.*;
++import org.osgi.framework.BundleActivator;
++import org.osgi.framework.BundleContext;
+ 
+ public class Activator implements BundleActivator {
+ 	public static BundleContext context;
+ 	public static final String ID = "org.eclipse.equinox.p2.exemplarysetup"; //$NON-NLS-1$
+ 
+-	private IProvisioningAgent agent;
+-
+-	/**
+-	 * Register the agent instance representing the currently running system.
+-	 * This will be the "default" agent for anyone not specifically trying to manipulate
+-	 * a different p2 agent location
+-	 */
+-	private void registerAgent() {
+-		//currently location is defined by p2.core but will be defined by the agent in the future
+-		//for now continue to treat it as a singleton
+-		ServiceReference locationRef = context.getServiceReference(IAgentLocation.SERVICE_NAME);
+-		if (locationRef == null)
+-			throw new RuntimeException("Unable to instantiate p2 agent because agent location is not available"); //$NON-NLS-1$
+-		IAgentLocation location = (IAgentLocation) context.getService(locationRef);
+-		if (location == null)
+-			throw new RuntimeException("Unable to instantiate p2 agent because agent location is not available"); //$NON-NLS-1$
+-
+-		ServiceReference agentProviderRef = context.getServiceReference(IProvisioningAgentProvider.SERVICE_NAME);
+-		IProvisioningAgentProvider provider = (IProvisioningAgentProvider) context.getService(agentProviderRef);
+-		try {
+-			agent = provider.createAgent(null);
+-		} catch (Exception e) {
+-			//we can't proceed without an agent, so fail early
+-			final String msg = "Unable to instantiate p2 agent at location " + location.getRootLocation(); //$NON-NLS-1$
+-			LogHelper.log(new Status(IStatus.ERROR, ID, msg, e));
+-			throw new RuntimeException(msg);
+-		}
+-
+-	}
+-
+ 	public void start(BundleContext aContext) throws Exception {
+ 		//Need to do the configuration of all the bits and pieces:
+ 		Activator.context = aContext;
+-		registerAgent();
+ 
+ 		startGarbageCollector();
+ 
+@@ -68,15 +34,7 @@ public class Activator implements BundleActivator {
+ 	}
+ 
+ 	public void stop(BundleContext aContext) throws Exception {
+-		unregisterAgent();
+ 		Activator.context = null;
+ 	}
+ 
+-	private void unregisterAgent() {
+-		if (agent != null) {
+-			agent.stop();
+-			agent = null;
+-		}
+-	}
+-
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.tests/All p2 Tests.launch b/bundles/org.eclipse.equinox.p2.tests/All p2 Tests.launch
+index 154e5c4..3cd7574 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/All p2 Tests.launch	
++++ b/bundles/org.eclipse.equinox.p2.tests/All p2 Tests.launch	
+@@ -57,7 +57,7 @@
+ <stringAttribute key="org.eclipse.jdt.launching.PROGRAM_ARGUMENTS" value="-os ${target.os} -ws ${target.ws} -arch ${target.arch} -nl ${target.nl} -consolelog -console"/>
+ <stringAttribute key="org.eclipse.jdt.launching.PROJECT_ATTR" value="org.eclipse.equinox.p2.tests"/>
+ <stringAttribute key="org.eclipse.jdt.launching.SOURCE_PATH_PROVIDER" value="org.eclipse.pde.ui.workbenchClasspathProvider"/>
+-<stringAttribute key="org.eclipse.jdt.launching.VM_ARGUMENTS" value="-Dorg.eclipse.equinox.p2.reconciler.tests.platform.archive=/home/thhal/Download/eclipse-platform-N20091109-2000-linux-gtk-x86_64.tar.gz&#13;&#10;-Dorg.eclipse.equinox.p2.reconciler.tests.35.platform.archive=/home/thhal/Download/eclipse-platform-3.5.1-linux-gtk-x86_64.tar.gz&#13;&#10;-Dorg.eclipse.equinox.p2.repository&#13;&#10;-Dorg.eclipse.equinox.p2.tests.current.build.repo=http://eclipsebuildserv/3.6-I-builds/&#13;&#13;&#10;-Xmx512m"/>
++<stringAttribute key="org.eclipse.jdt.launching.VM_ARGUMENTS" value="-Dorg.eclipse.equinox.p2.reconciler.tests.platform.archive=c:/builds/eclipse-platform-I20090811-0800-win32.zip&#13;&#10;-Dorg.eclipse.equinox.p2.reconciler.tests.35.platform.archive=c:/builds/eclipse-platform-3.5-win32.zip&#13;&#10;-Dorg.eclipse.equinox.p2.repository&#13;&#10;-Dorg.eclipse.equinox.p2.tests.current.build.repo=http://eclipsebuildserv/3.6-I-builds/&#13;&#13;&#10;-Xmx512m"/>
+ <stringAttribute key="pde.version" value="3.3"/>
+ <stringAttribute key="product" value="org.eclipse.sdk.ide"/>
+ <booleanAttribute key="run_in_ui_thread" value="true"/>
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/ArtifactRepositoryManagerTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/ArtifactRepositoryManagerTest.java
+index 52ebf67..5b8835b 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/ArtifactRepositoryManagerTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/artifact/repository/ArtifactRepositoryManagerTest.java
+@@ -116,7 +116,7 @@ public class ArtifactRepositoryManagerTest extends AbstractProvisioningTest {
+ 		IPreferencesService prefService = (IPreferencesService) ServiceHelper.getService(TestActivator.getContext(), IPreferencesService.class.getName());
+ 		IAgentLocation agentLocation = (IAgentLocation) getAgent().getService(IAgentLocation.SERVICE_NAME);
+ 		String locationString = EncodingUtils.encodeSlashes(agentLocation.getRootLocation().toString());
+-		Preferences prefs = prefService.getRootNode().node("/profile/" + locationString + "_SELF_/" + REPO_BUNDLE + "/repositories"); //$NON-NLS-1$ //$NON-NLS-2$
++		Preferences prefs = prefService.getRootNode().node("/profile/" + locationString + "/_SELF_/" + REPO_BUNDLE + "/repositories"); //$NON-NLS-1$ //$NON-NLS-2$
+ 		try {
+ 			String[] children = prefs.childrenNames();
+ 			for (int i = 0; i < children.length; i++)
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/LocalMetadataRepositoryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/LocalMetadataRepositoryTest.java
+index c87edf3..562fd31 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/LocalMetadataRepositoryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/metadata/repository/LocalMetadataRepositoryTest.java
+@@ -11,6 +11,8 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.metadata.repository;
+ 
++import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
++
+ import org.eclipse.equinox.p2.metadata.Version;
+ 
+ import java.io.File;
+@@ -206,7 +208,8 @@ public class LocalMetadataRepositoryTest extends AbstractProvisioningTest {
+ 				callCount[0]++;
+ 			}
+ 		};
+-		getEventBus().addListener(listener);
++		final IProvisioningEventBus eventBus = getEventBus();
++		eventBus.addListener(listener);
+ 		try {
+ 			//now remove and reload the repository
+ 			manager.removeRepository(repoURI);
+@@ -215,7 +218,7 @@ public class LocalMetadataRepositoryTest extends AbstractProvisioningTest {
+ 			assertTrue("1.1", wasEnabled[0]);
+ 			assertEquals("1.2", 1, callCount[0]);
+ 		} finally {
+-			getEventBus().removeListener(listener);
++			eventBus.removeListener(listener);
+ 		}
+ 	}
+ 
+commit 6cec9ab88bc5d6e0655d5158ba45f69172306f12
+Author: John Arthorne <johna>
+Date:   Thu Feb 11 20:45:07 2010 +0000
+
+    Bug 300450 -  Agent service lifecycle problems
+
+61	9	bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningAgent.java
+0	19	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Activator.java
+14	5	bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
+diff --git a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningAgent.java b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningAgent.java
+index 9dadaf1..bd98c85 100644
+--- a/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningAgent.java
++++ b/bundles/org.eclipse.equinox.p2.core/src/org/eclipse/equinox/internal/p2/core/ProvisioningAgent.java
+@@ -17,16 +17,19 @@ import org.eclipse.equinox.p2.core.IProvisioningAgent;
+ import org.eclipse.equinox.p2.core.spi.IAgentService;
+ import org.eclipse.equinox.p2.core.spi.IAgentServiceFactory;
+ import org.osgi.framework.*;
++import org.osgi.util.tracker.ServiceTracker;
++import org.osgi.util.tracker.ServiceTrackerCustomizer;
+ 
+ /**
+  * Represents a p2 agent instance.
+  */
+-public class ProvisioningAgent implements IProvisioningAgent {
++public class ProvisioningAgent implements IProvisioningAgent, ServiceTrackerCustomizer {
+ 
+ 	private final Map<String, Object> agentServices = Collections.synchronizedMap(new HashMap<String, Object>());
+ 	private BundleContext context;
+ 	private boolean stopped = false;
+ 	private ServiceRegistration reg;
++	private final Map<ServiceReference, ServiceTracker> trackers = Collections.synchronizedMap(new HashMap<ServiceReference, ServiceTracker>());
+ 
+ 	/**
+ 	 * Instantiates a provisioning agent.
+@@ -53,16 +56,21 @@ public class ProvisioningAgent implements IProvisioningAgent {
+ 		}
+ 		if (refs == null || refs.length == 0)
+ 			return null;
+-		IAgentServiceFactory factory = (IAgentServiceFactory) context.getService(refs[0]);
+-		if (factory == null)
++		//track the factory so that we can automatically remove the service when the factory goes away
++		ServiceTracker tracker = new ServiceTracker(context, refs[0], this);
++		tracker.open();
++		IAgentServiceFactory factory = (IAgentServiceFactory) tracker.getService();
++		if (factory == null) {
++			tracker.close();
+ 			return null;
+-		try {
+-			service = factory.createService(this);
+-		} finally {
+-			context.ungetService(refs[0]);
+ 		}
+-		if (service != null)
+-			registerService(serviceName, service);
++		service = factory.createService(this);
++		if (service == null) {
++			tracker.close();
++			return null;
++		}
++		registerService(serviceName, service);
++		trackers.put(refs[0], tracker);
+ 		return service;
+ 	}
+ 
+@@ -111,6 +119,7 @@ public class ProvisioningAgent implements IProvisioningAgent {
+ 	}
+ 
+ 	public void stop() {
++		//give services a chance to do their own shutdown
+ 		for (Object service : agentServices.values()) {
+ 			if (service instanceof IAgentService)
+ 				((IAgentService) service).stop();
+@@ -118,6 +127,12 @@ public class ProvisioningAgent implements IProvisioningAgent {
+ 		synchronized (this) {
+ 			stopped = true;
+ 		}
++		//close all service trackers
++		synchronized (trackers) {
++			for (ServiceTracker t : trackers.values())
++				t.close();
++			trackers.clear();
++		}
+ 		if (reg != null) {
+ 			reg.unregister();
+ 			reg = null;
+@@ -127,4 +142,41 @@ public class ProvisioningAgent implements IProvisioningAgent {
+ 	public void setServiceRegistration(ServiceRegistration reg) {
+ 		this.reg = reg;
+ 	}
++
++	/*(non-Javadoc)
++	 * @see org.osgi.util.tracker.ServiceTrackerCustomizer#addingService(org.osgi.framework.ServiceReference)
++	 */
++	public Object addingService(ServiceReference reference) {
++		if (stopped)
++			return null;
++		return context.getService(reference);
++	}
++
++	/*(non-Javadoc)
++	 * @see org.osgi.util.tracker.ServiceTrackerCustomizer#modifiedService(org.osgi.framework.ServiceReference, java.lang.Object)
++	 */
++	public void modifiedService(ServiceReference reference, Object service) {
++		//nothing to do
++	}
++
++	/*(non-Javadoc)
++	 * @see org.osgi.util.tracker.ServiceTrackerCustomizer#removedService(org.osgi.framework.ServiceReference, java.lang.Object)
++	 */
++	public void removedService(ServiceReference reference, Object factoryService) {
++		if (stopped)
++			return;
++		String serviceName = (String) reference.getProperty(IAgentServiceFactory.PROP_CREATED_SERVICE_NAME);
++		if (serviceName == null)
++			return;
++		Object registered = agentServices.get(serviceName);
++		if (registered == null)
++			return;
++		if (FrameworkUtil.getBundle(registered.getClass()) == FrameworkUtil.getBundle(factoryService.getClass())) {
++			//the service we are holding is going away
++			unregisterService(serviceName, registered);
++			ServiceTracker toRemove = trackers.remove(reference);
++			if (toRemove != null)
++				toRemove.close();
++		}
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Activator.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Activator.java
+index a9d3cf0..695e287 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Activator.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/Activator.java
+@@ -12,12 +12,9 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.internal.p2.repository;
+ 
+-import java.util.ArrayList;
+-import java.util.List;
+ import org.eclipse.ecf.filetransfer.service.IRetrieveFileTransferFactory;
+ import org.eclipse.ecf.provider.filetransfer.IFileTransferProtocolToFactoryMapper;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+-import org.eclipse.equinox.internal.p2.repository.helpers.AbstractRepositoryManager;
+ import org.osgi.framework.*;
+ import org.osgi.service.packageadmin.PackageAdmin;
+ import org.osgi.util.tracker.ServiceTracker;
+@@ -42,17 +39,6 @@ public class Activator implements BundleActivator {
+ 
+ 	// The shared instance
+ 	private static Activator plugin;
+-	/**
+-	 * Remember a repository manager so we can shut it down when the bundle stops
+-	 */
+-	private static final List<AbstractRepositoryManager<? extends Object>> createdManagers = new ArrayList<AbstractRepositoryManager<? extends Object>>();
+-
+-	public static void addManager(AbstractRepositoryManager<? extends Object> manager) {
+-		synchronized (createdManagers) {
+-			if (createdManagers.indexOf(manager) < 0)
+-				createdManagers.add(manager);
+-		}
+-	}
+ 
+ 	public void start(BundleContext aContext) throws Exception {
+ 		Activator.context = aContext;
+@@ -60,11 +46,6 @@ public class Activator implements BundleActivator {
+ 	}
+ 
+ 	public void stop(BundleContext aContext) throws Exception {
+-		synchronized (createdManagers) {
+-			for (AbstractRepositoryManager<? extends Object> manager : createdManagers)
+-				manager.shutdown();
+-			createdManagers.clear();
+-		}
+ 		Activator.context = null;
+ 		Activator.plugin = null;
+ 		if (retrievalFactoryTracker != null) {
+diff --git a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
+index dbcdfe6..ff6475d 100644
+--- a/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
++++ b/bundles/org.eclipse.equinox.p2.repository/src/org/eclipse/equinox/internal/p2/repository/helpers/AbstractRepositoryManager.java
+@@ -22,6 +22,7 @@ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEv
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.ProvisioningListener;
+ import org.eclipse.equinox.internal.provisional.p2.repository.RepositoryEvent;
+ import org.eclipse.equinox.p2.core.*;
++import org.eclipse.equinox.p2.core.spi.IAgentService;
+ import org.eclipse.equinox.p2.query.*;
+ import org.eclipse.equinox.p2.repository.IRepository;
+ import org.eclipse.equinox.p2.repository.IRepositoryManager;
+@@ -33,7 +34,7 @@ import org.osgi.service.prefs.Preferences;
+ /**
+  * Common code shared between artifact and metadata repository managers.
+  */
+-public abstract class AbstractRepositoryManager<T> implements IRepositoryManager<T>, ProvisioningListener {
++public abstract class AbstractRepositoryManager<T> implements IRepositoryManager<T>, IAgentService, ProvisioningListener {
+ 	protected static class RepositoryInfo<R> {
+ 		public String description;
+ 		public boolean isEnabled = true;
+@@ -95,7 +96,6 @@ public abstract class AbstractRepositoryManager<T> implements IRepositoryManager
+ 		agentLocation = (IAgentLocation) agent.getService(IAgentLocation.SERVICE_NAME);
+ 		eventBus = (IProvisioningEventBus) agent.getService(IProvisioningEventBus.SERVICE_NAME);
+ 		eventBus.addListener(this);
+-		Activator.addManager(this);
+ 	}
+ 
+ 	/**
+@@ -490,6 +490,8 @@ public abstract class AbstractRepositoryManager<T> implements IRepositoryManager
+ 		if (agentLocation == null)
+ 			return null;
+ 		IPreferencesService prefService = (IPreferencesService) ServiceHelper.getService(Activator.getContext(), IPreferencesService.class.getName());
++		if (prefService == null)
++			return null;
+ 		try {
+ 			//see ProfileScope for preference path format
+ 			String locationString = EncodingUtils.encodeSlashes(agentLocation.getRootLocation().toString());
+@@ -974,10 +976,17 @@ public abstract class AbstractRepositoryManager<T> implements IRepositoryManager
+ 		broadcastChangeEvent(location, getRepositoryType(), RepositoryEvent.ENABLEMENT, enablement);
+ 	}
+ 
+-	/**
+-	 * Shuts down the repository manager.
++	/*(non-Javadoc)
++	 * @see org.eclipse.equinox.p2.core.spi.IAgentService#start()
++	 */
++	public void start() {
++		//nothing to do
++	}
++
++	/*(non-Javadoc)
++	 * @see org.eclipse.equinox.p2.core.spi.IAgentService#stop()
+ 	 */
+-	public void shutdown() {
++	public void stop() {
+ 		eventBus.removeListener(this);
+ 		//ensure all repository state in memory is written to disk
+ 		boolean changed = false;

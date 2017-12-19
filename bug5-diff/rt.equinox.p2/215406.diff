@@ -1,0 +1,245 @@
+commit 4cd86753bbdbf680bbf9370039337ffd8fad22d0
+Author: Simon Kaegi <skaegi>
+Date:   Sun Jan 20 03:07:24 2008 +0000
+
+    Bug 215406 [prov] Updatesite bundle IUs and fidelity
+
+18	4	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+5	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Touchpoint.java
+13	12	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+2	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
+31	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+38	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/MetadataGeneratorUtils.java
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index 794f881..8ea5689 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -210,10 +210,11 @@ public class SimplePlanner implements IPlanner {
+ 	}
+ 
+ 	protected IInstallableUnit[] gatherAvailableInstallableUnits(IInstallableUnit[] additionalSource, URL[] repositories, IProgressMonitor monitor) {
+-		List results = new ArrayList();
++		Map resultsMap = new HashMap();
+ 		if (additionalSource != null) {
+ 			for (int i = 0; i < additionalSource.length; i++) {
+-				results.add(additionalSource[i]);
++				String key = additionalSource[i].getId() + "_" + additionalSource[i].getVersion().toString(); //$NON-NLS-1$
++				resultsMap.put(key, additionalSource[i]);
+ 			}
+ 		}
+ 
+@@ -226,16 +227,29 @@ public class SimplePlanner implements IPlanner {
+ 			try {
+ 				IMetadataRepository repository = repoMgr.loadRepository(repositories[i], sub.newChild(100));
+ 				Collector matches = repository.query(new InstallableUnitQuery(null, VersionRange.emptyRange), new Collector(), sub.newChild(100));
+-				for (Iterator it = matches.iterator(); it.hasNext();)
+-					results.add(it.next());
++				for (Iterator it = matches.iterator(); it.hasNext();) {
++					IInstallableUnit iu = (IInstallableUnit) it.next();
++					String key = iu.getId() + "_" + iu.getVersion().toString(); //$NON-NLS-1$
++					IInstallableUnit currentIU = (IInstallableUnit) resultsMap.get(key);
++					if (currentIU == null || hasHigherFidelity(iu, currentIU))
++						resultsMap.put(key, iu);
++				}
+ 			} catch (ProvisionException e) {
+ 				//skip unreadable repositories
+ 			}
+ 		}
+ 		sub.done();
++		Collection results = resultsMap.values();
+ 		return (IInstallableUnit[]) results.toArray(new IInstallableUnit[results.size()]);
+ 	}
+ 
++	private boolean hasHigherFidelity(IInstallableUnit iu, IInstallableUnit currentIU) {
++		if (new Boolean(currentIU.getProperty("iu.mock")).booleanValue() && !new Boolean(iu.getProperty("iu.mock")).booleanValue())
++			return true;
++
++		return false;
++	}
++
+ 	public ProvisioningPlan getReplacePlan(IInstallableUnit[] toUninstall, IInstallableUnit[] toInstall, Profile profile, URL[] metadataRepositories, IProgressMonitor monitor) {
+ 		SubMonitor sub = SubMonitor.convert(monitor, ExpandWork);
+ 		sub.setTaskName(Messages.Director_Task_Resolving_Dependencies);
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Touchpoint.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Touchpoint.java
+index 80e6322..1f7d7f1 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Touchpoint.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/Touchpoint.java
+@@ -12,6 +12,7 @@ package org.eclipse.equinox.p2.engine;
+ 
+ import java.util.Map;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.metadata.TouchpointType;
+ 
+ /**
+@@ -39,4 +40,8 @@ public abstract class Touchpoint {
+ 	public IStatus completeOperand(Profile profile, String phaseId, Operand operand, Map parameters) {
+ 		return Status.OK_STATUS;
+ 	}
++
++	public IInstallableUnit prepareIU(IInstallableUnit iu, Profile profile) {
++		return iu;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+index 305cbcc..31e7b67 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/p2/engine/phases/Install.java
+@@ -26,10 +26,10 @@ public class Install extends Phase {
+ 	final static class BeforeInstallEventAction extends ProvisioningAction {
+ 
+ 		public IStatus execute(Map parameters) {
+-			Profile profile = (Profile) parameters.get(PARM_PROFILE); 
+-			String phaseId = (String) parameters.get(PARM_PHASE_ID); 
+-			Touchpoint touchpoint = (Touchpoint) parameters.get(PARM_TOUCHPOINT); 
+-			Operand operand = (Operand) parameters.get(PARM_OPERAND); 
++			Profile profile = (Profile) parameters.get(PARM_PROFILE);
++			String phaseId = (String) parameters.get(PARM_PHASE_ID);
++			Touchpoint touchpoint = (Touchpoint) parameters.get(PARM_TOUCHPOINT);
++			Operand operand = (Operand) parameters.get(PARM_OPERAND);
+ 			((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(phaseId, true, profile, operand, InstallableUnitEvent.INSTALL, touchpoint));
+ 			return null;
+ 		}
+@@ -53,17 +53,18 @@ public class Install extends Phase {
+ 			String phaseId = (String) parameters.get(PARM_PHASE_ID);
+ 			Touchpoint touchpoint = (Touchpoint) parameters.get(PARM_TOUCHPOINT);
+ 			Operand operand = (Operand) parameters.get(PARM_OPERAND);
+-			IInstallableUnit iu = (IInstallableUnit) parameters.get(PARM_IU); 
+-			profile.addInstallableUnit(iu);
++			IInstallableUnit iu = (IInstallableUnit) parameters.get(PARM_IU);
++			IInstallableUnit preparedIU = touchpoint.prepareIU(iu, profile);
++			profile.addInstallableUnit(preparedIU);
+ 			((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(phaseId, false, profile, operand, InstallableUnitEvent.INSTALL, touchpoint));
+ 			return null;
+ 		}
+ 
+ 		public IStatus undo(Map parameters) {
+-			Profile profile = (Profile) parameters.get(PARM_PROFILE); 
+-			String phaseId = (String) parameters.get(PARM_PHASE_ID); 
+-			Touchpoint touchpoint = (Touchpoint) parameters.get(PARM_TOUCHPOINT); 
+-			Operand operand = (Operand) parameters.get(PARM_OPERAND); 
++			Profile profile = (Profile) parameters.get(PARM_PROFILE);
++			String phaseId = (String) parameters.get(PARM_PHASE_ID);
++			Touchpoint touchpoint = (Touchpoint) parameters.get(PARM_TOUCHPOINT);
++			Operand operand = (Operand) parameters.get(PARM_OPERAND);
+ 			((ProvisioningEventBus) ServiceHelper.getService(EngineActivator.getContext(), ProvisioningEventBus.class.getName())).publishEvent(new InstallableUnitEvent(phaseId, true, profile, operand, InstallableUnitEvent.UNINSTALL, touchpoint));
+ 			return null;
+ 		}
+@@ -107,11 +108,11 @@ public class Install extends Phase {
+ 	protected IStatus initializeOperand(Profile profile, Operand operand, Map parameters, IProgressMonitor monitor) {
+ 		IInstallableUnit iu = operand.second();
+ 		monitor.subTask(NLS.bind(Messages.Phase_Install_Task, iu.getId()));
+-		parameters.put(PARM_IU, iu); 
++		parameters.put(PARM_IU, iu);
+ 
+ 		IArtifactKey[] artifacts = iu.getArtifacts();
+ 		if (artifacts != null && artifacts.length > 0)
+-			parameters.put(PARM_ARTIFACT, artifacts[0]); 
++			parameters.put(PARM_ARTIFACT, artifacts[0]);
+ 
+ 		return Status.OK_STATUS;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
+index cea339e..2af9e8f 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/META-INF/MANIFEST.MF
+@@ -20,6 +20,7 @@ Import-Package: org.eclipse.core.runtime;common=split,
+  org.eclipse.equinox.p2.engine,
+  org.eclipse.equinox.p2.garbagecollector,
+  org.eclipse.equinox.p2.metadata,
++ org.eclipse.equinox.p2.metadata.generator;resolution:=optional,
+  org.eclipse.equinox.p2.metadata.query,
+  org.eclipse.equinox.p2.query,
+  org.eclipse.equinox.spi.p2.artifact.repository,
+@@ -27,6 +28,7 @@ Import-Package: org.eclipse.core.runtime;common=split,
+  org.eclipse.osgi.framework.util,
+  org.eclipse.osgi.service.datalocation;version="1.0.0",
+  org.eclipse.osgi.service.environment;version="1.0.0",
++ org.eclipse.osgi.service.resolver;version="1.2.0";resolution:=optional,
+  org.eclipse.osgi.util;version="1.1.0",
+  org.eclipse.update.configurator;resolution:=optional,
+  org.osgi.framework;version="1.3.0",
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+index f8934c8..5f565f4 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/EclipseTouchpoint.java
+@@ -746,4 +746,35 @@ public class EclipseTouchpoint extends Touchpoint {
+ 
+ 		return configuration.removeFeatureEntry(featureId);
+ 	}
++
++	public IInstallableUnit prepareIU(IInstallableUnit iu, Profile profile) {
++
++		if (!new Boolean(iu.getProperty("iu.mock")).booleanValue()) //$NON-NLS-1$
++			return iu;
++
++		Class c = null;
++		try {
++			c = Class.forName("org.eclipse.equinox.p2.metadata.generator.MetadataGeneratorHelper"); //$NON-NLS-1$
++			if (c != null)
++				c = Class.forName("org.eclipse.osgi.service.resolver.PlatformAdmin"); //$NON-NLS-1$
++		} catch (ClassNotFoundException e) {
++			throw new IllegalStateException("The mock IU could not be updated. Generator not available: " + e.getMessage()); //$NON-NLS-1$
++		}
++
++		if (c != null) {
++			IArtifactKey[] artifacts = iu.getArtifacts();
++			if (artifacts == null || artifacts.length == 0)
++				return iu;
++
++			IArtifactKey artifactKey = artifacts[0];
++			if (artifactKey == null)
++				return iu;
++
++			File bundleFile = Util.getBundleFile(artifactKey, profile);
++			return MetadataGeneratorUtils.createBundleIU(artifactKey, bundleFile);
++		}
++
++		// should not occur
++		throw new IllegalStateException("Unexpected");
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/MetadataGeneratorUtils.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/MetadataGeneratorUtils.java
+new file mode 100644
+index 0000000..42d901c
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/MetadataGeneratorUtils.java
+@@ -0,0 +1,38 @@
++package org.eclipse.equinox.internal.p2.touchpoint.eclipse;
++
++import java.io.File;
++import java.util.Map;
++import org.eclipse.equinox.p2.metadata.IArtifactKey;
++import org.eclipse.equinox.p2.metadata.IInstallableUnit;
++import org.eclipse.equinox.p2.metadata.generator.BundleDescriptionFactory;
++import org.eclipse.equinox.p2.metadata.generator.MetadataGeneratorHelper;
++import org.eclipse.osgi.service.resolver.*;
++import org.osgi.framework.BundleContext;
++import org.osgi.framework.ServiceReference;
++
++public class MetadataGeneratorUtils {
++
++	public static IInstallableUnit createBundleIU(IArtifactKey artifactKey, File bundleFile) {
++		BundleDescriptionFactory factory = initializeBundleDescriptionFactory(Activator.getContext());
++		BundleDescription bundleDescription = factory.getBundleDescription(bundleFile);
++		return MetadataGeneratorHelper.createBundleIU(bundleDescription, (Map) bundleDescription.getUserObject(), bundleFile.isDirectory(), artifactKey);
++	}
++
++	private static BundleDescriptionFactory initializeBundleDescriptionFactory(BundleContext context) {
++
++		ServiceReference reference = context.getServiceReference(PlatformAdmin.class.getName());
++		if (reference == null)
++			throw new IllegalStateException("PlatformAdmin not registered.");
++		PlatformAdmin platformAdmin = (PlatformAdmin) context.getService(reference);
++		if (platformAdmin == null)
++			throw new IllegalStateException("PlatformAdmin not registered.");
++
++		try {
++			StateObjectFactory stateObjectFactory = platformAdmin.getFactory();
++			return new BundleDescriptionFactory(stateObjectFactory, null);
++		} finally {
++			context.ungetService(reference);
++		}
++	}
++
++}

@@ -1,0 +1,301 @@
+commit d2677d2457798d0dc10711a78430477339195870
+Author: Susan Franklin <sfranklin>
+Date:   Thu Apr 17 22:58:05 2008 +0000
+
+    Bug 215560 - [prov] [ui] denote unwritable (locked) IUs
+
+31	0	bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/IInstallableUnit.java
+61	44	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/updates/AutomaticUpdater.java
+16	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProfileModificationAction.java
+3	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UninstallAction.java
+3	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
+diff --git a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/IInstallableUnit.java b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/IInstallableUnit.java
+index 54611e5..6007e44 100644
+--- a/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/IInstallableUnit.java
++++ b/bundles/org.eclipse.equinox.p2.metadata/src/org/eclipse/equinox/internal/provisional/p2/metadata/IInstallableUnit.java
+@@ -71,6 +71,19 @@ public interface IInstallableUnit extends Comparable {
+ 	 */
+ 	public static final String PROP_TYPE_GROUP = "org.eclipse.equinox.p2.type.group"; //$NON-NLS-1$
+ 
++	/**
++	 * A property key (value <code>"org.eclipse.equinox.p2.type.lock"</code>) for an
++	 * integer property indicating how an installable unit is locked in its profile.
++	 * The integer is a bit-mask indicating the different locks defined on the installable
++	 * unit.  The property should be obtained from a profile using 
++	 * IProfile#getInstallableUnitProperty(IInstallableUnit, String).
++	 * 
++	 * @see #LOCK_UNINSTALL
++	 * @see #LOCK_UPDATE
++	 * @see #LOCK_NONE
++	 */
++	public static final String PROP_PROFILE_LOCKED_IU = "org.eclipse.equinox.p2.type.lock"; //$NON-NLS-1$
++
+ 	//TODO Move to UI
+ 	public static final String PROP_PROFILE_ROOT_IU = "org.eclipse.equinox.p2.type.root"; //$NON-NLS-1$
+ 
+@@ -113,6 +126,24 @@ public interface IInstallableUnit extends Comparable {
+ 	 */
+ 	public static final String PROP_PROVIDER = "org.eclipse.equinox.p2.provider"; //$NON-NLS-1$
+ 
++	/**
++	 * Constant used to indicate that an installable unit is not locked in anyway.
++	 * @see #PROP_PROFILE_LOCKED_IU
++	 */
++	public static int LOCK_NONE = 0;
++	/**
++	 * Constant used to indicate that an installable unit is locked so that it may
++	 * not be uninstalled.
++	 * @see #PROP_PROFILE_LOCKED_IU
++	 */
++	public static int LOCK_UNINSTALL = 1 << 0;
++	/**
++	 * Constant used to indicate that an installable unit is locked so that it may
++	 * not be updated. updates.
++	 * @see #PROP_PROFILE_LOCKED_IU
++	 */
++	public static int LOCK_UPDATE = 1 << 1;
++
+ 	public IArtifactKey[] getArtifacts();
+ 
+ 	/**
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/updates/AutomaticUpdater.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/updates/AutomaticUpdater.java
+index f0ee0c5..a708340 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/updates/AutomaticUpdater.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/updates/AutomaticUpdater.java
+@@ -23,8 +23,7 @@ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEv
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.ProvisioningListener;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProfileChangeRequest;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProvisioningPlan;
+-import org.eclipse.equinox.internal.provisional.p2.engine.ProfileEvent;
+-import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningContext;
++import org.eclipse.equinox.internal.provisional.p2.engine.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.ui.*;
+ import org.eclipse.equinox.internal.provisional.p2.ui.actions.UpdateAction;
+@@ -53,7 +52,7 @@ public class AutomaticUpdater implements IUpdateListener {
+ 	 *
+ 	 */
+ 	final class AutomaticUpdateAction extends UpdateAction {
+-		ProvisioningPlan plan;
++		ProvisioningPlan currentPlan;
+ 
+ 		AutomaticUpdateAction(ISelectionProvider selectionProvider, String profileId, IProfileChooser chooser, Policies policies, Shell shell) {
+ 			super(selectionProvider, profileId, chooser, policies, shell);
+@@ -61,17 +60,45 @@ public class AutomaticUpdater implements IUpdateListener {
+ 
+ 		public void initializePlan() {
+ 			try {
+-				plan = getProvisioningPlan(iusWithUpdates, profileId, new NullProgressMonitor());
++				currentPlan = getProvisioningPlan(iusWithUpdates, profileId, new NullProgressMonitor());
+ 			} catch (ProvisionException e) {
+ 				// ignore
+ 			}
+ 		}
+ 
+ 		protected ProvisioningPlan getProvisioningPlan() {
+-			if (plan != null)
+-				return plan;
++			if (currentPlan != null)
++				return currentPlan;
+ 			return super.getProvisioningPlan();
+ 		}
++
++		protected IPlanValidator getPlanValidator() {
++			return new IPlanValidator() {
++				public boolean continueWorkingWithPlan(ProvisioningPlan plan, Shell shell) {
++					if (alreadyValidated)
++						return true;
++					// In all other cases we return false, because the clicking the popup will actually run the action.
++					String openPlan = prefs.getString(PreferenceConstants.PREF_OPEN_WIZARD_ON_NONOK_PLAN);
++					if (plan != null) {
++						if (plan.getStatus().isOK() || !(MessageDialogWithToggle.NEVER.equals(openPlan))) {
++							// Show the affordance if user prefers always opening a currentPlan or being prompted
++							// In this context, the affordance is the prompt.
++							if (updateAffordance == null)
++								createUpdateAffordance();
++							setUpdateAffordanceState(plan.getStatus().isOK());
++							// If the user always wants to open invalid plans, or status is OK then go ahead and show
++							// the popup.
++							if (plan.getStatus().isOK() || MessageDialogWithToggle.ALWAYS.equals(openPlan) && popup == null)
++								createUpdatePopup();
++						} else {
++							// The pref is NEVER, the user doesn't want to know about it
++							ProvUI.reportStatus(plan.getStatus(), StatusManager.LOG);
++						}
++					}
++					return false;
++				}
++			};
++		}
+ 	}
+ 
+ 	Preferences prefs;
+@@ -98,6 +125,7 @@ public class AutomaticUpdater implements IUpdateListener {
+ 		final boolean download = prefs.getBoolean(PreferenceConstants.PREF_DOWNLOAD_ONLY);
+ 		profileId = event.getProfileId();
+ 		iusWithUpdates = event.getIUs();
++		validateUpdates(null, true);
+ 		alreadyDownloaded = false;
+ 
+ 		if (iusWithUpdates.length <= 0) {
+@@ -153,20 +181,22 @@ public class AutomaticUpdater implements IUpdateListener {
+ 	}
+ 
+ 	/*
+-	 * Recheck that iusToBeUpdated is still valid, and reset the cache.  
+-	 * Reminding the user of updates may happen long after the update 
+-	 * was discovered,  so it's possible that the update list is stale.
+-	 * This reduces the risk of notifying the user of updates and then 
+-	 * not finding them (which can still happen, but
+-	 * we are trying to reduce the window in which it can happen.)
++	 * Validate that iusToBeUpdated is valid, and reset the cache.  
++	 * If isKnownToBeAvailable is false, then recheck that the update is
++	 * available.  isKnownToBeAvailable should be false when the update list 
++	 * might be stale (Reminding the user of updates may happen long
++	 * after the update.  This reduces the risk of notifying the user
++	 * of updates and then not finding them .)
+ 	 */
+ 
+-	private void recheckUpdates(IProgressMonitor monitor) {
++	void validateUpdates(IProgressMonitor monitor, boolean isKnownToBeAvailable) {
+ 		ArrayList list = new ArrayList();
+ 		for (int i = 0; i < iusWithUpdates.length; i++) {
+ 			try {
+-				if (ProvisioningUtil.getPlanner().updatesFor(iusWithUpdates[i], new ProvisioningContext(), monitor).length > 0)
+-					list.add(iusWithUpdates[i]);
++				if (isKnownToBeAvailable || ProvisioningUtil.getPlanner().updatesFor(iusWithUpdates[i], new ProvisioningContext(), monitor).length > 0) {
++					if (!updateLocked(iusWithUpdates[i]))
++						list.add(iusWithUpdates[i]);
++				}
+ 			} catch (ProvisionException e) {
+ 				ProvUI.handleException(e, ProvSDKMessages.AutomaticUpdater_ErrorCheckingUpdates, StatusManager.LOG);
+ 				continue;
+@@ -175,6 +205,21 @@ public class AutomaticUpdater implements IUpdateListener {
+ 		iusWithUpdates = (IInstallableUnit[]) list.toArray(new IInstallableUnit[list.size()]);
+ 	}
+ 
++	private boolean updateLocked(IInstallableUnit iu) {
++		int lock = IInstallableUnit.LOCK_NONE;
++		try {
++			IProfile profile = ProvisioningUtil.getProfile(profileId);
++			String value = profile.getInstallableUnitProperty(iu, IInstallableUnit.PROP_PROFILE_LOCKED_IU);
++			if (value != null)
++				lock = Integer.parseInt(value);
++		} catch (ProvisionException e) {
++			// ignore
++		} catch (NumberFormatException e) {
++			// ignore and assume no lock
++		}
++		return (lock & IInstallableUnit.LOCK_UPDATE) == IInstallableUnit.LOCK_UPDATE;
++	}
++
+ 	Shell getWorkbenchWindowShell() {
+ 		IWorkbenchWindow activeWindow = PlatformUI.getWorkbench().getActiveWorkbenchWindow();
+ 		return activeWindow != null ? activeWindow.getShell() : null;
+@@ -262,34 +307,6 @@ public class AutomaticUpdater implements IUpdateListener {
+ 			updateAction = new AutomaticUpdateAction(getSelectionProvider(), profileId, null, ProvPolicies.getDefault(), null);
+ 	}
+ 
+-	IPlanValidator getPlanValidator() {
+-		return new IPlanValidator() {
+-			public boolean continueWorkingWithPlan(ProvisioningPlan plan, Shell shell) {
+-				if (alreadyValidated)
+-					return true;
+-				// In all other cases we return false, because the clicking the popup will actually run the action.
+-				String openPlan = prefs.getString(PreferenceConstants.PREF_OPEN_WIZARD_ON_NONOK_PLAN);
+-				if (plan != null) {
+-					if (plan.getStatus().isOK() || !(MessageDialogWithToggle.NEVER.equals(openPlan))) {
+-						// Show the affordance if user prefers always opening a plan or being prompted
+-						// In this context, the affordance is the prompt.
+-						if (updateAffordance == null)
+-							createUpdateAffordance();
+-						setUpdateAffordanceState(plan.getStatus().isOK());
+-						// If the user always wants to open invalid plans, then go ahead and show
+-						// the popup.
+-						if (MessageDialogWithToggle.ALWAYS.equals(openPlan) && popup == null)
+-							createUpdatePopup();
+-					} else {
+-						// The pref is NEVER, the user doesn't want to know about it
+-						ProvUI.reportStatus(plan.getStatus(), StatusManager.LOG);
+-					}
+-				}
+-				return false;
+-			}
+-		};
+-	}
+-
+ 	void clearUpdatesAvailable() {
+ 		if (updateAffordance != null) {
+ 			IStatusLineManager manager = getStatusLineManager();
+@@ -373,7 +390,7 @@ public class AutomaticUpdater implements IUpdateListener {
+ 			public IStatus runInUIThread(IProgressMonitor monitor) {
+ 				if (monitor.isCanceled())
+ 					return Status.CANCEL_STATUS;
+-				recheckUpdates(monitor);
++				validateUpdates(monitor, false);
+ 				if (iusWithUpdates.length == 0)
+ 					clearUpdatesAvailable();
+ 				else {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProfileModificationAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProfileModificationAction.java
+index e704c04..a50f74c 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProfileModificationAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/ProfileModificationAction.java
+@@ -16,9 +16,11 @@ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProvisioningPlan;
++import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.ui.*;
+ import org.eclipse.equinox.internal.provisional.p2.ui.model.ElementUtils;
++import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningUtil;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.*;
+ import org.eclipse.jface.dialogs.ProgressMonitorDialog;
+ import org.eclipse.jface.operation.IRunnableWithProgress;
+@@ -131,4 +133,18 @@ public abstract class ProfileModificationAction extends ProvisioningAction {
+ 	}
+ 
+ 	protected abstract boolean isEnabledFor(Object[] selections);
++
++	protected int getLock(IInstallableUnit iu) {
++		try {
++			IProfile profile = ProvisioningUtil.getProfile(profileId);
++			String value = profile.getInstallableUnitProperty(iu, IInstallableUnit.PROP_PROFILE_LOCKED_IU);
++			if (value != null)
++				return Integer.parseInt(value);
++		} catch (ProvisionException e) {
++			// ignore, we have bigger problems to report elsewhere
++		} catch (NumberFormatException e) {
++			// ignore and assume no lock
++		}
++		return IInstallableUnit.LOCK_NONE;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UninstallAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UninstallAction.java
+index 80a46b4..5997d6e 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UninstallAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UninstallAction.java
+@@ -41,6 +41,9 @@ public class UninstallAction extends ProfileModificationAction {
+ 			for (int i = 0; i < selectionArray.length; i++) {
+ 				if (selectionArray[i] instanceof InstalledIUElement) {
+ 					InstalledIUElement element = (InstalledIUElement) selectionArray[i];
++					int lock = getLock(element.getIU());
++					if ((lock & IInstallableUnit.LOCK_UNINSTALL) == IInstallableUnit.LOCK_UNINSTALL)
++						return false;
+ 					if (parent == null) {
+ 						parent = element.getParent(null);
+ 					} else if (parent != element.getParent(null)) {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
+index 18e2616..f1ddbbd 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/actions/UpdateAction.java
+@@ -104,6 +104,9 @@ public class UpdateAction extends ProfileModificationAction {
+ 			for (int i = 0; i < selectionArray.length; i++) {
+ 				if (selectionArray[i] instanceof InstalledIUElement) {
+ 					InstalledIUElement element = (InstalledIUElement) selectionArray[i];
++					int lock = getLock(element.getIU());
++					if ((lock & IInstallableUnit.LOCK_UPDATE) == IInstallableUnit.LOCK_UPDATE)
++						return false;
+ 					if (parent == null) {
+ 						parent = element.getParent(null);
+ 					} else if (parent != element.getParent(null)) {

@@ -1,0 +1,374 @@
+commit f3c706bfa8df1589d5835736528d83fcc35878b8
+Author: Walter Harley <wharley>
+Date:   Thu Jul 19 23:32:43 2007 +0000
+
+    bug 197050 - support -XprintRounds and -XprintProcessorInfo flags
+
+2	2	org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/AnnotationDiscoveryVisitor.java
+12	1	org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BaseAnnotationProcessorManager.java
+70	10	org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BatchAnnotationProcessorManager.java
+27	0	org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/ProcessorInfo.java
+67	2	org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/RoundDispatcher.java
+3	0	org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/RoundEnvImpl.java
+diff --git a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/AnnotationDiscoveryVisitor.java b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/AnnotationDiscoveryVisitor.java
+index d67ccd0..fd425e4 100644
+--- a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/AnnotationDiscoveryVisitor.java
++++ b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/AnnotationDiscoveryVisitor.java
+@@ -42,12 +42,12 @@ public class AnnotationDiscoveryVisitor extends ASTVisitor {
+ 	 * Collects a many-to-many map of annotation types to
+ 	 * the elements they appear on.
+ 	 */
+-	ManyToMany<TypeElement, Element> _annoToElement;
++	final ManyToMany<TypeElement, Element> _annoToElement;
+ 
+ 	public AnnotationDiscoveryVisitor(BaseProcessingEnvImpl env) {
+ 		_env = env;
+ 		_factory = env.getFactory();
+-		this._annoToElement = new ManyToMany<TypeElement, Element>();
++		_annoToElement = new ManyToMany<TypeElement, Element>();
+ 	}
+ 
+ 	@Override
+diff --git a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BaseAnnotationProcessorManager.java b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BaseAnnotationProcessorManager.java
+index 5c536d2..658a99a 100644
+--- a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BaseAnnotationProcessorManager.java
++++ b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BaseAnnotationProcessorManager.java
+@@ -51,6 +51,11 @@ public abstract class BaseAnnotationProcessorManager extends AbstractAnnotationP
+ 	 */
+ 	protected List<ProcessorInfo> _processors = new ArrayList<ProcessorInfo>();
+ 	
++	// Tracing
++	protected boolean _printProcessorInfo = false;
++	protected boolean _printRounds = false;
++	protected int _round;
++	
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.jdt.internal.compiler.AbstractAnnotationProcessorManager#configure(org.eclipse.jdt.internal.compiler.batch.Main, java.lang.String[])
+ 	 */
+@@ -144,7 +149,13 @@ public abstract class BaseAnnotationProcessorManager extends AbstractAnnotationP
+ 		if (_isFirstRound) {
+ 			_isFirstRound = false;
+ 		}
+-		RoundDispatcher dispatcher = new RoundDispatcher(this, roundEnv, roundEnv.getRootAnnotations());
++		PrintWriter traceProcessorInfo = _printProcessorInfo ? _out : null;
++		PrintWriter traceRounds = _printRounds ? _out : null;
++		if (traceRounds != null) {
++			traceRounds.println("Round " + ++_round + ':'); //$NON-NLS-1$
++		}
++		RoundDispatcher dispatcher = new RoundDispatcher(
++				this, roundEnv, roundEnv.getRootAnnotations(), traceProcessorInfo, traceRounds);
+ 		dispatcher.round();
+ 	}
+ 
+diff --git a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BatchAnnotationProcessorManager.java b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BatchAnnotationProcessorManager.java
+index c1e232b..d6c1a7f 100644
+--- a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BatchAnnotationProcessorManager.java
++++ b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/BatchAnnotationProcessorManager.java
+@@ -47,6 +47,10 @@ public class BatchAnnotationProcessorManager extends BaseAnnotationProcessorMana
+ 	
+ 	private ClassLoader _procLoader;
+ 	
++	// Set this to true in order to trace processor discovery when -XprintProcessorInfo is specified
++	private final static boolean VERBOSE_PROCESSOR_DISCOVERY = true;
++	private boolean _printProcessorDiscovery = false;
++	
+ 	/**
+ 	 * Zero-arg constructor so this object can be easily created via reflection.
+ 	 * A BatchAnnotationProcessorManager cannot be used until its
+@@ -65,10 +69,8 @@ public class BatchAnnotationProcessorManager extends BaseAnnotationProcessorMana
+ 		BatchProcessingEnvImpl processingEnv = new BatchProcessingEnvImpl(this, (Main) batchCompiler, commandLineArguments);
+ 		_processingEnv = processingEnv;
+ 		_procLoader = processingEnv.getFileManager().getClassLoader(StandardLocation.ANNOTATION_PROCESSOR_PATH);
+-		_commandLineProcessors = parseCommandLineProcessors(commandLineArguments);
+-		if (null != _commandLineProcessors) {
+-			_commandLineProcessorIter = _commandLineProcessors.iterator();
+-		}
++		parseCommandLine(commandLineArguments);
++		_round = 0;
+ 	}
+ 	
+ 	/**
+@@ -77,20 +79,30 @@ public class BatchAnnotationProcessorManager extends BaseAnnotationProcessorMana
+ 	 * @param commandLineArguments contains one string for every space-delimited token on the command line
+ 	 * @return a list of qualified classnames, or null if there was no -processor option.
+ 	 */
+-	private List<String> parseCommandLineProcessors(String[] commandLineArguments) {
+-		List<String> result = null;
++	private void parseCommandLine(String[] commandLineArguments) {
++		List<String> commandLineProcessors = null;
+ 		for (int i = 0; i < commandLineArguments.length; ++i) {
+ 			String option = commandLineArguments[i];
+-			if ("-processor".equals(option)) { //$NON-NLS-1$
+-				result = new ArrayList<String>();
++			if ("-XprintProcessorInfo".equals(option)) { //$NON-NLS-1$
++				_printProcessorInfo = true;
++				_printProcessorDiscovery = VERBOSE_PROCESSOR_DISCOVERY;
++			}
++			else if ("-XprintRounds".equals(option)) { //$NON-NLS-1$
++				_printRounds = true;
++			}
++			else if ("-processor".equals(option)) { //$NON-NLS-1$
++				commandLineProcessors = new ArrayList<String>();
+ 				String procs = commandLineArguments[++i];
+ 				for (String proc : procs.split(",")) { //$NON-NLS-1$
+-					result.add(proc);
++					commandLineProcessors.add(proc);
+ 				}
+ 				break;
+ 			}
+ 		}
+-		return result;
++		_commandLineProcessors =  commandLineProcessors;
++		if (null != _commandLineProcessors) {
++			_commandLineProcessorIter = _commandLineProcessors.iterator();
++		}
+ 	}
+ 
+ 	@Override
+@@ -102,6 +114,9 @@ public class BatchAnnotationProcessorManager extends BaseAnnotationProcessorMana
+ 				p.init(_processingEnv);
+ 				ProcessorInfo pi = new ProcessorInfo(p);
+ 				_processors.add(pi);
++				if (_printProcessorDiscovery && null != _out) {
++					_out.println("API specified processor: " + pi); //$NON-NLS-1$
++				}
+ 				return pi;
+ 			}
+ 			return null;
+@@ -119,6 +134,9 @@ public class BatchAnnotationProcessorManager extends BaseAnnotationProcessorMana
+ 					p.init(_processingEnv);
+ 					ProcessorInfo pi = new ProcessorInfo(p);
+ 					_processors.add(pi);
++					if (_printProcessorDiscovery && null != _out) {
++						_out.println("Command line specified processor: " + pi); //$NON-NLS-1$
++					}
+ 					return pi;
+ 				} catch (Exception e) {
+ 					// TODO: better error handling
+@@ -140,6 +158,16 @@ public class BatchAnnotationProcessorManager extends BaseAnnotationProcessorMana
+ 				p.init(_processingEnv);
+ 				ProcessorInfo pi = new ProcessorInfo(p);
+ 				_processors.add(pi);
++				if (_printProcessorDiscovery && null != _out) {
++					StringBuilder sb = new StringBuilder();
++					sb.append("Discovered processor service "); //$NON-NLS-1$
++					sb.append(pi);
++					sb.append("\n  supporting "); //$NON-NLS-1$
++					sb.append(pi.getSupportedAnnotationTypesAsString());
++					sb.append("\n  in "); //$NON-NLS-1$
++					sb.append(getProcessorLocation(p));
++					_out.println(sb.toString());
++				}
+ 				return pi;
+ 			}
+ 		} catch (ServiceConfigurationError e) {
+@@ -148,6 +176,38 @@ public class BatchAnnotationProcessorManager extends BaseAnnotationProcessorMana
+ 		}
+ 		return null;
+ 	}
++	
++	/**
++	 * Used only for debugging purposes.  Generates output like "file:jar:D:/temp/jarfiles/myJar.jar!/".
++	 * Surely this code already exists in several hundred other places?  
++	 * @return the location whence a processor class was loaded.
++	 */
++	private String getProcessorLocation(Processor p) {
++		// Get the classname in a form that can be passed to ClassLoader.getResource(),
++		// e.g., "pa/pb/pc/Outer$Inner.class"
++		boolean isMember = false;
++		Class<?> outerClass = p.getClass();
++		StringBuilder innerName = new StringBuilder();
++		while (outerClass.isMemberClass()) {
++			innerName.insert(0, outerClass.getSimpleName());
++			innerName.insert(0, '$');
++			isMember = true;
++			outerClass = outerClass.getEnclosingClass();
++		}
++		String path = outerClass.getName();
++		path = path.replace('.', '/');
++		if (isMember) {
++			path = path + innerName;
++		}
++		path = path + ".class"; //$NON-NLS-1$
++		
++		// Find the URL for the class resource and strip off the resource name itself
++		String location = _procLoader.getResource(path).toString();
++		if (location.endsWith(path)) {
++			location = location.substring(0, location.length() - path.length());
++		}
++		return location;
++	}
+ 
+ 	@Override
+ 	public void reportProcessorException(Processor p, Exception e) {
+diff --git a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/ProcessorInfo.java b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/ProcessorInfo.java
+index 8b54530..b9a463d 100644
+--- a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/ProcessorInfo.java
++++ b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/ProcessorInfo.java
+@@ -145,5 +145,32 @@ public class ProcessorInfo {
+ 			return false;
+ 		return true;
+ 	}
++
++	@Override
++	public String toString()
++	{
++		return _processor.getClass().getName();
++	}
++	
++	/**
++	 * @return a string representing the set of supported annotation types, in a format
++	 * suitable for debugging.  The format is unspecified and subject to change.
++	 */
++	public String getSupportedAnnotationTypesAsString()
++	{
++		StringBuilder sb = new StringBuilder();
++		sb.append('[');
++		Iterator<String> iAnnots = _processor.getSupportedAnnotationTypes().iterator(); 
++		boolean hasNext = iAnnots.hasNext();
++		while (hasNext) {
++			sb.append(iAnnots.next());
++			hasNext = iAnnots.hasNext();
++			if (hasNext) {
++				sb.append(',');
++			}
++		}
++		sb.append(']');
++		return sb.toString();
++	}
+ }
+ 
+diff --git a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/RoundDispatcher.java b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/RoundDispatcher.java
+index 6a02271..86e0687 100644
+--- a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/RoundDispatcher.java
++++ b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/RoundDispatcher.java
+@@ -12,11 +12,14 @@
+ 
+ package org.eclipse.jdt.internal.compiler.apt.dispatch;
+ 
++import java.io.PrintWriter;
+ import java.util.HashSet;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Set;
+ 
+ import javax.annotation.processing.RoundEnvironment;
++import javax.lang.model.element.Element;
+ import javax.lang.model.element.TypeElement;
+ 
+ /**
+@@ -28,6 +31,8 @@ public class RoundDispatcher {
+ 	private final RoundEnvironment _roundEnv;
+ 	private final IProcessorProvider _provider;
+ 	private boolean _searchForStar = false;
++	private final PrintWriter _traceProcessorInfo;
++	private final PrintWriter _traceRounds;
+ 	
+ 	/**
+ 	 * Processors discovered so far.  This list may grow during the
+@@ -39,14 +44,23 @@ public class RoundDispatcher {
+ 	 * @param rootAnnotations a possibly empty but non-null set of annotations on the
+ 	 * root compilation units of this round.  A local copy of the set will be made, to
+ 	 * avoid modifying the set passed in.
++	 * @param traceProcessorInfo a PrintWriter that processor trace output will be sent 
++	 * to, or null if tracing is not desired.
++	 * @param traceRounds 
+ 	 */
+ 	public RoundDispatcher(
+-			IProcessorProvider provider, RoundEnvironment env, Set<TypeElement> rootAnnotations)
++			IProcessorProvider provider, 
++			RoundEnvironment env, 
++			Set<TypeElement> rootAnnotations, 
++			PrintWriter traceProcessorInfo, 
++			PrintWriter traceRounds)
+ 	{
+ 		_provider = provider;
+ 		_processors = provider.getDiscoveredProcessors();
+ 		_roundEnv = env;
+ 		_unclaimedAnnotations = new HashSet<TypeElement>(rootAnnotations);
++		_traceProcessorInfo = traceProcessorInfo;
++		_traceRounds = traceRounds;
+ 	}
+ 	
+ 	/**
+@@ -54,6 +68,38 @@ public class RoundDispatcher {
+ 	 */
+ 	public void round()
+ 	{
++		if (null != _traceRounds) {
++			StringBuilder sbElements = new StringBuilder();
++			sbElements.append("\tinput files: {"); //$NON-NLS-1$
++			Iterator<? extends Element> iElements = _roundEnv.getRootElements().iterator();
++			boolean hasNext = iElements.hasNext();
++			while (hasNext) {
++				sbElements.append(iElements.next());
++				hasNext = iElements.hasNext();
++				if (hasNext) {
++					sbElements.append(',');
++				}
++			}
++			sbElements.append('}');
++			_traceRounds.println(sbElements.toString());
++			
++			StringBuilder sbAnnots = new StringBuilder();
++			sbAnnots.append("\tannotations: ["); //$NON-NLS-1$
++			Iterator<TypeElement> iAnnots = _unclaimedAnnotations.iterator();
++			hasNext = iAnnots.hasNext();
++			while (hasNext) {
++				sbAnnots.append(iAnnots.next());
++				hasNext = iAnnots.hasNext();
++				if (hasNext) {
++					sbAnnots.append(',');
++				}
++			}
++			sbAnnots.append(']');
++			_traceRounds.println(sbAnnots.toString());
++			
++			_traceRounds.println("\tlast round: " + _roundEnv.processingOver()); //$NON-NLS-1$
++		}
++		
+ 		// If there are no root annotations, try to find a processor that claims "*"
+ 		_searchForStar = _unclaimedAnnotations.isEmpty();
+ 		
+@@ -90,7 +136,26 @@ public class RoundDispatcher {
+ 			boolean shouldCall = pi.computeSupportedAnnotations(
+ 					_unclaimedAnnotations, annotationsToProcess);
+ 			if (shouldCall) {
+-				if (pi._processor.process(annotationsToProcess, _roundEnv)) {
++				boolean claimed = pi._processor.process(annotationsToProcess, _roundEnv);
++				if (null != _traceProcessorInfo && !_roundEnv.processingOver()) {
++					StringBuilder sb = new StringBuilder();
++					sb.append("Processor "); //$NON-NLS-1$
++					sb.append(pi._processor.getClass().getName());
++					sb.append(" matches ["); //$NON-NLS-1$
++					Iterator<TypeElement> i = annotationsToProcess.iterator();
++					boolean hasNext = i.hasNext();
++					while (hasNext) {
++						sb.append(i.next());
++						hasNext = i.hasNext();
++						if (hasNext) {
++							sb.append(' ');
++						}
++					}
++					sb.append("] and returns "); //$NON-NLS-1$
++					sb.append(claimed);
++					_traceProcessorInfo.println(sb.toString());
++				}
++				if (claimed) {
+ 					// The processor claimed its annotations.
+ 					_unclaimedAnnotations.removeAll(annotationsToProcess);
+ 					if (pi.supportsStar()) {
+diff --git a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/RoundEnvImpl.java b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/RoundEnvImpl.java
+index 188e891..22f85a3 100644
+--- a/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/RoundEnvImpl.java
++++ b/org.eclipse.jdt.compiler.apt/src/org/eclipse/jdt/internal/compiler/apt/dispatch/RoundEnvImpl.java
+@@ -189,6 +189,9 @@ public class RoundEnvImpl implements RoundEnvironment
+ 	@Override
+ 	public Set<? extends Element> getRootElements()
+ 	{
++		if (_units == null) {
++			return Collections.emptySet();
++		}
+ 		if (_rootElements == null) {
+ 			Set<Element> elements = new HashSet<Element>(_units.length);
+ 			for (CompilationUnitDeclaration unit : _units) {

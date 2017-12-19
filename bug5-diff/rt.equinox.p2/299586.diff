@@ -1,0 +1,201 @@
+commit c97c841b8087ec6ef5df03bf523495c39f7c798f
+Author: Susan Franklin <sfranklin>
+Date:   Thu Jan 14 20:05:39 2010 +0000
+
+    Bug 299586 -  [ui] - Install new software combo is switching/flashing during first load
+
+2	2	bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/PreloadingRepositoryHandler.java
+0	14	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/InstallWizard.java
+55	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
+0	12	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
+9	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/LoadMetadataRepositoryJob.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/PreloadingRepositoryHandler.java b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/PreloadingRepositoryHandler.java
+index 73655e8..6aa65fa 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/PreloadingRepositoryHandler.java
++++ b/bundles/org.eclipse.equinox.p2.ui.sdk/src/org/eclipse/equinox/internal/p2/ui/sdk/PreloadingRepositoryHandler.java
+@@ -66,8 +66,8 @@ abstract class PreloadingRepositoryHandler extends AbstractHandler {
+ 			} else {
+ 				loadJob.setSystem(true);
+ 				loadJob.setUser(false);
+-				loadJob.schedule();
+-				doExecute(null);
++				loadJob.setProperty(LoadMetadataRepositoryJob.WIZARD_CLIENT_SHOULD_SCHEDULE, Boolean.toString(true));
++				doExecute(loadJob);
+ 			}
+ 		} else {
+ 			doExecute(null);
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/InstallWizard.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/InstallWizard.java
+index 1bf65a9..3bcf45f 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/InstallWizard.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/InstallWizard.java
+@@ -10,8 +10,6 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.ui.dialogs;
+ 
+-import org.eclipse.equinox.internal.p2.ui.model.AvailableIUElement;
+-
+ import java.util.ArrayList;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIImages;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+@@ -23,7 +21,6 @@ import org.eclipse.equinox.p2.operations.ProfileChangeOperation;
+ import org.eclipse.equinox.p2.ui.LoadMetadataRepositoryJob;
+ import org.eclipse.equinox.p2.ui.ProvisioningUI;
+ import org.eclipse.jface.wizard.IWizardPage;
+-import org.eclipse.swt.widgets.Composite;
+ 
+ /**
+  * An install wizard that allows the users to browse all of the repositories
+@@ -72,17 +69,6 @@ public class InstallWizard extends WizardWithLicenses {
+ 		planSelections = selections.toArray();
+ 	}
+ 
+-	public void createPageControls(Composite pageContainer) {
+-		super.createPageControls(pageContainer);
+-		if (repoPreloadJob != null)
+-			// async exec since we are in the middle of opening
+-			pageContainer.getDisplay().asyncExec(new Runnable() {
+-				public void run() {
+-					repoPreloadJob.reportAccumulatedStatus();
+-				}
+-			});
+-	}
+-
+ 	protected ProvisioningContext getProvisioningContext() {
+ 		return ((AvailableIUsPage) mainPage).getProvisioningContext();
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
+index 03409ab..a5126b3 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
+@@ -14,6 +14,7 @@ import java.lang.reflect.InvocationTargetException;
+ import java.util.Arrays;
+ import java.util.HashSet;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.jobs.*;
+ import org.eclipse.equinox.internal.p2.ui.*;
+ import org.eclipse.equinox.internal.p2.ui.model.ElementUtils;
+ import org.eclipse.equinox.internal.p2.ui.model.IUElementListRoot;
+@@ -25,6 +26,8 @@ import org.eclipse.jface.operation.IRunnableContext;
+ import org.eclipse.jface.operation.IRunnableWithProgress;
+ import org.eclipse.jface.wizard.IWizardPage;
+ import org.eclipse.jface.wizard.Wizard;
++import org.eclipse.swt.widgets.Composite;
++import org.eclipse.ui.PlatformUI;
+ import org.eclipse.ui.statushandlers.StatusManager;
+ 
+ /**
+@@ -230,4 +233,56 @@ public abstract class ProvisioningOperationWizard extends Wizard {
+ 	protected boolean shouldShowProvisioningPlanChildren() {
+ 		return ProvUI.getQueryContext(getPolicy()).getShowProvisioningPlanChildren();
+ 	}
++
++	/*
++	 * Overridden to start the preload job after page control creation.
++	 * This allows any listeners on repo events to be set up before a
++	 * batch load occurs.  The job creator uses a property to indicate if
++	 * the job needs scheduling (the client may have already completed the job
++	 * before the UI was opened).
++	 * (non-Javadoc)
++	 * @see org.eclipse.jface.wizard.Wizard#createPageControls(org.eclipse.swt.widgets.Composite)
++	 */
++	public void createPageControls(Composite pageContainer) {
++		super.createPageControls(pageContainer);
++		if (repoPreloadJob != null) {
++			if (repoPreloadJob.getProperty(LoadMetadataRepositoryJob.WIZARD_CLIENT_SHOULD_SCHEDULE) != null) {
++				// job has not been scheduled.  Set a listener so we can report accumulated errors and
++				// schedule it.
++				repoPreloadJob.addJobChangeListener(new JobChangeAdapter() {
++					public void done(IJobChangeEvent e) {
++						asyncReportLoadFailures();
++					}
++				});
++				repoPreloadJob.schedule();
++			} else {
++				// job has been scheduled, might already be done.
++				if (repoPreloadJob.getState() == Job.NONE) {
++					// job is done, report failures found so far
++					// do it asynchronously since we are in the middle of creation
++					asyncReportLoadFailures();
++				} else {
++					// job is waiting, sleeping, running, report failures when
++					// it's done
++					repoPreloadJob.addJobChangeListener(new JobChangeAdapter() {
++						public void done(IJobChangeEvent e) {
++							asyncReportLoadFailures();
++						}
++					});
++				}
++
++			}
++		}
++	}
++
++	void asyncReportLoadFailures() {
++		if (repoPreloadJob != null && getShell() != null && !getShell().isDisposed()) {
++			getShell().getDisplay().asyncExec(new Runnable() {
++				public void run() {
++					if (PlatformUI.isWorkbenchRunning() && getShell() != null && !getShell().isDisposed())
++						repoPreloadJob.reportAccumulatedStatus();
++				}
++			});
++		}
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
+index 46b3758..56b975a 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
+@@ -21,7 +21,6 @@ import org.eclipse.equinox.p2.operations.*;
+ import org.eclipse.equinox.p2.ui.LoadMetadataRepositoryJob;
+ import org.eclipse.equinox.p2.ui.ProvisioningUI;
+ import org.eclipse.jface.wizard.IWizardPage;
+-import org.eclipse.swt.widgets.Composite;
+ 
+ /**
+  * @since 3.4
+@@ -99,17 +98,6 @@ public class UpdateWizard extends WizardWithLicenses {
+ 		planSelections = selected.toArray();
+ 	}
+ 
+-	public void createPageControls(Composite pageContainer) {
+-		super.createPageControls(pageContainer);
+-		if (getRepositoryPreloadJob() != null)
+-			// async exec since we are in the middle of opening
+-			pageContainer.getDisplay().asyncExec(new Runnable() {
+-				public void run() {
+-					getRepositoryPreloadJob().reportAccumulatedStatus();
+-				}
+-			});
+-	}
+-
+ 	protected IResolutionErrorReportingPage createErrorReportingPage() {
+ 		return (SelectableIUsPage) mainPage;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/LoadMetadataRepositoryJob.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/LoadMetadataRepositoryJob.java
+index 7702f59..42043b9 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/LoadMetadataRepositoryJob.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/p2/ui/LoadMetadataRepositoryJob.java
+@@ -43,7 +43,7 @@ public class LoadMetadataRepositoryJob extends ProvisioningJob {
+ 
+ 	/**
+ 	 * The key that should be used to set a property on a repository load job to indicate
+-	 * that authentication should be suppressed when loading the repositories.
++	 * that authentication should be suppressed when loading the repositories. 
+ 	 */
+ 	public static final QualifiedName SUPPRESS_AUTHENTICATION_JOB_MARKER = new QualifiedName(ProvUIActivator.PLUGIN_ID, "SUPPRESS_AUTHENTICATION_REQUESTS"); //$NON-NLS-1$
+ 
+@@ -56,6 +56,14 @@ public class LoadMetadataRepositoryJob extends ProvisioningJob {
+ 
+ 	/**
+ 	 * The key that should be used to set a property on a repository load job to indicate
++	 * that a wizard receiving this job needs to schedule it.  In some cases, a load job
++	 * is finished before invoking a wizard.  In other cases, the job has not yet been
++	 * scheduled so that listeners can be set up first.
++	 */
++	public static final QualifiedName WIZARD_CLIENT_SHOULD_SCHEDULE = new QualifiedName(ProvUIActivator.PLUGIN_ID, "WIZARD_CLIENT_SHOULD_SCHEDULE"); //$NON-NLS-1$
++
++	/**
++	 * The key that should be used to set a property on a repository load job to indicate
+ 	 * that load errors should be accumulated into a single status rather than reported
+ 	 * as they occur.
+ 	 */

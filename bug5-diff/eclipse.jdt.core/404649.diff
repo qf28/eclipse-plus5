@@ -1,0 +1,1059 @@
+commit 86ee968d8acf90a0a75c72085f72a3416b02186d
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sun Mar 31 19:54:00 2013 +0200
+
+    Bug 404649 - [1.8][compiler] detect illegal reference to indirect or
+    redundant super
+
+3	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+71	2	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest.java
+61	57	org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+12	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedSuperReference.java
+4	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedThisReference.java
+4	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
+11	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+index 6f71968..3fa18e4 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+@@ -28,6 +28,7 @@
+  *								bug 382789 - [compiler][null] warn when syntactically-nonnull expression is compared against null
+  *								bug 402028 - [1.8][compiler] null analysis for reference expressions 
+  *								bug 401796 - [1.8][compiler] don't treat default methods as overriding an independent inherited abstract method
++ *								bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
+  *     Jesper S Moller - Contributions for
+  *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+@@ -908,6 +909,7 @@ public void test011_problem_categories() {
+ 		expectedProblemAttributes.put("StaticMethodRequested", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+ 		expectedProblemAttributes.put("StaticMethodShouldBeAccessedStatically", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+ 		expectedProblemAttributes.put("StringConstantIsExceedingUtf8Limit", new ProblemAttributes(CategorizedProblem.CAT_INTERNAL));
++		expectedProblemAttributes.put("SuperAccessCannotBypassDirectSuper", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+ 		expectedProblemAttributes.put("SuperInterfaceMustBeAnInterface", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+ 		expectedProblemAttributes.put("SuperInterfacesCollide", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+ 		expectedProblemAttributes.put("SuperTypeUsingWildcard", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+@@ -1684,6 +1686,7 @@ public void test012_compiler_problems_tuning() {
+ 		expectedProblemAttributes.put("StaticMethodRequested", SKIP);
+ 		expectedProblemAttributes.put("StaticMethodShouldBeAccessedStatically", SKIP);
+ 		expectedProblemAttributes.put("StringConstantIsExceedingUtf8Limit", SKIP);
++		expectedProblemAttributes.put("SuperAccessCannotBypassDirectSuper", SKIP);
+ 		expectedProblemAttributes.put("SuperInterfaceMustBeAnInterface", SKIP);
+ 		expectedProblemAttributes.put("SuperInterfacesCollide", SKIP);
+ 		expectedProblemAttributes.put("SuperTypeUsingWildcard", SKIP);
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest.java
+index ddbb5a1..a48863c 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest.java
+@@ -28,7 +28,7 @@ public class InterfaceMethodsTest extends AbstractComparableTest {
+ // Static initializer to specify tests subset using TESTS_* static variables
+ // All specified tests which do not belong to the class are skipped...
+ 	static {
+-//			TESTS_NAMES = new String[] { "testBridge02" };
++//			TESTS_NAMES = new String[] { "testSuperCall" };
+ //			TESTS_NUMBERS = new int[] { 561 };
+ //			TESTS_RANGE = new int[] { 1, 2049 };
+ 	}
+@@ -1138,7 +1138,7 @@ public class InterfaceMethodsTest extends AbstractComparableTest {
+ 			"1. ERROR in T.java (at line 6)\n" + 
+ 			"	return List.super.stream(); // List is not a direct super interface\n" + 
+ 			"	       ^^^^^^^^^^\n" + 
+-			"No enclosing instance of the type List<E> is accessible in scope\n" + 
++			"Illegal reference to super type List, cannot bypass the more specific direct super type OrderedSet\n" + 
+ 			"----------\n" + 
+ 			"2. ERROR in T.java (at line 12)\n" + 
+ 			"	return OrderedSet.super.stream(); // not a super interface of the direct enclosing class\n" + 
+@@ -1188,6 +1188,75 @@ public class InterfaceMethodsTest extends AbstractComparableTest {
+ 			"OK!"
+ 		);
+ 	}
++
++	// 15.12.1 (and 15.12.3, which seems to be redundant)
++	// https://bugs.eclipse.org/404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
++	public void testSuperCall4() {
++		this.runNegativeTest(
++			new String[] {
++				"X.java",
++				"public class X implements I2, I1 {\n" +
++				"	@Override\n" +
++				"	public void print() {\n" +
++				"		I1.super.print(); // illegal attempt to skip I2.print()\n" +
++				"		System.out.print(\"!\");" +
++				"	}\n" +
++				"	public static void main(String... args) {\n" +
++				"		new X().print();\n" +
++				"	}\n" +
++				"}\n" +
++				"interface I1 {\n" +
++				"	default void print() {\n" +
++				"		System.out.print(\"O\");\n" +
++				"	}\n" +
++				"}\n" +
++				"interface I2 extends I1 {\n" +
++				"	@Override default void print() {\n" +
++				"		System.out.print(\"K\");\n" +
++				"	}\n" +
++				"}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 4)\n" + 
++			"	I1.super.print(); // illegal attempt to skip I2.print()\n" + 
++			"	^^^^^^^^\n" + 
++			"Illegal reference to super type I1, cannot bypass the more specific direct super type I2\n" + 
++			"----------\n"
++		);
++	}
++
++	// 15.12.1
++	// https://bugs.eclipse.org/404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
++	public void testSuperCall5() {
++		this.runNegativeTest(
++			new String[] {
++				"X.java",
++				"public class X implements I2, I1 {\n" +
++				"	@Override\n" +
++				"	public void print() {\n" +
++				"		I1.super.print(); // illegal attempt to skip I2.print()\n" +
++				"		System.out.print(\"!\");" +
++				"	}\n" +
++				"	public static void main(String... args) {\n" +
++				"		new X().print();\n" +
++				"	}\n" +
++				"}\n" +
++				"interface I1 {\n" +
++				"	default void print() {\n" +
++				"		System.out.print(\"O\");\n" +
++				"	}\n" +
++				"}\n" +
++				"interface I2 extends I1 {\n" +
++				"}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in X.java (at line 4)\n" + 
++			"	I1.super.print(); // illegal attempt to skip I2.print()\n" + 
++			"	^^^^^^^^\n" + 
++			"Illegal reference to super type I1, cannot bypass the more specific direct super type I2\n" + 
++			"----------\n"
++		);
++	}
+ 	
+ 	// Bug 401235 - [1.8][compiler] 'this' reference must be allowed in default methods and local classes
+ 	public void testThisReference1() {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+index f025b2a..c0e1f57 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+@@ -175,6 +175,7 @@
+  *									ReferenceExpressionReturnNullRedef
+  *									ReferenceExpressionReturnNullRedefUnchecked
+  *									DuplicateInheritedDefaultMethods
++ *									SuperAccessCannotBypassDirectSuper
+  *      Jesper S Moller  - added the following constants
+  *									TargetTypeNotAFunctionalInterface
+  *									OuterLocalMustBeEffectivelyFinal
+@@ -421,7 +422,7 @@ void setSourceStart(int sourceStart);
+ 	int DuplicateBlankFinalFieldInitialization = FieldRelated + 82;
+ 	/** @since 3.6 */
+ 	int UnresolvedVariable = FieldRelated + 83;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int NonStaticOrAlienTypeReceiver = MethodRelated + 84;
+ 	// variable hiding
+ 	/** @since 3.0 */
+@@ -438,11 +439,11 @@ void setSourceStart(int sourceStart);
+ 	int ArgumentHidingField = Internal + 95;
+ 	/** @since 3.1 */
+ 	int MissingSerialVersion = Internal + 96;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int LambdaRedeclaresArgument = Internal + 97;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int LambdaRedeclaresLocal = Internal + 98;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int LambdaDescriptorMentionsUnmentionable = 99;
+ 
+ 	// methods
+@@ -474,17 +475,17 @@ void setSourceStart(int sourceStart);
+ 	int MethodCanBeStatic = Internal + MethodRelated + 121;
+ 	/** @since 3.7 */
+ 	int MethodCanBePotentiallyStatic = Internal + MethodRelated + 122;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int MethodReferenceSwingsBothWays = Internal + MethodRelated + 123;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int StaticMethodShouldBeAccessedStatically = Internal + MethodRelated + 124;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int InvalidArrayConstructorReference = Internal + MethodRelated + 125;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int ConstructedArrayIncompatible = Internal + MethodRelated + 126;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int DanglingReference = Internal + MethodRelated + 127;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int IncompatibleMethodReference = Internal + MethodRelated + 128;
+ 
+ 	// constructors
+@@ -917,7 +918,7 @@ void setSourceStart(int sourceStart);
+ 	/** @since 3.2 */
+ 	int EnumConstantsCannotBeSurroundedByParenthesis = Syntax + Internal + 442;
+ 
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int IllegalUseOfUnderscoreAsAnIdentifier = Syntax + Internal + 443;
+ 	// detected task
+ 	/** @since 2.1 */
+@@ -1341,51 +1342,51 @@ void setSourceStart(int sourceStart);
+ 	int UnusedWarningToken = Internal + 635;
+ 	/** @since 3.6 */
+ 	int MissingOverrideAnnotationForInterfaceMethodImplementation = MethodRelated + 636;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+     int InvalidUsageOfTypeAnnotations = Syntax + Internal + 637;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int DisallowedExplicitThisParameter = Syntax + Internal + 638;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int MisplacedTypeAnnotations = Syntax + Internal + 639;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int IllegalTypeAnnotationsInStaticMemberAccess = Internal + Syntax + 640;
+-    /** @since 3.9*/
++    /** @since 3.9 BETA_JAVA8 */
+     int IllegalUsageOfTypeAnnotations = Internal + Syntax + 641;
+-    /** @since 3.9*/
++    /** @since 3.9 BETA_JAVA8 */
+     int IllegalDeclarationOfThisParameter = Internal + Syntax + 642;
+-    /** @since 3.9*/
++    /** @since 3.9 BETA_JAVA8 */
+     int ExplicitThisParameterNotBelow18 = Internal + Syntax + 643;
+-    /** @since 3.9*/
++    /** @since 3.9 BETA_JAVA8 */
+     int DefaultMethodNotBelow18 = Internal + Syntax + 644;
+-    /** @since 3.9*/
++    /** @since 3.9 BETA_JAVA8 */
+     int LambdaExpressionNotBelow18 = Internal + Syntax + 645;
+-    /** @since 3.9*/
++    /** @since 3.9 BETA_JAVA8 */
+     int MethodReferenceNotBelow18 = Internal + Syntax + 646;
+-    /** @since 3.9*/
++    /** @since 3.9 BETA_JAVA8 */
+     int ConstructorReferenceNotBelow18 = Internal + Syntax + 647;
+-    /** @since 3.9*/
++    /** @since 3.9 BETA_JAVA8 */
+     int ExplicitThisParameterNotInLambda = Internal + Syntax + 648;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int ExplicitAnnotationTargetRequired = TypeRelated + 649;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int IllegalTypeForExplicitThis = Internal + Syntax + 650;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int IllegalQualifierForExplicitThis = Internal + Syntax + 651;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int IllegalQualifierForExplicitThis2 = Internal + Syntax + 652;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int TargetTypeNotAFunctionalInterface = Internal + TypeRelated + 653;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int IllegalVarargInLambda = Internal + TypeRelated + 654;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int illFormedParameterizationOfFunctionalInterface = Internal + TypeRelated + 655;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int lambdaSignatureMismatched = Internal + TypeRelated + 656;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int lambdaParameterTypeMismatched = Internal + TypeRelated + 657;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int IncompatibleLambdaParameterType = Internal + TypeRelated + 658;
+-    /** @since 3.9 */
++    /** @since 3.9 BETA_JAVA8 */
+     int NoGenericLambda = Internal + TypeRelated + 659;
+     /**
+ 	 * More problems in generics
+@@ -1396,11 +1397,11 @@ void setSourceStart(int sourceStart);
+ 	int UnusedTypeParameter = TypeRelated + 661;
+ 	/** @since 3.9 */
+ 	int IllegalArrayOfUnionType = TypeRelated + 662;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int OuterLocalMustBeEffectivelyFinal = Internal + 663;
+-	/** @since Java 3.9*/
++	/** @since 3.9 BETA_JAVA8 */
+ 	int InterfaceNotFunctionalInterface = Internal + TypeRelated + 664;
+-	/** @since Java 3.9*/
++	/** @since 3.9 BETA_JAVA8 */
+ 	int ConstructionTypeMismatch = Internal + TypeRelated + 665;
+ 
+ 
+@@ -1572,17 +1573,17 @@ void setSourceStart(int sourceStart);
+ 	int ExplicitlyClosedAutoCloseable = Internal + 889;
+ 	/** @since 3.8 */
+ 	int SwitchOnEnumNotBelow15 = TypeRelated + 890;	// https://bugs.eclipse.org/bugs/show_bug.cgi?id=360317
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int IntersectionCastNotBelow18 = TypeRelated + 891;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int IllegalBasetypeInIntersectionCast = TypeRelated + 892;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int IllegalArrayTypeInIntersectionCast = TypeRelated + 893;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int DuplicateBoundInIntersectionCast = TypeRelated + 894;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int MultipleFunctionalInterfaces = TypeRelated + 895;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int StaticInterfaceMethodNotBelow18 = Internal + Syntax + 896;
+ 	
+ 	/**
+@@ -1651,42 +1652,45 @@ void setSourceStart(int sourceStart);
+ 	/** @since 3.9 */
+ 	int ConflictingInheritedNullAnnotations = MethodRelated + 940;
+ 	
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int ArrayReferencePotentialNullReference = Internal + 951;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int DereferencingNullableExpression = Internal + 952;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int NullityMismatchingTypeAnnotation = Internal + 953;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int NullityMismatchingTypeAnnotationUnchecked = Internal + 954;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int ReferenceExpressionParameterMismatchPromisedNullable = MethodRelated + 955;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int ReferenceExpressionParameterRequiredNonnullUnchecked = MethodRelated + 956;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int ReferenceExpressionReturnNullRedef = MethodRelated + 957;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int ReferenceExpressionReturnNullRedefUnchecked = MethodRelated + 958;
+ 
+ 	// Java 8 work
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int IllegalModifiersForElidedType = Internal + 1001;
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int IllegalModifiers = Internal + 1002;
+ 
+ 	// default methods:
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int IllegalModifierForInterfaceDefaultMethod = MethodRelated + 1050;
+ 
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int DefaultMethodOverridesObjectMethod = MethodRelated + 1051;
+ 	
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int InheritedDefaultMethodConflictsWithOtherInherited = MethodRelated + 1052;
+ 	
+-	/** @since 3.9 */
++	/** @since 3.9 BETA_JAVA8 */
+ 	int DuplicateInheritedDefaultMethods = MethodRelated + 1053;
+ 
++	/** @since 3.9 BETA_JAVA8 */
++	int SuperAccessCannotBypassDirectSuper = TypeRelated + 1054;
++
+ 	/**
+ 	 * External problems -- These are problems defined by other plugins
+ 	 */
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedSuperReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedSuperReference.java
+index b1f3ffe..c794ede 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedSuperReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedSuperReference.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2009 IBM Corporation and others.
++ * Copyright (c) 2000, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -13,6 +13,7 @@
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann - Contribution for
+  *								bug 382350 - [1.8][compiler] Unable to invoke inherited default method via I.super.m() syntax
++ *								bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -43,6 +44,10 @@ public TypeBinding resolveType(BlockScope scope) {
+ 		return null;
+ 	}
+ 	super.resolveType(scope);
++	if (!this.resolvedType.isValidBinding()) {
++		scope.problemReporter().illegalSuperAccess(this.qualification.resolvedType, this.resolvedType, this);
++		return null;
++	}
+ 	if (this.currentCompatibleType == null)
+ 		return null; // error case
+ 
+@@ -61,11 +66,15 @@ int findCompatibleEnclosing(ReferenceBinding enclosingType, TypeBinding type) {
+ 		ReferenceBinding[] supers = enclosingType.superInterfaces();
+ 		int length = supers.length;
+ 		for (int i = 0; i < length; i++) {
+-			this.currentCompatibleType = supers[i];
+-			if (this.currentCompatibleType.erasure() == type) {
++			if (supers[i].erasure() == type) {
++				this.currentCompatibleType = supers[i];
++			} else if (supers[i].erasure().isCompatibleWith(type)) {
++				this.currentCompatibleType = null;
++				this.resolvedType = new ProblemReferenceBinding(supers[i].compoundName, supers[i], ProblemReasons.AttemptToBypassDirectSuper);
+ 				return 0;
+ 			}
+ 		}
++		return 0;
+ 	}
+ 	return super.findCompatibleEnclosing(enclosingType, type);
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedThisReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedThisReference.java
+index 158d9dc..11a3e96 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedThisReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedThisReference.java
+@@ -13,6 +13,7 @@
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann - Contribution for
+  *								bug 382350 - [1.8][compiler] Unable to invoke inherited default method via I.super.m() syntax
++ *								bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -101,7 +102,9 @@ public class QualifiedThisReference extends ThisReference {
+ 		this.bits |= (depth & 0xFF) << DepthSHIFT; // encoded depth into 8 bits
+ 
+ 		if (this.currentCompatibleType == null) {
+-			scope.problemReporter().noSuchEnclosingInstance(type, this, false);
++			if (this.resolvedType.isValidBinding())
++				scope.problemReporter().noSuchEnclosingInstance(type, this, false);
++			// otherwise problem will be reported by the caller
+ 			return this.resolvedType;
+ 		}
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
+index bf582d6..fa11b45 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ProblemReasons.java
+@@ -8,8 +8,9 @@
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Jesper S Moller - Contributions for
+- *							bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+-
++ *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
++ *	   Stephan Herrmann - Contribution for
++ *								bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -35,4 +36,5 @@ public interface ProblemReasons {
+ 	final int NotAWellFormedParameterizedType = 18;
+ 	final int IntersectionHasMultipleFunctionalInterfaces = 19;
+ 	final int NonStaticOrAlienTypeReceiver = 20;
++	final int AttemptToBypassDirectSuper = 21; // super access within default method
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index 9900435..4614cdc 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -34,6 +34,7 @@
+  *								bug 382789 - [compiler][null] warn when syntactically-nonnull expression is compared against null
+  *								bug 402028 - [1.8][compiler] null analysis for reference expressions 
+  *								bug 401796 - [1.8][compiler] don't treat default methods as overriding an independent inherited abstract method
++ *								bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
+  *      Jesper S Moller <jesper@selskabet.org> -  Contributions for
+  *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+@@ -9457,4 +9458,14 @@ public void incompatibleReturnType(ReferenceExpression expression, MethodBinding
+ 				expression.sourceEnd);
+ 	}
+ }
++
++public void illegalSuperAccess(TypeBinding superType, TypeBinding directSuperType, ASTNode location) {
++	if (directSuperType.problemId() != ProblemReasons.AttemptToBypassDirectSuper)
++		needImplementation(location);
++	handle(IProblem.SuperAccessCannotBypassDirectSuper, 
++			new String[] { String.valueOf(superType.readableName()), String.valueOf(directSuperType.readableName()) },
++			new String[] { String.valueOf(superType.shortReadableName()), String.valueOf(directSuperType.shortReadableName()) },
++			location.sourceStart,
++			location.sourceEnd);
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+index 1eb090d..60c269f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+@@ -30,6 +30,7 @@
+ #							bug 382789 - [compiler][null] warn when syntactically-nonnull expression is compared against null
+ #							bug 402028 - [1.8][compiler] null analysis for reference expressions
+ #							bug 401796 - [1.8][compiler] don't treat default methods as overriding an independent inherited abstract method
++#							bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
+ #		Jesper S Moller <jesper@selskabet.org> - Contributions for
+ #							bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+ #							bug 384567 - [1.5][compiler] Compiler accepts illegal modifiers on package declaration
+@@ -776,7 +777,7 @@
+ 957 = Null type mismatch at method return type: Method descriptor {0} promises ''@{1} {2}'' but referenced method provides ''{3}{4}''
+ 958 = Null type safety at method return type: Method descriptor {0} promises ''@{1} {2}'' but referenced method provides ''{3}{4}''
+ 
+-// Java 8
++# Java 8
+ 1001 = Syntax error, modifiers and annotations are not allowed for the lambda parameter {0} as its type is elided
+ 1002 = Syntax error, modifiers are not allowed here
+ 
+@@ -786,6 +787,7 @@
+ 1051 = A default method cannot override a method from java.lang.Object 
+ 1052 = The default method {0} inherited from {1} conflicts with another method inherited from {2}
+ 1053 = Duplicate default methods named {0} with the parameters ({1}) and ({2}) are inherited from the types {3} and {4}
++1054 = Illegal reference to super type {0}, cannot bypass the more specific direct super type {1}
+ 
+ ### ELABORATIONS
+ ## Access restrictions
+commit 7915a529d4dab8b70a0cdb9189fc342b9112ed8e
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sun Mar 31 22:49:40 2013 +0200
+
+    Bug 404649 - [1.8][compiler] detect illegal reference to indirect or
+    redundant super
+
+2	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+40	3	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest.java
+3	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+17	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+11	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+11	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+1	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+index 3fa18e4..62feff1 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+@@ -910,6 +910,7 @@ public void test011_problem_categories() {
+ 		expectedProblemAttributes.put("StaticMethodShouldBeAccessedStatically", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+ 		expectedProblemAttributes.put("StringConstantIsExceedingUtf8Limit", new ProblemAttributes(CategorizedProblem.CAT_INTERNAL));
+ 		expectedProblemAttributes.put("SuperAccessCannotBypassDirectSuper", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
++		expectedProblemAttributes.put("SuperCallCannotBypassOverride", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+ 		expectedProblemAttributes.put("SuperInterfaceMustBeAnInterface", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+ 		expectedProblemAttributes.put("SuperInterfacesCollide", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+ 		expectedProblemAttributes.put("SuperTypeUsingWildcard", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+@@ -1687,6 +1688,7 @@ public void test012_compiler_problems_tuning() {
+ 		expectedProblemAttributes.put("StaticMethodShouldBeAccessedStatically", SKIP);
+ 		expectedProblemAttributes.put("StringConstantIsExceedingUtf8Limit", SKIP);
+ 		expectedProblemAttributes.put("SuperAccessCannotBypassDirectSuper", SKIP);
++		expectedProblemAttributes.put("SuperCallCannotBypassOverride", SKIP);
+ 		expectedProblemAttributes.put("SuperInterfaceMustBeAnInterface", SKIP);
+ 		expectedProblemAttributes.put("SuperInterfacesCollide", SKIP);
+ 		expectedProblemAttributes.put("SuperTypeUsingWildcard", SKIP);
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest.java
+index a48863c..c9f04f9 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/InterfaceMethodsTest.java
+@@ -28,7 +28,7 @@ public class InterfaceMethodsTest extends AbstractComparableTest {
+ // Static initializer to specify tests subset using TESTS_* static variables
+ // All specified tests which do not belong to the class are skipped...
+ 	static {
+-//			TESTS_NAMES = new String[] { "testSuperCall" };
++//			TESTS_NAMES = new String[] { "testSuperCall6" };
+ //			TESTS_NUMBERS = new int[] { 561 };
+ //			TESTS_RANGE = new int[] { 1, 2049 };
+ 	}
+@@ -1189,7 +1189,7 @@ public class InterfaceMethodsTest extends AbstractComparableTest {
+ 		);
+ 	}
+ 
+-	// 15.12.1 (and 15.12.3, which seems to be redundant)
++	// 15.12.1
+ 	// https://bugs.eclipse.org/404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
+ 	public void testSuperCall4() {
+ 		this.runNegativeTest(
+@@ -1257,7 +1257,44 @@ public class InterfaceMethodsTest extends AbstractComparableTest {
+ 			"----------\n"
+ 		);
+ 	}
+-	
++
++	// 15.12.3
++	// https://bugs.eclipse.org/404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
++	public void testSuperCall6() {
++		this.runNegativeTest(
++			new String[] {
++				"SuperOverride.java",
++				"interface I0 {\n" + 
++				"	default void foo() { System.out.println(\"I0\"); }\n" + 
++				"}\n" + 
++				"\n" + 
++				"interface IA extends I0 {}\n" + 
++				"\n" + 
++				"interface IB extends I0 {\n" + 
++				"	@Override default void foo() {\n" + 
++				"		System.out.println(\"IB\");\n" + 
++				"	}\n" + 
++				"}\n" + 
++				"interface IX extends IA, IB {\n" + 
++				"	@Override default void foo() {\n" + 
++				"		IA.super.foo(); // illegal attempt to skip IB.foo()\n" + 
++				"	}\n" + 
++				"}\n" + 
++				"public class SuperOverride implements IX {\n" + 
++				"	public static void main(String[] args) {\n" + 
++				"		new SuperOverride().foo();\n" + 
++				"	}\n" + 
++				"}\n"
++			},
++			"----------\n" + 
++			"1. ERROR in SuperOverride.java (at line 14)\n" + 
++			"	IA.super.foo(); // illegal attempt to skip IB.foo()\n" + 
++			"	^^^^^^^^^^^^^^\n" + 
++			"Illegal reference to super method foo() from type I0, cannot bypass the more specific override from type IB\n" + 
++			"----------\n"
++		);
++	}
++
+ 	// Bug 401235 - [1.8][compiler] 'this' reference must be allowed in default methods and local classes
+ 	public void testThisReference1() {
+ 		this.runConformTest(
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+index c0e1f57..02ecd71 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+@@ -176,6 +176,7 @@
+  *									ReferenceExpressionReturnNullRedefUnchecked
+  *									DuplicateInheritedDefaultMethods
+  *									SuperAccessCannotBypassDirectSuper
++ *									SuperCallCannotBypassOverride
+  *      Jesper S Moller  - added the following constants
+  *									TargetTypeNotAFunctionalInterface
+  *									OuterLocalMustBeEffectivelyFinal
+@@ -1690,6 +1691,8 @@ void setSourceStart(int sourceStart);
+ 
+ 	/** @since 3.9 BETA_JAVA8 */
+ 	int SuperAccessCannotBypassDirectSuper = TypeRelated + 1054;
++	/** @since 3.9 BETA_JAVA8 */
++	int SuperCallCannotBypassOverride = MethodRelated + 1055;
+ 
+ 	/**
+ 	 * External problems -- These are problems defined by other plugins
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index f3b4d63..b2b1591 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -29,6 +29,7 @@
+  *								bug 331649 - [compiler][null] consider null annotations for fields
+  *								bug 383368 - [compiler][null] syntactic null analysis for field references
+  *								bug 382350 - [1.8][compiler] Unable to invoke inherited default method via I.super.m() syntax
++ *								bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -46,10 +47,10 @@ import org.eclipse.jdt.internal.compiler.impl.ReferenceContext;
+ import org.eclipse.jdt.internal.compiler.lookup.Binding;
+ import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
+ import org.eclipse.jdt.internal.compiler.lookup.ExtraCompilerModifiers;
++import org.eclipse.jdt.internal.compiler.lookup.ImplicitNullAnnotationVerifier;
+ import org.eclipse.jdt.internal.compiler.lookup.InvocationSite;
+ import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.MissingTypeBinding;
+-import org.eclipse.jdt.internal.compiler.lookup.ImplicitNullAnnotationVerifier;
+ import org.eclipse.jdt.internal.compiler.lookup.ParameterizedGenericMethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.PolyTypeBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.PolymorphicMethodBinding;
+@@ -689,6 +690,21 @@ public TypeBinding resolveType(BlockScope scope) {
+ 			}
+ 		}
+ 	}
++	if (this.receiver.isSuper() && this.actualReceiverType.isInterface()) {
++		// 15.12.3 (Java 8)
++		ReferenceBinding enclosingType = scope.enclosingReceiverType();
++		MethodBinding otherMethod = scope.getMethod(enclosingType.superclass(), this.selector, argumentTypes, this);
++		if (scope.checkAppropriate(this.binding, otherMethod, this)) {
++			ReferenceBinding[] superInterfaces = enclosingType.superInterfaces();
++			if (superInterfaces != null) {
++				for (int i = 0; i < superInterfaces.length; i++) {
++					otherMethod = scope.getMethod(superInterfaces[i], this.selector, argumentTypes, this);
++					if (!scope.checkAppropriate(this.binding, otherMethod, this))
++						break;
++				}
++			}
++		}
++	}
+ 	if (this.typeArguments != null && this.binding.original().typeVariables == Binding.NO_TYPE_VARIABLES) {
+ 		scope.problemReporter().unnecessaryTypeArgumentsForMethodInvocation(this.binding, this.genericTypeArguments, this.typeArguments);
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+index 40bdb8e..0b4b6a2 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+@@ -16,6 +16,7 @@
+  *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *								bug 379784 - [compiler] "Method can be static" is not getting reported
+  *								bug 394768 - [compiler][resource] Incorrect resource leak warning when creating stream in conditional
++ *								bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -1187,4 +1188,14 @@ public void correlateTrackingVarsIfElse(FlowInfo thenFlowInfo, FlowInfo elseFlow
+ 	if (this.parent instanceof BlockScope)
+ 		((BlockScope) this.parent).correlateTrackingVarsIfElse(thenFlowInfo, elseFlowInfo);
+ }
++/** 15.12.3 (Java 8) "Compile-Time Step 3: Is the Chosen Method Appropriate?" */
++public boolean checkAppropriate(MethodBinding compileTimeDeclaration, MethodBinding otherMethod, MessageSend location) {
++	if (otherMethod == null || !otherMethod.isValidBinding() || otherMethod == compileTimeDeclaration)
++		return true;
++	if (MethodVerifier.doesMethodOverride(otherMethod, compileTimeDeclaration, this.environment())) {
++		problemReporter().illegalSuperCallBypassingOverride(location, compileTimeDeclaration, otherMethod.declaringClass);
++		return false; 
++	}
++	return true;
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index 4614cdc..a9178e9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -9468,4 +9468,15 @@ public void illegalSuperAccess(TypeBinding superType, TypeBinding directSuperTyp
+ 			location.sourceStart,
+ 			location.sourceEnd);
+ }
++public void illegalSuperCallBypassingOverride(ASTNode location, MethodBinding targetMethod, ReferenceBinding overrider) {
++	this.handle(IProblem.SuperCallCannotBypassOverride,
++			new String[] { 	String.valueOf(targetMethod.readableName()),
++							String.valueOf(targetMethod.declaringClass.readableName()),
++							String.valueOf(overrider.readableName()) },
++			new String[] { 	String.valueOf(targetMethod.shortReadableName()),
++							String.valueOf(targetMethod.declaringClass.shortReadableName()),
++							String.valueOf(overrider.shortReadableName()) },
++			location.sourceStart,
++			location.sourceEnd);
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+index 60c269f..8274a0f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+@@ -788,6 +788,7 @@
+ 1052 = The default method {0} inherited from {1} conflicts with another method inherited from {2}
+ 1053 = Duplicate default methods named {0} with the parameters ({1}) and ({2}) are inherited from the types {3} and {4}
+ 1054 = Illegal reference to super type {0}, cannot bypass the more specific direct super type {1}
++1055 = Illegal reference to super method {0} from type {1}, cannot bypass the more specific override from type {2}
+ 
+ ### ELABORATIONS
+ ## Access restrictions
+commit f28c28de6ed3d2e9e475bca36caf25c219a92533
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Mon Apr 1 23:23:10 2013 +0200
+
+    Bug 404649 - [1.8][compiler] detect illegal reference to indirect or
+    redundant super via I.super.m() syntax
+    - improve how we proceed after detecting an illegal super access
+    - moved checking code to BlockScope to share among MessageSend
+      and ReferenceExpression
+    - hook these check into ReferenceExpression, too.
+
+90	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+1	12	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+19	5	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedSuperReference.java
+12	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+18	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+3	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+index c53301b..1405f06 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NegativeLambdaExpressionsTest.java
+@@ -15,6 +15,8 @@
+  *							bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *							bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+  *                          Bug 384687 - [1.8] Wildcard type arguments should be rejected for lambda and reference expressions
++ *     Stephan Herrmann - Contribution for
++ *							bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super via I.super.m() syntax
+  *******************************************************************************/
+ package org.eclipse.jdt.core.tests.compiler.regression;
+ 
+@@ -26,7 +28,7 @@ import junit.framework.Test;
+ public class NegativeLambdaExpressionsTest extends AbstractRegressionTest {
+ 
+ static {
+-//	TESTS_NAMES = new String[] { "test380112e"};
++//	TESTS_NAMES = new String[] { "testSuperReference"};
+ //	TESTS_NUMBERS = new int[] { 50 };
+ //	TESTS_RANGE = new int[] { 11, -1 };
+ }
+@@ -6234,6 +6236,93 @@ public void test402609c() {
+ 			"The method f(I) is ambiguous for the type X\n" + 
+ 			"----------\n");
+ }
++
++// 15.28:
++// https://bugs.eclipse.org/382350 - [1.8][compiler] Unable to invoke inherited default method via I.super.m() syntax
++public void testSuperReference01() {
++	this.runNegativeTest(
++		new String[] {
++			"X.java",
++			"public class X implements I2, I1 {\n" +
++			"	@Override\n" +
++			"	public void print() {\n" +
++			"		System.out.print(\"!\");" +
++			"	}\n" +
++			"   void test() {\n" +
++			"		doOutput(I1.super::print); // illegal attempt to skip I2.print()\n" +
++			"	}\n" +
++			"	public static void main(String... args) {\n" +
++			"		new X().test();\n" +
++			"	}\n" +
++			"   void doOutput(CanPrint printer) {\n" +
++			"      printer.print();" +
++			"   }\n" +
++			"}\n" +
++			"interface CanPrint {\n" +
++			"	void print();\n" +
++			"}\n" +
++			"interface I1 {\n" +
++			"	default void print() {\n" +
++			"		System.out.print(\"O\");\n" +
++			"	}\n" +
++			"}\n" +
++			"interface I2 extends I1 {\n" +
++			"}\n"
++		},
++		"----------\n" + 
++		"1. ERROR in X.java (at line 6)\n" + 
++		"	doOutput(I1.super::print); // illegal attempt to skip I2.print()\n" + 
++		"	         ^^^^^^^^\n" + 
++		"Illegal reference to super type I1, cannot bypass the more specific direct super type I2\n" + 
++		"----------\n"
++	);
++}
++
++// 15.28.1:
++// https://bugs.eclipse.org/382350 - [1.8][compiler] Unable to invoke inherited default method via I.super.m() syntax
++public void testSuperReference02() {
++	this.runNegativeTest(
++		new String[] {
++			"X.java",
++			"interface I0 {\n" + 
++			"	default void print() { System.out.println(\"I0\"); }\n" + 
++			"}\n" + 
++			"\n" + 
++			"interface IA extends I0 {}\n" + 
++			"\n" + 
++			"interface IB extends I0 {\n" + 
++			"	@Override default void print() {\n" + 
++			"		System.out.println(\"IB\");\n" + 
++			"	}\n" + 
++			"}\n" + 
++			"public class X implements IA, IB {\n" +
++			"	@Override\n" +
++			"	public void print() {\n" +
++			"		System.out.print(\"!\");" +
++			"	}\n" +
++			"   void test() {\n" +
++			"		doOutput(IA.super::print); // illegal attempt to skip IB.print()\n" +
++			"	}\n" +
++			"	public static void main(String... args) {\n" +
++			"		new X().test();\n" +
++			"	}\n" +
++			"   void doOutput(CanPrint printer) {\n" +
++			"      printer.print();" +
++			"   }\n" +
++			"}\n" +
++			"interface CanPrint {\n" +
++			"	void print();\n" +
++			"}\n"
++		},
++		"----------\n" + 
++		"1. ERROR in X.java (at line 17)\n" + 
++		"	doOutput(IA.super::print); // illegal attempt to skip IB.print()\n" + 
++		"	         ^^^^^^^^^^^^^^^\n" + 
++		"Illegal reference to super method print() from type I0, cannot bypass the more specific override from type IB\n" + 
++		"----------\n"
++	);
++}
++
+ public static Class testClass() {
+ 	return NegativeLambdaExpressionsTest.class;
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index b2b1591..e3a5430 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -692,18 +692,7 @@ public TypeBinding resolveType(BlockScope scope) {
+ 	}
+ 	if (this.receiver.isSuper() && this.actualReceiverType.isInterface()) {
+ 		// 15.12.3 (Java 8)
+-		ReferenceBinding enclosingType = scope.enclosingReceiverType();
+-		MethodBinding otherMethod = scope.getMethod(enclosingType.superclass(), this.selector, argumentTypes, this);
+-		if (scope.checkAppropriate(this.binding, otherMethod, this)) {
+-			ReferenceBinding[] superInterfaces = enclosingType.superInterfaces();
+-			if (superInterfaces != null) {
+-				for (int i = 0; i < superInterfaces.length; i++) {
+-					otherMethod = scope.getMethod(superInterfaces[i], this.selector, argumentTypes, this);
+-					if (!scope.checkAppropriate(this.binding, otherMethod, this))
+-						break;
+-				}
+-			}
+-		}
++		scope.checkAppropriateMethodAgainstSupers(this.selector, this.binding, argumentTypes, this);
+ 	}
+ 	if (this.typeArguments != null && this.binding.original().typeVariables == Binding.NO_TYPE_VARIABLES) {
+ 		scope.problemReporter().unnecessaryTypeArgumentsForMethodInvocation(this.binding, this.genericTypeArguments, this.typeArguments);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedSuperReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedSuperReference.java
+index c794ede..7fdf84f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedSuperReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedSuperReference.java
+@@ -65,16 +65,30 @@ int findCompatibleEnclosing(ReferenceBinding enclosingType, TypeBinding type) {
+ 		// super call to an overridden default method? (not considering outer enclosings)
+ 		ReferenceBinding[] supers = enclosingType.superInterfaces();
+ 		int length = supers.length;
++		boolean isLegal = true; // false => compoundName != null && closestMatch != null
++		char[][] compoundName = null;
++		ReferenceBinding closestMatch = null;
+ 		for (int i = 0; i < length; i++) {
+ 			if (supers[i].erasure() == type) {
+-				this.currentCompatibleType = supers[i];
++				this.currentCompatibleType = closestMatch = supers[i];
+ 			} else if (supers[i].erasure().isCompatibleWith(type)) {
+-				this.currentCompatibleType = null;
+-				this.resolvedType = new ProblemReferenceBinding(supers[i].compoundName, supers[i], ProblemReasons.AttemptToBypassDirectSuper);
+-				return 0;
++				isLegal = false;
++				compoundName = supers[i].compoundName;
++				if (closestMatch == null)
++					closestMatch = supers[i];
++				// keep looking to ensure we always find the referenced type (even if illegal) 
+ 			}
+ 		}
+-		return 0;
++		if (!isLegal) {
++			this.currentCompatibleType = null;
++			// Please note the slightly unconventional use of the ProblemReferenceBinding:
++			// we use the problem's compoundName to report the type being illegally bypassed,
++			// whereas the closestMatch denotes the resolved (though illegal) target type
++			// for downstream resolving.
++			this.resolvedType =  new ProblemReferenceBinding(compoundName, 
++					closestMatch, ProblemReasons.AttemptToBypassDirectSuper);
++		}
++		return 0; // never an outer enclosing type
+ 	}
+ 	return super.findCompatibleEnclosing(enclosingType, type);
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+index f0aead8..42aa571 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+@@ -16,6 +16,7 @@
+  *                          Bug 384687 - [1.8] Wildcard type arguments should be rejected for lambda and reference expressions
+  *	   Stephan Herrmann - Contribution for
+  *							bug 402028 - [1.8][compiler] null analysis for reference expressions 
++ *							bug 404649 - [1.8][compiler] detect illegal reference to indirect or redundant super via I.super.m() syntax
+  *******************************************************************************/
+ 
+ package org.eclipse.jdt.internal.compiler.ast;
+@@ -35,6 +36,7 @@ import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
+ import org.eclipse.jdt.internal.compiler.lookup.InvocationSite;
+ import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.PolyTypeBinding;
++import org.eclipse.jdt.internal.compiler.lookup.ProblemReasons;
+ import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.Scope;
+ import org.eclipse.jdt.internal.compiler.lookup.TagBits;
+@@ -110,8 +112,12 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+ 		}
+ 		super.resolveType(scope);
+ 		
+-    	if (lhsType == null || !lhsType.isValidBinding()) 
+-			return this.resolvedType = null;
++    	if (lhsType == null) 
++			return this.resolvedType = null; 	// no hope
++		if (lhsType.problemId() == ProblemReasons.AttemptToBypassDirectSuper)
++			lhsType = lhsType.closestMatch();	// improve resolving experience
++    	if (!lhsType.isValidBinding()) 
++			return this.resolvedType = null;	// nope, no useful type found
+ 		
+ 		final TypeBinding[] descriptorParameters = this.descriptor != null ? this.descriptor.parameters : Binding.NO_PARAMETERS;
+ 		if (lhsType.isBaseType()) {
+@@ -194,7 +200,10 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+         		}
+         	}
+         }
+-        
++    	if (this.lhs.isSuper() && this.lhs.resolvedType.isInterface()) {
++    		scope.checkAppropriateMethodAgainstSupers(this.selector, someMethod, this.descriptor.parameters, this);
++    	}
++
+         MethodBinding anotherMethod = null;
+         if (!this.haveReceiver && isMethodReference && parametersLength > 0) {
+         	final TypeBinding potentialReceiver = descriptorParameters[0];
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+index 0b4b6a2..e2eab17 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+@@ -1188,8 +1188,25 @@ public void correlateTrackingVarsIfElse(FlowInfo thenFlowInfo, FlowInfo elseFlow
+ 	if (this.parent instanceof BlockScope)
+ 		((BlockScope) this.parent).correlateTrackingVarsIfElse(thenFlowInfo, elseFlowInfo);
+ }
++
+ /** 15.12.3 (Java 8) "Compile-Time Step 3: Is the Chosen Method Appropriate?" */
+-public boolean checkAppropriate(MethodBinding compileTimeDeclaration, MethodBinding otherMethod, MessageSend location) {
++public void checkAppropriateMethodAgainstSupers(char[] selector, MethodBinding compileTimeMethod,
++		TypeBinding[] parameters, InvocationSite site)
++{
++	ReferenceBinding enclosingType = enclosingReceiverType();
++	MethodBinding otherMethod = getMethod(enclosingType.superclass(), selector, parameters, site);
++	if (checkAppropriate(compileTimeMethod, otherMethod, site)) {
++		ReferenceBinding[] superInterfaces = enclosingType.superInterfaces();
++		if (superInterfaces != null) {
++			for (int i = 0; i < superInterfaces.length; i++) {
++				otherMethod = getMethod(superInterfaces[i], selector, parameters, site);
++				if (!checkAppropriate(compileTimeMethod, otherMethod, site))
++					break;
++			}
++		}
++	}
++}
++private boolean checkAppropriate(MethodBinding compileTimeDeclaration, MethodBinding otherMethod, InvocationSite location) {
+ 	if (otherMethod == null || !otherMethod.isValidBinding() || otherMethod == compileTimeDeclaration)
+ 		return true;
+ 	if (MethodVerifier.doesMethodOverride(otherMethod, compileTimeDeclaration, this.environment())) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index a9178e9..49272992 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -9468,7 +9468,7 @@ public void illegalSuperAccess(TypeBinding superType, TypeBinding directSuperTyp
+ 			location.sourceStart,
+ 			location.sourceEnd);
+ }
+-public void illegalSuperCallBypassingOverride(ASTNode location, MethodBinding targetMethod, ReferenceBinding overrider) {
++public void illegalSuperCallBypassingOverride(InvocationSite location, MethodBinding targetMethod, ReferenceBinding overrider) {
+ 	this.handle(IProblem.SuperCallCannotBypassOverride,
+ 			new String[] { 	String.valueOf(targetMethod.readableName()),
+ 							String.valueOf(targetMethod.declaringClass.readableName()),
+@@ -9476,7 +9476,7 @@ public void illegalSuperCallBypassingOverride(ASTNode location, MethodBinding ta
+ 			new String[] { 	String.valueOf(targetMethod.shortReadableName()),
+ 							String.valueOf(targetMethod.declaringClass.shortReadableName()),
+ 							String.valueOf(overrider.shortReadableName()) },
+-			location.sourceStart,
+-			location.sourceEnd);
++			location.sourceStart(),
++			location.sourceEnd());
+ }
+ }

@@ -1,0 +1,462 @@
+commit 8eb2fb72a4aa74202f4b097049aaa00307d64fe8
+Author: John Arthorne <johna>
+Date:   Tue Dec 2 03:54:32 2008 +0000
+
+    Bug 202985 [prov] [repo] Store repositories in the profile
+
+46	2	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+16	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
+13	37	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddRepositoryAction.java
+20	21	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RemoveRepositoryAction.java
+187	0	bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RepositoryAction.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index a1e1046..c80507a 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -10,20 +10,22 @@ package org.eclipse.equinox.internal.p2.engine;
+ 
+ import java.io.*;
+ import java.lang.ref.SoftReference;
+-import java.net.MalformedURLException;
+-import java.net.URL;
++import java.net.*;
+ import java.util.*;
+ import java.util.Map.Entry;
+ import javax.xml.parsers.ParserConfigurationException;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.core.runtime.Status;
+ import org.eclipse.equinox.internal.p2.core.helpers.*;
++import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+ import org.eclipse.equinox.internal.provisional.p2.core.location.AgentLocation;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.engine.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.query.InstallableUnitQuery;
++import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.query.Collector;
+ import org.eclipse.osgi.service.datalocation.Location;
+ import org.eclipse.osgi.util.NLS;
+@@ -231,9 +233,51 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 			updateSelfProfile = false;
+ 			updateSelfProfile(result);
+ 		}
++		publishRepositoryReferences(result);
+ 		return result;
+ 	}
+ 
++	/**
++	 * Publishes any repository references for the currently running profile in this registry.
++	 */
++	private void publishRepositoryReferences(Map profileMap) {
++		Profile profile = (Profile) profileMap.get(self);
++		if (profile == null)
++			return;
++		String repos = profile.getProperty(IProfile.PROP_METADATA_REPOSITORIES);
++		if (repos != null) {
++			IRepositoryManager manager = (IRepositoryManager) ServiceHelper.getService(EngineActivator.getContext(), IMetadataRepositoryManager.SERVICE_NAME);
++			doPublishRepositories(manager, repos);
++		}
++		repos = profile.getProperty(IProfile.PROP_ARTIFACT_REPOSITORIES);
++		if (repos != null) {
++			IRepositoryManager manager = (IRepositoryManager) ServiceHelper.getService(EngineActivator.getContext(), IArtifactRepositoryManager.SERVICE_NAME);
++			doPublishRepositories(manager, repos);
++		}
++	}
++
++	/**
++	 * Adds the given list of repositories to the given repository manager.
++	 */
++	private void doPublishRepositories(IRepositoryManager manager, String repos) {
++		StringTokenizer tokens = new StringTokenizer(repos, ","); //$NON-NLS-1$
++		while (tokens.hasMoreTokens())
++			manager.addRepository(decodeURI(tokens.nextToken()));
++	}
++
++	/**
++	 * Decodes a URI that has had literal comma characters encoded.
++	 */
++	private URI decodeURI(String locationString) {
++		//convert escaped commas back to literal commas
++		int nextComma = locationString.indexOf("${#44}"); //$NON-NLS-1$
++		while (nextComma > 0) {
++			locationString = locationString.substring(0, nextComma) + ',' + locationString.substring(nextComma + 6);
++			nextComma = locationString.indexOf("${#44}");//$NON-NLS-1$
++		}
++		return URI.create(locationString);
++	}
++
+ 	public synchronized void updateProfile(Profile profile) {
+ 		String id = profile.getProfileId();
+ 		Profile current = internalGetProfile(id);
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
+index f4c371a..c1615a8 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfile.java
+@@ -78,6 +78,22 @@ public interface IProfile extends IQueryable {
+ 	 */
+ 	public static final String PROP_INSTALL_FEATURES = "org.eclipse.update.install.features"; //$NON-NLS-1$
+ 
++	/**
++	 * Profile property constant for a String property indicating additional metadata repositories 
++	 * associated with this profile. The format of the property value is a comma-separated 
++	 * list of repository location URIs, where any literal comma characters are encoded 
++	 * with the corresponding unicode escape sequence (${#44}).
++	 */
++	public static final String PROP_METADATA_REPOSITORIES = "org.eclipse.equinox.p2.metadataRepositories"; //$NON-NLS-1$
++
++	/**
++	 * Profile property constant for a String property indicating additional artifact repositories 
++	 * associated with this profile. The format of the property value is a comma-separated 
++	 * list of repository location URIs, where any literal comma characters are encoded 
++	 * with the corresponding unicode escape sequence (${#44}).
++	 */
++	public static final String PROP_ARTIFACT_REPOSITORIES = "org.eclipse.equinox.p2.artifactRepositories"; //$NON-NLS-1$
++
+ 	public String getProfileId();
+ 
+ 	public IProfile getParentProfile();
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddRepositoryAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddRepositoryAction.java
+index 05c0172..fa95c15 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddRepositoryAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/AddRepositoryAction.java
+@@ -10,60 +10,36 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
+ 
+-import java.net.URI;
+-import java.net.URISyntaxException;
+ import java.util.Map;
+ import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+-import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Activator;
+-import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
+-import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
++import org.eclipse.equinox.internal.p2.engine.Profile;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.RepositoryEvent;
+-import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction;
+-import org.eclipse.osgi.util.NLS;
+ 
+ /**
+  * An action that adds a repository to the list of known repositories.
+  */
+-public class AddRepositoryAction extends ProvisioningAction {
++public class AddRepositoryAction extends RepositoryAction {
+ 	public static final String ID = "addRepository"; //$NON-NLS-1$
+ 
+-	static RepositoryEvent createEvent(Map parameters) throws CoreException {
+-		String parm = (String) parameters.get(ActionConstants.PARM_REPOSITORY_LOCATION);
+-		if (parm == null)
+-			throw new CoreException(Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_REPOSITORY_LOCATION, ID)));
+-		URI location = null;
+-		try {
+-			location = new URI(parm);
+-		} catch (URISyntaxException e) {
+-			throw new CoreException(Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_REPOSITORY_LOCATION, ID), e));
+-		}
+-		parm = (String) parameters.get(ActionConstants.PARM_REPOSITORY_TYPE);
+-		if (parm == null)
+-			throw new CoreException(Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_REPOSITORY_TYPE, ID)));
+-		int type = 0;
+-		try {
+-			type = Integer.parseInt(parm);
+-		} catch (NumberFormatException e) {
+-			throw new CoreException(Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_REPOSITORY_TYPE, ID), e));
+-		}
+-		//default is to be enabled
+-		String enablement = (String) parameters.get(ActionConstants.PARM_REPOSITORY_ENABLEMENT);
+-		boolean enabled = enablement == null ? true : Boolean.valueOf(enablement).booleanValue();
+-		return new RepositoryEvent(location, type, RepositoryEvent.DISCOVERED, enabled);
+-	}
+-
+ 	public IStatus execute(Map parameters) {
+-		IProvisioningEventBus bus = (IProvisioningEventBus) ServiceHelper.getService(Activator.getContext(), IProvisioningEventBus.SERVICE_NAME);
+ 		try {
+-			if (bus != null)
+-				bus.publishEvent(createEvent(parameters));
++			final RepositoryEvent event = createEvent(parameters);
++			Profile profile = (Profile) parameters.get(ActionConstants.PARM_PROFILE);
++			if (profile != null)
++				addRepositoryToProfile(profile, event.getRepositoryLocation(), event.getRepositoryType());
++			//if provisioning into the current profile, broadcast an event to add this repository directly to the current repository managers.
++			if (isSelfProfile(profile))
++				addToSelf(event);
+ 			return Status.OK_STATUS;
+ 		} catch (CoreException e) {
+ 			return e.getStatus();
+ 		}
+ 	}
+ 
++	protected String getId() {
++		return ID;
++	}
++
+ 	public IStatus undo(Map parameters) {
+ 		//TODO: we don't know if the repository was already present
+ 		return Status.OK_STATUS;
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RemoveRepositoryAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RemoveRepositoryAction.java
+index f237513..77d20ee 100644
+--- a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RemoveRepositoryAction.java
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RemoveRepositoryAction.java
+@@ -12,33 +12,24 @@ package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
+ 
+ import java.util.Map;
+ import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+-import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Activator;
+-import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
+-import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+-import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
++import org.eclipse.equinox.internal.p2.engine.Profile;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.RepositoryEvent;
+-import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningAction;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
+ 
+ /**
+  * An action that adds a repository to the list of known repositories.
+  */
+-public class RemoveRepositoryAction extends ProvisioningAction {
++public class RemoveRepositoryAction extends RepositoryAction {
+ 	public static final String ID = "removeRepository"; //$NON-NLS-1$
+ 
+ 	public IStatus execute(Map parameters) {
+ 		try {
+-			RepositoryEvent event = AddRepositoryAction.createEvent(parameters);
+-			if (event.getRepositoryType() == IRepository.TYPE_METADATA) {
+-				IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(Activator.getContext(), IMetadataRepositoryManager.SERVICE_NAME);
+-				if (manager != null)
+-					manager.removeRepository(event.getRepositoryLocation());
+-			} else if (event.getRepositoryType() == IRepository.TYPE_ARTIFACT) {
+-				IArtifactRepositoryManager manager = (IArtifactRepositoryManager) ServiceHelper.getService(Activator.getContext(), IArtifactRepositoryManager.SERVICE_NAME);
+-				if (manager != null)
+-					manager.removeRepository(event.getRepositoryLocation());
+-			}
++			RepositoryEvent event = createEvent(parameters);
++			Profile profile = (Profile) parameters.get(ActionConstants.PARM_PROFILE);
++			if (profile != null)
++				removeRepositoryFromProfile(profile, event.getRepositoryLocation(), event.getRepositoryType());
++			//if we are provisioning into the self profile, update the current set of repositories in this configuration
++			if (isSelfProfile(profile))
++				removeFromSelf(event);
+ 		} catch (CoreException e) {
+ 			return e.getStatus();
+ 		}
+@@ -46,13 +37,21 @@ public class RemoveRepositoryAction extends ProvisioningAction {
+ 	}
+ 
+ 	public IStatus undo(Map parameters) {
+-		IProvisioningEventBus bus = (IProvisioningEventBus) ServiceHelper.getService(Activator.getContext(), IProvisioningEventBus.SERVICE_NAME);
+ 		try {
+-			if (bus != null)
+-				bus.publishEvent(AddRepositoryAction.createEvent(parameters));
++			RepositoryEvent event = createEvent(parameters);
++			Profile profile = (Profile) parameters.get(ActionConstants.PARM_PROFILE);
++			if (profile != null)
++				addRepositoryToProfile(profile, event.getRepositoryLocation(), event.getRepositoryType());
++			//if we are provisioning into the self profile, update the current set of repositories in this configuration
++			if (isSelfProfile(profile))
++				addToSelf(event);
+ 			return Status.OK_STATUS;
+ 		} catch (CoreException e) {
+ 			return e.getStatus();
+ 		}
+ 	}
++
++	protected String getId() {
++		return ID;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RepositoryAction.java b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RepositoryAction.java
+new file mode 100644
+index 0000000..8ce1ce2
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.touchpoint.eclipse/src/org/eclipse/equinox/internal/p2/touchpoint/eclipse/actions/RepositoryAction.java
+@@ -0,0 +1,187 @@
++/*******************************************************************************
++ * Copyright (c) 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.touchpoint.eclipse.actions;
++
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.util.Map;
++import java.util.StringTokenizer;
++import org.eclipse.core.runtime.CoreException;
++import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
++import org.eclipse.equinox.internal.p2.engine.Profile;
++import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Activator;
++import org.eclipse.equinox.internal.p2.touchpoint.eclipse.Util;
++import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
++import org.eclipse.equinox.internal.provisional.p2.core.repository.*;
++import org.eclipse.equinox.internal.provisional.p2.engine.*;
++import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
++import org.eclipse.osgi.util.NLS;
++
++/**
++ * Helper base class for dealing with repositories associated with profiles. Repositories
++ * are associated with a profile by encoding the repository locations in a comma-delimited
++ * list in a profile property.
++ * @see AddRepositoryAction
++ * @see RemoveRepositoryAction
++ */
++abstract class RepositoryAction extends ProvisioningAction {
++
++	/**
++	 * Returns the repository manager of the given type, or <code>null</code>
++	 * if not available.
++	 */
++	private static IRepositoryManager getRepositoryManager(int type) {
++		if (type == IRepository.TYPE_METADATA) {
++			return (IRepositoryManager) ServiceHelper.getService(Activator.getContext(), IMetadataRepositoryManager.SERVICE_NAME);
++		} else if (type == IRepository.TYPE_ARTIFACT) {
++			return (IRepositoryManager) ServiceHelper.getService(Activator.getContext(), IArtifactRepositoryManager.SERVICE_NAME);
++		}
++		return null;
++	}
++
++	/**
++	 * Associates the repository described by the given event with the given profile.
++	 * Has no effect if the repository is already associated with this profile.
++	 */
++	protected void addRepositoryToProfile(Profile profile, URI location, int type) {
++		String key = type == IRepository.TYPE_METADATA ? IProfile.PROP_METADATA_REPOSITORIES : IProfile.PROP_ARTIFACT_REPOSITORIES;
++		String encodedURI = encodeURI(location);
++		String currentRepos = profile.getProperty(key);
++		if (currentRepos == null) {
++			currentRepos = encodedURI;
++		} else {
++			//if we already have the repository location, we are done
++			StringTokenizer tokens = new StringTokenizer(currentRepos, ","); //$NON-NLS-1$
++			while (tokens.hasMoreTokens())
++				if (tokens.nextToken().equals(encodedURI))
++					return;
++			//add to comma-separated list
++			currentRepos = currentRepos + ',' + encodedURI;
++		}
++		profile.setProperty(key, currentRepos);
++	}
++
++	/**
++	 * Adds the repository corresponding to the given event to the currently running instance.
++	 */
++	protected void addToSelf(RepositoryEvent event) {
++		IRepositoryManager manager = getRepositoryManager(event.getRepositoryType());
++		if (manager != null)
++			manager.addRepository(event.getRepositoryLocation());
++		if (!event.isRepositoryEnabled())
++			manager.setEnabled(event.getRepositoryLocation(), false);
++	}
++
++	protected RepositoryEvent createEvent(Map parameters) throws CoreException {
++		String parm = (String) parameters.get(ActionConstants.PARM_REPOSITORY_LOCATION);
++		if (parm == null)
++			throw new CoreException(Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_REPOSITORY_LOCATION, getId())));
++		URI location = null;
++		try {
++			location = new URI(parm);
++		} catch (URISyntaxException e) {
++			throw new CoreException(Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_REPOSITORY_LOCATION, getId()), e));
++		}
++		parm = (String) parameters.get(ActionConstants.PARM_REPOSITORY_TYPE);
++		if (parm == null)
++			throw new CoreException(Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_REPOSITORY_TYPE, getId())));
++		int type = 0;
++		try {
++			type = Integer.parseInt(parm);
++		} catch (NumberFormatException e) {
++			throw new CoreException(Util.createError(NLS.bind(Messages.parameter_not_set, ActionConstants.PARM_REPOSITORY_TYPE, getId()), e));
++		}
++		//default is to be enabled
++		String enablement = (String) parameters.get(ActionConstants.PARM_REPOSITORY_ENABLEMENT);
++		boolean enabled = enablement == null ? true : Boolean.valueOf(enablement).booleanValue();
++		return new RepositoryEvent(location, type, RepositoryEvent.DISCOVERED, enabled);
++	}
++
++	/**
++	 * Encodes a URI as a string, in a form suitable for storing in a comma-separated
++	 * list of location strings. Any comma character in the local string is encoded.
++	 */
++	private String encodeURI(URI repositoryLocation) {
++		char[] chars = repositoryLocation.toString().toCharArray();
++		StringBuffer result = new StringBuffer(chars.length);
++		for (int i = 0; i < chars.length; i++) {
++			if (chars[i] == ',')
++				result.append("${#").append(Integer.toString(chars[i])).append('}'); //$NON-NLS-1$
++			else
++				result.append(chars[i]);
++		}
++		return result.toString();
++	}
++
++	/**
++	 * Returns the id of this action.
++	 */
++	protected abstract String getId();
++
++	/**
++	 * Return <code>true</code> if the given profile is the currently running profile,
++	 * and <code>false</code> otherwise.
++	 */
++	protected boolean isSelfProfile(Profile profile) {
++		//if we can't determine the current profile, assume we are running on self
++		if (profile == null)
++			return true;
++		IProfileRegistry registry = (IProfileRegistry) ServiceHelper.getService(Activator.getContext(), IProfileRegistry.class.getName());
++		if (registry == null)
++			return false;
++		final IProfile selfProfile = registry.getProfile(IProfileRegistry.SELF);
++		//if we can't determine the self profile, assume we are running on self
++		if (selfProfile == null)
++			return true;
++		return profile.getProfileId().equals(selfProfile.getProfileId());
++	}
++
++	/**
++	 * Removes the repository corresponding to the given event from the currently running instance.
++	 */
++	protected void removeFromSelf(RepositoryEvent event) {
++		IRepositoryManager manager = getRepositoryManager(event.getRepositoryType());
++		if (manager != null)
++			manager.removeRepository(event.getRepositoryLocation());
++	}
++
++	/**
++	 * Removes the association between the repository described by the given event
++	 * and the given profile. Has no effect if the location is not already associated with
++	 * this profile.
++	 */
++	protected void removeRepositoryFromProfile(Profile profile, URI location, int type) {
++		String key = type == IRepository.TYPE_METADATA ? IProfile.PROP_METADATA_REPOSITORIES : IProfile.PROP_ARTIFACT_REPOSITORIES;
++		String encodedURI = encodeURI(location);
++		String currentRepos = profile.getProperty(key);
++		//if this profile has no associated repositories, we are done
++		if (currentRepos == null)
++			return;
++		//find the matching location, if any
++		StringTokenizer tokens = new StringTokenizer(currentRepos, ","); //$NON-NLS-1$
++		StringBuffer result = new StringBuffer(currentRepos.length());
++		boolean found = false;
++		while (tokens.hasMoreTokens()) {
++			final String nextLocation = tokens.nextToken();
++			if (nextLocation.equals(encodedURI)) {
++				found = true;
++			} else {
++				//add back any location not being removed
++				result.append(nextLocation);
++				if (tokens.hasMoreTokens())
++					result.append(',');
++			}
++		}
++		if (!found)
++			return;
++		profile.setProperty(key, result.toString());
++	}
++}

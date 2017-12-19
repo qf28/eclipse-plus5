@@ -1,0 +1,683 @@
+commit 051572f99b6a73010e844cbf76e196d479c1689d
+Author: Terry Parker <tparker@google.com>
+Date:   Wed Nov 6 08:22:25 2013 -0800
+
+    Fixed bug 421165: Low hit rates in JavaModel caches
+    
+    Change-Id: Ib1920cfdc87fcb57f2e36d61b4bd382cc771297b
+    Signed-off-by: Terry Parker <tparker@google.com>
+
+62	1	org.eclipse.jdt.core.tests.performance/src/org/eclipse/jdt/core/tests/performance/FullSourceWorkspaceModelTests.java
+55	11	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+14	8	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ExternalFoldersManager.java
+52	56	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModel.java
+66	5	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+2	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/JavaBuilder.java
+diff --git a/org.eclipse.jdt.core.tests.performance/src/org/eclipse/jdt/core/tests/performance/FullSourceWorkspaceModelTests.java b/org.eclipse.jdt.core.tests.performance/src/org/eclipse/jdt/core/tests/performance/FullSourceWorkspaceModelTests.java
+index 2cd10aa..259c2d8 100644
+--- a/org.eclipse.jdt.core.tests.performance/src/org/eclipse/jdt/core/tests/performance/FullSourceWorkspaceModelTests.java
++++ b/org.eclipse.jdt.core.tests.performance/src/org/eclipse/jdt/core/tests/performance/FullSourceWorkspaceModelTests.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -8,6 +8,7 @@
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Thirumala Reddy Mutchukota <thirumala@google.com> - Contribution to bug: https://bugs.eclipse.org/bugs/show_bug.cgi?id=411423
++ *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
+  *******************************************************************************/
+ package org.eclipse.jdt.core.tests.performance;
+ 
+@@ -1501,6 +1502,66 @@ public void testResolveClasspath() throws Exception {
+ 	}
+ }
+ 
++/*
++ * Overriding getExternalPath() to be on a non-local disk (e.g., NFS) shows the advantages
++ * of caching file existence checks in the testJavaModelManagerExternalFilesCache() test.
++ */
++protected String getExternalPath() {
++	// NOTE: Do something similar to this commented-out code to set up the tests to
++	// use a non-local file system.
++	//	return "/home/" + System.getProperty("user.name") + "/performance_test/";
++	return super.getExternalPath();
++}
++
++//https://bugs.eclipse.org/bugs/show_bug.cgi?id=421165
++public void testGetAllPackageFragmentRoots() throws Exception {
++	int jarCount = 100;
++	IClasspathEntry[] oldClasspath = BIG_PROJECT.getRawClasspath();
++	try {
++	    IClasspathEntry[] classpath = new IClasspathEntry[jarCount];
++	    for (int index = 0; index < jarCount; index++) {
++	        String filePath = getExternalResourcePath("lib"+ index +".jar");
++	        org.eclipse.jdt.core.tests.util.Util.createJar(new String[0],
++	            new String[] {
++	                "META-INF/MANIFEST.MF",
++	                "Manifest-Version: 1.0\n",
++	            },
++	            filePath,
++	            JavaCore.VERSION_1_4);
++	        classpath[index] = JavaCore.newLibraryEntry(new Path(filePath), null, null);
++	    }
++	    BIG_PROJECT.setRawClasspath(classpath, null);
++	    IFile file = (IFile) WORKING_COPY.getResource();
++
++	    // warm up
++	    int max = 20;
++	    int warmup = WARMUP_COUNT / 10;
++	    for (int i = 0; i < warmup; i++) {
++	        for (int j = 0; j < max; j++) {
++	            file.touch(null/*no progress*/);
++	            BIG_PROJECT.getAllPackageFragmentRoots();
++	        }
++	    }
++
++	    // measure performance
++	    for (int i = 0; i < MEASURES_COUNT; i++) {
++	        runGc();
++	        startMeasuring();
++	        for (int j = 0; j < max; j++) {
++	          file.touch(null/*no progress*/);
++	          BIG_PROJECT.getAllPackageFragmentRoots();
++	        }
++	        stopMeasuring();
++	    }
++
++	    commitMeasurements();
++	    assertPerformance();
++
++	} finally {
++	    BIG_PROJECT.setRawClasspath(oldClasspath, null);
++	}
++}
++
+ protected void resetCounters() {
+ 	// do nothing
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+index a720993..71f98ab 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/DeltaProcessor.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -9,6 +9,7 @@
+  *     IBM Corporation - initial API and implementation
+  *     Terry Parker <tparker@google.com> - DeltaProcessor exhibits O(N^2) behavior, see https://bugs.eclipse.org/bugs/show_bug.cgi?id=354332
+  *     Terry Parker <tparker@google.com> - DeltaProcessor misses state changes in archive files, see https://bugs.eclipse.org/bugs/show_bug.cgi?id=357425
++ *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -16,6 +17,7 @@ import java.io.File;
+ import java.net.URL;
+ import java.util.*;
+ 
++import org.eclipse.core.resources.IBuildConfiguration;
+ import org.eclipse.core.resources.IContainer;
+ import org.eclipse.core.resources.IFile;
+ import org.eclipse.core.resources.IFolder;
+@@ -65,6 +67,9 @@ import org.eclipse.jdt.internal.core.util.Util;
+ @SuppressWarnings({ "rawtypes", "unchecked" })
+ public class DeltaProcessor {
+ 
++	/*
++	 * An object to hold information about a project's output folders (where .class files are generated).
++	 */
+ 	static class OutputsInfo {
+ 		int outputCount;
+ 		IPath[] paths;
+@@ -102,14 +107,20 @@ public class DeltaProcessor {
+ 		}
+ 	}
+ 
++	/*
++	 * An object to hold information about IPackageFragmentRoots (which correspond to
++	 * individual classpath entry items, e.g., a java/javatests source root or library
++	 * archive jar.)
++	 */
+ 	public static class RootInfo {
+-		char[][] inclusionPatterns;
+-		char[][] exclusionPatterns;
+-		public JavaProject project;
+-		IPath rootPath;
+-		int entryKind;
++		final char[][] inclusionPatterns;
++		final char[][] exclusionPatterns;
++		final public JavaProject project;
++		final IPath rootPath;
++		final int entryKind;
+ 		IPackageFragmentRoot root;
+ 		IPackageFragmentRoot cache;
++
+ 		RootInfo(JavaProject project, IPath rootPath, char[][] inclusionPatterns, char[][] exclusionPatterns, int entryKind) {
+ 			this.project = project;
+ 			this.rootPath = rootPath;
+@@ -967,6 +978,9 @@ public class DeltaProcessor {
+ 					String status = (String)externalArchivesStatus.get(entryPath);
+ 					if (status == null){
+ 
++						// Clear the external file state for this path, since this method is responsible for updating it.
++						this.manager.clearExternalFileState(entryPath);
++
+ 						// compute shared status
+ 						Object targetLibrary = JavaModel.getTarget(entryPath, true);
+ 
+@@ -1060,8 +1074,6 @@ public class DeltaProcessor {
+ 				javaProject.resetResolvedClasspath();
+ 			}
+ 		}
+-		// ensure the external file cache is reset so that if a .jar file is deleted but no longer on the classpath, it won't appear as changed next time it is added
+-		JavaModel.flushExternalFileCache();
+ 
+ 		if (hasDelta){
+ 			// flush jar type cache
+@@ -1131,7 +1143,7 @@ public class DeltaProcessor {
+ 
+ 		if (elementType == IJavaElement.JAVA_PROJECT) {
+ 			// project add is handled by JavaProject.configure() because
+-			// when a project is created, it does not yet have a java nature
++			// when a project is created, it does not yet have a Java nature
+ 			IProject project;
+ 			if (delta != null && JavaProject.hasJavaNature(project = (IProject)delta.getResource())) {
+ 				addToParentInfo(element);
+@@ -2156,7 +2168,39 @@ public class DeltaProcessor {
+ 				}
+ 
+ 				if (isAffected) {
+-					JavaModel.flushExternalFileCache();
++					Object source = event.getSource();
++					projects = null;
++					if (source instanceof IWorkspace) {
++						 projects = ((IWorkspace) source).getRoot().getProjects();
++					} else if (source instanceof IProject) {
++						projects = new IProject[] {(IProject) source};
++					} else {
++						Util.log(new Exception(),
++								"Expected to see a workspace or project on the PRE_BUILD resource change but was: " + source.toString()); //$NON-NLS-1$
++					}
++					if (projects != null) {
++						// If we are about to do a build and a Java project's first builder is not the Java builder,
++						// then it is possible that one of the earlier builders will build a jar file that is on that
++						// project's classpath. If we see that, then to be safe we must flush the caching of the
++						// JavaModelManager's external file state.
++						// A possible further optimization for this situation where earlier builders can affect the
++						// Java builder would be to add a new classpath element attribute that identifies whether
++						// or not a library jar is "stable" and needs to be flushed.
++						for (int i = 0; i < projects.length; i++) {
++							try {
++								IProject project = projects[i];
++								if (project.isOpen() && project.hasNature(JavaCore.NATURE_ID)) {
++									IBuildConfiguration[] configs = project.getBuildConfigs();
++									if (configs.length > 1 && !JavaCore.BUILDER_ID.equals(configs[0].getName())) {
++										this.manager.resetExternalFilesCache();
++										break;
++									}
++								}
++							} catch (CoreException exception) {
++				        		Util.log(exception, "Exception while checking builder configuration ordering"); //$NON-NLS-1$
++							}
++						 }
++					}
+ 					JavaBuilder.buildStarting();
+ 				}
+ 
+@@ -2477,7 +2521,7 @@ public class DeltaProcessor {
+ 	}
+ 
+ 	/*
+-	 * Update the current delta (i.e. add/remove/change the given element) and update the correponding index.
++	 * Update the current delta (i.e. add/remove/change the given element) and update the corresponding index.
+ 	 * Returns whether the children of the given delta must be processed.
+ 	 * @throws a JavaModelException if the delta doesn't correspond to a java element of the given type.
+ 	 */
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ExternalFoldersManager.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ExternalFoldersManager.java
+index 5478eb5..07b3461 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ExternalFoldersManager.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ExternalFoldersManager.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -9,6 +9,7 @@
+  *     IBM Corporation - initial API and implementation
+  *     Stephan Herrmann <stephan@cs.tu-berlin.de> - inconsistent initialization of classpath container backed by external class folder, see https://bugs.eclipse.org/320618
+  *     Thirumala Reddy Mutchukota <thirumala@google.com> - Contribution to bug: https://bugs.eclipse.org/bugs/show_bug.cgi?id=411423
++ *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -69,9 +70,9 @@ public class ExternalFoldersManager {
+ 		return MANAGER;
+ 	}
+ 	
+-	/*
+-	 * Returns a set of external path to external folders referred to on the given classpath.
+-	 * Returns null if none.
++	/**
++	 * Returns a set of external paths to external folders referred to on the given classpath.
++	 * Returns <code>null</code> if there are none.
+ 	 */
+ 	public static HashSet getExternalFolders(IClasspathEntry[] classpath) {
+ 		if (classpath == null)
+@@ -97,7 +98,9 @@ public class ExternalFoldersManager {
+ 		return folders;
+ 	}
+ 
+-
++	/**
++	 * Returns <code>true</code> if the provided path is a folder external to the project.
++	 */
+ 	public static boolean isExternalFolderPath(IPath externalPath) {
+ 		if (externalPath == null)
+ 			return false;
+@@ -105,14 +108,17 @@ public class ExternalFoldersManager {
+ 		if (firstSegment != null && ResourcesPlugin.getWorkspace().getRoot().getProject(firstSegment).exists())
+ 			return false;
+ 		JavaModelManager manager = JavaModelManager.getJavaModelManager();
+-		if (manager.isExternalFile(externalPath))
++		if (manager.isExternalFile(externalPath) || manager.isAssumedExternalFile(externalPath))
+ 			return false;
+ 		File externalFolder = externalPath.toFile();
+-		if (externalFolder.isFile()
+-			|| (externalPath.getFileExtension() != null/*likely a .jar, .zip, .rar or other file*/ && !externalFolder.exists())) {
++		if (externalFolder.isFile()) {
+ 			manager.addExternalFile(externalPath);
+ 			return false;
+ 		}
++		if (externalPath.getFileExtension() != null/*likely a .jar, .zip, .rar or other file*/ && !externalFolder.exists()) {
++			manager.addAssumedExternalFile(externalPath);
++			return false;
++		}
+ 		return true;
+ 	}
+ 
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModel.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModel.java
+index d9921f5..8e8a746 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModel.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModel.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -7,12 +7,12 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+ import java.io.File;
+ import java.util.ArrayList;
+-import java.util.HashSet;
+ import java.util.Map;
+ 
+ import org.eclipse.core.resources.IFile;
+@@ -41,20 +41,6 @@ import org.eclipse.jdt.internal.core.util.Messages;
+ @SuppressWarnings({"rawtypes", "unchecked"})
+ public class JavaModel extends Openable implements IJavaModel {
+ 
+-	/**
+-	 * A set of java.io.Files used as a cache of external jars that
+-	 * are known to be existing.
+-	 * Note this cache is kept for the whole session.
+-	 */
+-	public static HashSet existingExternalFiles = new HashSet();
+-
+-	/**
+-	 * A set of external files ({@link #existingExternalFiles}) which have
+-	 * been confirmed as file (i.e. which returns true to {@link java.io.File#isFile()}.
+-	 * Note this cache is kept for the whole session.
+-	 */
+-	public static HashSet existingExternalConfirmedFiles = new HashSet();
+-
+ /**
+  * Constructs a new Java Model on the given workspace.
+  * Note that only one instance of JavaModel handle should ever be created.
+@@ -148,13 +134,6 @@ public boolean equals(Object o) {
+ public int getElementType() {
+ 	return JAVA_MODEL;
+ }
+-/**
+- * Flushes the cache of external files known to be existing.
+- */
+-public static void flushExternalFileCache() {
+-	existingExternalFiles = new HashSet();
+-	existingExternalConfirmedFiles = new HashSet();
+-}
+ 
+ /*
+  * @see JavaElement
+@@ -309,9 +288,16 @@ protected void toStringInfo(int tab, StringBuffer buffer, Object info, boolean s
+ }
+ 
+ /**
+- * Helper method - returns the targeted item (IResource if internal or java.io.File if external),
+- * or null if unbound
+- * Internal items must be referred to using container relative paths.
++ * Helper method - for the provided {@link IPath}, returns:
++ * <ul>
++ * <li>If the path corresponds to an internal file or folder, the {@link IResource} for that resource
++ * <li>If the path corresponds to an external folder linked through {@link ExternalFoldersManager},
++ * the {@link IFolder} for that folder
++ * <li>If the path corresponds to an external library archive, the {@link File} for that archive
++ * <li>Can return <code>null</code> if <code>checkResourceExistence</code> is <code>true</code>
++ * and the entity referred to by the path does not exist on the file system
++ * </ul>
++ * Internal items must be referred to using container-relative paths.
+  */
+ public static Object getTarget(IPath path, boolean checkResourceExistence) {
+ 	Object target = getWorkspaceTarget(path); // Implicitly checks resource existence
+@@ -319,6 +305,11 @@ public static Object getTarget(IPath path, boolean checkResourceExistence) {
+ 		return target;
+ 	return getExternalTarget(path, checkResourceExistence);
+ }
++
++/**
++ * Helper method - returns the {@link IResource} corresponding to the provided {@link IPath},
++ * or <code>null</code> if no such resource exists.
++ */
+ public static IResource getWorkspaceTarget(IPath path) {
+ 	if (path == null || path.getDevice() != null)
+ 		return null;
+@@ -327,6 +318,13 @@ public static IResource getWorkspaceTarget(IPath path) {
+ 		return null;
+ 	return workspace.getRoot().findMember(path);
+ }
++
++/**
++ * Helper method - returns either the linked {@link IFolder} or the {@link File} corresponding
++ * to the provided {@link IPath}. If <code>checkResourceExistence</code> is <code>false</code>,
++ * then the IFolder or File object is always returned, otherwise <code>null</code> is returned
++ * if it does not exist on the file system.
++ */
+ public static Object getExternalTarget(IPath path, boolean checkResourceExistence) {
+ 	if (path == null)
+ 		return null;
+@@ -345,50 +343,48 @@ public static Object getExternalTarget(IPath path, boolean checkResourceExistenc
+ 	File externalFile = new File(path.toOSString());
+ 	if (!checkResourceExistence) {
+ 		return externalFile;
+-	} else if (existingExternalFilesContains(externalFile)) {
++	} else if (isExternalFile(path)) {
+ 		return externalFile;
+-	} else {
+-		if (JavaModelManager.ZIP_ACCESS_VERBOSE) {
+-			System.out.println("(" + Thread.currentThread() + ") [JavaModel.getTarget(...)] Checking existence of " + path.toString()); //$NON-NLS-1$ //$NON-NLS-2$
+-		}
+-		if (externalFile.isFile()) { // isFile() checks for existence (it returns false if a directory)
+-			// cache external file
+-			existingExternalFilesAdd(externalFile);
+-			return externalFile;
+-		}
+ 	}
+ 	return null;
+ }
+-private synchronized static void existingExternalFilesAdd(File externalFile) {
+-	existingExternalFiles.add(externalFile);
+-}
+-private synchronized static boolean existingExternalFilesContains(File externalFile) {
+-	return existingExternalFiles.contains(externalFile);
+-}
+ 
+ /**
+- * Helper method - returns whether an object is afile (i.e. which returns true to {@link java.io.File#isFile()}.
++ * Helper method - returns whether an object is a file (i.e., it returns <code>true</code>
++ * to {@link File#isFile()}.
+  */
+ public static boolean isFile(Object target) {
+-	return getFile(target) != null;
++	if (target instanceof File) {
++		IPath path = Path.fromOSString(((File) target).getPath());
++		return isExternalFile(path);
++	}
++	return false;
+ }
+ 
+ /**
+- * Helper method - returns the file item (i.e. which returns true to {@link java.io.File#isFile()},
+- * or null if unbound
++ * Returns whether the provided path is an external file, checking and updating the
++ * JavaModelManager's external file cache.
+  */
+-public static synchronized File getFile(Object target) {
+-	if (existingExternalConfirmedFiles.contains(target))
+-		return (File) target;
+-	if (target instanceof File) {
+-		File f = (File) target;
+-		if (f.isFile()) {
+-			existingExternalConfirmedFiles.add(f);
+-			return f;
+-		}
++static private boolean isExternalFile(IPath path) {
++	if (JavaModelManager.getJavaModelManager().isExternalFile(path)) {
++		return true;
+ 	}
++	if (JavaModelManager.ZIP_ACCESS_VERBOSE) {
++		System.out.println("(" + Thread.currentThread() + ") [JavaModel.isExternalFile(...)] Checking existence of " + path.toString()); //$NON-NLS-1$ //$NON-NLS-2$
++	}
++	boolean isFile = path.toFile().isFile();
++	if (isFile) {
++		JavaModelManager.getJavaModelManager().addExternalFile(path);
++	}
++	return isFile;
++}
+ 
+-	return null;
++/**
++ * Helper method - returns the {@link File} item if <code>target</code> is a file (i.e., the target
++ * returns <code>true</code> to {@link File#isFile()}. Otherwise returns <code>null</code>.
++ */
++public static File getFile(Object target) {
++	return isFile(target) ? (File) target : null;
+ }
+ 
+ protected IStatus validateExistence(IResource underlyingResource) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+index d6de845..30bc98a 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaModelManager.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -13,6 +13,7 @@
+  *     Stephan Herrmann - Contribution for Bug 346010 - [model] strange initialization dependency in OptionTests
+  *     Terry Parker <tparker@google.com> - DeltaProcessor misses state changes in archive files, see https://bugs.eclipse.org/bugs/show_bug.cgi?id=357425
+  *     Thirumala Reddy Mutchukota <thirumala@google.com> - Contribution to bug: https://bugs.eclipse.org/bugs/show_bug.cgi?id=411423
++ *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+@@ -91,6 +92,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	private static final String NON_CHAINING_JARS_CACHE = "nonChainingJarsCache"; //$NON-NLS-1$
+ 	private static final String INVALID_ARCHIVES_CACHE = "invalidArchivesCache";  //$NON-NLS-1$
+ 	private static final String EXTERNAL_FILES_CACHE = "externalFilesCache";  //$NON-NLS-1$
++	private static final String ASSUMED_EXTERNAL_FILES_CACHE = "assumedExternalFilesCache";  //$NON-NLS-1$
+ 
+ 	/**
+ 	 * Define a zip cache object.
+@@ -1439,20 +1441,27 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 	private UserLibraryManager userLibraryManager;
+ 	
+ 	/*
+-	 * List of IPath of jars that are known to not contain a chaining (through MANIFEST.MF) to another library
++	 * A set of IPaths for jars that are known to not contain a chaining (through MANIFEST.MF) to another library
+ 	 */
+ 	private Set nonChainingJars;
+ 	
+ 	/*
+-	 * List of IPath of jars that are known to be invalid - such as not being a valid/known format
++	 * A set of IPaths for jars that are known to be invalid - such as not being a valid/known format
+ 	 */
+ 	private Set invalidArchives;
+ 
+ 	/*
+-	 * List of IPath of files that are known to be external to the workspace
++	 * A set of IPaths for files that are known to be external to the workspace.
++	 * Need not be referenced by the classpath.
+ 	 */
+ 	private Set externalFiles;
+ 
++	/*
++	 * A set of IPaths for files that do not exist on the file system but are assumed to be
++	 * external archives (rather than external folders).
++	 */
++	private Set assumedExternalFiles;
++
+ 	/**
+ 	 * Update the classpath variable cache
+ 	 */
+@@ -1588,6 +1597,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 			this.nonChainingJars = loadClasspathListCache(NON_CHAINING_JARS_CACHE);
+ 			this.invalidArchives = loadClasspathListCache(INVALID_ARCHIVES_CACHE);
+ 			this.externalFiles = loadClasspathListCache(EXTERNAL_FILES_CACHE);
++			this.assumedExternalFiles = loadClasspathListCache(ASSUMED_EXTERNAL_FILES_CACHE);
+ 			String includeContainerReferencedLib = System.getProperty(RESOLVE_REFERENCED_LIBRARIES_FOR_CONTAINERS);
+ 			this.resolveReferencedLibrariesForContainers = TRUE.equalsIgnoreCase(includeContainerReferencedLib);
+ 		}
+@@ -1616,6 +1626,10 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 		}
+ 	}
+ 
++	/**
++	 * Adds a path to the external files cache. It is the responsibility of callers to
++	 * determine the file's existence, as determined by  {@link File#isFile()}.
++	 */
+ 	public void addExternalFile(IPath path) {
+ 		// unlikely to be null
+ 		if (this.externalFiles == null) {
+@@ -3116,10 +3130,52 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 		}
+ 	}
+ 
++	/**
++	 * Returns the cached value for whether the file referred to by <code>path</code> exists
++	 * and is a file, as determined by the return value of {@link File#isFile()}.
++	 */
+ 	public boolean isExternalFile(IPath path) {
+ 		return this.externalFiles != null && this.externalFiles.contains(path);
+ 	}
+ 
++	/**
++	 * Removes the cached state of a single entry in the externalFiles cache.
++	 */
++	public void clearExternalFileState(IPath path) {
++		if (this.externalFiles != null) {
++			this.externalFiles.remove(path);
++		}
++	}
++
++	/**
++	 * Resets the entire externalFiles cache.
++	 */
++	public void resetExternalFilesCache() {
++		if (this.externalFiles != null) {
++			this.externalFiles.clear();
++		}
++	}
++
++	/**
++	 * Returns whether the provided {@link IPath} appears to be an external file,
++	 * which is true if the path does not represent an internal resource, does not
++	 * exist on the file system, and does have a file extension (this is the definition
++	 * provided by {@link ExternalFoldersManager#isExternalFolderPath}).
++	 */
++	public boolean isAssumedExternalFile(IPath path) {
++		if (this.assumedExternalFiles == null) {
++			return false;
++		}
++		return this.assumedExternalFiles.contains(path);
++	}
++
++	/**
++	 * Adds the provided {@link IPath} to the list of assumed external files.
++	 */
++	public void addAssumedExternalFile(IPath path) {
++		this.assumedExternalFiles.add(path);
++	}
++
+ 	public void setClasspathBeingResolved(IJavaProject project, boolean classpathIsResolved) {
+ 	    if (classpathIsResolved) {
+ 	        getClasspathBeingResolved().add(project);
+@@ -3141,7 +3197,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 			}
+ 		} catch (IOException e) {
+ 			if (cacheFile.exists())
+-				Util.log(e, "Unable to read non-chaining jar cache file"); //$NON-NLS-1$
++				Util.log(e, "Unable to read JavaModelManager " + cacheName + " file"); //$NON-NLS-1$ //$NON-NLS-2$
+ 		} finally {
+ 			if (in != null) {
+ 				try {
+@@ -3190,6 +3246,8 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 			return this.invalidArchives;
+ 		else if (cacheName == EXTERNAL_FILES_CACHE)
+ 			return this.externalFiles;
++		else if (cacheName == ASSUMED_EXTERNAL_FILES_CACHE)
++			return this.assumedExternalFiles;
+ 		else
+ 			return null;
+ 	}
+@@ -3934,6 +3992,8 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 			this.invalidArchives.clear();
+ 		if (this.externalFiles != null)
+ 			this.externalFiles.clear();
++		if (this.assumedExternalFiles != null)
++			this.assumedExternalFiles.clear();
+ 	}
+ 
+ 	/*
+@@ -4283,6 +4343,7 @@ public class JavaModelManager implements ISaveParticipant, IContentTypeChangeLis
+ 				saveClasspathListCache(NON_CHAINING_JARS_CACHE);
+ 				saveClasspathListCache(INVALID_ARCHIVES_CACHE);
+ 				saveClasspathListCache(EXTERNAL_FILES_CACHE);
++				saveClasspathListCache(ASSUMED_EXTERNAL_FILES_CACHE);
+ 	
+ 				// will need delta since this save (see https://bugs.eclipse.org/bugs/show_bug.cgi?id=38658)
+ 				context.needDelta();
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/JavaBuilder.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/JavaBuilder.java
+index bde243e..0c66e66 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/JavaBuilder.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/JavaBuilder.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2013 IBM Corporation and others.
++ * Copyright (c) 2000, 2014 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -7,6 +7,7 @@
+  *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Terry Parker <tparker@google.com> - [performance] Low hit rates in JavaModel caches - https://bugs.eclipse.org/421165
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core.builder;
+ 
+@@ -594,7 +595,6 @@ private int initializeBuilder(int kind, boolean forBuild) throws CoreException {
+ 		// Flush the existing external files cache if this is the beginning of a build cycle
+ 		String projectName = this.currentProject.getName();
+ 		if (builtProjects == null || builtProjects.contains(projectName)) {
+-			JavaModel.flushExternalFileCache();
+ 			builtProjects = new ArrayList();
+ 		}
+ 		builtProjects.add(projectName);

@@ -1,0 +1,1116 @@
+commit fb2a7c4287d62c5ea38390868d83f476b5ce22e3
+Author: Stephan Herrmann <stephan@cs.tu-berlin.de>
+Date:   Sun Sep 16 00:18:32 2012 +0200
+
+    Bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+
+46	6	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayInitializer.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+39	18	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
+3	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+3	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+14	11	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TryStatement.java
+6	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
+index f991f10..031432d 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
+@@ -26,7 +26,7 @@ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ public class ResourceLeakTests extends AbstractRegressionTest {
+ 
+ static {
+-//	TESTS_NAMES = new String[] { "testBug385415" };
++//	TESTS_NAMES = new String[] { "testBug388996" };
+ //	TESTS_NUMBERS = new int[] { 50 };
+ //	TESTS_RANGE = new int[] { 11, -1 };
+ }
+@@ -3329,8 +3329,8 @@ public void test066b() {
+ 
+ // Bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+ // example from comment 12
+-// disabled because null info after try-catch is too weak,
+-// see also Bug 370424 - [compiler][null] throw-catch analysis for null flow could be more precise
++// Red herring (disabled): warning says "potential" because in the exception case no resource
++// would actually be allocated.
+ public void _test067() {
+ 	Map options = getCompilerOptions();
+ 	options.put(CompilerOptions.OPTION_ReportUnclosedCloseable, CompilerOptions.ERROR);
+@@ -3359,9 +3359,7 @@ public void _test067() {
+ 
+ // Bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+ // example from comment 12
+-// disabled because null info after try-catch is too weak,
+-// see also Bug 370424 - [compiler][null] throw-catch analysis for null flow could be more precise
+-public void _test067b() {
++public void test067b() {
+ 	Map options = getCompilerOptions();
+ 	options.put(CompilerOptions.OPTION_ReportUnclosedCloseable, CompilerOptions.ERROR);
+ 	options.put(CompilerOptions.OPTION_ReportPotentiallyUnclosedCloseable, CompilerOptions.ERROR);
+@@ -3830,4 +3828,46 @@ public void _testBug386534() {
+ 		options,
+ 		null);
+ }
++
++// https://bugs.eclipse.org/388996 - [compiler][resource] Incorrect 'potential resource leak'
++public void testBug388996() {
++	Map options = getCompilerOptions();
++	options.put(CompilerOptions.OPTION_ReportPotentiallyUnclosedCloseable, CompilerOptions.ERROR);
++	runConformTest(
++		new String[] {
++			"Bug.java",
++			"import java.io.*;\n" +
++			"public class Bug {\n" +
++			"	public void processRequest(ResponseContext responseContext) throws IOException {\n" + 
++			"		OutputStream bao = null;\n" + 
++			"\n" + 
++			"		try {\n" + 
++			"			HttpServletResponse response = responseContext.getResponse();\n" + 
++			"\n" + 
++			"			bao = response.getOutputStream(); // <<<<\n" + 
++			"		} finally {\n" + 
++			"			if(bao != null) {\n" + 
++			"				bao.close();\n" + 
++			"			}\n" + 
++			"		}\n" + 
++			"	}" +
++			"}\n" +
++			"class ResponseContext {\n" + 
++			"	public HttpServletResponse getResponse() {\n" + 
++			"		return null;\n" + 
++			"	}\n" + 
++			"}\n" + 
++			"class HttpServletResponse {\n" + 
++			"	public OutputStream getOutputStream() {\n" + 
++			"		return null;\n" + 
++			"	}\n" + 
++			"}"
++		},
++		"",
++		null,
++		true,
++		null,
++		options,
++		null);
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+index 42030e0..84a0d64 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+@@ -16,6 +16,7 @@
+  *							bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *							bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *							bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *							bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -60,7 +61,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 					.unconditionalInits();
+ 			// if argument is an AutoCloseable insert info that it *may* be closed (by the target method, i.e.)
+ 			if (analyseResources && !hasResourceWrapperType) { // allocation of wrapped closeables is analyzed specially
+-				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, false);
++				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, flowContext, false);
+ 			}
+ 			if ((this.arguments[i].implicitConversion & TypeIds.UNBOXING) != 0) {
+ 				this.arguments[i].checkNPE(currentScope, flowContext, flowInfo);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayInitializer.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayInitializer.java
+index 41027f8..f35b7b1 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayInitializer.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayInitializer.java
+@@ -10,6 +10,7 @@
+  *     Stephan Herrmann - Contributions for 
+  *								bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -40,7 +41,7 @@ public class ArrayInitializer extends Expression {
+ 				flowInfo = this.expressions[i].analyseCode(currentScope, flowContext, flowInfo).unconditionalInits();
+ 
+ 				if (analyseResources && FakedTrackingVariable.isAnyCloseable(this.expressions[i].resolvedType)) {
+-					flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.expressions[i], flowInfo, false);
++					flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.expressions[i], flowInfo, flowContext, false);
+ 				}
+ 			}
+ 		}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+index a69879c..4c32b01 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+@@ -18,6 +18,7 @@
+  *							bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *							bug 365859 - [compiler][null] distinguish warnings based on flow analysis vs. null annotations
+  *							bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *							bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -68,7 +69,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 		.unconditionalInits();
+ 
+ 	if (shouldAnalyseResource)
+-		FakedTrackingVariable.handleResourceAssignment(currentScope, preInitInfo, flowInfo, this, this.expression, local);
++		FakedTrackingVariable.handleResourceAssignment(currentScope, preInitInfo, flowInfo, flowContext, this, this.expression, local);
+ 	else
+ 		FakedTrackingVariable.cleanUpAfterAssignment(currentScope, this.lhs.bits, this.expression);
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+index f081f32..9e8de3f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+@@ -12,6 +12,7 @@
+  *								bug 186342 - [compiler][null] Using annotations for null checking
+  *								bug 361407 - Resource leak warning when resource is assigned to a field outside of constructor
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -84,7 +85,7 @@ public class ExplicitConstructorCall extends Statement implements InvocationSite
+ 							.unconditionalInits();
+ 					if (analyseResources) {
+ 						// if argument is an AutoCloseable insert info that it *may* be closed (by the target constructor, i.e.)
+-						flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, false);
++						flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, flowContext, false);
+ 					}
+ 					if ((this.arguments[i].implicitConversion & TypeIds.UNBOXING) != 0) {
+ 						this.arguments[i].checkNPE(currentScope, flowContext, flowInfo);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
+index f65ca7e..20dde0b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
+@@ -17,6 +17,7 @@ import java.util.Map.Entry;
+ import java.util.Set;
+ 
+ import org.eclipse.jdt.internal.compiler.codegen.CodeStream;
++import org.eclipse.jdt.internal.compiler.flow.FinallyFlowContext;
+ import org.eclipse.jdt.internal.compiler.flow.FlowContext;
+ import org.eclipse.jdt.internal.compiler.flow.FlowInfo;
+ import org.eclipse.jdt.internal.compiler.impl.Constant;
+@@ -79,14 +80,19 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 
+ 	// temporary storage while analyzing "res = new Res();":
+ 	private ASTNode currentAssignment; // temporarily store the assignment as the location for error reporting
++	
++	// if tracking var was allocated from a finally context, record here the flow context of the corresponding try block
++	private FlowContext tryContext;
+ 
+-	public FakedTrackingVariable(LocalVariableBinding original, ASTNode location) {
++	public FakedTrackingVariable(LocalVariableBinding original, ASTNode location, FlowContext flowContext) {
+ 		super(original.name, location.sourceStart, location.sourceEnd);
+ 		this.type = new SingleTypeReference(
+ 				TypeConstants.OBJECT,
+ 				((long)this.sourceStart <<32)+this.sourceEnd);
+ 		this.methodScope = original.declaringScope.methodScope();
+ 		this.originalBinding = original;
++		if (flowContext instanceof FinallyFlowContext)
++			this.tryContext = ((FinallyFlowContext) flowContext).tryContext;
+ 		resolve(original.declaringScope);
+ 	}
+ 
+@@ -129,7 +135,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 	 * @param expression
+ 	 * @return a new {@link FakedTrackingVariable} or null.
+ 	 */
+-	public static FakedTrackingVariable getCloseTrackingVariable(Expression expression) {
++	public static FakedTrackingVariable getCloseTrackingVariable(Expression expression, FlowContext flowContext) {
+ 		while (true) {
+ 			if (expression instanceof CastExpression)
+ 				expression = ((CastExpression) expression).expression;
+@@ -149,7 +155,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 				// tracking var doesn't yet exist. This happens in finally block
+ 				// which is analyzed before the corresponding try block
+ 				Statement location = local.declaration;
+-				local.closeTracker = new FakedTrackingVariable(local, location);
++				local.closeTracker = new FakedTrackingVariable(local, location, flowContext);
+ 				if (local.isParameter()) {
+ 					local.closeTracker.globalClosingState |= OWNED_BY_OUTSIDE;
+ 					// status of this tracker is now UNKNOWN
+@@ -181,7 +187,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 			closeTracker = local.closeTracker;
+ 			if (closeTracker == null) {
+ 				if (rhs.resolvedType != TypeBinding.NULL) { // not NULL means valid closeable as per method precondition
+-					closeTracker = new FakedTrackingVariable(local, location);
++					closeTracker = new FakedTrackingVariable(local, location, null);
+ 					if (local.isParameter()) {
+ 						closeTracker.globalClosingState |= OWNED_BY_OUTSIDE;
+ 					}
+@@ -321,12 +327,13 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 	 * @param scope scope containing the assignment
+ 	 * @param upstreamInfo info without analysis of the rhs, use this to determine the status of a resource being disconnected
+ 	 * @param flowInfo info with analysis of the rhs, use this for recording resource status because this will be passed downstream
++	 * @param flowContext 
+ 	 * @param location where to report warnigs/errors against
+ 	 * @param rhs the right hand side of the assignment, this expression is to be analyzed.
+ 	 *			The caller has already checked that the rhs is either of a closeable type or null.
+ 	 * @param local the local variable into which the rhs is being assigned
+ 	 */
+-	public static void handleResourceAssignment(BlockScope scope, FlowInfo upstreamInfo, FlowInfo flowInfo, ASTNode location, Expression rhs, LocalVariableBinding local)
++	public static void handleResourceAssignment(BlockScope scope, FlowInfo upstreamInfo, FlowInfo flowInfo, FlowContext flowContext, ASTNode location, Expression rhs, LocalVariableBinding local)
+ 	{
+ 		// does the LHS (local) already have a tracker, indicating we may leak a resource by the assignment?
+ 		FakedTrackingVariable previousTracker = null;
+@@ -342,7 +349,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 		rhsAnalyis:
+ 		if (rhs.resolvedType != TypeBinding.NULL) {
+ 			// new value is AutoCloseable, start tracking, possibly re-using existing tracker var:
+-			FakedTrackingVariable rhsTrackVar = getCloseTrackingVariable(rhs);
++			FakedTrackingVariable rhsTrackVar = getCloseTrackingVariable(rhs, flowContext);
+ 			if (rhsTrackVar != null) {								// 1. if RHS has a tracking variable...
+ 				if (local.closeTracker == null) {
+ 					// null shouldn't occur but let's play safe:
+@@ -361,7 +368,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 								&& ((rhsTrackVar.globalClosingState & OWNED_BY_OUTSIDE) != 0)) {
+ 																	// 		c.: assigning a fresh resource (pre-connected alloc) 
+ 																	//			to a local previously holding an alien resource -> start over
+-							local.closeTracker = new FakedTrackingVariable(local, location);
++							local.closeTracker = new FakedTrackingVariable(local, location, flowContext);
+ 							flowInfo.markAsDefinitelyNull(local.closeTracker.binding);
+ 							// still check disconnectedTracker below
+ 							break rhsAnalyis;
+@@ -371,12 +378,26 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 				}
+ 				// keep close-status of RHS unchanged across this assignment
+ 			} else if (previousTracker != null) {					// 2. re-use tracking variable from the LHS?
+-				// re-assigning from a fresh value, mark as not-closed again:
+-				if ((previousTracker.globalClosingState & (SHARED_WITH_OUTSIDE|OWNED_BY_OUTSIDE)) == 0)
+-					flowInfo.markAsDefinitelyNull(previousTracker.binding);
+-				local.closeTracker = analyseCloseableExpression(flowInfo, local, location, rhs, previousTracker);
++				FlowContext currentFlowContext = flowContext;
++				checkReuseTracker : {
++					if (previousTracker.tryContext != null) {
++						while (currentFlowContext != null) {
++							if (previousTracker.tryContext == currentFlowContext) {
++								// "previous" location was the finally block of the current try statement.
++								// -> This is not a re-assignment.
++								// see https://bugs.eclipse.org/388996
++								break checkReuseTracker;
++							}
++							currentFlowContext = currentFlowContext.parent;
++						}
++					}
++					// re-assigning from a fresh value, mark as not-closed again:
++					if ((previousTracker.globalClosingState & (SHARED_WITH_OUTSIDE|OWNED_BY_OUTSIDE)) == 0)
++						flowInfo.markAsDefinitelyNull(previousTracker.binding);
++					local.closeTracker = analyseCloseableExpression(flowInfo, flowContext, local, location, rhs, previousTracker);
++				}
+ 			} else {												// 3. no re-use, create a fresh tracking variable:
+-				rhsTrackVar = analyseCloseableExpression(flowInfo, local, location, rhs, null);
++				rhsTrackVar = analyseCloseableExpression(flowInfo, flowContext, local, location, rhs, null);
+ 				if (rhsTrackVar != null) {
+ 					local.closeTracker = rhsTrackVar;
+ 					// a fresh resource, mark as not-closed:
+@@ -411,7 +432,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 	 *  		which we should then re-use
+ 	 * @return a tracking variable associated with local or null if no need to track
+ 	 */
+-	private static FakedTrackingVariable analyseCloseableExpression(FlowInfo flowInfo, LocalVariableBinding local, 
++	private static FakedTrackingVariable analyseCloseableExpression(FlowInfo flowInfo, FlowContext flowContext, LocalVariableBinding local, 
+ 									ASTNode location, Expression expression, FakedTrackingVariable previousTracker) 
+ 	{
+ 		// unwrap uninteresting nodes:
+@@ -437,7 +458,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 				|| expression instanceof ArrayReference) 
+ 		{
+ 			// we *might* be responsible for the resource obtained
+-			FakedTrackingVariable tracker = new FakedTrackingVariable(local, location);
++			FakedTrackingVariable tracker = new FakedTrackingVariable(local, location, flowContext);
+ 			tracker.globalClosingState |= SHARED_WITH_OUTSIDE;
+ 			flowInfo.markPotentiallyNullBit(tracker.binding); // shed some doubt
+ 			return tracker;
+@@ -447,7 +468,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 						&& ((QualifiedNameReference) expression).isFieldAccess()))
+ 		{
+ 			// responsibility for this resource probably lies at a higher level
+-			FakedTrackingVariable tracker = new FakedTrackingVariable(local, location);
++			FakedTrackingVariable tracker = new FakedTrackingVariable(local, location, flowContext);
+ 			tracker.globalClosingState |= OWNED_BY_OUTSIDE;
+ 			// leave state as UNKNOWN, the bit OWNED_BY_OUTSIDE will prevent spurious warnings
+ 			return tracker;			
+@@ -463,7 +484,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 		if (local.closeTracker != null)
+ 			// (c): inner has already been analyzed: -> re-use track var
+ 			return local.closeTracker;
+-		FakedTrackingVariable newTracker = new FakedTrackingVariable(local, location);
++		FakedTrackingVariable newTracker = new FakedTrackingVariable(local, location, flowContext);
+ 		LocalVariableBinding rhsLocal = expression.localVariableBinding();
+ 		if (rhsLocal != null && rhsLocal.isParameter()) {
+ 			newTracker.globalClosingState |= OWNED_BY_OUTSIDE;
+@@ -604,9 +625,9 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 	 * and thus should be considered as potentially closed.
+ 	 * @param owned should the resource be considered owned by some outside?
+ 	 */
+-	public static FlowInfo markPassedToOutside(BlockScope scope, Expression expression, FlowInfo flowInfo, boolean owned) {	
++	public static FlowInfo markPassedToOutside(BlockScope scope, Expression expression, FlowInfo flowInfo, FlowContext flowContext, boolean owned) {	
+ 		
+-		FakedTrackingVariable trackVar = getCloseTrackingVariable(expression);
++		FakedTrackingVariable trackVar = getCloseTrackingVariable(expression, flowContext);
+ 		if (trackVar != null) {
+ 			// insert info that the tracked resource *may* be closed (by the target method, i.e.)
+ 			FlowInfo infoResourceIsClosed = owned ? flowInfo : flowInfo.copy();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
+index 48723a6..ec70457 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
+@@ -16,6 +16,7 @@
+  *							bug 358903 - Filter practically unimportant resource leak warnings
+  *							bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *							bug 365859 - [compiler][null] distinguish warnings based on flow analysis vs. null annotations
++ *							bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -106,7 +107,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 			.unconditionalInits();
+ 
+ 	if (shouldAnalyseResource)
+-		FakedTrackingVariable.handleResourceAssignment(currentScope, preInitInfo, flowInfo, this, this.initialization, this.binding);
++		FakedTrackingVariable.handleResourceAssignment(currentScope, preInitInfo, flowInfo, flowContext, this, this.initialization, this.binding);
+ 	else
+ 		FakedTrackingVariable.cleanUpAfterAssignment(currentScope, Binding.LOCAL, this.initialization);
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index dddb1a0..fb84b3c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -15,6 +15,7 @@
+  *								bug 358903 - Filter practically unimportant resource leak warnings
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -73,7 +74,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 	boolean analyseResources = currentScope.compilerOptions().analyseResourceLeaks;
+ 	if (analyseResources && CharOperation.equals(TypeConstants.CLOSE, this.selector)) 
+ 	{
+-		FakedTrackingVariable trackingVariable = FakedTrackingVariable.getCloseTrackingVariable(this.receiver);
++		FakedTrackingVariable trackingVariable = FakedTrackingVariable.getCloseTrackingVariable(this.receiver, flowContext);
+ 		if (trackingVariable != null) { // null happens if receiver is not a local variable or not an AutoCloseable
+ 			if (trackingVariable.methodScope == currentScope.methodScope()) {
+ 				trackingVariable.markClose(flowInfo, flowContext);
+@@ -137,7 +138,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 			}
+ 			if (analyseResources) {
+ 				// if argument is an AutoCloseable insert info that it *may* be closed (by the target method, i.e.)
+-				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, argument, flowInfo, false);
++				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, argument, flowInfo, flowContext, false);
+ 			}
+ 		}
+ 		analyseArguments(currentScope, flowContext, flowInfo, this.binding, this.arguments);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+index fdbf4d0..f068ce9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+@@ -14,6 +14,7 @@
+  *								bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -90,7 +91,7 @@ public class QualifiedAllocationExpression extends AllocationExpression {
+ 			for (int i = 0, count = this.arguments.length; i < count; i++) {
+ 				if (analyseResources) {
+ 					// if argument is an AutoCloseable insert info that it *may* be closed (by the target method, i.e.)
+-					flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, false);
++					flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, flowContext, false);
+ 				}
+ 				flowInfo = this.arguments[i].analyseCode(currentScope, flowContext, flowInfo);
+ 				if ((this.arguments[i].implicitConversion & TypeIds.UNBOXING) != 0) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+index 760d30c..c1ac819 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+@@ -19,6 +19,7 @@
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *								bug 365859 - [compiler][null] distinguish warnings based on flow analysis vs. null annotations
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -55,12 +56,12 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 		if (flowInfo.reachMode() == FlowInfo.REACHABLE)
+ 			checkAgainstNullAnnotation(currentScope, flowContext, this.expression.nullStatus(flowInfo));
+ 		if (currentScope.compilerOptions().analyseResourceLeaks) {
+-			FakedTrackingVariable trackingVariable = FakedTrackingVariable.getCloseTrackingVariable(this.expression);
++			FakedTrackingVariable trackingVariable = FakedTrackingVariable.getCloseTrackingVariable(this.expression, flowContext);
+ 			if (trackingVariable != null) {
+ 				if (methodScope != trackingVariable.methodScope)
+ 					trackingVariable.markClosedInNestedMethod();
+ 				// by returning the method passes the responsibility to the caller:
+-				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.expression, flowInfo, true);
++				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.expression, flowInfo, flowContext, true);
+ 			}
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TryStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TryStatement.java
+index be0922f..4df8676 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TryStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TryStatement.java
+@@ -14,6 +14,7 @@
+  *     							bug 359334 - Analysis for resource leak warnings does not consider exceptions as method exit points
+  *								bug 358903 - Filter practically unimportant resource leak warnings
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -253,11 +254,23 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 		// analyse finally block first
+ 		insideSubContext = new InsideSubRoutineFlowContext(flowContext, this);
+ 
++		// process the try block in a context handling the local exceptions.
++		// (advance instantiation so we can wire this into the FinallyFlowContext)
++		ExceptionHandlingFlowContext handlingContext =
++			new ExceptionHandlingFlowContext(
++				insideSubContext,
++				this,
++				this.caughtExceptionTypes,
++				this.caughtExceptionsCatchBlocks,
++				null,
++				this.scope,
++				flowInfo);
++
+ 		subInfo =
+ 			this.finallyBlock
+ 				.analyseCode(
+ 					currentScope,
+-					finallyContext = new FinallyFlowContext(flowContext, this.finallyBlock),
++					finallyContext = new FinallyFlowContext(flowContext, this.finallyBlock, handlingContext),
+ 					flowInfo.nullInfoLessUnconditionalCopy())
+ 				.unconditionalInits();
+ 		if (subInfo == FlowInfo.DEAD_END) {
+@@ -273,16 +286,6 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 			}
+ 		}
+ 		this.subRoutineInits = subInfo;
+-		// process the try block in a context handling the local exceptions.
+-		ExceptionHandlingFlowContext handlingContext =
+-			new ExceptionHandlingFlowContext(
+-				insideSubContext,
+-				this,
+-				this.caughtExceptionTypes,
+-				this.caughtExceptionsCatchBlocks,
+-				null,
+-				this.scope,
+-				flowInfo);
+ 		// only try blocks initialize that member - may consider creating a
+ 		// separate class if needed
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
+index 7bbb894..2efcbd9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
+@@ -13,6 +13,7 @@
+  *								bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *								bug 365859 - [compiler][null] distinguish warnings based on flow analysis vs. null annotations
+  *								bug 385626 - @NonNull fails across loop boundaries
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.flow;
+ 
+@@ -45,8 +46,12 @@ public class FinallyFlowContext extends FlowContext {
+ 	int nullCount;
+ 	// see also the related field FlowContext#expectedTypes
+ 
+-	public FinallyFlowContext(FlowContext parent, ASTNode associatedNode) {
++	// back reference to the flow context of the corresponding try statement
++	public FlowContext tryContext;
++
++	public FinallyFlowContext(FlowContext parent, ASTNode associatedNode, ExceptionHandlingFlowContext tryContext) {
+ 		super(parent, associatedNode);
++		this.tryContext = tryContext;
+ 	}
+ 
+ /**
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+index 4388ebe..4df6fbc 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+@@ -13,6 +13,7 @@
+  *								bug 358903 - Filter practically unimportant resource leak warnings
+  *								bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -1050,7 +1051,7 @@ public void checkUnclosedCloseables(FlowInfo flowInfo, FlowContext flowContext,
+ 	if (location != null && flowInfo.reachMode() != 0) return;
+ 
+ 	FakedTrackingVariable returnVar = (location instanceof ReturnStatement) ?
+-			FakedTrackingVariable.getCloseTrackingVariable(((ReturnStatement)location).expression) : null;
++			FakedTrackingVariable.getCloseTrackingVariable(((ReturnStatement)location).expression, flowContext) : null;
+ 
+ 	Set varSet = new HashSet(this.trackingVariables);
+ 	FakedTrackingVariable trackingVar;
+commit 1b2e1f16a7b68739fef072ffcd776d1f0d560caa
+Author: Stephan Herrmann <stephan@cs.tu-berlin.de>
+Date:   Sun Sep 16 00:18:32 2012 +0200
+
+    Bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+
+46	6	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayInitializer.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+39	18	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
+3	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+3	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+14	11	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TryStatement.java
+6	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
+2	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
+index f991f10..031432d 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ResourceLeakTests.java
+@@ -26,7 +26,7 @@ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ public class ResourceLeakTests extends AbstractRegressionTest {
+ 
+ static {
+-//	TESTS_NAMES = new String[] { "testBug385415" };
++//	TESTS_NAMES = new String[] { "testBug388996" };
+ //	TESTS_NUMBERS = new int[] { 50 };
+ //	TESTS_RANGE = new int[] { 11, -1 };
+ }
+@@ -3329,8 +3329,8 @@ public void test066b() {
+ 
+ // Bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+ // example from comment 12
+-// disabled because null info after try-catch is too weak,
+-// see also Bug 370424 - [compiler][null] throw-catch analysis for null flow could be more precise
++// Red herring (disabled): warning says "potential" because in the exception case no resource
++// would actually be allocated.
+ public void _test067() {
+ 	Map options = getCompilerOptions();
+ 	options.put(CompilerOptions.OPTION_ReportUnclosedCloseable, CompilerOptions.ERROR);
+@@ -3359,9 +3359,7 @@ public void _test067() {
+ 
+ // Bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+ // example from comment 12
+-// disabled because null info after try-catch is too weak,
+-// see also Bug 370424 - [compiler][null] throw-catch analysis for null flow could be more precise
+-public void _test067b() {
++public void test067b() {
+ 	Map options = getCompilerOptions();
+ 	options.put(CompilerOptions.OPTION_ReportUnclosedCloseable, CompilerOptions.ERROR);
+ 	options.put(CompilerOptions.OPTION_ReportPotentiallyUnclosedCloseable, CompilerOptions.ERROR);
+@@ -3830,4 +3828,46 @@ public void _testBug386534() {
+ 		options,
+ 		null);
+ }
++
++// https://bugs.eclipse.org/388996 - [compiler][resource] Incorrect 'potential resource leak'
++public void testBug388996() {
++	Map options = getCompilerOptions();
++	options.put(CompilerOptions.OPTION_ReportPotentiallyUnclosedCloseable, CompilerOptions.ERROR);
++	runConformTest(
++		new String[] {
++			"Bug.java",
++			"import java.io.*;\n" +
++			"public class Bug {\n" +
++			"	public void processRequest(ResponseContext responseContext) throws IOException {\n" + 
++			"		OutputStream bao = null;\n" + 
++			"\n" + 
++			"		try {\n" + 
++			"			HttpServletResponse response = responseContext.getResponse();\n" + 
++			"\n" + 
++			"			bao = response.getOutputStream(); // <<<<\n" + 
++			"		} finally {\n" + 
++			"			if(bao != null) {\n" + 
++			"				bao.close();\n" + 
++			"			}\n" + 
++			"		}\n" + 
++			"	}" +
++			"}\n" +
++			"class ResponseContext {\n" + 
++			"	public HttpServletResponse getResponse() {\n" + 
++			"		return null;\n" + 
++			"	}\n" + 
++			"}\n" + 
++			"class HttpServletResponse {\n" + 
++			"	public OutputStream getOutputStream() {\n" + 
++			"		return null;\n" + 
++			"	}\n" + 
++			"}"
++		},
++		"",
++		null,
++		true,
++		null,
++		options,
++		null);
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+index 42030e0..84a0d64 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/AllocationExpression.java
+@@ -16,6 +16,7 @@
+  *							bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *							bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *							bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *							bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -60,7 +61,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 					.unconditionalInits();
+ 			// if argument is an AutoCloseable insert info that it *may* be closed (by the target method, i.e.)
+ 			if (analyseResources && !hasResourceWrapperType) { // allocation of wrapped closeables is analyzed specially
+-				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, false);
++				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, flowContext, false);
+ 			}
+ 			if ((this.arguments[i].implicitConversion & TypeIds.UNBOXING) != 0) {
+ 				this.arguments[i].checkNPE(currentScope, flowContext, flowInfo);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayInitializer.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayInitializer.java
+index 41027f8..f35b7b1 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayInitializer.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ArrayInitializer.java
+@@ -10,6 +10,7 @@
+  *     Stephan Herrmann - Contributions for 
+  *								bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -40,7 +41,7 @@ public class ArrayInitializer extends Expression {
+ 				flowInfo = this.expressions[i].analyseCode(currentScope, flowContext, flowInfo).unconditionalInits();
+ 
+ 				if (analyseResources && FakedTrackingVariable.isAnyCloseable(this.expressions[i].resolvedType)) {
+-					flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.expressions[i], flowInfo, false);
++					flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.expressions[i], flowInfo, flowContext, false);
+ 				}
+ 			}
+ 		}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+index a69879c..4c32b01 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Assignment.java
+@@ -18,6 +18,7 @@
+  *							bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *							bug 365859 - [compiler][null] distinguish warnings based on flow analysis vs. null annotations
+  *							bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *							bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -68,7 +69,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 		.unconditionalInits();
+ 
+ 	if (shouldAnalyseResource)
+-		FakedTrackingVariable.handleResourceAssignment(currentScope, preInitInfo, flowInfo, this, this.expression, local);
++		FakedTrackingVariable.handleResourceAssignment(currentScope, preInitInfo, flowInfo, flowContext, this, this.expression, local);
+ 	else
+ 		FakedTrackingVariable.cleanUpAfterAssignment(currentScope, this.lhs.bits, this.expression);
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+index f081f32..9e8de3f 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ExplicitConstructorCall.java
+@@ -12,6 +12,7 @@
+  *								bug 186342 - [compiler][null] Using annotations for null checking
+  *								bug 361407 - Resource leak warning when resource is assigned to a field outside of constructor
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -84,7 +85,7 @@ public class ExplicitConstructorCall extends Statement implements InvocationSite
+ 							.unconditionalInits();
+ 					if (analyseResources) {
+ 						// if argument is an AutoCloseable insert info that it *may* be closed (by the target constructor, i.e.)
+-						flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, false);
++						flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, flowContext, false);
+ 					}
+ 					if ((this.arguments[i].implicitConversion & TypeIds.UNBOXING) != 0) {
+ 						this.arguments[i].checkNPE(currentScope, flowContext, flowInfo);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
+index f65ca7e..20dde0b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/FakedTrackingVariable.java
+@@ -17,6 +17,7 @@ import java.util.Map.Entry;
+ import java.util.Set;
+ 
+ import org.eclipse.jdt.internal.compiler.codegen.CodeStream;
++import org.eclipse.jdt.internal.compiler.flow.FinallyFlowContext;
+ import org.eclipse.jdt.internal.compiler.flow.FlowContext;
+ import org.eclipse.jdt.internal.compiler.flow.FlowInfo;
+ import org.eclipse.jdt.internal.compiler.impl.Constant;
+@@ -79,14 +80,19 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 
+ 	// temporary storage while analyzing "res = new Res();":
+ 	private ASTNode currentAssignment; // temporarily store the assignment as the location for error reporting
++	
++	// if tracking var was allocated from a finally context, record here the flow context of the corresponding try block
++	private FlowContext tryContext;
+ 
+-	public FakedTrackingVariable(LocalVariableBinding original, ASTNode location) {
++	public FakedTrackingVariable(LocalVariableBinding original, ASTNode location, FlowContext flowContext) {
+ 		super(original.name, location.sourceStart, location.sourceEnd);
+ 		this.type = new SingleTypeReference(
+ 				TypeConstants.OBJECT,
+ 				((long)this.sourceStart <<32)+this.sourceEnd);
+ 		this.methodScope = original.declaringScope.methodScope();
+ 		this.originalBinding = original;
++		if (flowContext instanceof FinallyFlowContext)
++			this.tryContext = ((FinallyFlowContext) flowContext).tryContext;
+ 		resolve(original.declaringScope);
+ 	}
+ 
+@@ -129,7 +135,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 	 * @param expression
+ 	 * @return a new {@link FakedTrackingVariable} or null.
+ 	 */
+-	public static FakedTrackingVariable getCloseTrackingVariable(Expression expression) {
++	public static FakedTrackingVariable getCloseTrackingVariable(Expression expression, FlowContext flowContext) {
+ 		while (true) {
+ 			if (expression instanceof CastExpression)
+ 				expression = ((CastExpression) expression).expression;
+@@ -149,7 +155,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 				// tracking var doesn't yet exist. This happens in finally block
+ 				// which is analyzed before the corresponding try block
+ 				Statement location = local.declaration;
+-				local.closeTracker = new FakedTrackingVariable(local, location);
++				local.closeTracker = new FakedTrackingVariable(local, location, flowContext);
+ 				if (local.isParameter()) {
+ 					local.closeTracker.globalClosingState |= OWNED_BY_OUTSIDE;
+ 					// status of this tracker is now UNKNOWN
+@@ -181,7 +187,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 			closeTracker = local.closeTracker;
+ 			if (closeTracker == null) {
+ 				if (rhs.resolvedType != TypeBinding.NULL) { // not NULL means valid closeable as per method precondition
+-					closeTracker = new FakedTrackingVariable(local, location);
++					closeTracker = new FakedTrackingVariable(local, location, null);
+ 					if (local.isParameter()) {
+ 						closeTracker.globalClosingState |= OWNED_BY_OUTSIDE;
+ 					}
+@@ -321,12 +327,13 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 	 * @param scope scope containing the assignment
+ 	 * @param upstreamInfo info without analysis of the rhs, use this to determine the status of a resource being disconnected
+ 	 * @param flowInfo info with analysis of the rhs, use this for recording resource status because this will be passed downstream
++	 * @param flowContext 
+ 	 * @param location where to report warnigs/errors against
+ 	 * @param rhs the right hand side of the assignment, this expression is to be analyzed.
+ 	 *			The caller has already checked that the rhs is either of a closeable type or null.
+ 	 * @param local the local variable into which the rhs is being assigned
+ 	 */
+-	public static void handleResourceAssignment(BlockScope scope, FlowInfo upstreamInfo, FlowInfo flowInfo, ASTNode location, Expression rhs, LocalVariableBinding local)
++	public static void handleResourceAssignment(BlockScope scope, FlowInfo upstreamInfo, FlowInfo flowInfo, FlowContext flowContext, ASTNode location, Expression rhs, LocalVariableBinding local)
+ 	{
+ 		// does the LHS (local) already have a tracker, indicating we may leak a resource by the assignment?
+ 		FakedTrackingVariable previousTracker = null;
+@@ -342,7 +349,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 		rhsAnalyis:
+ 		if (rhs.resolvedType != TypeBinding.NULL) {
+ 			// new value is AutoCloseable, start tracking, possibly re-using existing tracker var:
+-			FakedTrackingVariable rhsTrackVar = getCloseTrackingVariable(rhs);
++			FakedTrackingVariable rhsTrackVar = getCloseTrackingVariable(rhs, flowContext);
+ 			if (rhsTrackVar != null) {								// 1. if RHS has a tracking variable...
+ 				if (local.closeTracker == null) {
+ 					// null shouldn't occur but let's play safe:
+@@ -361,7 +368,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 								&& ((rhsTrackVar.globalClosingState & OWNED_BY_OUTSIDE) != 0)) {
+ 																	// 		c.: assigning a fresh resource (pre-connected alloc) 
+ 																	//			to a local previously holding an alien resource -> start over
+-							local.closeTracker = new FakedTrackingVariable(local, location);
++							local.closeTracker = new FakedTrackingVariable(local, location, flowContext);
+ 							flowInfo.markAsDefinitelyNull(local.closeTracker.binding);
+ 							// still check disconnectedTracker below
+ 							break rhsAnalyis;
+@@ -371,12 +378,26 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 				}
+ 				// keep close-status of RHS unchanged across this assignment
+ 			} else if (previousTracker != null) {					// 2. re-use tracking variable from the LHS?
+-				// re-assigning from a fresh value, mark as not-closed again:
+-				if ((previousTracker.globalClosingState & (SHARED_WITH_OUTSIDE|OWNED_BY_OUTSIDE)) == 0)
+-					flowInfo.markAsDefinitelyNull(previousTracker.binding);
+-				local.closeTracker = analyseCloseableExpression(flowInfo, local, location, rhs, previousTracker);
++				FlowContext currentFlowContext = flowContext;
++				checkReuseTracker : {
++					if (previousTracker.tryContext != null) {
++						while (currentFlowContext != null) {
++							if (previousTracker.tryContext == currentFlowContext) {
++								// "previous" location was the finally block of the current try statement.
++								// -> This is not a re-assignment.
++								// see https://bugs.eclipse.org/388996
++								break checkReuseTracker;
++							}
++							currentFlowContext = currentFlowContext.parent;
++						}
++					}
++					// re-assigning from a fresh value, mark as not-closed again:
++					if ((previousTracker.globalClosingState & (SHARED_WITH_OUTSIDE|OWNED_BY_OUTSIDE)) == 0)
++						flowInfo.markAsDefinitelyNull(previousTracker.binding);
++					local.closeTracker = analyseCloseableExpression(flowInfo, flowContext, local, location, rhs, previousTracker);
++				}
+ 			} else {												// 3. no re-use, create a fresh tracking variable:
+-				rhsTrackVar = analyseCloseableExpression(flowInfo, local, location, rhs, null);
++				rhsTrackVar = analyseCloseableExpression(flowInfo, flowContext, local, location, rhs, null);
+ 				if (rhsTrackVar != null) {
+ 					local.closeTracker = rhsTrackVar;
+ 					// a fresh resource, mark as not-closed:
+@@ -411,7 +432,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 	 *  		which we should then re-use
+ 	 * @return a tracking variable associated with local or null if no need to track
+ 	 */
+-	private static FakedTrackingVariable analyseCloseableExpression(FlowInfo flowInfo, LocalVariableBinding local, 
++	private static FakedTrackingVariable analyseCloseableExpression(FlowInfo flowInfo, FlowContext flowContext, LocalVariableBinding local, 
+ 									ASTNode location, Expression expression, FakedTrackingVariable previousTracker) 
+ 	{
+ 		// unwrap uninteresting nodes:
+@@ -437,7 +458,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 				|| expression instanceof ArrayReference) 
+ 		{
+ 			// we *might* be responsible for the resource obtained
+-			FakedTrackingVariable tracker = new FakedTrackingVariable(local, location);
++			FakedTrackingVariable tracker = new FakedTrackingVariable(local, location, flowContext);
+ 			tracker.globalClosingState |= SHARED_WITH_OUTSIDE;
+ 			flowInfo.markPotentiallyNullBit(tracker.binding); // shed some doubt
+ 			return tracker;
+@@ -447,7 +468,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 						&& ((QualifiedNameReference) expression).isFieldAccess()))
+ 		{
+ 			// responsibility for this resource probably lies at a higher level
+-			FakedTrackingVariable tracker = new FakedTrackingVariable(local, location);
++			FakedTrackingVariable tracker = new FakedTrackingVariable(local, location, flowContext);
+ 			tracker.globalClosingState |= OWNED_BY_OUTSIDE;
+ 			// leave state as UNKNOWN, the bit OWNED_BY_OUTSIDE will prevent spurious warnings
+ 			return tracker;			
+@@ -463,7 +484,7 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 		if (local.closeTracker != null)
+ 			// (c): inner has already been analyzed: -> re-use track var
+ 			return local.closeTracker;
+-		FakedTrackingVariable newTracker = new FakedTrackingVariable(local, location);
++		FakedTrackingVariable newTracker = new FakedTrackingVariable(local, location, flowContext);
+ 		LocalVariableBinding rhsLocal = expression.localVariableBinding();
+ 		if (rhsLocal != null && rhsLocal.isParameter()) {
+ 			newTracker.globalClosingState |= OWNED_BY_OUTSIDE;
+@@ -604,9 +625,9 @@ public class FakedTrackingVariable extends LocalDeclaration {
+ 	 * and thus should be considered as potentially closed.
+ 	 * @param owned should the resource be considered owned by some outside?
+ 	 */
+-	public static FlowInfo markPassedToOutside(BlockScope scope, Expression expression, FlowInfo flowInfo, boolean owned) {	
++	public static FlowInfo markPassedToOutside(BlockScope scope, Expression expression, FlowInfo flowInfo, FlowContext flowContext, boolean owned) {	
+ 		
+-		FakedTrackingVariable trackVar = getCloseTrackingVariable(expression);
++		FakedTrackingVariable trackVar = getCloseTrackingVariable(expression, flowContext);
+ 		if (trackVar != null) {
+ 			// insert info that the tracked resource *may* be closed (by the target method, i.e.)
+ 			FlowInfo infoResourceIsClosed = owned ? flowInfo : flowInfo.copy();
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
+index b337ac0..dc2397d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/LocalDeclaration.java
+@@ -20,6 +20,7 @@
+  *							bug 358903 - Filter practically unimportant resource leak warnings
+  *							bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *							bug 365859 - [compiler][null] distinguish warnings based on flow analysis vs. null annotations
++ *							bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -113,7 +114,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 			.unconditionalInits();
+ 
+ 	if (shouldAnalyseResource)
+-		FakedTrackingVariable.handleResourceAssignment(currentScope, preInitInfo, flowInfo, this, this.initialization, this.binding);
++		FakedTrackingVariable.handleResourceAssignment(currentScope, preInitInfo, flowInfo, flowContext, this, this.initialization, this.binding);
+ 	else
+ 		FakedTrackingVariable.cleanUpAfterAssignment(currentScope, Binding.LOCAL, this.initialization);
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index dddb1a0..fb84b3c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -15,6 +15,7 @@
+  *								bug 358903 - Filter practically unimportant resource leak warnings
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -73,7 +74,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 	boolean analyseResources = currentScope.compilerOptions().analyseResourceLeaks;
+ 	if (analyseResources && CharOperation.equals(TypeConstants.CLOSE, this.selector)) 
+ 	{
+-		FakedTrackingVariable trackingVariable = FakedTrackingVariable.getCloseTrackingVariable(this.receiver);
++		FakedTrackingVariable trackingVariable = FakedTrackingVariable.getCloseTrackingVariable(this.receiver, flowContext);
+ 		if (trackingVariable != null) { // null happens if receiver is not a local variable or not an AutoCloseable
+ 			if (trackingVariable.methodScope == currentScope.methodScope()) {
+ 				trackingVariable.markClose(flowInfo, flowContext);
+@@ -137,7 +138,7 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 			}
+ 			if (analyseResources) {
+ 				// if argument is an AutoCloseable insert info that it *may* be closed (by the target method, i.e.)
+-				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, argument, flowInfo, false);
++				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, argument, flowInfo, flowContext, false);
+ 			}
+ 		}
+ 		analyseArguments(currentScope, flowContext, flowInfo, this.binding, this.arguments);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+index fdbf4d0..f068ce9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedAllocationExpression.java
+@@ -14,6 +14,7 @@
+  *								bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -90,7 +91,7 @@ public class QualifiedAllocationExpression extends AllocationExpression {
+ 			for (int i = 0, count = this.arguments.length; i < count; i++) {
+ 				if (analyseResources) {
+ 					// if argument is an AutoCloseable insert info that it *may* be closed (by the target method, i.e.)
+-					flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, false);
++					flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.arguments[i], flowInfo, flowContext, false);
+ 				}
+ 				flowInfo = this.arguments[i].analyseCode(currentScope, flowContext, flowInfo);
+ 				if ((this.arguments[i].implicitConversion & TypeIds.UNBOXING) != 0) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+index 760d30c..c1ac819 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReturnStatement.java
+@@ -19,6 +19,7 @@
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
+  *								bug 365859 - [compiler][null] distinguish warnings based on flow analysis vs. null annotations
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -55,12 +56,12 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 		if (flowInfo.reachMode() == FlowInfo.REACHABLE)
+ 			checkAgainstNullAnnotation(currentScope, flowContext, this.expression.nullStatus(flowInfo));
+ 		if (currentScope.compilerOptions().analyseResourceLeaks) {
+-			FakedTrackingVariable trackingVariable = FakedTrackingVariable.getCloseTrackingVariable(this.expression);
++			FakedTrackingVariable trackingVariable = FakedTrackingVariable.getCloseTrackingVariable(this.expression, flowContext);
+ 			if (trackingVariable != null) {
+ 				if (methodScope != trackingVariable.methodScope)
+ 					trackingVariable.markClosedInNestedMethod();
+ 				// by returning the method passes the responsibility to the caller:
+-				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.expression, flowInfo, true);
++				flowInfo = FakedTrackingVariable.markPassedToOutside(currentScope, this.expression, flowInfo, flowContext, true);
+ 			}
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TryStatement.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TryStatement.java
+index be0922f..4df8676 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TryStatement.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TryStatement.java
+@@ -14,6 +14,7 @@
+  *     							bug 359334 - Analysis for resource leak warnings does not consider exceptions as method exit points
+  *								bug 358903 - Filter practically unimportant resource leak warnings
+  *								bug 345305 - [compiler][null] Compiler misidentifies a case of "variable can only be null"
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.ast;
+ 
+@@ -253,11 +254,23 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 		// analyse finally block first
+ 		insideSubContext = new InsideSubRoutineFlowContext(flowContext, this);
+ 
++		// process the try block in a context handling the local exceptions.
++		// (advance instantiation so we can wire this into the FinallyFlowContext)
++		ExceptionHandlingFlowContext handlingContext =
++			new ExceptionHandlingFlowContext(
++				insideSubContext,
++				this,
++				this.caughtExceptionTypes,
++				this.caughtExceptionsCatchBlocks,
++				null,
++				this.scope,
++				flowInfo);
++
+ 		subInfo =
+ 			this.finallyBlock
+ 				.analyseCode(
+ 					currentScope,
+-					finallyContext = new FinallyFlowContext(flowContext, this.finallyBlock),
++					finallyContext = new FinallyFlowContext(flowContext, this.finallyBlock, handlingContext),
+ 					flowInfo.nullInfoLessUnconditionalCopy())
+ 				.unconditionalInits();
+ 		if (subInfo == FlowInfo.DEAD_END) {
+@@ -273,16 +286,6 @@ public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, Fl
+ 			}
+ 		}
+ 		this.subRoutineInits = subInfo;
+-		// process the try block in a context handling the local exceptions.
+-		ExceptionHandlingFlowContext handlingContext =
+-			new ExceptionHandlingFlowContext(
+-				insideSubContext,
+-				this,
+-				this.caughtExceptionTypes,
+-				this.caughtExceptionsCatchBlocks,
+-				null,
+-				this.scope,
+-				flowInfo);
+ 		// only try blocks initialize that member - may consider creating a
+ 		// separate class if needed
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
+index 7bbb894..2efcbd9 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/flow/FinallyFlowContext.java
+@@ -13,6 +13,7 @@
+  *								bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *								bug 365859 - [compiler][null] distinguish warnings based on flow analysis vs. null annotations
+  *								bug 385626 - @NonNull fails across loop boundaries
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.flow;
+ 
+@@ -45,8 +46,12 @@ public class FinallyFlowContext extends FlowContext {
+ 	int nullCount;
+ 	// see also the related field FlowContext#expectedTypes
+ 
+-	public FinallyFlowContext(FlowContext parent, ASTNode associatedNode) {
++	// back reference to the flow context of the corresponding try statement
++	public FlowContext tryContext;
++
++	public FinallyFlowContext(FlowContext parent, ASTNode associatedNode, ExceptionHandlingFlowContext tryContext) {
+ 		super(parent, associatedNode);
++		this.tryContext = tryContext;
+ 	}
+ 
+ /**
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+index 4388ebe..4df6fbc 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BlockScope.java
+@@ -13,6 +13,7 @@
+  *								bug 358903 - Filter practically unimportant resource leak warnings
+  *								bug 368546 - [compiler][resource] Avoid remaining false positives found when compiling the Eclipse SDK
+  *								bug 370639 - [compiler][resource] restore the default for resource leak warnings
++ *								bug 388996 - [compiler][resource] Incorrect 'potential resource leak'
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -1050,7 +1051,7 @@ public void checkUnclosedCloseables(FlowInfo flowInfo, FlowContext flowContext,
+ 	if (location != null && flowInfo.reachMode() != 0) return;
+ 
+ 	FakedTrackingVariable returnVar = (location instanceof ReturnStatement) ?
+-			FakedTrackingVariable.getCloseTrackingVariable(((ReturnStatement)location).expression) : null;
++			FakedTrackingVariable.getCloseTrackingVariable(((ReturnStatement)location).expression, flowContext) : null;
+ 
+ 	Set varSet = new HashSet(this.trackingVariables);
+ 	FakedTrackingVariable trackingVar;

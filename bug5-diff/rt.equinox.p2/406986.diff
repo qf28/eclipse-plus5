@@ -1,0 +1,552 @@
+commit 95151949762679fcc359c29c1e96032be9899be8
+Author: Pascal Rapicault (JBoss) <pascal@rapicault.net>
+Date:   Wed May 1 16:54:27 2013 -0400
+
+    Bug 406986 - [operation] Remediation does heavy lifting in resolveModal
+
+49	0	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/RemediationResolutionJob.java
+38	13	bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemediationOperation.java
+1	1	bundles/org.eclipse.equinox.p2.ui.discovery/src/org/eclipse/equinox/internal/p2/ui/discovery/operations/DiscoveryInstallOperation.java
+3	2	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/PreselectedIUInstallWizard.java
+9	6	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
+59	83	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationGroup.java
+6	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationPage.java
+1	1	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/RemediationResolutionJob.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/RemediationResolutionJob.java
+new file mode 100644
+index 0000000..873d7ee
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/internal/p2/operations/RemediationResolutionJob.java
+@@ -0,0 +1,49 @@
++/*******************************************************************************
++ *  Copyright (c) 2010 IBM Corporation and others.
++ *  All rights reserved. This program and the accompanying materials
++ *  are made available under the terms of the Eclipse Public License v1.0
++ *  which accompanies this distribution, and is available at
++ *  http://www.eclipse.org/legal/epl-v10.html
++ * 
++ *  Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.operations;
++
++import java.lang.reflect.InvocationTargetException;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.director.ProfileChangeRequest;
++import org.eclipse.equinox.p2.engine.ProvisioningContext;
++import org.eclipse.equinox.p2.operations.ProvisioningSession;
++import org.eclipse.equinox.p2.operations.RemediationOperation;
++import org.eclipse.equinox.p2.repository.IRunnableWithProgress;
++
++public class RemediationResolutionJob extends PlannerResolutionJob {
++
++	IRunnableWithProgress computeRemediationRunnable;
++	RemediationOperation operation;
++	ProfileChangeRequest[] requestHolder;
++
++	public RemediationResolutionJob(String label, ProvisioningSession session, String profileId, ProfileChangeRequest request, ProvisioningContext context, IFailedStatusEvaluator evaluator, MultiStatus additionalStatus, IRunnableWithProgress computeRemediationRunnable, ProfileChangeRequest[] requestFromOperation, RemediationOperation operation) {
++		super(label, session, profileId, request, context, evaluator, additionalStatus);
++		this.computeRemediationRunnable = computeRemediationRunnable;
++		this.operation = operation;
++		this.requestHolder = requestFromOperation;
++	}
++
++	public IStatus runModal(IProgressMonitor monitor) {
++		SubMonitor sub = SubMonitor.convert(monitor);
++		try {
++			computeRemediationRunnable.run(sub.newChild(500));
++			if (requestHolder.length > 0)
++				this.request = requestHolder[0];
++		} catch (OperationCanceledException e) {
++			return Status.CANCEL_STATUS;
++		} catch (InvocationTargetException e) {
++			// ignore, we don't actually throw this in the supplied runnable
++		}
++		if (request != null)
++			return super.runModal(sub.newChild(500));
++		return operation.getResolutionResult();
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemediationOperation.java b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemediationOperation.java
+index e7592b8..13fef8a 100644
+--- a/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemediationOperation.java
++++ b/bundles/org.eclipse.equinox.p2.operations/src/org/eclipse/equinox/p2/operations/RemediationOperation.java
+@@ -12,11 +12,12 @@ package org.eclipse.equinox.p2.operations;
+ 
+ import java.util.*;
+ import org.eclipse.core.runtime.*;
++import org.eclipse.core.runtime.jobs.Job;
+ import org.eclipse.equinox.internal.p2.director.ProfileChangeRequest;
+-import org.eclipse.equinox.internal.p2.operations.Messages;
+-import org.eclipse.equinox.internal.p2.operations.RequestFlexer;
++import org.eclipse.equinox.internal.p2.operations.*;
+ import org.eclipse.equinox.p2.planner.IPlanner;
+ import org.eclipse.equinox.p2.planner.IProfileChangeRequest;
++import org.eclipse.equinox.p2.repository.IRunnableWithProgress;
+ 
+ /**
+  * <p>
+@@ -44,6 +45,7 @@ public class RemediationOperation extends ProfileChangeOperation {
+ 
+ 	public void setCurrentRemedy(Remedy currentRemedy) {
+ 		this.currentRemedy = currentRemedy;
++		request = currentRemedy == null ? null : currentRemedy.getRequest();
+ 	}
+ 
+ 	private IProfileChangeRequest originalRequest;
+@@ -95,8 +97,9 @@ public class RemediationOperation extends ProfileChangeOperation {
+ 		} catch (OperationCanceledException e) {
+ 			status.add(Status.CANCEL_STATUS);
+ 		}
+-		if (!isCheckForUpdates)
++		if (!isCheckForUpdates) {
+ 			determineBestSolutions();
++		}
+ 	}
+ 
+ 	private IStatus computeCheckForUpdates(IProgressMonitor monitor) {
+@@ -132,7 +135,7 @@ public class RemediationOperation extends ProfileChangeOperation {
+ 			sub.done();
+ 		}
+ 		remedies = tmpRemedies;
+-		return Status.OK_STATUS;
++		return getResolutionResult();
+ 	}
+ 
+ 	private void determineBestSolutions() {
+@@ -151,13 +154,8 @@ public class RemediationOperation extends ProfileChangeOperation {
+ 					installationWeight = remedy.getInstallationRelaxedWeight();
+ 					continue;
+ 				}
+-				request = remedy.getRequest();
+ 			}
+ 		}
+-		if (bestSolutionChangingTheRequest != null)
+-			request = bestSolutionChangingTheRequest.getRequest();
+-		else if (bestSolutionChangingWhatIsInstalled != null)
+-			request = bestSolutionChangingWhatIsInstalled.getRequest();
+ 	}
+ 
+ 	private Remedy computeRemedy(RemedyConfig configuration, IProgressMonitor monitor) {
+@@ -218,11 +216,38 @@ public class RemediationOperation extends ProfileChangeOperation {
+ 		return null;
+ 	}
+ 
+-	public boolean hasRemedies() {
+-		return (remedies != null && remedies.size() > 0);
+-	}
+-
+ 	public ProfileChangeRequest getOriginalRequest() {
+ 		return (ProfileChangeRequest) originalRequest;
+ 	}
++
++	void makeResolveJob(final IProgressMonitor monitor) {
++		// throw away any previous requests
++		request = null;
++		noChangeRequest = PlanAnalyzer.getProfileChangeAlteredStatus();
++		// the requestHolder is a hack to work around the fact that there is no public API
++		// for the resolution job to get the request from the operation after it has been
++		// computed.
++		final ProfileChangeRequest[] requestHolder = new ProfileChangeRequest[1];
++		job = new RemediationResolutionJob(getResolveJobName(), session, profileId, request, getFirstPassProvisioningContext(), getSecondPassEvaluator(), noChangeRequest, new IRunnableWithProgress() {
++			public void run(IProgressMonitor mon) throws OperationCanceledException {
++				//Weird hack to get progress reporting to do something in the install wizard....
++				if (monitor != null)
++					mon = monitor;
++				// We only check for other jobs running if this job is *not* scheduled
++				if (job.getState() == Job.NONE && session.hasScheduledOperationsFor(profileId)) {
++					noChangeRequest.add(PlanAnalyzer.getStatus(IStatusCodes.OPERATION_ALREADY_IN_PROGRESS, null));
++				} else {
++					computeProfileChangeRequest(noChangeRequest, mon);
++					requestHolder[0] = RemediationOperation.this.request;
++				}
++			}
++		}, requestHolder, this);
++	}
++
++	@Override
++	public IStatus getResolutionResult() {
++		if (currentRemedy != null)
++			return super.getResolutionResult();
++		return remedies.size() > 0 ? Status.OK_STATUS : new Status(IStatus.ERROR, Activator.ID, "No remedy found");
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui.discovery/src/org/eclipse/equinox/internal/p2/ui/discovery/operations/DiscoveryInstallOperation.java b/bundles/org.eclipse.equinox.p2.ui.discovery/src/org/eclipse/equinox/internal/p2/ui/discovery/operations/DiscoveryInstallOperation.java
+index 4212a50..023f04d 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.discovery/src/org/eclipse/equinox/internal/p2/ui/discovery/operations/DiscoveryInstallOperation.java
++++ b/bundles/org.eclipse.equinox.p2.ui.discovery/src/org/eclipse/equinox/internal/p2/ui/discovery/operations/DiscoveryInstallOperation.java
+@@ -73,7 +73,7 @@ public class DiscoveryInstallOperation implements IRunnableWithProgress {
+ 				if (installOperation.getResolutionResult().getSeverity() > IStatus.WARNING) {
+ 					monitor.setTaskName(ProvUIMessages.ProvisioningOperationWizard_Remediation_Operation);
+ 					final RemediationOperation remediationOperation = new RemediationOperation(provisioningUI.getSession(), installOperation.getProfileChangeRequest());
+-					remediationOperation.getResolveJob(monitor.newChild(50));
++					remediationOperation.resolveModal(monitor.newChild(50));
+ 					Display.getDefault().asyncExec(new Runnable() {
+ 						public void run() {
+ 							provisioningUI.openInstallWizard(Arrays.asList(ius), installOperation, remediationOperation, null);
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/PreselectedIUInstallWizard.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/PreselectedIUInstallWizard.java
+index 10a548c..8c1dcb9 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/PreselectedIUInstallWizard.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/PreselectedIUInstallWizard.java
+@@ -14,6 +14,7 @@ package org.eclipse.equinox.internal.p2.ui.dialogs;
+ 
+ import java.util.ArrayList;
+ import java.util.Collection;
++import org.eclipse.core.runtime.Status;
+ import org.eclipse.equinox.internal.p2.ui.*;
+ import org.eclipse.equinox.internal.p2.ui.model.*;
+ import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+@@ -41,7 +42,7 @@ public class PreselectedIUInstallWizard extends WizardWithLicenses {
+ 
+ 	@Override
+ 	public IWizardPage getStartingPage() {
+-		if (remediationOperation != null && remediationOperation.hasRemedies()) {
++		if (remediationOperation != null && remediationOperation.getResolutionResult() == Status.OK_STATUS) {
+ 			return getNextPage(mainPage);
+ 		}
+ 		return super.getStartingPage();
+@@ -56,7 +57,7 @@ public class PreselectedIUInstallWizard extends WizardWithLicenses {
+ 	}
+ 
+ 	protected ResolutionResultsWizardPage createResolutionPage() {
+-		return new InstallWizardPage(ui, this, root, (InstallOperation) operation);
++		return new InstallWizardPage(ui, this, root, operation);
+ 	}
+ 
+ 	protected void initializeResolutionModelElements(Object[] selectedElements) {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
+index 1309efd..ba2af24 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/ProvisioningOperationWizard.java
+@@ -131,8 +131,9 @@ public abstract class ProvisioningOperationWizard extends Wizard {
+ 
+ 		if (page == remediationPage) {
+ 			try {
+-				getContainer().run(true, false, new IRunnableWithProgress() {
++				getContainer().run(true, true, new IRunnableWithProgress() {
+ 					public void run(IProgressMonitor monitor) {
++						remediationOperation.setCurrentRemedy(remediationPage.getRemediationGroup().getCurrentRemedy());
+ 						remediationOperation.resolveModal(monitor);
+ 					}
+ 				});
+@@ -160,10 +161,11 @@ public abstract class ProvisioningOperationWizard extends Wizard {
+ 			IStatus status = operation.getResolutionResult();
+ 			if (status == null || status.getSeverity() == IStatus.ERROR) {
+ 				if (page == mainPage) {
+-					if (remediationOperation != null && remediationOperation.hasRemedies() && remediationOperation.getRemedies().size() == 1) {
++					if (remediationOperation != null && remediationOperation.getResolutionResult() == Status.OK_STATUS && remediationOperation.isCheckForUpdates()) {
+ 						planChanged();
+ 						return getNextPage(remediationPage);
+-					} else if (remediationOperation != null && remediationOperation.hasRemedies()) {
++					}
++					if (remediationOperation != null && remediationOperation.getResolutionResult() == Status.OK_STATUS) {
+ 						planChanged();
+ 						return remediationPage;
+ 					}
+@@ -229,7 +231,7 @@ public abstract class ProvisioningOperationWizard extends Wizard {
+ 
+ 	protected void planChanged() {
+ 		IWizardPage currentPage = ((WizardDialog) getContainer()).getCurrentPage();
+-		if ((currentPage == null || currentPage == mainPage) && remediationPage != null && remediationOperation != null && remediationOperation.hasRemedies()) {
++		if ((currentPage == null || currentPage == mainPage) && remediationPage != null && remediationOperation != null && remediationOperation.getResolutionResult() == Status.OK_STATUS) {
+ 			remediationPage.updateStatus(root, operation, planSelections);
+ 		}
+ 		resolutionPage.updateStatus(root, operation);
+@@ -260,7 +262,7 @@ public abstract class ProvisioningOperationWizard extends Wizard {
+ 		SubMonitor sub = SubMonitor.convert(monitor, ProvUIMessages.ProvisioningOperationWizard_Remediation_Operation, RemedyConfig.getAllRemdyConfigs().length);
+ 		monitor.setTaskName(ProvUIMessages.ProvisioningOperationWizard_Remediation_Operation);
+ 		remediationOperation = new RemediationOperation(ui.getSession(), op.getProfileChangeRequest());
+-		remediationOperation.getResolveJob(monitor);
++		remediationOperation.resolveModal(monitor);
+ 		sub.done();
+ 	}
+ 
+@@ -273,9 +275,10 @@ public abstract class ProvisioningOperationWizard extends Wizard {
+ 	public void recomputePlan(IRunnableContext runnableContext, final boolean withRemediation) {
+ 		couldNotResolveStatus = Status.OK_STATUS;
+ 		provisioningContext = getProvisioningContext();
++		operation = null;
++		remediationOperation = null;
+ 		initializeResolutionModelElements(getOperationSelections());
+ 		if (planSelections.length == 0) {
+-			operation = null;
+ 			couldNotResolve(ProvUIMessages.ResolutionWizardPage_NoSelections);
+ 		} else {
+ 			operation = getProfileChangeOperation(planSelections);
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationGroup.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationGroup.java
+index 4a0e5ad..9f65f28 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationGroup.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationGroup.java
+@@ -13,13 +13,10 @@ package org.eclipse.equinox.internal.p2.ui.dialogs;
+ import java.util.*;
+ import java.util.List;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+-import org.eclipse.equinox.internal.p2.ui.model.AvailableIUElement;
+-import org.eclipse.equinox.internal.p2.ui.model.IUElementListRoot;
++import org.eclipse.equinox.internal.p2.ui.model.*;
+ import org.eclipse.equinox.internal.p2.ui.viewers.*;
+-import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.p2.operations.RemediationOperation;
+ import org.eclipse.equinox.p2.operations.Remedy;
+-import org.eclipse.equinox.p2.ui.ProvisioningUI;
+ import org.eclipse.jface.viewers.TreeViewer;
+ import org.eclipse.jface.wizard.WizardPage;
+ import org.eclipse.swt.SWT;
+@@ -44,6 +41,7 @@ public class RemediationGroup {
+ 	private Composite resultComposite;
+ 	private Composite resultNotFoundComposite;
+ 	private Composite resultErrorComposite;
++	private Remedy currentRemedy;
+ 
+ 	private TreeViewer treeViewer;
+ 	protected IUElementListRoot input;
+@@ -71,12 +69,12 @@ public class RemediationGroup {
+ 	public void createRemediationControl(Composite container) {
+ 		remediationComposite = new Composite(container, SWT.NONE);
+ 		remediationComposite.setLayout(new GridLayout());
+-		Listener bestSolutionlistener;
++		Listener solutionslistener;
+ 
+ 		Label descriptionLabel = new Label(remediationComposite, SWT.NONE);
+ 		descriptionLabel.setText(ProvUIMessages.RemediationPage_SubDescription);
+ 
+-		bestSolutionlistener = new Listener() {
++		solutionslistener = new Listener() {
+ 			public void handleEvent(Event e) {
+ 				Button btn = (Button) e.widget;
+ 				Remedy remedy = (btn.getData() == null ? null : (Remedy) btn.getData());
+@@ -95,26 +93,28 @@ public class RemediationGroup {
+ 					checkBoxesComposite.setVisible(false);
+ 					((GridData) checkBoxesComposite.getLayoutData()).exclude = true;
+ 				}
+-				refresh();
++				currentRemedy = searchRemedyMatchingUserChoices();
++				refreshResultComposite();
+ 				remediationComposite.layout(false);
+ 			}
+ 		};
+ 
+ 		bestBeingInstalledRelaxedButton = new Button(remediationComposite, SWT.RADIO);
+ 		bestBeingInstalledRelaxedButton.setText(ProvUIMessages.RemediationPage_BestSolutionBeingInstalledRelaxed);
+-		bestBeingInstalledRelaxedButton.addListener(SWT.Selection, bestSolutionlistener);
++		bestBeingInstalledRelaxedButton.addListener(SWT.Selection, solutionslistener);
+ 
+ 		bestInstalledRelaxedButton = new Button(remediationComposite, SWT.RADIO);
+ 		bestInstalledRelaxedButton.setText(ProvUIMessages.RemediationPage_BestSolutionInstallationRelaxed);
+-		bestInstalledRelaxedButton.addListener(SWT.Selection, bestSolutionlistener);
++		bestInstalledRelaxedButton.addListener(SWT.Selection, solutionslistener);
+ 
+ 		buildMyOwnSolution = new Button(remediationComposite, SWT.RADIO);
+ 		buildMyOwnSolution.setText(ProvUIMessages.RemediationPage_BestSolutionBuilt);
+-		buildMyOwnSolution.addListener(SWT.Selection, bestSolutionlistener);
++		buildMyOwnSolution.addListener(SWT.Selection, solutionslistener);
+ 
+-		Listener relaxedConstraintlistener = new Listener() {
++		Listener checkboxListener = new Listener() {
+ 			public void handleEvent(Event e) {
+-				refresh();
++				currentRemedy = searchRemedyMatchingUserChoices();
++				refreshResultComposite();
+ 			}
+ 		};
+ 		checkBoxesComposite = new Composite(remediationComposite, SWT.NONE);
+@@ -135,7 +135,7 @@ public class RemediationGroup {
+ 				checkBtn.setText(value);
+ 				checkBtn.setData(value);
+ 				checkBtn.setLayoutData(gd);
+-				checkBtn.addListener(SWT.Selection, relaxedConstraintlistener);
++				checkBtn.addListener(SWT.Selection, checkboxListener);
+ 				checkboxes.add(checkBtn);
+ 			}
+ 
+@@ -193,32 +193,38 @@ public class RemediationGroup {
+ 		return iuDetailsGroup;
+ 	}
+ 
+-	public void update(RemediationOperation operation) {
+-		this.remediationOperation = operation;
+-		boolean isSelected = false;
++	private Remedy searchBestDefaultRemedy() {
+ 		if (remediationOperation.bestSolutionChangingTheRequest() != null) {
+-			bestBeingInstalledRelaxedButton.setData(remediationOperation.bestSolutionChangingTheRequest());
+-			bestBeingInstalledRelaxedButton.setSelection(true);
+-			remediationOperation.setCurrentRemedy(remediationOperation.bestSolutionChangingTheRequest());
+-			bestBeingInstalledRelaxedButton.notifyListeners(SWT.Selection, new Event());
+-			isSelected = true;
++			return remediationOperation.bestSolutionChangingTheRequest();
+ 		}
+-		bestBeingInstalledRelaxedButton.setEnabled(remediationOperation.bestSolutionChangingTheRequest() != null);
+-
+ 		if (remediationOperation.bestSolutionChangingWhatIsInstalled() != null) {
+-			bestInstalledRelaxedButton.setData(remediationOperation.bestSolutionChangingWhatIsInstalled());
+-			bestInstalledRelaxedButton.setSelection(isSelected == false);
+-			if (!isSelected) {
+-				remediationOperation.setCurrentRemedy(remediationOperation.bestSolutionChangingWhatIsInstalled());
+-				bestInstalledRelaxedButton.notifyListeners(SWT.Selection, new Event());
+-			}
+-			isSelected = true;
++			return remediationOperation.bestSolutionChangingWhatIsInstalled();
+ 		}
++		return remediationOperation.getRemedies().get(0);
++	}
++
++	public void update(RemediationOperation operation) {
++		this.remediationOperation = operation;
++		currentRemedy = searchBestDefaultRemedy();
++
++		bestBeingInstalledRelaxedButton.setData(remediationOperation.bestSolutionChangingTheRequest());
++		bestInstalledRelaxedButton.setData(remediationOperation.bestSolutionChangingWhatIsInstalled());
++
++		bestBeingInstalledRelaxedButton.setEnabled(remediationOperation.bestSolutionChangingTheRequest() != null);
+ 		bestInstalledRelaxedButton.setEnabled(remediationOperation.bestSolutionChangingWhatIsInstalled() != null);
+-		buildMyOwnSolution.setSelection(isSelected == false);
+-		if (!isSelected) {
+-			remediationOperation.setCurrentRemedy(remediationOperation.getRemedies().get(0));
+-			buildMyOwnSolution.setData(remediationOperation.getRemedies().get(0));
++		bestBeingInstalledRelaxedButton.setSelection(false);
++		bestInstalledRelaxedButton.setSelection(false);
++		buildMyOwnSolution.setSelection(false);
++
++		if (currentRemedy == remediationOperation.bestSolutionChangingTheRequest()) {
++			bestBeingInstalledRelaxedButton.setSelection(true);
++			bestBeingInstalledRelaxedButton.notifyListeners(SWT.Selection, new Event());
++		} else if (currentRemedy == remediationOperation.bestSolutionChangingWhatIsInstalled()) {
++			bestInstalledRelaxedButton.setSelection(true);
++			bestInstalledRelaxedButton.notifyListeners(SWT.Selection, new Event());
++		} else {
++			buildMyOwnSolution.setData(currentRemedy);
++			buildMyOwnSolution.setSelection(true);
+ 			buildMyOwnSolution.notifyListeners(SWT.Selection, new Event());
+ 		}
+ 	}
+@@ -227,35 +233,33 @@ public class RemediationGroup {
+ 		return (checkboxes.get(btnIndex).getSelection() && value) || (!checkboxes.get(btnIndex).getSelection() && !value);
+ 	}
+ 
+-	void refresh() {
++	Remedy searchRemedyMatchingUserChoices() {
++		List<Remedy> remedies = remediationOperation.getRemedies();
++		for (Remedy remedy : remedies) {
++			if (isContraintOK(ALLOWPARTIALINSTALL_INDEX, remedy.getConfig().allowPartialInstall) && isContraintOK(ALLOWDIFFERENTVERSION_INDEX, remedy.getConfig().allowDifferentVersion) && isContraintOK(ALLOWINSTALLEDUPDATE_INDEX, remedy.getConfig().allowInstalledUpdate) && isContraintOK(ALLOWINSTALLEDREMOVAL_INDEX, remedy.getConfig().allowInstalledRemoval)) {
++				if (remedy.getRequest() != null) {
++					return remedy;
++				}
++			}
++		}
++		return null;
++	}
++
++	void refreshResultComposite() {
+ 		resultComposite.setVisible(true);
+-		remediationOperation.setCurrentRemedy(null);
+-		Remedy currentRemedy = null;
+ 		if (!checkboxes.get(ALLOWPARTIALINSTALL_INDEX).getSelection() && !checkboxes.get(ALLOWDIFFERENTVERSION_INDEX).getSelection() && !checkboxes.get(ALLOWINSTALLEDUPDATE_INDEX).getSelection() && !checkboxes.get(ALLOWINSTALLEDREMOVAL_INDEX).getSelection()) {
+ 			switchRemediationLayout.topControl = resultErrorComposite;
+ 		} else {
+-			List<Remedy> remedies = remediationOperation.getRemedies();
+-			for (Remedy remedy : remedies) {
+-				if (isContraintOK(ALLOWPARTIALINSTALL_INDEX, remedy.getConfig().allowPartialInstall) && isContraintOK(ALLOWDIFFERENTVERSION_INDEX, remedy.getConfig().allowDifferentVersion) && isContraintOK(ALLOWINSTALLEDUPDATE_INDEX, remedy.getConfig().allowInstalledUpdate) && isContraintOK(ALLOWINSTALLEDREMOVAL_INDEX, remedy.getConfig().allowInstalledRemoval)) {
+-					if (remedy.getRequest() != null) {
+-						currentRemedy = remedy;
+-						remediationOperation.setCurrentRemedy(currentRemedy);
+-						break;
+-					}
+-				}
+-			}
++
+ 			if (currentRemedy == null) {
+ 				switchRemediationLayout.topControl = resultNotFoundComposite;
+ 			} else {
+-
+ 				input = new IUElementListRoot();
+-				ArrayList<AvailableIUElement> ius = new ArrayList<AvailableIUElement>();
+-				ius.addAll(transformIUstoIUElements());
+-				if (ius.size() == 0) {
++				AvailableIUElement[] ius = ElementUtils.requestToElement(currentRemedy);
++				if (ius.length == 0) {
+ 					switchRemediationLayout.topControl = resultNotFoundComposite;
+-					currentRemedy = null;
+ 				} else {
+-					input.setChildren(ius.toArray());
++					input.setChildren(ius);
+ 					treeViewer.setInput(input);
+ 					switchRemediationLayout.topControl = resultFoundComposite;
+ 				}
+@@ -265,36 +269,8 @@ public class RemediationGroup {
+ 		containerPage.setPageComplete(currentRemedy != null);
+ 	}
+ 
+-	private ArrayList<AvailableIUElement> transformIUstoIUElements() {
+-		ArrayList<AvailableIUElement> temp = new ArrayList<AvailableIUElement>();
+-
+-		ArrayList<String> updateIds = new ArrayList<String>();
+-		IUElementListRoot root = new IUElementListRoot();
+-		Remedy currentRemedy = remediationOperation.getCurrentRemedy();
+-		for (IInstallableUnit addedIU : currentRemedy.getRequest().getAdditions()) {
+-			AvailableIUElement element = new AvailableIUElement(root, addedIU, ProvisioningUI.getDefaultUI().getProfileId(), true);
+-			for (IInstallableUnit removedIU : currentRemedy.getRequest().getRemovals()) {
+-				if (removedIU.getId().equals(addedIU.getId())) {
+-					int addedComparedToRemoved = addedIU.getVersion().compareTo(removedIU.getVersion());
+-					element.setBeingDowngraded(addedComparedToRemoved < 0);
+-					element.setBeingUpgraded(addedComparedToRemoved > 0);
+-					updateIds.add(addedIU.getId());
+-					break;
+-				}
+-			}
+-			if (!updateIds.contains(addedIU.getId())) {
+-				element.setBeingAdded(true);
+-			}
+-			temp.add(element);
+-		}
+-		for (IInstallableUnit removedIU : currentRemedy.getRequest().getRemovals()) {
+-			if (!updateIds.contains(removedIU.getId())) {
+-				AvailableIUElement element = new AvailableIUElement(root, removedIU, ProvisioningUI.getDefaultUI().getProfileId(), false);
+-				element.setBeingRemoved(true);
+-				temp.add(element);
+-			}
+-		}
+-		return temp;
++	public Remedy getCurrentRemedy() {
++		return currentRemedy;
+ 	}
+ 
+ 	public String getMessage() {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationPage.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationPage.java
+index 7b35684..3309f13 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationPage.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RemediationPage.java
+@@ -27,6 +27,7 @@ import org.eclipse.swt.widgets.Control;
+ public class RemediationPage extends ResolutionStatusPage {
+ 
+ 	private RemediationGroup remediationGroup;
++
+ 	private Composite mainComposite;
+ 
+ 	protected RemediationPage(ProvisioningUI ui, ProvisioningOperationWizard wizard, IUElementListRoot input, ProfileChangeOperation operation) {
+@@ -56,8 +57,12 @@ public class RemediationPage extends ResolutionStatusPage {
+ 		Dialog.applyDialogFont(mainComposite);
+ 	}
+ 
++	public RemediationGroup getRemediationGroup() {
++		return remediationGroup;
++	}
++
+ 	public boolean canFlipToNextPage() {
+-		return isPageComplete() && ((ProvisioningOperationWizard) getWizard()).getRemediationOperation().getCurrentRemedy() != null;
++		return isPageComplete() && remediationGroup.getCurrentRemedy() != null;
+ 	}
+ 
+ 	public void updateStatus(IUElementListRoot newRoot, ProfileChangeOperation operation, Object[] planSelections) {
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
+index d608286..209a799 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/UpdateWizard.java
+@@ -120,7 +120,7 @@ public class UpdateWizard extends WizardWithLicenses {
+ 		if (operation instanceof RemediationOperation) {
+ 			AvailableIUElement[] elements = ElementUtils.requestToElement(((RemediationOperation) operation).getCurrentRemedy());
+ 			root.setChildren(elements);
+-			planSelections = elements;
++			//planSelections = elements;
+ 		} else {
+ 			ArrayList<AvailableUpdateElement> list = new ArrayList<AvailableUpdateElement>(selectedElements.length);
+ 			ArrayList<AvailableUpdateElement> selected = new ArrayList<AvailableUpdateElement>(selectedElements.length);

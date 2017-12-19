@@ -1,0 +1,1194 @@
+commit 4a19397b9bfa705be8ca92a225d61cbd9fc3836a
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Thu Sep 7 14:17:27 2017 +0200
+
+    Bug 521896: [9] core support for --patch-module
+    
+    
+    Change-Id: I611aa40e61d81bc07c126744778b2d7256237cd6
+
+13	8	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
+76	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+7	1	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+17	1	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+4	1	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaProject.java
+12	8	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
+24	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+20	45	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+64	26	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+81	25	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
+index fe60b5f..fa7c9ec 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
+@@ -2828,6 +2828,18 @@ public abstract class AbstractJavaModelTests extends SuiteOfTestCases {
+ 	}
+ 	protected IJavaProject setupModuleProject(String name, String[] srcFolders, String[] sources, IClasspathEntry[] deps) throws CoreException {
+ 		IJavaProject project = createJava9Project(name, srcFolders);
++		createSourceFiles(project, sources);
++		if (deps != null) {
++			IClasspathEntry[] old = project.getRawClasspath();
++			IClasspathEntry[] newPath = new IClasspathEntry[old.length + deps.length];
++			System.arraycopy(old, 0, newPath, 0, old.length);
++			System.arraycopy(deps, 0, newPath, old.length, deps.length);
++			project.setRawClasspath(newPath, null);
++		}
++		return project;
++	}
++
++	protected void createSourceFiles(IJavaProject project, String[] sources) throws CoreException {
+ 		IProgressMonitor monitor = new NullProgressMonitor();
+ 		for (int i = 0; i < sources.length; i+= 2) {
+ 			IPath path = new Path(sources[i]);
+@@ -2838,15 +2850,8 @@ public abstract class AbstractJavaModelTests extends SuiteOfTestCases {
+ 			IFile file = project.getProject().getFile(new Path(sources[i]));
+ 			file.create(new ByteArrayInputStream(sources[i+1].getBytes()), true, monitor);
+ 		}
+-		if (deps != null) {
+-			IClasspathEntry[] old = project.getRawClasspath();
+-			IClasspathEntry[] newPath = new IClasspathEntry[old.length + deps.length];
+-			System.arraycopy(old, 0, newPath, 0, old.length);
+-			System.arraycopy(deps, 0, newPath, old.length, deps.length);
+-			project.setRawClasspath(newPath, null);
+-		}
+-		return project;
+ 	}
++
+ 	/**
+ 	 * Check locally for the required JCL files, <jclName>.jar and <jclName>src.zip.
+ 	 * If not available, copy from the project resources.
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 8fe6843..8597038 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -5170,6 +5170,82 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 				deleteProject(auto);
+ 		}
+ 	}
++
++	// patch can see unexported type from host (and package accessible method), but not vice versa
++	public void testPatch1() throws CoreException, IOException {
++		if (!isJRE9) return;
++		try {
++			IJavaProject mainProject = createJava9Project("org.astro");
++			String[] sources = { 
++				"src/module-info.java",
++				"module org.astro {\n" + // no exports
++				"}",
++				"src/org/astro/World.java",
++				"package org.astro;\n" +
++				"public class World {\n" +
++				"	public String name() { return \"world\"; }\n" +
++				"	void internalTest() { }\n" +
++				"	public org.astro.test.WorldTest test;\n" +
++				"}",
++			};
++			createSourceFiles(mainProject, sources);
++
++			IJavaProject patchProject = createJava9Project("org.astro.patch");
++			IClasspathAttribute[] attributes = {
++						JavaCore.newClasspathAttribute(IClasspathAttribute.MODULE, "true"),
++						JavaCore.newClasspathAttribute(IClasspathAttribute.PATCH_MODULE, "org.astro")
++					};
++			addClasspathEntry(patchProject, JavaCore.newProjectEntry(new Path("/org.astro"), null, false, attributes, false));
++			String[] patchSources = {
++				"src/org/astro/test/WorldTest.java",
++				"package org.astro.test;\n" +
++				"import org.astro.*;\n" +
++				"public class WorldTest {\n" +
++				"	void testWorld(World w) {\n" +
++				"		w.name();\n" +
++				"	}\n" +
++				"}\n",
++				"src/org/astro/Test2.java",
++				"package org.astro;\n" +
++				"class Test2 {\n" +
++				"	void test(World w) {\n" +
++				"		w.internalTest();\n" + // package access
++				"	}\n" +
++				"}\n"
++			};
++			createSourceFiles(patchProject, patchSources);
++			
++			getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			IMarker[] markers = mainProject.getProject().findMarkers(null, true, IResource.DEPTH_INFINITE);
++			assertMarkers("Unexpected markers",
++					"org.astro.test cannot be resolved to a type", // missing reverse dependency
++					markers);
++
++			this.problemRequestor.reset();
++			ICompilationUnit cu = getCompilationUnit("/org.astro.patch/src/org/astro/test/WorldTest.java");
++			cu.getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++				"Unexpected problems",
++				"----------\n" +
++				"----------\n",
++				this.problemRequestor);
++
++			this.problemRequestor.reset();
++			cu = getCompilationUnit("/org.astro/src/org/astro/World.java");
++			cu.getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++				"Unexpected problems",
++				"----------\n" + 
++				"1. ERROR in /org.astro/src/org/astro/World.java\n" + 
++				"org.astro.test cannot be resolved to a type\n" +
++				"----------\n",
++				this.problemRequestor);
++
++		} finally {
++			this.deleteProject("org.astro");
++			this.deleteProject("org.astro.patch");
++		}
++	}
+ 	protected void assertNoErrors() throws CoreException {
+ 		for (IProject p : getWorkspace().getRoot().getProjects()) {
+ 			int maxSeverity = p.findMaxProblemSeverity(null, true, IResource.DEPTH_INFINITE);
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+index 84ec5fb..1480cb8 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+@@ -39,6 +39,7 @@ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IMethod;
+ import org.eclipse.jdt.core.IModuleDescription;
++import org.eclipse.jdt.core.IPackageFragmentRoot;
+ import org.eclipse.jdt.core.IType;
+ import org.eclipse.jdt.core.ITypeRoot;
+ import org.eclipse.jdt.core.JavaCore;
+@@ -10688,7 +10689,12 @@ public final class CompletionEngine
+ 	}
+ 
+ 	private void findPackagesInCurrentModule() {
+-		this.nameEnvironment.findPackages(CharOperation.toLowerCase(this.completionToken), this, this.javaProject);
++		try {
++			IPackageFragmentRoot[] moduleRoots = SearchableEnvironment.getOwnedPackageFragmentRoots(this.javaProject);
++			this.nameEnvironment.findPackages(CharOperation.toLowerCase(this.completionToken), this, moduleRoots);
++		} catch (JavaModelException e) {
++			// silent
++		}
+ 	}
+ 	private void findPackages(CompletionOnPackageReference packageStatement) {
+ 		this.completionToken = CharOperation.concatWithAll(packageStatement.tokens, '.');
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+index 7b2d2dd..899c0f3 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IClasspathAttribute.java
+@@ -145,7 +145,7 @@ public interface IClasspathAttribute {
+ 	String ADD_EXPORTS = "add-exports"; //$NON-NLS-1$
+ 
+ 	/**
+-	 * Constant for the name of the add_exports attribute.
++	 * Constant for the name of the add-reads attribute.
+ 	 * 
+ 	 * <p>The value of this attribute must adhere to the syntax of <code>javac's</code>
+ 	 * {@code --add-reads} command line option: {@code <source-module>=<target-module>}.
+@@ -156,6 +156,22 @@ public interface IClasspathAttribute {
+ 	String ADD_READS = "add-reads"; //$NON-NLS-1$
+ 
+ 	/**
++	 * Constant for the name of the patch-module attribute.
++	 * 
++	 * <p>The value of this attribute must be the name of a module defined in the
++	 * classpath entry, to which this attribute is attached.</p>
++	 * 
++	 * <p>This attribute is supported for classpath entries of kind
++	 * {@link IClasspathEntry#CPE_CONTAINER}, {@link IClasspathEntry#CPE_LIBRARY}
++	 * and {@link IClasspathEntry#CPE_PROJECT}.
++	 * A classpath entry having this attribute must also have the
++	 * {@link #MODULE} attribute with value <code>"true"</code>.</p>
++	 *
++	 * @since 3.13 BETA_JAVA9
++	 */
++	String PATCH_MODULE = "patch-module"; //$NON-NLS-1$
++
++	/**
+ 	 * Constant for the name of the external annotation path attribute. 
+ 	 * 
+ 	 * <p>The value for this attribute has to be the string representation of a path.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaProject.java
+index aa8f7d3..33df693 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaProject.java
+@@ -598,7 +598,10 @@ public interface IJavaProject extends IParent, IJavaElement, IOpenable {
+ 	 * null if the Java project doesn't represent any named module. A Java 
+ 	 * project is said to represent a module if any of its source package 
+ 	 * fragment roots (see {@link IPackageFragmentRoot#K_SOURCE}) contains a 
+-	 * valid Java module descriptor.
++	 * valid Java module descriptor, or if one of its classpath entries
++	 * has a valid {@link IClasspathAttribute#PATCH_MODULE} attribute.
++	 * In the latter case the corresponding module description of the
++	 * location referenced by that classpath entry is returned.
+ 	 * 
+ 	 * @return the <code>IModule</code> this project represents.
+ 	 * @exception JavaModelException if this element does not exist or if an
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
+index 1c70a88..7c1f207 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClasspathEntry.java
+@@ -1368,14 +1368,7 @@ public class ClasspathEntry implements IClasspathEntry {
+ 	 * @return the attached external annotation path, or null.
+ 	 */
+ 	static String getRawExternalAnnotationPath(IClasspathEntry entry) {
+-		IClasspathAttribute[] extraAttributes = entry.getExtraAttributes();
+-		for (int i = 0, length = extraAttributes.length; i < length; i++) {
+-			IClasspathAttribute attribute = extraAttributes[i];
+-			if (IClasspathAttribute.EXTERNAL_ANNOTATION_PATH.equals(attribute.getName())) {
+-				return attribute.getValue();
+-			}
+-		}
+-		return null;
++		return getExtraAttribute(entry, IClasspathAttribute.EXTERNAL_ANNOTATION_PATH);
+ 	}
+ 
+ 	private static void invalidExternalAnnotationPath(IProject project) {
+@@ -1413,6 +1406,17 @@ public class ClasspathEntry implements IClasspathEntry {
+ 						new String[] { annotationPath.toString(), project.getName(), this.path.toString()}));
+ 	}
+ 
++	public static String getExtraAttribute(IClasspathEntry entry, String attributeName) {
++		IClasspathAttribute[] extraAttributes = entry.getExtraAttributes();
++		for (int i = 0, length = extraAttributes.length; i < length; i++) {
++			IClasspathAttribute attribute = extraAttributes[i];
++			if (attributeName.equals(attribute.getName())) {
++				return attribute.getValue();
++			}
++		}
++		return null;
++	}
++
+ 	public IClasspathEntry getReferencingEntry() {
+ 		return this.referencingEntry;
+ 	}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+index f257c69..914f902 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/JavaProject.java
+@@ -3372,7 +3372,30 @@ public class JavaProject
+ 
+ 	public IModuleDescription getModuleDescription() throws JavaModelException {
+ 		JavaProjectElementInfo info = (JavaProjectElementInfo) getElementInfo();
+-		return info.getModule();
++		IModuleDescription module = info.getModule();
++		if (module != null)
++			return module;
++		for(IClasspathEntry entry : getRawClasspath()) {
++			String mainModule = ClasspathEntry.getExtraAttribute(entry, IClasspathAttribute.PATCH_MODULE);
++			if (mainModule != null) {
++				switch (entry.getEntryKind()) {
++					case IClasspathEntry.CPE_PROJECT:
++						IJavaProject referencedProject = getJavaModel().getJavaProject(entry.getPath().toString());
++						module = referencedProject.getModuleDescription();
++						if (module != null && module.getElementName().equals(mainModule))
++							return module;
++						break;
++					case IClasspathEntry.CPE_LIBRARY:
++					case IClasspathEntry.CPE_CONTAINER:
++						for (IPackageFragmentRoot root : findPackageFragmentRoots(entry)) {
++							module = root.getModuleDescription();
++							if (module != null && module.getElementName().equals(mainModule))
++								return module;
++						}
++				}
++			}
++		}
++		return null;
+ 	}
+ 
+ 	public void setModuleDescription(IModuleDescription module) throws JavaModelException {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+index e9c2aec..213bcd6 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+@@ -23,7 +23,6 @@ import java.util.jar.Manifest;
+ import org.eclipse.core.resources.*;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.IProgressMonitor;
+-import org.eclipse.core.runtime.Path;
+ import org.eclipse.jdt.core.IClasspathEntry;
+ import org.eclipse.jdt.core.ICompilationUnit;
+ import org.eclipse.jdt.core.IField;
+@@ -720,7 +719,7 @@ public class NameLookup implements SuffixConstants {
+ 	 * It means that secondary types may be not found under certain circumstances...
+ 	 * @see "https://bugs.eclipse.org/bugs/show_bug.cgi?id=118789"
+ 	 */
+-	public Answer findType(String typeName, String packageName, boolean partialMatch, int acceptFlags, boolean checkRestrictions, IJavaElement moduleContext) {
++	public Answer findType(String typeName, String packageName, boolean partialMatch, int acceptFlags, boolean checkRestrictions, IPackageFragmentRoot[] moduleContext) {
+ 		return findType(typeName,
+ 			packageName,
+ 			partialMatch,
+@@ -782,7 +781,7 @@ public class NameLookup implements SuffixConstants {
+ 			boolean waitForIndexes,
+ 			boolean checkRestrictions,
+ 			IProgressMonitor monitor,
+-			IJavaElement moduleContext) {
++			IPackageFragmentRoot[] moduleContext) {
+ 		if (packageName == null || packageName.length() == 0) {
+ 			packageName= IPackageFragment.DEFAULT_PACKAGE_NAME;
+ 		} else if (typeName.length() > 0 && ScannerHelper.isLowerCase(typeName.charAt(0))) {
+@@ -1085,30 +1084,22 @@ public class NameLookup implements SuffixConstants {
+ 		return this.packageFragments.get(pkgName) != null;
+ 	}
+ 
+-	public boolean isPackage(String[] pkgName, IJavaElement moduleContext) {
++	public boolean isPackage(String[] pkgName, IPackageFragmentRoot[] moduleContext) {
+ 		if (moduleContext == null) // includes the case where looking for module UNNAMED or ANY
+ 			return isPackage(pkgName);
+ 		
+-		switch (moduleContext.getElementType()) {
+-			case IJavaElement.PACKAGE_FRAGMENT_ROOT:
+-				IPackageFragmentRoot moduleRoot = (IPackageFragmentRoot) moduleContext;
+-				return moduleRoot.getPackageFragment(String.join(".", pkgName)).exists(); //$NON-NLS-1$
+-			case IJavaElement.JAVA_PROJECT:
+-				try {
+-					IJavaElement element = ((IJavaProject) moduleContext).findElement(new Path(String.join("/", pkgName))); //$NON-NLS-1$
+-					if (element instanceof IPackageFragment) {
+-						IPackageFragmentRoot root = (IPackageFragmentRoot) element.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT);
+-						return root.getKind() == IPackageFragmentRoot.K_SOURCE;
+-					}
+-				} catch (JavaModelException e) {
+-					return false;
+-				}
++		for (IPackageFragmentRoot moduleRoot : moduleContext) {
++			if (moduleRoot.getPackageFragment(String.join(".", pkgName)).exists()) //$NON-NLS-1$
++				return true;
+ 		}
+ 		return false;
+ 	}
+ 
+-	private boolean moduleMatches(IPackageFragmentRoot root, IJavaElement moduleContext) {
+-		return moduleContext.equals(moduleContext.getElementType() == IJavaElement.JAVA_PROJECT ? root.getJavaProject() : root);
++	private boolean moduleMatches(IPackageFragmentRoot root, IPackageFragmentRoot[] moduleContext) {
++		for (IPackageFragmentRoot moduleRoot : moduleContext)
++			if (moduleRoot.equals(root))
++				return true;
++		return false;
+ 	}
+ 
+ 	/**
+@@ -1157,7 +1148,7 @@ public class NameLookup implements SuffixConstants {
+ 	 * @param partialMatch partial name matches qualify when <code>true</code>;
+ 	 *	only exact name matches qualify when <code>false</code>
+ 	 */
+-	public void seekPackageFragments(String name, boolean partialMatch, IJavaElementRequestor requestor, IJavaElement moduleContext) {
++	public void seekPackageFragments(String name, boolean partialMatch, IJavaElementRequestor requestor, IPackageFragmentRoot[] moduleContext) {
+ 		if (moduleContext == null) {
+ 			seekPackageFragments(name, partialMatch, requestor);
+ 			return;
+@@ -1166,26 +1157,10 @@ public class NameLookup implements SuffixConstants {
+ 			seekModuleAwarePartialPackageFragments(name, requestor, moduleContext);
+ 			return;
+ 		}
+-		switch (moduleContext.getElementType()) {
+-			case IJavaElement.PACKAGE_FRAGMENT_ROOT:
+-				IPackageFragmentRoot moduleRoot = (IPackageFragmentRoot) moduleContext;
+-				IPackageFragment fragment = moduleRoot.getPackageFragment(name);
+-				if (fragment.exists())
+-					requestor.acceptPackageFragment(fragment);
+-				break;
+-			case IJavaElement.JAVA_PROJECT:
+-				try {
+-					IJavaProject javaProject = (IJavaProject) moduleContext;
+-					for (IPackageFragmentRoot fragmentRoot : javaProject.getPackageFragmentRoots()) {
+-						if (!fragmentRoot.isExternal()) {
+-							fragment = fragmentRoot.getPackageFragment(name);
+-							if (fragment.exists())
+-								requestor.acceptPackageFragment(fragment);
+-						}
+-					}
+-				} catch (JavaModelException e) {
+-					// silent
+-				}
++		for (IPackageFragmentRoot moduleRoot : moduleContext) {
++			IPackageFragment fragment = moduleRoot.getPackageFragment(name);
++			if (fragment.exists())
++				requestor.acceptPackageFragment(fragment);
+ 		}
+ 	}
+ 
+@@ -1200,7 +1175,7 @@ public class NameLookup implements SuffixConstants {
+ 	 *	only exact name matches qualify when <code>false</code>
+ 	 */
+ 	public void seekTypes(String pkgName, String name, boolean partialMatch, IJavaElementRequestor requestor, 
+-			int acceptFlags, IJavaElement moduleContext, String moduleName) {
++			int acceptFlags, IPackageFragmentRoot[] moduleContext, String moduleName) {
+ 		Selector selector = new Selector(moduleName);
+ 		seekPackageFragments(pkgName, true /*partialMatch*/, selector, moduleContext);	
+ 		if (selector.pkgFragments.size() == 0) return;
+@@ -1209,7 +1184,7 @@ public class NameLookup implements SuffixConstants {
+ 		}
+ 	}
+ 	
+-	private void seekModuleAwarePartialPackageFragments(String name, IJavaElementRequestor requestor, IJavaElement moduleContext) {
++	private void seekModuleAwarePartialPackageFragments(String name, IJavaElementRequestor requestor, IPackageFragmentRoot[] moduleContext) {
+ 		boolean allPrefixMatch = CharOperation.equals(name.toCharArray(), CharOperation.ALL_PREFIX);
+ 		Arrays.stream(this.packageFragments.keyTable)
+ 		.filter(k -> k != null)
+@@ -1219,7 +1194,7 @@ public class NameLookup implements SuffixConstants {
+ 		});
+ 	}
+ 
+-	private void checkModulePackages(IJavaElementRequestor requestor, IJavaElement moduleContext, int pkgIndex) {
++	private void checkModulePackages(IJavaElementRequestor requestor, IPackageFragmentRoot[] moduleContext, int pkgIndex) {
+ 		Object value = this.packageFragments.valueTable[pkgIndex];
+ 		// reuse existing String[]
+ 		String[] pkgName = (String[]) this.packageFragments.keyTable[pkgIndex];
+@@ -1691,7 +1666,7 @@ public class NameLookup implements SuffixConstants {
+ 		return false;
+ 	}
+ 
+-	public boolean hasCompilationUnit(char[][] pkgName, IJavaElement moduleContext) {
++	public boolean hasCompilationUnit(char[][] pkgName, IPackageFragmentRoot[] moduleContext) {
+ 		String packageName = CharOperation.toString(pkgName);
+ 		if (packageName == null || packageName.length() == 0) {
+ 			packageName= IPackageFragment.DEFAULT_PACKAGE_NAME;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+index 0ae3b22..46a656f 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironment.java
+@@ -15,10 +15,12 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
++import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.function.Function;
+ 
++import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.OperationCanceledException;
+@@ -63,8 +65,8 @@ public class SearchableEnvironment
+ 	protected IJavaSearchScope searchScope;
+ 
+ 	protected boolean checkAccessRestrictions;
+-	// moduleName -> IJavaProject | IJavaPackageFragmentRoot (lazily populated)
+-	private Map<String,IJavaElement> knownModuleLocations; // null indicates: not using JPMS
++	// moduleName -> IPackageFragmentRoot[](lazily populated)
++	private Map<String,IPackageFragmentRoot[]> knownModuleLocations; // null indicates: not using JPMS
+ 
+ 	private ModuleUpdater moduleUpdater;
+ 	private Map<IPackageFragmentRoot,IModuleDescription> rootToModule;
+@@ -124,17 +126,18 @@ public class SearchableEnvironment
+ 	 * Returns the given type in the the given package if it exists,
+ 	 * otherwise <code>null</code>.
+ 	 */
+-	protected NameEnvironmentAnswer find(String typeName, String packageName, IJavaElement moduleContext) {
++	protected NameEnvironmentAnswer find(String typeName, String packageName, IPackageFragmentRoot[] moduleContext) {
+ 		if (packageName == null)
+ 			packageName = IPackageFragment.DEFAULT_PACKAGE_NAME;
+ 		if (this.owner != null) {
+ 			String source = this.owner.findSource(typeName, packageName);
+ 			if (source != null) {
++				IJavaElement moduleElement = (moduleContext != null && moduleContext.length > 0) ? moduleContext[0] : null;
+ 				ICompilationUnit cu = new BasicCompilationUnit(
+ 						source.toCharArray(),
+ 						CharOperation.splitOn('.', packageName.toCharArray()),
+ 						typeName + Util.defaultJavaExtension(),
+-						moduleContext);
++						moduleElement);
+ 				return new NameEnvironmentAnswer(cu, null);
+ 			}
+ 		}
+@@ -232,7 +235,7 @@ public class SearchableEnvironment
+ 	 * The packages found are passed to:
+ 	 *    ISearchRequestor.acceptPackage(char[][] packageName)
+ 	 */
+-	public void findPackages(char[] prefix, ISearchRequestor requestor, IJavaElement moduleContext) {
++	public void findPackages(char[] prefix, ISearchRequestor requestor, IPackageFragmentRoot[] moduleContext) {
+ 		this.nameLookup.seekPackageFragments(
+ 			new String(prefix),
+ 			true,
+@@ -347,12 +350,12 @@ public class SearchableEnvironment
+ 		if (compoundTypeName == null) return null;
+ 
+ 		boolean isNamedStrategy = LookupStrategy.get(moduleName) == LookupStrategy.Named;
+-		IJavaElement moduleLocation = isNamedStrategy ? findModuleContext(moduleName) : null;
++		IPackageFragmentRoot[] moduleLocations = isNamedStrategy ? findModuleContext(moduleName) : null;
+ 
+ 		int length = compoundTypeName.length;
+ 		if (length <= 1) {
+ 			if (length == 0) return null;
+-			return find(new String(compoundTypeName[0]), null, moduleLocation);
++			return find(new String(compoundTypeName[0]), null, moduleLocations);
+ 		}
+ 
+ 		int lengthM1 = length - 1;
+@@ -362,7 +365,7 @@ public class SearchableEnvironment
+ 		return find(
+ 			new String(compoundTypeName[lengthM1]),
+ 			CharOperation.toString(packageName),
+-			moduleLocation);
++			moduleLocations);
+ 	}
+ 
+ 	/**
+@@ -373,11 +376,11 @@ public class SearchableEnvironment
+ 		if (name == null) return null;
+ 
+ 		boolean isNamedStrategy = LookupStrategy.get(moduleName) == LookupStrategy.Named;
+-		IJavaElement moduleLocation = isNamedStrategy ? findModuleContext(moduleName) : null;
++		IPackageFragmentRoot[] moduleLocations = isNamedStrategy ? findModuleContext(moduleName) : null;
+ 		return find(
+ 			new String(name),
+ 			packageName == null || packageName.length == 0 ? null : CharOperation.toString(packageName),
+-			moduleLocation);
++			moduleLocations);
+ 	}
+ 
+ 	/**
+@@ -786,7 +789,7 @@ public class SearchableEnvironment
+ 		switch (strategy) {
+ 			case Named:
+ 				if (this.knownModuleLocations != null) {
+-					IJavaElement moduleContext = findModuleContext(moduleName);
++					IPackageFragmentRoot[] moduleContext = findModuleContext(moduleName);
+ 					if (moduleContext != null) {
+ 						// (this.owner != null && this.owner.isPackage(pkgName)) // TODO(SHMOD) see old isPackage
+ 						if (this.nameLookup.isPackage(pkgName, moduleContext)) {
+@@ -807,10 +810,12 @@ public class SearchableEnvironment
+ 				//$FALL-THROUGH$
+ 			case AnyNamed:
+ 				char[][] names = CharOperation.NO_CHAR_CHAR;
+-				for (IPackageFragmentRoot packageRoot : this.nameLookup.packageFragmentRoots) {
+-					if (strategy.matches(packageRoot, loc -> loc instanceof JrtPackageFragmentRoot || getModuleDescription(loc) != null)) {
+-						if (this.nameLookup.isPackage(pkgName, packageRoot)) {
+-							IModuleDescription moduleDescription = getModuleDescription(packageRoot);
++				IPackageFragmentRoot[] packageRoots = this.nameLookup.packageFragmentRoots;
++				for (IPackageFragmentRoot packageRoot : packageRoots) {
++					IPackageFragmentRoot[] singleton = { packageRoot };
++					if (strategy.matches(singleton, locs -> locs[0] instanceof JrtPackageFragmentRoot || getModuleDescription(locs) != null)) {
++						if (this.nameLookup.isPackage(pkgName, singleton)) {
++							IModuleDescription moduleDescription = getModuleDescription(singleton);
+ 							char[] aName = moduleDescription != null ? moduleDescription.getElementName().toCharArray() : ModuleBinding.UNNAMED;
+ 							names = CharOperation.arrayConcat(names, aName);
+ 						}
+@@ -827,7 +832,7 @@ public class SearchableEnvironment
+ 		switch (strategy) {
+ 			case Named:
+ 				if (this.knownModuleLocations != null) {
+-					IJavaElement moduleContext = findModuleContext(moduleName);
++					IPackageFragmentRoot[] moduleContext = findModuleContext(moduleName);
+ 					if (moduleContext != null) {
+ 						// (this.owner != null && this.owner.isPackage(pkgName)) // TODO(SHMOD) see old isPackage
+ 						if (this.nameLookup.hasCompilationUnit(pkgName, moduleContext))
+@@ -844,9 +849,11 @@ public class SearchableEnvironment
+ 				}
+ 				//$FALL-THROUGH$
+ 			case AnyNamed:
+-				for (IPackageFragmentRoot packageRoot : this.nameLookup.packageFragmentRoots) {
+-					if (strategy.matches(packageRoot, loc -> loc instanceof JrtPackageFragmentRoot || getModuleDescription(loc) != null)) {
+-						if (this.nameLookup.hasCompilationUnit(pkgName, packageRoot))
++				IPackageFragmentRoot[] packageRoots = this.nameLookup.packageFragmentRoots;
++				for (IPackageFragmentRoot packageRoot : packageRoots) {
++					IPackageFragmentRoot[] singleton = { packageRoot };
++					if (strategy.matches(singleton, locs -> locs[0] instanceof JrtPackageFragmentRoot || getModuleDescription(locs) != null)) {
++						if (this.nameLookup.hasCompilationUnit(pkgName, singleton))
+ 							return true;
+ 					}
+ 				}
+@@ -856,22 +863,27 @@ public class SearchableEnvironment
+ 		}
+ 	}
+ 
+-	private IModuleDescription getModuleDescription(IPackageFragmentRoot root) {
++	private IModuleDescription getModuleDescription(IPackageFragmentRoot[] roots) {
+ 		if (this.rootToModule == null) {
+ 			this.rootToModule = new HashMap<>();
+ 		}
+ 		Function<IPackageFragmentRoot, IClasspathEntry> rootToEntry = r -> {
+ 			try {
+-				return ((JavaProject) root.getJavaProject()).getClasspathEntryFor(root.getPath());
++				return ((JavaProject) r.getJavaProject()).getClasspathEntryFor(r.getPath());
+ 			} catch (JavaModelException e) {
+ 				return null;
+ 			}
+ 		};
+-		return NameLookup.getModuleDescription(root, this.rootToModule, rootToEntry);
++		for (IPackageFragmentRoot root : roots) {
++			IModuleDescription moduleDescription = NameLookup.getModuleDescription(root, this.rootToModule, rootToEntry);
++			if (moduleDescription != null)
++				return moduleDescription;
++		}
++		return null;
+ 	}
+ 
+-	private IJavaElement findModuleContext(char[] moduleName) {
+-		IJavaElement moduleContext = null;
++	private IPackageFragmentRoot[] findModuleContext(char[] moduleName) {
++		IPackageFragmentRoot[] moduleContext = null;
+ 		if (this.knownModuleLocations != null && moduleName != null && moduleName.length > 0) {
+ 			moduleContext = this.knownModuleLocations.get(String.valueOf(moduleName));
+ 			if (moduleContext == null) {
+@@ -881,11 +893,19 @@ public class SearchableEnvironment
+ 					while (moduleContext == null && current != null) {
+ 						switch (current.getElementType()) {
+ 							case IJavaElement.PACKAGE_FRAGMENT_ROOT:
+-								if (!((IPackageFragmentRoot) current).isExternal())
++								if (!((IPackageFragmentRoot) current).isExternal()) {
+ 									current = current.getJavaProject();
++								} else {
++									moduleContext = new IPackageFragmentRoot[] { (IPackageFragmentRoot) current }; // TODO: validate
++									break;
++								}
+ 								//$FALL-THROUGH$
+ 							case IJavaElement.JAVA_PROJECT:
+-								moduleContext = current;
++								try {
++									moduleContext = getOwnedPackageFragmentRoots((IJavaProject) current);
++								} catch (JavaModelException e) {
++									// silent?
++								}
+ 								break;
+ 							default:
+ 								current = current.getParent();
+@@ -941,4 +961,22 @@ public class SearchableEnvironment
+ 		if (this.moduleUpdater != null)
+ 			this.moduleUpdater.applyModuleUpdates(module, kind);
+ 	}
++
++	public static IPackageFragmentRoot[] getOwnedPackageFragmentRoots(IJavaProject javaProject) throws JavaModelException {
++		IPackageFragmentRoot[] allRoots = javaProject.getPackageFragmentRoots();
++		IPackageFragmentRoot[] sourceRoots = Arrays.copyOf(allRoots, allRoots.length);
++		int count = 0;
++		for (int i = 0; i < allRoots.length; i++) {
++			IPackageFragmentRoot root = allRoots[i];
++			if (root.getKind() == IPackageFragmentRoot.K_BINARY) {
++				IResource resource = root.getResource();
++				if (resource == null || !resource.getProject().equals(javaProject.getProject()))
++					continue; // outside this project
++			}
++			sourceRoots[count++] = root;
++		}
++		if (count < allRoots.length)
++			return Arrays.copyOf(sourceRoots, count);
++		return sourceRoots;
++	}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+index 78f8e0d..cdb3b1d 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+@@ -118,6 +118,9 @@ private void computeClasspathLocations(
+ 	}
+ 	IModuleDescription mod = null;
+ 	
++	String patchedModuleName = pushPatchToFront(classpathEntries);
++	IModule patchedModule = null;
++
+ 	nextEntry : for (int i = 0, l = classpathEntries.length; i < l; i++) {
+ 		ClasspathEntry entry = (ClasspathEntry) classpathEntries[i];
+ 		IPath path = entry.getPath();
+@@ -143,12 +146,16 @@ private void computeClasspathLocations(
+ 					if (!outputFolder.exists())
+ 						createOutputFolder(outputFolder);
+ 				}
+-				sLocations.add(ClasspathLocation.forSourceFolder(
++				ClasspathLocation sourceLocation = ClasspathLocation.forSourceFolder(
+ 							(IContainer) target, 
+ 							outputFolder,
+ 							entry.fullInclusionPatternChars(), 
+ 							entry.fullExclusionPatternChars(),
+-							entry.ignoreOptionalProblems()));
++							entry.ignoreOptionalProblems());
++				if (patchedModule != null) {
++					combineIntoModuleEntry(sourceLocation, patchedModule, moduleEntries);
++				}
++				sLocations.add(sourceLocation);
+ 				continue nextEntry;
+ 
+ 			case IClasspathEntry.CPE_PROJECT :
+@@ -204,7 +211,10 @@ private void computeClasspathLocations(
+ 						info = IModule.createAutomatic(prereqJavaProject.getElementName(), false, prereqJavaProject.getManifest());
+ 					ModulePathEntry projectEntry = new ModulePathEntry(prereqJavaProject.getPath(), info,
+ 							projectLocations.toArray(new ClasspathLocation[projectLocations.size()]));
+-					moduleEntries.put(String.valueOf(info.name()), projectEntry);
++					String moduleName = String.valueOf(info.name());
++					moduleEntries.put(moduleName, projectEntry);
++					if (moduleName.equals(patchedModuleName))
++						patchedModule = info;
+ 				}
+ 				continue nextEntry;
+ 
+@@ -231,17 +241,7 @@ private void computeClasspathLocations(
+ 					// TODO: Ideally we need to do something like mapToModulePathEntry using the path and if it is indeed
+ 					// a module path entry, then add the corresponding entry here, but that would need the target platform
+ 					if (moduleEntries != null) {
+-						if (bLocation instanceof IMultiModuleEntry) {
+-							IMultiModuleEntry binaryModulePathEntry = (IMultiModuleEntry) bLocation;
+-							for (String moduleName : binaryModulePathEntry.getModuleNames()) {
+-								moduleEntries.put(moduleName, binaryModulePathEntry);							
+-							}
+-						} else if (isOnModulePath) {
+-							IModulePathEntry binaryModulePathEntry = new ModulePathEntry(path, bLocation);
+-							IModule module = binaryModulePathEntry.getModule();
+-							if (module != null)
+-								moduleEntries.put(String.valueOf(module.name()), binaryModulePathEntry);
+-						}
++						patchedModule = collectModuleEntries(bLocation, path, isOnModulePath, patchedModuleName, moduleEntries);
+ 					}
+ 					if (binaryLocationsPerProject != null) { // normal builder mode
+ 						IProject p = resource.getProject(); // can be the project being built
+@@ -264,17 +264,7 @@ private void computeClasspathLocations(
+ 					ClasspathLocation bLocation = ClasspathLocation.forLibrary(path.toOSString(), accessRuleSet, externalAnnotationPath, isOnModulePath);
+ 					bLocations.add(bLocation);
+ 					if (moduleEntries != null) {
+-						if (bLocation instanceof IMultiModuleEntry) {
+-							IMultiModuleEntry binaryModulePathEntry = (IMultiModuleEntry) bLocation;
+-							for (String moduleName : binaryModulePathEntry.getModuleNames()) {
+-								moduleEntries.put(moduleName, binaryModulePathEntry);							
+-							}
+-						} else if (isOnModulePath) {
+-							IModulePathEntry binaryModulePathEntry = new ModulePathEntry(path, bLocation);
+-							IModule module = binaryModulePathEntry.getModule();
+-							if (module != null)
+-								moduleEntries.put(String.valueOf(module.name()), binaryModulePathEntry);
+-						}
++						patchedModule = collectModuleEntries(bLocation, path, isOnModulePath, patchedModuleName, moduleEntries);
+ 					}
+ 				}
+ 				continue nextEntry;
+@@ -328,6 +318,72 @@ private void computeClasspathLocations(
+ 		this.modulePathEntries = moduleEntries;
+ }
+ 
++/**
++ * Establish that an entry with --patch-module appears at position 0, if any.
++ * This ensures that in the first iteration we find the patchedModule (see e.g., collectModuleEntries()),
++ * which later can be combined into each src-entry (see combineIntoModuleEntry()).
++ */
++private String pushPatchToFront(IClasspathEntry[] classpathEntries) {
++	String patchedModule = null;
++	for (int i = 0; i < classpathEntries.length; i++) {
++		IClasspathEntry entry = classpathEntries[i];
++		patchedModule = ClasspathEntry.getExtraAttribute(entry, IClasspathAttribute.PATCH_MODULE);
++		if (patchedModule != null) {
++			if (i > 0) {
++				IClasspathEntry tmp = classpathEntries[0];
++				classpathEntries[0] = entry;
++				classpathEntries[i] = tmp;
++			}
++			return patchedModule;
++		}
++	}
++	return null;
++}
++
++/** Returns the patched module if that is served by the current (binary) location. */
++IModule collectModuleEntries(ClasspathLocation bLocation, IPath path, boolean isOnModulePath, String patchedModuleName,
++								Map<String, IModulePathEntry> moduleEntries) {
++	if (bLocation instanceof IMultiModuleEntry) {
++		IMultiModuleEntry binaryModulePathEntry = (IMultiModuleEntry) bLocation;
++		for (String moduleName : binaryModulePathEntry.getModuleNames()) {
++			moduleEntries.put(moduleName, binaryModulePathEntry);
++		}
++		if (patchedModuleName != null) {
++			IModule module = binaryModulePathEntry.getModule(patchedModuleName.toCharArray());
++			if (module != null)
++				return module;
++		}
++	} else if (isOnModulePath) {
++		IModulePathEntry binaryModulePathEntry = new ModulePathEntry(path, bLocation);
++		IModule module = binaryModulePathEntry.getModule();
++		if (module != null) {
++			String moduleName = String.valueOf(module.name());
++			moduleEntries.put(moduleName, binaryModulePathEntry);
++			if (patchedModuleName != null && moduleName.equals(patchedModuleName))
++				return module;
++		}
++	}
++	return null;
++}
++
++void combineIntoModuleEntry(ClasspathLocation sourceLocation, IModule patchedModule, Map<String, IModulePathEntry> moduleEntries) {
++	sourceLocation.setModule(patchedModule);
++	String patchedModuleName = String.valueOf(patchedModule.name());
++	IModulePathEntry mainEntry = moduleEntries.get(patchedModuleName);
++	ClasspathLocation[] combinedLocations = null;
++	if (mainEntry instanceof ModulePathEntry) {
++		ClasspathLocation[] mainLocs = ((ModulePathEntry) mainEntry).locations;
++		combinedLocations = Arrays.copyOf(mainLocs, mainLocs.length+1);
++		combinedLocations[combinedLocations.length-1] = sourceLocation;
++	} else if (mainEntry instanceof ClasspathLocation) {
++		combinedLocations = new ClasspathLocation[] { (ClasspathLocation) mainEntry, sourceLocation };
++	} else {
++		// FIXME: JrtPackageFragmentRoot, ProjectEntry ??
++		System.err.println("ups!");
++	}
++	moduleEntries.put(patchedModuleName, new ModulePathEntry(null, patchedModule, combinedLocations));
++}
++
+ protected boolean isOnModulePath(ClasspathEntry entry) {
+ 	return entry.isModular();
+ }
+commit bc0e5b8ad19af75654b974dfc4cfc05b5b467507
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sun Sep 10 01:10:35 2017 +0200
+
+    Bug 521896: [9] core support for --patch-module
+    
+    
+    Change-Id: I6f5eeedccdcb5a8ff809277aeaa645f5f0e4554c
+
+4	1	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
+38	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+51	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
+13	5	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
+index fa7c9ec..36cff59 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AbstractJavaModelTests.java
+@@ -1307,10 +1307,13 @@ public abstract class AbstractJavaModelTests extends SuiteOfTestCases {
+ 		return createJava9Project(name, new String[]{"src"});
+ 	}
+ 	protected IJavaProject createJava9Project(String name, String[] srcFolders) throws CoreException {
++		return createJava9ProjectWithJREAttributes(name, srcFolders, null);
++	}
++	protected IJavaProject createJava9ProjectWithJREAttributes(String name, String[] srcFolders, IClasspathAttribute[] attributes) throws CoreException {
+ 		String javaHome = System.getProperty("java.home") + File.separator;
+ 		Path bootModPath = new Path(javaHome +"/lib/jrt-fs.jar");
+ 		Path sourceAttachment = new Path(javaHome +"/lib/src.zip");
+-		IClasspathEntry jrtEntry = JavaCore.newLibraryEntry(bootModPath, sourceAttachment, null, null, null, false);
++		IClasspathEntry jrtEntry = JavaCore.newLibraryEntry(bootModPath, sourceAttachment, null, null, attributes, false);
+ 		IJavaProject project = this.createJavaProject(name, srcFolders, new String[0],
+ 				new String[0], "bin", "9");
+ 		IClasspathEntry[] old = project.getRawClasspath();
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 1ddf31d..d8b8280 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -5328,6 +5328,44 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			this.deleteProject("org.astro.patch");
+ 		}
+ 	}
++
++	// patch can see unexported type from host - JRE
++	public void testPatch2() throws CoreException, IOException {
++		if (!isJRE9) return;
++		try {
++			IClasspathAttribute[] attributes = {
++					JavaCore.newClasspathAttribute(IClasspathAttribute.MODULE, "true"),
++					JavaCore.newClasspathAttribute(IClasspathAttribute.PATCH_MODULE, "java.base")
++			};
++			IJavaProject patchProject = createJava9ProjectWithJREAttributes("org.astro.patch", new String[]{"src"}, attributes);
++
++			String[] patchSources = {
++				"src/org/astro/Test2.java",
++				"package org.astro;\n" +
++				"class Test2 {\n" +
++				"	int test(jdk.internal.misc.Unsafe unsafe) {\n" +
++				"		return unsafe.addressSize();\n" +
++				"	}\n" +
++				"}\n"
++			};
++			createSourceFiles(patchProject, patchSources);
++			
++			getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			assertNoErrors();
++
++			this.problemRequestor.reset();
++			ICompilationUnit cu = getCompilationUnit("/org.astro.patch/src/org/astro/Test2.java");
++			cu.getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++				"Unexpected problems",
++				"----------\n" +
++				"----------\n",
++				this.problemRequestor);
++
++		} finally {
++			this.deleteProject("org.astro.patch");
++		}
++	}
+ 	protected void assertNoErrors() throws CoreException {
+ 		for (IProject p : getWorkspace().getRoot().getProjects()) {
+ 			int maxSeverity = p.findMaxProblemSeverity(null, true, IResource.DEPTH_INFINITE);
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
+index 6924d0d..161e01f 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/ModulePathEntry.java
+@@ -15,10 +15,16 @@
+ package org.eclipse.jdt.internal.core.builder;
+ 
+ 
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.HashSet;
++import java.util.Set;
++
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
++import org.eclipse.jdt.internal.compiler.env.IMultiModuleEntry;
+ 
+ /**
+  * Represents a project on the module path.
+@@ -114,4 +120,49 @@ public class ModulePathEntry implements IModulePathEntry {
+ 		}
+ 		return false;
+ 	}
++
++	/**
++	 * Combines an IMultiModuleEntry with further locations in order to support patch-module.
++	 * Implemented by adding IMultiModuleEntry functionality to ModulePathEntry.
++	 */
++	static public class Multi extends ModulePathEntry implements IMultiModuleEntry {
++
++		Multi(IPath path, IModule module, ClasspathLocation[] locations) {
++			super(path, module, locations);
++		}
++
++		void addPatchLocation(ClasspathLocation location) {
++			this.locations = Arrays.copyOf(this.locations, this.locations.length+1);
++			this.locations[this.locations.length-1] = location;
++			location.setModule(this.module);
++		}
++
++		@Override
++		public IModule getModule(char[] name) {
++			for (ClasspathLocation loc : this.locations) {
++				if (loc instanceof IMultiModuleEntry) {
++					IModule mod = ((IMultiModuleEntry) loc).getModule(name);
++					if (mod != null)
++						return mod;
++				} else {
++					IModule mod = loc.getModule();
++					if (CharOperation.equals(mod.name(), name))
++						return mod;
++				}
++			}
++			return null;
++		}
++
++		@Override
++		public Collection<String> getModuleNames() {
++			Set<String> result = new HashSet<>();
++			for (ClasspathLocation loc : this.locations) {
++				if (loc instanceof IMultiModuleEntry)
++					result.addAll(((IMultiModuleEntry) loc).getModuleNames());
++				else
++					result.add(String.valueOf(loc.getModule().name()));
++			}
++			return result;
++		}
++	}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+index 0271be8..77b5439 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+@@ -278,10 +278,12 @@ private void computeClasspathLocations(
+ 		sLocations.toArray(this.sourceLocations);
+ 		if (moduleEntries != null && (mod = javaProject.getModuleDescription()) != null) {
+ 			try {
+-				SourceModule sourceModule = (SourceModule)mod;
++				AbstractModule sourceModule = (AbstractModule)mod;
+ 				ModuleDescriptionInfo info = (ModuleDescriptionInfo) sourceModule.getElementInfo();
+ 				ModulePathEntry projectEntry = new ModulePathEntry(javaProject.getPath(), info, this.sourceLocations);
+-				moduleEntries.put(sourceModule.getElementName(), projectEntry);
++				if (!moduleEntries.containsKey(sourceModule.getElementName())) { // can be registered already, if patching
++					moduleEntries.put(sourceModule.getElementName(), projectEntry);
++				}
+ 			} catch (JavaModelException jme) {
+ 				// do nothing, probably a non module project
+ 			}
+@@ -371,15 +373,21 @@ void combineIntoModuleEntry(ClasspathLocation sourceLocation, IModule patchedMod
+ 	String patchedModuleName = String.valueOf(patchedModule.name());
+ 	IModulePathEntry mainEntry = moduleEntries.get(patchedModuleName);
+ 	ClasspathLocation[] combinedLocations = null;
+-	if (mainEntry instanceof ModulePathEntry) {
++	if (mainEntry instanceof ModulePathEntry.Multi) {
++		((ModulePathEntry.Multi) mainEntry).addPatchLocation(sourceLocation);
++		return;
++	} else if (mainEntry instanceof ClasspathJrt) {
++		combinedLocations = new ClasspathLocation[] { (ClasspathLocation) mainEntry, sourceLocation };
++		moduleEntries.put(patchedModuleName, new ModulePathEntry.Multi(null, patchedModule, combinedLocations));
++		return;
++	} else if (mainEntry instanceof ModulePathEntry) {
+ 		ClasspathLocation[] mainLocs = ((ModulePathEntry) mainEntry).locations;
+ 		combinedLocations = Arrays.copyOf(mainLocs, mainLocs.length+1);
+ 		combinedLocations[combinedLocations.length-1] = sourceLocation;
+ 	} else if (mainEntry instanceof ClasspathLocation) {
+ 		combinedLocations = new ClasspathLocation[] { (ClasspathLocation) mainEntry, sourceLocation };
+ 	} else {
+-		// FIXME: JrtPackageFragmentRoot, ProjectEntry ??
+-		System.err.println("ups!");
++		throw new IllegalStateException("Cannot patch the module of classpath entry "+mainEntry); //$NON-NLS-1$
+ 	}
+ 	moduleEntries.put(patchedModuleName, new ModulePathEntry(null, patchedModule, combinedLocations));
+ }
+commit 3fdff8c16ef3021f27f964af8f00b5d40e7cbabb
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sun Sep 10 18:29:41 2017 +0200
+
+    Bug 521896: [9] core support for --patch-module
+    
+    - more / better test & some clean-up
+    
+    Change-Id: Idf42ff1dadf6f65c70e2b1bbbf5a5fb9e9cc0d5f
+
+56	2	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+17	7	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index d8b8280..01b88c5 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -5329,7 +5329,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 		}
+ 	}
+ 
+-	// patch can see unexported type from host - JRE
++	// patch can see unexported type from host - JRE patched from two source folders
+ 	public void testPatch2() throws CoreException, IOException {
+ 		if (!isJRE9) return;
+ 		try {
+@@ -5337,7 +5337,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 					JavaCore.newClasspathAttribute(IClasspathAttribute.MODULE, "true"),
+ 					JavaCore.newClasspathAttribute(IClasspathAttribute.PATCH_MODULE, "java.base")
+ 			};
+-			IJavaProject patchProject = createJava9ProjectWithJREAttributes("org.astro.patch", new String[]{"src"}, attributes);
++			IJavaProject patchProject = createJava9ProjectWithJREAttributes("org.astro.patch", new String[]{"src", "src2"}, attributes);
+ 
+ 			String[] patchSources = {
+ 				"src/org/astro/Test2.java",
+@@ -5346,6 +5346,11 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 				"	int test(jdk.internal.misc.Unsafe unsafe) {\n" +
+ 				"		return unsafe.addressSize();\n" +
+ 				"	}\n" +
++				"}\n",
++				"src2/jdk/internal/misc/Test3.java",
++				"package jdk.internal.misc;\n" +
++				"class Test3 {\n" +
++				"	Signal.NativeHandler handler;\n" + // package access
+ 				"}\n"
+ 			};
+ 			createSourceFiles(patchProject, patchSources);
+@@ -5366,6 +5371,55 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 			this.deleteProject("org.astro.patch");
+ 		}
+ 	}
++
++	// patch can share a package with its host - jar
++	public void testPatch3() throws CoreException, IOException {
++		if (!isJRE9) return;
++		try {
++			String[] sources = {
++				"p/a/X.java",
++				"package p.a;\n" +
++				"class X {}\n;", // package access
++				"module-info.java",
++				"module mod.one {\n" + // no exports
++				"}\n"
++			};
++			String outputDirectory = Util.getOutputDirectory();
++
++			String jarPath = outputDirectory + File.separator + "mod-one.jar";
++			Util.createJar(sources, jarPath, "9");
++
++			IJavaProject patchProject = createJava9Project("mod.one.patch");			
++			IClasspathAttribute[] attributes = {
++					JavaCore.newClasspathAttribute(IClasspathAttribute.MODULE, "true"),
++					JavaCore.newClasspathAttribute(IClasspathAttribute.PATCH_MODULE, "mod.one")
++			};
++			addClasspathEntry(patchProject, JavaCore.newLibraryEntry(new Path(jarPath), null, null, null, attributes, false));
++
++			String[] patchSources = {
++				"src/p/a/Test2.java",
++				"package p.a;\n" +
++				"class Test2 extends X {\n" +
++				"}\n"
++			};
++			createSourceFiles(patchProject, patchSources);
++			
++			getWorkspace().build(IncrementalProjectBuilder.FULL_BUILD, null);
++			assertNoErrors();
++
++			this.problemRequestor.reset();
++			ICompilationUnit cu = getCompilationUnit("/mod.one.patch/src/p/a/Test2.java");
++			cu.getWorkingCopy(this.wcOwner, null);
++			assertProblems(
++				"Unexpected problems",
++				"----------\n" +
++				"----------\n",
++				this.problemRequestor);
++
++		} finally {
++			this.deleteProject("org.astro.patch");
++		}
++	}
+ 	protected void assertNoErrors() throws CoreException {
+ 		for (IProject p : getWorkspace().getRoot().getProjects()) {
+ 			int maxSeverity = p.findMaxProblemSeverity(null, true, IResource.DEPTH_INFINITE);
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+index 77b5439..b587d14 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/NameEnvironment.java
+@@ -122,6 +122,12 @@ private void computeClasspathLocations(
+ 	IModule patchedModule = null;
+ 
+ 	nextEntry : for (int i = 0, l = classpathEntries.length; i < l; i++) {
++		if (i == 1) {
++			if (patchedModuleName != null) {
++				// TODO(SHMOD) assert that patchModule has been assigned
++				patchedModuleName = null; // expire, applies to the first entry, only
++			}
++		}
+ 		ClasspathEntry entry = (ClasspathEntry) classpathEntries[i];
+ 		IPath path = entry.getPath();
+ 		Object target = JavaModel.getTarget(path, true);
+@@ -241,7 +247,7 @@ private void computeClasspathLocations(
+ 					// TODO: Ideally we need to do something like mapToModulePathEntry using the path and if it is indeed
+ 					// a module path entry, then add the corresponding entry here, but that would need the target platform
+ 					if (moduleEntries != null) {
+-						patchedModule = collectModuleEntries(bLocation, path, isOnModulePath, patchedModuleName, moduleEntries);
++						patchedModule = collectModuleEntries(bLocation, path, isOnModulePath, patchedModuleName, patchedModule, moduleEntries);
+ 					}
+ 					if (binaryLocationsPerProject != null) { // normal builder mode
+ 						IProject p = resource.getProject(); // can be the project being built
+@@ -264,7 +270,7 @@ private void computeClasspathLocations(
+ 					ClasspathLocation bLocation = ClasspathLocation.forLibrary(path.toOSString(), accessRuleSet, externalAnnotationPath, isOnModulePath);
+ 					bLocations.add(bLocation);
+ 					if (moduleEntries != null) {
+-						patchedModule = collectModuleEntries(bLocation, path, isOnModulePath, patchedModuleName, moduleEntries);
++						patchedModule = collectModuleEntries(bLocation, path, isOnModulePath, patchedModuleName, patchedModule, moduleEntries);
+ 					}
+ 				}
+ 				continue nextEntry;
+@@ -343,8 +349,8 @@ private String pushPatchToFront(IClasspathEntry[] classpathEntries) {
+ }
+ 
+ /** Returns the patched module if that is served by the current (binary) location. */
+-IModule collectModuleEntries(ClasspathLocation bLocation, IPath path, boolean isOnModulePath, String patchedModuleName,
+-								Map<String, IModulePathEntry> moduleEntries) {
++IModule collectModuleEntries(ClasspathLocation bLocation, IPath path, boolean isOnModulePath,
++								String patchedModuleName, IModule patchedModule, Map<String, IModulePathEntry> moduleEntries) {
+ 	if (bLocation instanceof IMultiModuleEntry) {
+ 		IMultiModuleEntry binaryModulePathEntry = (IMultiModuleEntry) bLocation;
+ 		for (String moduleName : binaryModulePathEntry.getModuleNames()) {
+@@ -354,6 +360,7 @@ IModule collectModuleEntries(ClasspathLocation bLocation, IPath path, boolean is
+ 			IModule module = binaryModulePathEntry.getModule(patchedModuleName.toCharArray());
+ 			if (module != null)
+ 				return module;
++			// TODO(SHMOD): report problem: patchedModuleName didn't match a module from this location
+ 		}
+ 	} else if (isOnModulePath) {
+ 		IModulePathEntry binaryModulePathEntry = new ModulePathEntry(path, bLocation);
+@@ -361,11 +368,14 @@ IModule collectModuleEntries(ClasspathLocation bLocation, IPath path, boolean is
+ 		if (module != null) {
+ 			String moduleName = String.valueOf(module.name());
+ 			moduleEntries.put(moduleName, binaryModulePathEntry);
+-			if (patchedModuleName != null && moduleName.equals(patchedModuleName))
+-				return module;
++			if (patchedModuleName != null) {
++				if (moduleName.equals(patchedModuleName))
++					return module;
++				// TODO(SHMOD): report problem: patchedModuleName didn't match a module from this location
++			}
+ 		}
+ 	}
+-	return null;
++	return patchedModule;
+ }
+ 
+ void combineIntoModuleEntry(ClasspathLocation sourceLocation, IModule patchedModule, Map<String, IModulePathEntry> moduleEntries) {

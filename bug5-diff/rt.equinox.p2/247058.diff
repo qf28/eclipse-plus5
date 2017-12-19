@@ -1,0 +1,1991 @@
+commit 2b84ca339b353190f782950aee40e784cf50bcbe
+Author: Simon Kaegi <skaegi>
+Date:   Wed Jan 7 06:35:39 2009 +0000
+
+    Bug 247058 [revert] Reading and Writing of rollback repo gets really slow after many updates
+
+13	0	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+11	0	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+2	0	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IDirector.java
+3	0	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IPlanner.java
+49	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+19	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfileRegistry.java
+149	7	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
+27	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+index a986b90..c1ec73f 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+@@ -52,6 +52,19 @@ public class SimpleDirector implements IDirector {
+ 		}
+ 	}
+ 
++	public IStatus revert(IProfile currentProfile, IProfile revertProfile, ProvisioningContext context, IProgressMonitor monitor) {
++		SubMonitor sub = SubMonitor.convert(monitor, Messages.Director_Task_Updating, PlanWork + EngineWork);
++		try {
++			ProvisioningPlan plan = planner.getRevertPlan(currentProfile, revertProfile, context, sub.newChild(PlanWork));
++			if (!plan.getStatus().isOK())
++				return plan.getStatus();
++
++			return engine.perform(currentProfile, new DefaultPhaseSet(), plan.getOperands(), context, sub.newChild(EngineWork));
++		} finally {
++			sub.done();
++		}
++	}
++
+ 	public IStatus revert(IInstallableUnit target, IProfile profile, ProvisioningContext context, IProgressMonitor monitor) {
+ 		SubMonitor sub = SubMonitor.convert(monitor, Messages.Director_Task_Updating, PlanWork + EngineWork);
+ 		try {
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index dfbe979..84d0d95 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -184,6 +184,17 @@ public class SimplePlanner implements IPlanner {
+ 		}
+ 	}
+ 
++	public ProvisioningPlan getRevertPlan(IProfile currentProfile, IProfile revertProfile, ProvisioningContext context, IProgressMonitor monitor) {
++		SubMonitor sub = SubMonitor.convert(monitor, ExpandWork);
++		sub.setTaskName(Messages.Director_Task_Resolving_Dependencies);
++		try {
++			ProfileChangeRequest profileChangeRequest = FormerState.generateProfileDeltaChangeRequest(currentProfile, revertProfile);
++			return getProvisioningPlan(profileChangeRequest, context, sub.newChild(ExpandWork / 2));
++		} finally {
++			sub.done();
++		}
++	}
++
+ 	public static IInstallableUnit[] findPlannerMarkedIUs(final IProfile profile) {
+ 		Query markerQuery = new Query() {
+ 			public boolean isMatch(Object candidate) {
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IDirector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IDirector.java
+index c11d25e..06d7b80 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IDirector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IDirector.java
+@@ -55,4 +55,6 @@ public interface IDirector {
+ 	 * previous profile states is stored.
+ 	 */
+ 	public URI getRollbackRepositoryLocation();
++
++	public IStatus revert(IProfile profile, IProfile revertProfile, ProvisioningContext context, IProgressMonitor monitor);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IPlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IPlanner.java
+index ab5fba4..7a34fde 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IPlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IPlanner.java
+@@ -11,6 +11,7 @@
+ package org.eclipse.equinox.internal.provisional.p2.director;
+ 
+ import org.eclipse.core.runtime.IProgressMonitor;
++import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningContext;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ 
+@@ -28,4 +29,6 @@ public interface IPlanner {
+ 
+ 	public IInstallableUnit[] updatesFor(IInstallableUnit toUpdate, ProvisioningContext context, IProgressMonitor monitor);
+ 
++	public ProvisioningPlan getRevertPlan(IProfile currentProfile, IProfile revertProfile, ProvisioningContext context, IProgressMonitor monitor);
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index 2e2b3bf..8a8414f 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -176,6 +176,53 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 		return profile.snapshot();
+ 	}
+ 
++	public IProfile getProfile(String id, long timestamp) {
++		IProfile profile = getProfile(id);
++		if (profile != null && profile.getTimestamp() == timestamp)
++			return profile;
++
++		File profileDirectory = new File(store, escape(id) + PROFILE_EXT);
++		if (!profileDirectory.isDirectory())
++			return null;
++
++		File profileFile = new File(profileDirectory, Long.toString(timestamp) + PROFILE_EXT);
++		if (!profileFile.exists())
++			return null;
++
++		Parser parser = new Parser(EngineActivator.getContext(), EngineActivator.ID);
++		try {
++			parser.parse(profileFile);
++		} catch (IOException e) {
++			LogHelper.log(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.error_parsing_profile, profileFile), e));
++		}
++		return (IProfile) parser.getProfileMap().get(id);
++	}
++
++	public long[] listProfileTimestamps(String id) {
++		File profileDirectory = new File(store, escape(id) + PROFILE_EXT);
++		if (!profileDirectory.isDirectory())
++			return new long[0];
++
++		File[] profileFiles = profileDirectory.listFiles(new FileFilter() {
++			public boolean accept(File pathname) {
++				return pathname.getName().endsWith(PROFILE_EXT) && pathname.isFile();
++			}
++		});
++
++		long[] timestamps = new long[profileFiles.length];
++		for (int i = 0; i < profileFiles.length; i++) {
++			String filename = profileFiles[i].getName();
++			int extensionIndex = filename.lastIndexOf(PROFILE_EXT);
++			try {
++				timestamps[i] = Long.parseLong(filename.substring(0, extensionIndex));
++			} catch (NumberFormatException e) {
++				throw new IllegalStateException("Incompatible profile file name. Expected format is {timestamp}" + PROFILE_EXT + " but was " + filename + "."); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
++			}
++		}
++		Arrays.sort(timestamps);
++		return timestamps;
++	}
++
+ 	private Profile internalGetProfile(String id) {
+ 		if (SELF.equals(id))
+ 			id = self;
+@@ -425,6 +472,8 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 
+ 		long previousTimestamp = profile.getTimestamp();
+ 		long currentTimestamp = System.currentTimeMillis();
++		if (currentTimestamp <= previousTimestamp)
++			currentTimestamp = previousTimestamp + 1;
+ 		File profileFile = new File(profileDirectory, Long.toString(currentTimestamp) + PROFILE_EXT);
+ 
+ 		profile.setTimestamp(currentTimestamp);
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfileRegistry.java
+index 0d88556..0a14b8a 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/provisional/p2/engine/IProfileRegistry.java
+@@ -30,6 +30,25 @@ public interface IProfileRegistry {
+ 	IProfile getProfile(String id);
+ 
+ 	/**
++	 * Return the profile in the registry that has the given id and timestamp. If it does not exist, 
++	 * then return <code>null</code>.
++	 * 
++	 * @param id the profile identifier
++	 * @param timestamp the profile's timestamp
++
++	 * @return the profile or <code>null</code>
++	 */
++	IProfile getProfile(String id, long timestamp);
++
++	/**
++	 * Return an array of timestamps in ascending order for the profile in question. If there are none, then
++	 * return an empty array.
++	 * 
++	 * @return the array of timestamps
++	 */
++	long[] listProfileTimestamps(String id);
++
++	/**
+ 	 * Return an array of profiles known to this registry. If there are none, then
+ 	 * return an empty array.
+ 	 * 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
+index 145d294..19b49d9 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
+@@ -18,8 +18,7 @@ import org.eclipse.equinox.internal.provisional.p2.core.*;
+ import org.eclipse.equinox.internal.provisional.p2.core.location.AgentLocation;
+ import org.eclipse.equinox.internal.provisional.p2.director.IDirector;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProfileChangeRequest;
+-import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+-import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningContext;
++import org.eclipse.equinox.internal.provisional.p2.engine.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.query.InstallableUnitQuery;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+@@ -86,7 +85,7 @@ public class RollbackTest extends AbstractProvisioningTest {
+ 		}
+ 	}
+ 
+-	public void testRollbackProfileProperties() throws ProvisionException {
++	public void testOLDRollbackProfileProperties() throws ProvisionException {
+ 		assertEmptyRollbackRepo();
+ 
+ 		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
+@@ -127,7 +126,41 @@ public class RollbackTest extends AbstractProvisioningTest {
+ 		assertEquals("13.0", null, profile.getProperty("test3"));
+ 	}
+ 
+-	public void testRollbackIUs() throws ProvisionException {
++	public void testRollbackProfileProperties() {
++		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(TestActivator.getContext(), IProfileRegistry.class.getName());
++
++		assertEquals(1, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
++		request1.setProfileProperty("test1", "test");
++		request1.setProfileProperty("test2", "test");
++		IStatus status = director.provision(request1, null, new NullProgressMonitor());
++		assertEquals("1.0", IStatus.OK, status.getCode());
++		assertEquals("2.0", "test", profile.getProperty("test1"));
++		assertEquals("3.0", "test", profile.getProperty("test2"));
++
++		assertEquals(2, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++
++		ProfileChangeRequest request2 = new ProfileChangeRequest(profile);
++		request2.removeProfileProperty("test1");
++		request2.setProfileProperty("test2", "bad");
++		request2.setProfileProperty("test3", "test");
++		status = director.provision(request2, null, new NullProgressMonitor());
++		assertEquals("5.0", IStatus.OK, status.getCode());
++		assertEquals("6.0", null, profile.getProperty("test1"));
++		assertEquals("7.0", "bad", profile.getProperty("test2"));
++		assertEquals("8.0", "test", profile.getProperty("test3"));
++
++		assertEquals(3, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++		IProfile revertProfile = profileRegistry.getProfile(profile.getProfileId(), profileRegistry.listProfileTimestamps(profile.getProfileId())[1]);
++
++		status = director.revert(profile, revertProfile, new ProvisioningContext(), new NullProgressMonitor());
++		assertEquals("10.0", IStatus.OK, status.getCode());
++		assertEquals("11.0", "test", profile.getProperty("test1"));
++		assertEquals("12.0", "test", profile.getProperty("test2"));
++		assertEquals("13.0", null, profile.getProperty("test3"));
++	}
++
++	public void testOLDRollbackIUs() throws ProvisionException {
+ 		assertEmptyRollbackRepo();
+ 
+ 		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
+@@ -173,9 +206,46 @@ public class RollbackTest extends AbstractProvisioningTest {
+ 		assertFalse("13.0", profileIUs.contains(c1));
+ 	}
+ 
+-	public void testRollbackIUProfileProperties() throws ProvisionException {
+-		assertEmptyRollbackRepo();
++	public void testRollbackIUs() {
++		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(TestActivator.getContext(), IProfileRegistry.class.getName());
++
++		assertEquals(1, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
++		request1.addInstallableUnits(new IInstallableUnit[] {a1});
++		request1.addInstallableUnits(new IInstallableUnit[] {b1});
++		IStatus status = director.provision(request1, null, new NullProgressMonitor());
++		assertEquals("1.0", IStatus.OK, status.getCode());
++
++		List profileIUs = new ArrayList(profile.query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
++		assertTrue("2.0", profileIUs.contains(a1));
++		assertTrue("3.0", profileIUs.contains(b1));
++
++		assertEquals(2, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++
++		ProfileChangeRequest request2 = new ProfileChangeRequest(profile);
++		request2.removeInstallableUnits(new IInstallableUnit[] {a1});
++		request2.addInstallableUnits(new IInstallableUnit[] {c1});
++		status = director.provision(request2, null, new NullProgressMonitor());
++		assertEquals("5.0", IStatus.OK, status.getCode());
++
++		profileIUs = new ArrayList(profile.query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
++		assertFalse("6.0", profileIUs.contains(a1));
++		assertTrue("7.0", profileIUs.contains(b1));
++		assertTrue("8.0", profileIUs.contains(c1));
++
++		assertEquals(3, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++		IProfile revertProfile = profileRegistry.getProfile(profile.getProfileId(), profileRegistry.listProfileTimestamps(profile.getProfileId())[1]);
++
++		status = director.revert(profile, revertProfile, new ProvisioningContext(), new NullProgressMonitor());
++		assertEquals("10.0", IStatus.OK, status.getCode());
++
++		profileIUs = new ArrayList(profile.query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
++		assertTrue("11.0", profileIUs.contains(a1));
++		assertTrue("12.0", profileIUs.contains(b1));
++		assertFalse("13.0", profileIUs.contains(c1));
++	}
+ 
++	public void testOLDRollbackIUProfileProperties() throws ProvisionException {
+ 		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
+ 		request1.addInstallableUnits(new IInstallableUnit[] {a1});
+ 		request1.setInstallableUnitProfileProperty(a1, "test1", "test");
+@@ -215,7 +285,42 @@ public class RollbackTest extends AbstractProvisioningTest {
+ 		assertEquals("13.0", null, profile.getInstallableUnitProperty(a1, "test3"));
+ 	}
+ 
+-	public void testRollbackDependentIUProfileProperties() throws ProvisionException {
++	public void testRollbackIUProfileProperties() {
++		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(TestActivator.getContext(), IProfileRegistry.class.getName());
++
++		assertEquals(1, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
++		request1.addInstallableUnits(new IInstallableUnit[] {a1});
++		request1.setInstallableUnitProfileProperty(a1, "test1", "test");
++		request1.setInstallableUnitProfileProperty(a1, "test2", "test");
++		IStatus status = director.provision(request1, null, new NullProgressMonitor());
++		assertEquals("1.0", IStatus.OK, status.getCode());
++		assertEquals("2.0", "test", profile.getInstallableUnitProperty(a1, "test1"));
++		assertEquals("3.0", "test", profile.getInstallableUnitProperty(a1, "test2"));
++
++		assertEquals(2, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++
++		ProfileChangeRequest request2 = new ProfileChangeRequest(profile);
++		request2.removeInstallableUnitProfileProperty(a1, "test1");
++		request2.setInstallableUnitProfileProperty(a1, "test2", "bad");
++		request2.setInstallableUnitProfileProperty(a1, "test3", "test");
++		status = director.provision(request2, null, new NullProgressMonitor());
++		assertEquals("5.0", IStatus.OK, status.getCode());
++		assertEquals("6.0", null, profile.getInstallableUnitProperty(a1, "test1"));
++		assertEquals("7.0", "bad", profile.getInstallableUnitProperty(a1, "test2"));
++		assertEquals("8.0", "test", profile.getInstallableUnitProperty(a1, "test3"));
++
++		assertEquals(3, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++		IProfile revertProfile = profileRegistry.getProfile(profile.getProfileId(), profileRegistry.listProfileTimestamps(profile.getProfileId())[1]);
++
++		status = director.revert(profile, revertProfile, new ProvisioningContext(), new NullProgressMonitor());
++		assertEquals("10.0", IStatus.OK, status.getCode());
++		assertEquals("11.0", "test", profile.getInstallableUnitProperty(a1, "test1"));
++		assertEquals("12.0", "test", profile.getInstallableUnitProperty(a1, "test2"));
++		assertEquals("13.0", null, profile.getInstallableUnitProperty(a1, "test3"));
++	}
++
++	public void testOLDRollbackDependentIUProfileProperties() throws ProvisionException {
+ 		assertEmptyRollbackRepo();
+ 
+ 		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
+@@ -257,4 +362,41 @@ public class RollbackTest extends AbstractProvisioningTest {
+ 		assertEquals("12.0", "test", profile.getInstallableUnitProperty(a1, "test2"));
+ 		assertEquals("13.0", null, profile.getInstallableUnitProperty(b1, "test3"));
+ 	}
++
++	public void testRollbackDependentIUProfileProperties() {
++		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(TestActivator.getContext(), IProfileRegistry.class.getName());
++
++		assertEquals(1, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
++		request1.addInstallableUnits(new IInstallableUnit[] {d1});
++		request1.setInstallableUnitProfileProperty(d1, "test1", "test");
++		request1.setInstallableUnitProfileProperty(a1, "test2", "test");
++		IStatus status = director.provision(request1, null, new NullProgressMonitor());
++		assertEquals("1.0", IStatus.OK, status.getCode());
++		assertEquals("2.0", "test", profile.getInstallableUnitProperty(d1, "test1"));
++		assertEquals("3.0", "test", profile.getInstallableUnitProperty(a1, "test2"));
++
++		assertEquals(2, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++
++		ProfileChangeRequest request2 = new ProfileChangeRequest(profile);
++		request2.removeInstallableUnits(new IInstallableUnit[] {d1});
++		request2.addInstallableUnits(new IInstallableUnit[] {b1});
++		request2.setInstallableUnitProfileProperty(b1, "test3", "test");
++
++		status = director.provision(request2, null, new NullProgressMonitor());
++		assertEquals("5.0", IStatus.OK, status.getCode());
++		assertEquals("6.0", null, profile.getInstallableUnitProperty(d1, "test1"));
++		assertEquals("7.0", null, profile.getInstallableUnitProperty(a1, "test2"));
++		assertEquals("8.0", "test", profile.getInstallableUnitProperty(b1, "test3"));
++
++		assertEquals(3, profileRegistry.listProfileTimestamps(profile.getProfileId()).length);
++		IProfile revertProfile = profileRegistry.getProfile(profile.getProfileId(), profileRegistry.listProfileTimestamps(profile.getProfileId())[1]);
++
++		status = director.revert(profile, revertProfile, new ProvisioningContext(), new NullProgressMonitor());
++		assertEquals("10.0", IStatus.OK, status.getCode());
++		assertEquals("11.0", "test", profile.getInstallableUnitProperty(d1, "test1"));
++		assertEquals("12.0", "test", profile.getInstallableUnitProperty(a1, "test2"));
++		assertEquals("13.0", null, profile.getInstallableUnitProperty(b1, "test3"));
++	}
++
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
+index 65b9183..3178903 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/engine/ProfileRegistryTest.java
+@@ -202,4 +202,31 @@ public class ProfileRegistryTest extends AbstractProvisioningTest {
+ 		assertNotNull(profiles);
+ 		assertEquals(1, profiles.length);
+ 	}
++
++	public void testTimestampedProfiles() throws ProvisionException {
++		assertNull(registry.getProfile(PROFILE_NAME));
++		Properties properties = new Properties();
++		properties.put("test", "test");
++		Profile profile = (Profile) registry.addProfile(PROFILE_NAME, properties);
++		long oldtimestamp = profile.getTimestamp();
++		assertTrue(profile.getProperties().containsKey("test"));
++		long[] timestamps = registry.listProfileTimestamps(PROFILE_NAME);
++		assertEquals(1, timestamps.length);
++
++		assertTrue(profile.getProperties().containsKey("test"));
++		profile.removeProperty("test");
++		assertNull(profile.getProperty("test"));
++		saveProfile(registry, profile);
++		timestamps = registry.listProfileTimestamps(PROFILE_NAME);
++		assertEquals(2, timestamps.length);
++
++		Profile oldProfile = (Profile) registry.getProfile(PROFILE_NAME, oldtimestamp);
++		assertTrue(oldProfile.getProperties().containsKey("test"));
++		assertFalse(profile.getTimestamp() == oldProfile.getTimestamp());
++
++		registry.removeProfile(PROFILE_NAME);
++		assertNull(registry.getProfile(PROFILE_NAME, oldtimestamp));
++		timestamps = registry.listProfileTimestamps(PROFILE_NAME);
++		assertEquals(0, timestamps.length);
++	}
+ }
+commit 16d60118276599be08bedf7a11dcd8492211d947
+Author: Simon Kaegi <skaegi>
+Date:   Wed Jan 7 20:20:41 2009 +0000
+
+    Bug 247058 [revert] Reading and Writing of rollback repo gets really slow after many updates
+
+6	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index 8a8414f..2560e03 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -177,6 +177,9 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	}
+ 
+ 	public IProfile getProfile(String id, long timestamp) {
++		if (SELF.equals(id))
++			id = self;
++
+ 		IProfile profile = getProfile(id);
+ 		if (profile != null && profile.getTimestamp() == timestamp)
+ 			return profile;
+@@ -199,6 +202,9 @@ public class SimpleProfileRegistry implements IProfileRegistry {
+ 	}
+ 
+ 	public long[] listProfileTimestamps(String id) {
++		if (SELF.equals(id))
++			id = self;
++
+ 		File profileDirectory = new File(store, escape(id) + PROFILE_EXT);
+ 		if (!profileDirectory.isDirectory())
+ 			return new long[0];
+commit d1b16dda9b85923c46913573423b052cd28d5e54
+Author: Susan Franklin <sfranklin>
+Date:   Wed Jan 7 21:05:56 2009 +0000
+
+    Bug 247058 - [revert] Reading and Writing of rollback repo gets really slow after many updates
+    UI changes associated with new core API
+
+4	70	bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/MetadataRepositoriesView.java
+6	15	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/DefaultQueryProvider.java
+1	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+40	54	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RevertProfileWizardPage.java
+1	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+72	0	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
+27	77	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RollbackProfileElement.java
+0	32	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RollbackRepositoryElement.java
+0	33	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/query/RollbackIUCollector.java
+22	12	bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
+diff --git a/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/MetadataRepositoriesView.java b/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/MetadataRepositoriesView.java
+index a14d3dc..1935c04 100644
+--- a/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/MetadataRepositoriesView.java
++++ b/bundles/org.eclipse.equinox.p2.ui.admin/src/org/eclipse/equinox/internal/p2/ui/admin/MetadataRepositoriesView.java
+@@ -11,28 +11,22 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.ui.admin;
+ 
+-import java.lang.reflect.InvocationTargetException;
+ import java.net.URI;
+ import java.util.ArrayList;
+ import java.util.List;
+-import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.equinox.internal.p2.ui.admin.dialogs.AddMetadataRepositoryDialog;
+ import org.eclipse.equinox.internal.p2.ui.admin.preferences.PreferenceConstants;
+-import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepositoryManager;
+-import org.eclipse.equinox.internal.provisional.p2.director.ProvisioningPlan;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+-import org.eclipse.equinox.internal.provisional.p2.ui.*;
++import org.eclipse.equinox.internal.provisional.p2.ui.ProvisioningOperationRunner;
+ import org.eclipse.equinox.internal.provisional.p2.ui.actions.InstallAction;
+ import org.eclipse.equinox.internal.provisional.p2.ui.model.IRepositoryElement;
+ import org.eclipse.equinox.internal.provisional.p2.ui.model.MetadataRepositories;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.*;
+ import org.eclipse.equinox.internal.provisional.p2.ui.viewers.IUDragAdapter;
+ import org.eclipse.equinox.internal.provisional.p2.ui.viewers.StructuredViewerProvisioningListener;
+-import org.eclipse.jface.action.*;
+-import org.eclipse.jface.dialogs.ProgressMonitorDialog;
+-import org.eclipse.jface.operation.IRunnableWithProgress;
+-import org.eclipse.jface.viewers.*;
++import org.eclipse.jface.action.IMenuManager;
++import org.eclipse.jface.action.Separator;
++import org.eclipse.jface.viewers.TreeViewer;
+ import org.eclipse.swt.dnd.*;
+ import org.eclipse.swt.widgets.Shell;
+ import org.eclipse.ui.part.PluginTransfer;
+@@ -45,65 +39,7 @@ import org.eclipse.ui.statushandlers.StatusManager;
+  */
+ public class MetadataRepositoriesView extends RepositoriesView {
+ 
+-	private class RevertAction extends Action {
+-
+-		RevertAction() {
+-			setText(ProvUI.REVERT_COMMAND_LABEL);
+-			setToolTipText(ProvUI.REVERT_COMMAND_TOOLTIP);
+-			setImageDescriptor(ProvUIImages.getImageDescriptor(ProvUIImages.IMG_PROFILE));
+-		}
+-
+-		public void run() {
+-			IInstallableUnit[] ius = getSelectedIUs();
+-			String targetProfileId = ProvAdminUIActivator.getDefault().getPolicy().getProfileChooser().getProfileId(getShell());
+-			ProvisioningPlan plan = getProvisioningPlan(ius);
+-			if (ProvAdminUIActivator.getDefault().getPolicy().getPlanValidator().continueWorkingWithPlan(plan, getShell())) {
+-				ProvisioningOperation op = new ProfileModificationOperation(ProvAdminUIMessages.MetadataRepositoriesView_RevertLabel, targetProfileId, plan);
+-				ProvisioningOperationRunner.schedule(op, StatusManager.SHOW | StatusManager.LOG);
+-			}
+-		}
+-
+-		protected IInstallableUnit[] getSelectedIUs() {
+-			ISelection selection = viewer.getSelection();
+-			if (!(selection instanceof IStructuredSelection))
+-				return new IInstallableUnit[0];
+-			List elements = ((IStructuredSelection) selection).toList();
+-			List iusList = new ArrayList(elements.size());
+-
+-			for (int i = 0; i < elements.size(); i++) {
+-				IInstallableUnit iu = (IInstallableUnit) ProvUI.getAdapter(elements.get(i), IInstallableUnit.class);
+-				if (iu != null && !ProvisioningUtil.isCategory(iu))
+-					iusList.add(iu);
+-			}
+-			return (IInstallableUnit[]) iusList.toArray(new IInstallableUnit[iusList.size()]);
+-		}
+-
+-		private ProvisioningPlan getProvisioningPlan(final IInstallableUnit[] ius) {
+-			final ProvisioningPlan[] plan = new ProvisioningPlan[1];
+-			IRunnableWithProgress runnable = new IRunnableWithProgress() {
+-				public void run(IProgressMonitor monitor) {
+-					try {
+-						if (ius.length == 1)
+-							plan[0] = ProvisioningUtil.getRevertPlan(ius[0], monitor);
+-					} catch (ProvisionException e) {
+-						ProvUI.handleException(e, ProvAdminUIMessages.MetadataRepositoriesView_UnexpectedRevertError, StatusManager.BLOCK | StatusManager.LOG);
+-					}
+-				}
+-			};
+-			try {
+-				new ProgressMonitorDialog(getShell()).run(true, true, runnable);
+-			} catch (InterruptedException e) {
+-				// don't report thread interruption
+-			} catch (InvocationTargetException e) {
+-				ProvUI.handleException(e.getCause(), ProvAdminUIMessages.MetadataRepositoriesView_UnexpectedRevertError, StatusManager.BLOCK | StatusManager.LOG);
+-			}
+-			return plan[0];
+-		}
+-
+-	}
+-
+ 	private InstallAction installAction;
+-	private RevertAction revertAction;
+ 
+ 	/**
+ 	 * The constructor.
+@@ -144,14 +80,12 @@ public class MetadataRepositoriesView extends RepositoriesView {
+ 	protected void makeActions() {
+ 		super.makeActions();
+ 		installAction = new InstallAction(ProvAdminUIActivator.getDefault().getPolicy(), viewer, null);
+-		revertAction = new RevertAction();
+ 	}
+ 
+ 	protected void fillContextMenu(IMenuManager manager) {
+ 		if (installAction.isEnabled()) {
+ 			manager.add(new Separator());
+ 			manager.add(installAction);
+-			manager.add(revertAction);
+ 		}
+ 		super.fillContextMenu(manager);
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/DefaultQueryProvider.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/DefaultQueryProvider.java
+index 06d0a7f..d550436 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/DefaultQueryProvider.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/DefaultQueryProvider.java
+@@ -18,7 +18,6 @@ import org.eclipse.equinox.internal.provisional.p2.director.IUProfilePropertyQue
+ import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.query.IUPropertyQuery;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.query.InstallableUnitQuery;
+ import org.eclipse.equinox.internal.provisional.p2.query.*;
+ import org.eclipse.equinox.internal.provisional.p2.ui.*;
+ import org.eclipse.equinox.internal.provisional.p2.ui.model.MetadataRepositories;
+@@ -67,6 +66,7 @@ public class DefaultQueryProvider extends QueryProvider {
+ 						return true;
+ 					}
+ 				});
++
+ 			case QueryProvider.AVAILABLE_IUS :
+ 				// Things get more complicated if the user wants to filter out installed items. 
+ 				// This involves setting up a secondary query for installed content that the various
+@@ -85,14 +85,6 @@ public class DefaultQueryProvider extends QueryProvider {
+ 					}
+ 				}
+ 
+-				// Showing children of a rollback element
+-				if (element instanceof RollbackRepositoryElement) {
+-					Query profileIdQuery = new InstallableUnitQuery(((RollbackRepositoryElement) element).getProfileId());
+-					Query rollbackIUQuery = new IUPropertyQuery(IInstallableUnit.PROP_TYPE_PROFILE, Boolean.toString(true));
+-					availableIUCollector = new RollbackIUCollector(queryable, element.getParent(element));
+-					return new ElementQueryDescriptor(queryable, new CompoundQuery(new Query[] {profileIdQuery, rollbackIUQuery}, true), availableIUCollector);
+-				}
+-
+ 				Query topLevelQuery = new IUPropertyQuery(context.getVisibleAvailableIUProperty(), Boolean.TRUE.toString());
+ 				Query categoryQuery = new IUPropertyQuery(IInstallableUnit.PROP_TYPE_CATEGORY, Boolean.toString(true));
+ 
+@@ -133,6 +125,7 @@ public class DefaultQueryProvider extends QueryProvider {
+ 					return new ElementQueryDescriptor(queryable, new CompoundQuery(new Query[] {topLevelQuery, meetsAnyRequirementQuery}, true), availableIUCollector);
+ 				}
+ 				return null;
++
+ 			case QueryProvider.AVAILABLE_UPDATES :
+ 				IProfile profile;
+ 				IInstallableUnit[] toUpdate = null;
+@@ -160,6 +153,7 @@ public class DefaultQueryProvider extends QueryProvider {
+ 				else
+ 					collector = new Collector();
+ 				return new ElementQueryDescriptor(updateQueryable, allQuery, collector);
++
+ 			case QueryProvider.INSTALLED_IUS :
+ 				// Querying of IU's.  We are drilling down into the requirements.
+ 				if (element instanceof IIUElement && context.getShowInstallChildren()) {
+@@ -170,13 +164,8 @@ public class DefaultQueryProvider extends QueryProvider {
+ 				profile = (IProfile) ProvUI.getAdapter(element, IProfile.class);
+ 				if (profile == null)
+ 					return null;
+-				// See https://bugs.eclipse.org/bugs/show_bug.cgi?id=229352
+-				// Rollback profiles are specialized/temporary instances so we must use a query that uses the profile instance, not the id.
+-				if (element instanceof RollbackProfileElement)
+-					return new ElementQueryDescriptor(profile, new IUProfilePropertyQuery(profile, context.getVisibleInstalledIUProperty(), Boolean.toString(true)), new InstalledIUCollector(profile, element));
+-
+-				// Just a normal query of the installed IU's, query the profile and look for the visible ones
+ 				return new ElementQueryDescriptor(profile, new IUProfilePropertyQuery(profile, context.getVisibleInstalledIUProperty(), Boolean.toString(true)), new InstalledIUCollector(profile, element));
++
+ 			case QueryProvider.METADATA_REPOS :
+ 				if (element instanceof MetadataRepositories) {
+ 					if (queryable == null) {
+@@ -186,6 +175,7 @@ public class DefaultQueryProvider extends QueryProvider {
+ 					return new ElementQueryDescriptor(element.getQueryable(), null, new MetadataRepositoryElementCollector(element.getQueryable(), element));
+ 				}
+ 				return null;
++
+ 			case QueryProvider.PROFILES :
+ 				queryable = new QueryableProfileRegistry();
+ 				return new ElementQueryDescriptor(queryable, new Query() {
+@@ -193,6 +183,7 @@ public class DefaultQueryProvider extends QueryProvider {
+ 						return ProvUI.getAdapter(candidate, IProfile.class) != null;
+ 					}
+ 				}, new ProfileElementCollector(null, element));
++
+ 			default :
+ 				return null;
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+index 19b3303..c4ea147 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/ProvUIMessages.java
+@@ -69,6 +69,7 @@ public class ProvUIMessages extends NLS {
+ 	public static String ProfileModificationWizardPage_NothingSelected;
+ 	public static String ProfileModificationWizardPage_ResolutionOperationLabel;
+ 	public static String ProfileModificationWizardPage_UnexpectedError;
++	public static String ProfileSnapshots_Label;
+ 	// utility error messages
+ 	public static String ProvisioningUtil_NoRepositoryManager;
+ 	public static String ProvisioningUtil_LoadRepositoryFailure;
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RevertProfileWizardPage.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RevertProfileWizardPage.java
+index fb9d15c..b1ba138 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RevertProfileWizardPage.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/dialogs/RevertProfileWizardPage.java
+@@ -11,17 +11,15 @@
+ package org.eclipse.equinox.internal.p2.ui.dialogs;
+ 
+ import java.lang.reflect.InvocationTargetException;
+-import org.eclipse.core.runtime.IProgressMonitor;
+-import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
++import org.eclipse.equinox.internal.p2.ui.model.ProfileSnapshots;
+ import org.eclipse.equinox.internal.p2.ui.model.RollbackProfileElement;
+-import org.eclipse.equinox.internal.p2.ui.model.RollbackRepositoryElement;
+ import org.eclipse.equinox.internal.p2.ui.viewers.DeferredQueryContentProvider;
+ import org.eclipse.equinox.internal.p2.ui.viewers.IUDetailsLabelProvider;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProvisioningPlan;
+ import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.equinox.internal.provisional.p2.ui.ProvUI;
+ import org.eclipse.equinox.internal.provisional.p2.ui.ProvisioningOperationRunner;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.*;
+@@ -32,7 +30,6 @@ import org.eclipse.jface.operation.IRunnableWithProgress;
+ import org.eclipse.jface.viewers.*;
+ import org.eclipse.jface.wizard.WizardPage;
+ import org.eclipse.swt.SWT;
+-import org.eclipse.swt.custom.BusyIndicator;
+ import org.eclipse.swt.custom.SashForm;
+ import org.eclipse.swt.layout.GridData;
+ import org.eclipse.swt.layout.GridLayout;
+@@ -91,15 +88,18 @@ public class RevertProfileWizardPage extends WizardPage {
+ 		configsViewer.setLabelProvider(new ProvElementLabelProvider());
+ 		configsViewer.setComparator(new ViewerComparator() {
+ 			// We override the ViewerComparator so that we don't get the labels of the elements
+-			// for comparison, but rather get the version numbers and compare them.
++			// for comparison, but rather get the timestamps and compare them.
+ 			// Reverse sorting is used so that newest is first.
+ 			public int compare(Viewer viewer, Object o1, Object o2) {
+-				IInstallableUnit iu1 = (IInstallableUnit) ProvUI.getAdapter(o1, IInstallableUnit.class);
+-				IInstallableUnit iu2 = (IInstallableUnit) ProvUI.getAdapter(o2, IInstallableUnit.class);
+-				if (iu1 == null || iu2 == null)
+-					// this is naive (doesn't consult the label provider), but shouldn't happen
+-					return o2.toString().compareTo(o1.toString());
+-				return iu2.getVersion().compareTo(iu1.getVersion());
++				if (o1 instanceof RollbackProfileElement && o2 instanceof RollbackProfileElement) {
++					long timestamp1 = ((RollbackProfileElement) o1).getTimestamp();
++					long timestamp2 = ((RollbackProfileElement) o2).getTimestamp();
++					if (timestamp1 > timestamp2)
++						return -1;
++					return 1;
++				}
++				// this is naive (doesn't consult the label provider), but shouldn't happen
++				return o2.toString().compareTo(o1.toString());
+ 			}
+ 		});
+ 		configsViewer.setInput(getInput());
+@@ -140,34 +140,17 @@ public class RevertProfileWizardPage extends WizardPage {
+ 	}
+ 
+ 	private Object getInput() {
+-		try {
+-			RollbackRepositoryElement element = new RollbackRepositoryElement(ProvisioningUtil.getRollbackRepositoryURL(), profileId);
+-			return element;
+-		} catch (ProvisionException e) {
+-			ProvUI.handleException(e, ProvUIMessages.RevertProfileWizardPage_ErrorRetrievingHistory, StatusManager.BLOCK | StatusManager.LOG);
+-			return null;
+-		}
++		ProfileSnapshots element = new ProfileSnapshots(profileId);
++		return element;
+ 	}
+ 
+ 	void handleSelectionChanged(IStructuredSelection selection) {
+ 		if (!selection.isEmpty()) {
+ 			final Object selected = selection.getFirstElement();
+ 			if (selected instanceof RollbackProfileElement) {
+-				final IProfile[] snapshot = new IProfile[1];
+-				BusyIndicator.showWhile(getShell().getDisplay(), new Runnable() {
+-					public void run() {
+-						try {
+-							snapshot[0] = ((RollbackProfileElement) selected).getProfileSnapshot(null);
+-						} catch (ProvisionException e) {
+-							ProvUI.handleException(e, ProvUIMessages.RollbackProfileElement_InvalidSnapshot, StatusManager.LOG | StatusManager.SHOW);
+-						}
+-					}
+-				});
+-				if (snapshot[0] != null) {
+-					configContentsViewer.setInput(selected);
+-					setPageComplete(true);
+-					return;
+-				}
++				configContentsViewer.setInput(selected);
++				setPageComplete(true);
++				return;
+ 			}
+ 		}
+ 		configContentsViewer.setInput(null);
+@@ -185,10 +168,14 @@ public class RevertProfileWizardPage extends WizardPage {
+ 		}
+ 	}
+ 
+-	private IInstallableUnit getSelectedIU() {
++	private IProfile getSelectedSnapshot() {
+ 		Object selected = ((IStructuredSelection) configsViewer.getSelection()).getFirstElement();
+ 		if (selected != null && selected instanceof RollbackProfileElement)
+-			return ((RollbackProfileElement) selected).getIU();
++			try {
++				return ((RollbackProfileElement) selected).getProfileSnapshot(new NullProgressMonitor());
++			} catch (ProvisionException e) {
++				ProvUI.handleException(e, null, StatusManager.LOG);
++			}
+ 		return null;
+ 	}
+ 
+@@ -206,16 +193,27 @@ public class RevertProfileWizardPage extends WizardPage {
+ 	}
+ 
+ 	private boolean revert() {
+-		final IInstallableUnit iu = getSelectedIU();
+-		if (iu == null)
++		final IProfile snapshot = getSelectedSnapshot();
++		if (snapshot == null)
+ 			return false;
+-		final ProvisioningPlan[] plan = new ProvisioningPlan[1];
++		final boolean[] reverted = new boolean[1];
++		reverted[0] = false;
+ 		IRunnableWithProgress runnable = new IRunnableWithProgress() {
+ 			public void run(IProgressMonitor monitor) {
+ 				try {
+-					plan[0] = ProvisioningUtil.getRevertPlan(iu, monitor);
++					IProfile currentProfile = ProvisioningUtil.getProfile(profileId);
++					ProvisioningPlan plan = ProvisioningUtil.getRevertPlan(currentProfile, snapshot, monitor);
++					if (plan != null) {
++						if (plan.getStatus().isOK()) {
++							ProvisioningOperation op = new ProfileModificationOperation(ProvUIMessages.RevertDialog_RevertOperationLabel, profileId, plan);
++							ProvisioningOperationRunner.run(op, StatusManager.SHOW | StatusManager.LOG);
++							reverted[0] = true;
++						} else if (plan.getStatus().getSeverity() != IStatus.CANCEL) {
++							ProvUI.reportStatus(plan.getStatus(), StatusManager.LOG);
++							setMessage(ProvUIMessages.ProfileModificationWizardPage_UnexpectedError, IMessageProvider.ERROR);
++						}
++					}
+ 				} catch (ProvisionException e) {
+-					plan[0] = null;
+ 					ProvUI.handleException(e.getCause(), ProvUIMessages.ProfileModificationWizardPage_UnexpectedError, StatusManager.LOG);
+ 					setMessage(ProvUIMessages.ProfileModificationWizardPage_UnexpectedError, IMessageProvider.ERROR);
+ 				}
+@@ -223,24 +221,12 @@ public class RevertProfileWizardPage extends WizardPage {
+ 		};
+ 		try {
+ 			getContainer().run(true, true, runnable);
+-			if (plan[0] != null) {
+-				if (plan[0].getStatus().isOK()) {
+-					ProvisioningOperation op = new ProfileModificationOperation(ProvUIMessages.RevertDialog_RevertOperationLabel, profileId, plan[0]);
+-					ProvisioningOperationRunner.run(op, StatusManager.SHOW | StatusManager.LOG);
+-					return true;
+-				}
+-				// If user cancelled, do not report an error
+-				if (plan[0].getStatus().getSeverity() == IStatus.CANCEL)
+-					return false;
+-				ProvUI.reportStatus(plan[0].getStatus(), StatusManager.LOG);
+-				setMessage(ProvUIMessages.ProfileModificationWizardPage_UnexpectedError, IMessageProvider.ERROR);
+-			}
+ 		} catch (InterruptedException e) {
+ 			// don't report thread interruption
+ 		} catch (InvocationTargetException e) {
+ 			ProvUI.handleException(e.getCause(), ProvUIMessages.RevertDialog_RevertError, StatusManager.LOG);
+ 			setMessage(ProvUIMessages.RevertDialog_RevertError, IMessageProvider.ERROR);
+ 		}
+-		return false;
++		return reverted[0];
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+index 41f5b47..0203e30 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/messages.properties
+@@ -18,6 +18,7 @@ ProfileModificationWizardPage_DetailsLabel=Details
+ ProfileModificationWizardPage_NothingSelected=You must check some items in order to continue.
+ ProfileModificationWizardPage_ResolutionOperationLabel=Calculating Requirements
+ ProfileModificationWizardPage_UnexpectedError=An unexpected error occurred.  This wizard is no longer valid with the current selections.
++ProfileSnapshots_Label=Installation History
+ ProvisioningUtil_NoRepositoryManager=No repository manager was found
+ ProvisioningUtil_LoadRepositoryFailure=Unable to load the repository {0}
+ ProvisioningUtil_NoProfileRegistryFound=No profile registry was found
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
+new file mode 100644
+index 0000000..2663a74
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/ProfileSnapshots.java
+@@ -0,0 +1,72 @@
++/*******************************************************************************
++ * Copyright (c) 2007, 2008 IBM Corporation and others.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.internal.p2.ui.model;
++
++import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
++import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
++import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningUtil;
++
++/**
++ * Element class for profile snapshots
++ * 
++ * @since 3.5
++ */
++public class ProfileSnapshots extends ProvElement {
++
++	String profileId;
++
++	public ProfileSnapshots(String profileId) {
++		super(null);
++		this.profileId = profileId;
++	}
++
++	public String getProfileId() {
++		return profileId;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.ui.model.IWorkbenchAdapter#getChildren(java.lang.Object)
++	 */
++	public Object[] getChildren(Object o) {
++		try {
++			long[] timestamps = ProvisioningUtil.getProfileTimestamps(profileId);
++			// eliminate the last in the list (latest) because that is the current
++			// profile.  
++			RollbackProfileElement[] elements = new RollbackProfileElement[timestamps.length - 1];
++			boolean skipFirst = false;
++			for (int i = 0; i < timestamps.length - 1; i++) {
++				elements[i] = new RollbackProfileElement(this, profileId, timestamps[i]);
++				// Eliminate the first in the list (earliest) if there was no content at all.
++				// This doesn't always happen, but can, and we don't want to offer the user an empty profile to
++				// revert to.
++				if (i == 0) {
++					skipFirst = elements[0].getChildren(elements[0]).length == 0;
++				}
++			}
++			if (skipFirst) {
++				RollbackProfileElement[] elementsWithoutFirst = new RollbackProfileElement[elements.length - 1];
++				System.arraycopy(elements, 1, elementsWithoutFirst, 0, elements.length - 1);
++				return elementsWithoutFirst;
++			}
++			return elements;
++		} catch (ProvisionException e) {
++			handleException(e, null);
++		}
++		return null;
++	}
++
++	/* (non-Javadoc)
++	 * @see org.eclipse.ui.model.IWorkbenchAdapter#getLabel(java.lang.Object)
++	 */
++	public String getLabel(Object o) {
++		return ProvUIMessages.ProfileSnapshots_Label;
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RollbackProfileElement.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RollbackProfileElement.java
+index 9252581..1f2e962 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RollbackProfileElement.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RollbackProfileElement.java
+@@ -13,35 +13,30 @@ package org.eclipse.equinox.internal.p2.ui.model;
+ import com.ibm.icu.text.DateFormat;
+ import java.util.Date;
+ import org.eclipse.core.runtime.IProgressMonitor;
+-import org.eclipse.equinox.internal.p2.rollback.FormerState;
++import org.eclipse.core.runtime.NullProgressMonitor;
+ import org.eclipse.equinox.internal.p2.ui.ProvUIMessages;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+ import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+-import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningContext;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IRequiredCapability;
+ import org.eclipse.equinox.internal.provisional.p2.query.IQueryable;
+ import org.eclipse.equinox.internal.provisional.p2.ui.ProvUIImages;
+ import org.eclipse.equinox.internal.provisional.p2.ui.operations.ProvisioningUtil;
+ import org.eclipse.equinox.internal.provisional.p2.ui.policy.QueryProvider;
+ 
+ /**
+- * Element wrapper class for an IU that represents a profile snapshot
+- * from a rollback repository.  It has characteristics of an IU element,
+- * in that it is stored as an IU and can be adapted to its IU.  But 
+- * conceptually, it is more like a profile, in that its children are the
+- * IU's that represent the content of the profile when it was snapshotted.
++ * Element class for a profile snapshot
+  * 
+  * @since 3.4
+  */
+-public class RollbackProfileElement extends RemoteQueriedElement implements IIUElement {
++public class RollbackProfileElement extends RemoteQueriedElement {
+ 
+-	private IInstallableUnit iu;
++	private String profileId;
++	private long timestamp;
+ 	private IProfile snapshot;
+ 
+-	public RollbackProfileElement(Object parent, IInstallableUnit iu) {
++	public RollbackProfileElement(Object parent, String profileId, long timestamp) {
+ 		super(parent);
+-		this.iu = iu;
++		this.timestamp = timestamp;
++		this.profileId = profileId;
+ 	}
+ 
+ 	/*
+@@ -54,94 +49,49 @@ public class RollbackProfileElement extends RemoteQueriedElement implements IIUE
+ 	}
+ 
+ 	public String getLabel(Object o) {
+-		return DateFormat.getInstance().format(new Date(Long.decode(iu.getVersion().getQualifier()).longValue()));
++		return DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.LONG).format(new Date(timestamp));
+ 	}
+ 
+ 	public Object getAdapter(Class adapter) {
+-		if (adapter == IInstallableUnit.class)
+-			return iu;
+ 		if (adapter == IProfile.class)
+ 			try {
+-				return getProfileSnapshot(null);
++				return getProfileSnapshot(new NullProgressMonitor());
+ 			} catch (ProvisionException e) {
+ 				handleException(e, ProvUIMessages.RollbackProfileElement_InvalidSnapshot);
+ 			}
+ 		return super.getAdapter(adapter);
+ 	}
+ 
+-	public IInstallableUnit getIU() {
+-		return iu;
+-	}
+-
+-	public long getSize() {
+-		return SIZE_UNKNOWN;
+-	}
+-
+-	public boolean shouldShowSize() {
+-		return false;
+-	}
+-
+-	public boolean shouldShowVersion() {
+-		return false;
+-	}
+-
+-	public void computeSize(IProgressMonitor monitor) {
+-		// Should never be called, since shouldShowSize() returns false
+-	}
+-
+-	/*
+-	 * (non-Javadoc)
+-	 * @see org.eclipse.equinox.internal.provisional.p2.ui.query.QueriedElement#getDefaultQueryType()
+-	 */
+-	protected int getDefaultQueryType() {
+-		return QueryProvider.INSTALLED_IUS;
+-	}
+-
+-	/*
+-	 * overridden to lazily fetch profile
+-	 * (non-Javadoc)
+-	 * @see org.eclipse.equinox.internal.provisional.p2.ui.query.QueriedElement#getQueryable()
+-	 */
+-	public IQueryable getQueryable() {
+-		if (queryable == null)
+-			try {
+-				queryable = getProfileSnapshot(null);
+-			} catch (ProvisionException e) {
+-				handleException(e, ProvUIMessages.RollbackProfileElement_InvalidSnapshot);
+-			}
+-		return queryable;
+-	}
+-
+ 	public IProfile getProfileSnapshot(IProgressMonitor monitor) throws ProvisionException {
+ 		if (snapshot == null) {
+-			IProfile profile = ProvisioningUtil.getProfile(iu.getId());
+-			snapshot = FormerState.IUToProfile(iu, profile, new ProvisioningContext(), monitor);
++			snapshot = ProvisioningUtil.getProfile(profileId, timestamp);
+ 			setQueryable(snapshot);
+ 		}
+ 		return snapshot;
+ 	}
+ 
+-	/*
+-	 * overridden to check whether snapshot IU is specified rather
+-	 * than loading the profile via getQueryable()
+-	 * (non-Javadoc)
+-	 * @see org.eclipse.equinox.internal.provisional.p2.ui.query.QueriedElement#knowsQueryable()
+-	 */
+-	public boolean knowsQueryable() {
+-		return iu != null;
++	public long getTimestamp() {
++		return timestamp;
+ 	}
+ 
+ 	/* (non-Javadoc)
+-	 * @see org.eclipse.equinox.internal.p2.ui.model.IUElement#getRequirements()
++	 * @see org.eclipse.equinox.internal.p2.ui.model.QueriedElement#getDefaultQueryType()
+ 	 */
+-	public IRequiredCapability[] getRequirements() {
+-		return iu.getRequiredCapabilities();
++	protected int getDefaultQueryType() {
++		return QueryProvider.INSTALLED_IUS;
+ 	}
+ 
+-	/* (non-Javadoc)
+-	 * @see org.eclipse.equinox.internal.p2.ui.model.IIUElement#shouldShowChildren()
++	/*
++	 * The queryable is the profile snapshot
++	 * (non-Javadoc)
++	 * @see org.eclipse.equinox.internal.p2.ui.model.QueriedElement#getQueryable()
+ 	 */
+-	public boolean shouldShowChildren() {
+-		return false;
++	public IQueryable getQueryable() {
++		try {
++			return getProfileSnapshot(new NullProgressMonitor());
++		} catch (ProvisionException e) {
++			handleException(e, null);
++			return null;
++		}
+ 	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RollbackRepositoryElement.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RollbackRepositoryElement.java
+deleted file mode 100644
+index d43cea3..0000000
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/model/RollbackRepositoryElement.java
++++ /dev/null
+@@ -1,32 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.ui.model;
+-
+-import java.net.URI;
+-
+-/**
+- * Element wrapper class for a rollback repository.
+- * 
+- * @since 3.4
+- */
+-public class RollbackRepositoryElement extends MetadataRepositoryElement {
+-
+-	String profileId;
+-
+-	public RollbackRepositoryElement(URI location, String profileId) {
+-		super(null, location);
+-		this.profileId = profileId;
+-	}
+-
+-	public String getProfileId() {
+-		return profileId;
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/query/RollbackIUCollector.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/query/RollbackIUCollector.java
+deleted file mode 100644
+index 38fd773..0000000
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/p2/ui/query/RollbackIUCollector.java
++++ /dev/null
+@@ -1,33 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2007, 2008 IBM Corporation and others.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.equinox.internal.p2.ui.query;
+-
+-import org.eclipse.equinox.internal.p2.ui.model.IIUElement;
+-import org.eclipse.equinox.internal.p2.ui.model.RollbackProfileElement;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+-import org.eclipse.equinox.internal.provisional.p2.query.IQueryable;
+-
+-/**
+- * Collector that examines available IU's and wraps them in an
+- * element representing either a category an IU.
+- *  
+- * @since 3.4
+- */
+-public class RollbackIUCollector extends AvailableIUCollector {
+-
+-	public RollbackIUCollector(IQueryable queryable, Object parent) {
+-		super(queryable, parent, false, true);
+-	}
+-
+-	protected IIUElement makeDefaultElement(IInstallableUnit iu) {
+-		return new RollbackProfileElement(parent, iu);
+-	}
+-}
+diff --git a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
+index 909c99e..a077c8a 100644
+--- a/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
++++ b/bundles/org.eclipse.equinox.p2.ui/src/org/eclipse/equinox/internal/provisional/p2/ui/operations/ProvisioningUtil.java
+@@ -85,14 +85,6 @@ public class ProvisioningUtil {
+ 		return manager.validateRepositoryLocation(location, monitor);
+ 	}
+ 
+-	public static URI getRollbackRepositoryURL() throws ProvisionException {
+-		IDirector director = getDirector();
+-		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IMetadataRepositoryManager.class.getName());
+-		if (manager == null)
+-			throw new ProvisionException(ProvUIMessages.ProvisioningUtil_NoRepositoryManager);
+-		return director.getRollbackRepositoryLocation();
+-	}
+-
+ 	public static void removeMetadataRepository(URI location) throws ProvisionException {
+ 		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IMetadataRepositoryManager.class.getName());
+ 		if (manager == null) {
+@@ -174,6 +166,15 @@ public class ProvisioningUtil {
+ 		return profileRegistry.getProfiles();
+ 	}
+ 
++	public static long[] getProfileTimestamps(String id) throws ProvisionException {
++		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(ProvUIActivator.getContext(), IProfileRegistry.class.getName());
++		if (profileRegistry == null) {
++			throw new ProvisionException(ProvUIMessages.ProvisioningUtil_NoProfileRegistryFound);
++		}
++		return profileRegistry.listProfileTimestamps(id);
++
++	}
++
+ 	public static IProfile getProfile(String id) throws ProvisionException {
+ 		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(ProvUIActivator.getContext(), IProfileRegistry.class.getName());
+ 		if (profileRegistry == null) {
+@@ -182,6 +183,14 @@ public class ProvisioningUtil {
+ 		return profileRegistry.getProfile(id);
+ 	}
+ 
++	public static IProfile getProfile(String id, long timestamp) throws ProvisionException {
++		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(ProvUIActivator.getContext(), IProfileRegistry.class.getName());
++		if (profileRegistry == null) {
++			throw new ProvisionException(ProvUIMessages.ProvisioningUtil_NoProfileRegistryFound);
++		}
++		return profileRegistry.getProfile(id, timestamp);
++	}
++
+ 	public static URI[] getMetadataRepositories(int flags) throws ProvisionException {
+ 		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(ProvUIActivator.getContext(), IMetadataRepositoryManager.class.getName());
+ 		if (manager == null) {
+@@ -232,11 +241,12 @@ public class ProvisioningUtil {
+ 	}
+ 
+ 	/*
+-	 * Get a plan for becoming
++	 * Get a plan for reverting to a specified profile snapshot
+ 	 */
+-	public static ProvisioningPlan getRevertPlan(IInstallableUnit profileIU, IProgressMonitor monitor) throws ProvisionException {
+-		Assert.isNotNull(profileIU);
+-		return getPlanner().getRevertPlan(profileIU, new ProvisioningContext(), monitor);
++	public static ProvisioningPlan getRevertPlan(IProfile currentProfile, IProfile snapshot, IProgressMonitor monitor) throws ProvisionException {
++		Assert.isNotNull(currentProfile);
++		Assert.isNotNull(snapshot);
++		return getPlanner().getRevertPlan(currentProfile, snapshot, new ProvisioningContext(), monitor);
+ 	}
+ 
+ 	/*
+commit b9837c792d28c1a0b13130cc0357c39ad7364c34
+Author: Simon Kaegi <skaegi>
+Date:   Thu Jan 8 23:08:06 2009 +0000
+
+    Bug 247058 [revert] Reading and Writing of rollback repo gets really slow after many updates
+
+0	34	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+0	35	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+3	255	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/rollback/FormerState.java
+2	12	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IDirector.java
+0	2	bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IPlanner.java
+0	180	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
+6	11	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/End2EndTest.java
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+index c1ec73f..19b342c 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimpleDirector.java
+@@ -8,25 +8,20 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.internal.p2.director;
+ 
+-import java.net.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+-import org.eclipse.equinox.internal.p2.rollback.FormerState;
+-import org.eclipse.equinox.internal.provisional.p2.core.location.AgentLocation;
+ import org.eclipse.equinox.internal.provisional.p2.director.*;
+ import org.eclipse.equinox.internal.provisional.p2.engine.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ import org.eclipse.osgi.util.NLS;
+ 
+ public class SimpleDirector implements IDirector {
+-	private static final String ROLLBACK_LOCATION = "rollback"; //$NON-NLS-1$
+ 	static final int PlanWork = 10;
+ 	static final int EngineWork = 100;
+ 	private IEngine engine;
+ 	private IPlanner planner;
+ 
+ 	public SimpleDirector() {
+-		initializeRollbackRepository();
+ 		engine = (IEngine) ServiceHelper.getService(DirectorActivator.context, IEngine.SERVICE_NAME);
+ 		if (engine == null)
+ 			throw new IllegalStateException("Provisioning engine is not registered"); //$NON-NLS-1$
+@@ -35,23 +30,6 @@ public class SimpleDirector implements IDirector {
+ 			throw new IllegalStateException("Unable to find provisioning planner"); //$NON-NLS-1$
+ 	}
+ 
+-	private void initializeRollbackRepository() {
+-		new FormerState(getRollbackRepositoryLocation());
+-	}
+-
+-	public URI getRollbackRepositoryLocation() {
+-		AgentLocation agentLocation = (AgentLocation) ServiceHelper.getService(DirectorActivator.context, AgentLocation.class.getName());
+-		try {
+-			return URIUtil.toURI(new URL(agentLocation.getDataArea(DirectorActivator.PI_DIRECTOR), ROLLBACK_LOCATION));
+-		} catch (MalformedURLException e) {
+-			//we know this can't happen because the above URL is well-formed
+-			return null;
+-		} catch (URISyntaxException e) {
+-			//we know this can't happen because the above URL is well-formed
+-			return null;
+-		}
+-	}
+-
+ 	public IStatus revert(IProfile currentProfile, IProfile revertProfile, ProvisioningContext context, IProgressMonitor monitor) {
+ 		SubMonitor sub = SubMonitor.convert(monitor, Messages.Director_Task_Updating, PlanWork + EngineWork);
+ 		try {
+@@ -65,18 +43,6 @@ public class SimpleDirector implements IDirector {
+ 		}
+ 	}
+ 
+-	public IStatus revert(IInstallableUnit target, IProfile profile, ProvisioningContext context, IProgressMonitor monitor) {
+-		SubMonitor sub = SubMonitor.convert(monitor, Messages.Director_Task_Updating, PlanWork + EngineWork);
+-		try {
+-			ProvisioningPlan plan = planner.getRevertPlan(target, context, sub.newChild(PlanWork));
+-			if (!plan.getStatus().isOK())
+-				return plan.getStatus();
+-			return engine.perform(profile, new DefaultPhaseSet(), plan.getOperands(), context, sub.newChild(EngineWork));
+-		} finally {
+-			sub.done();
+-		}
+-	}
+-
+ 	public IStatus provision(ProfileChangeRequest request, ProvisioningContext context, IProgressMonitor monitor) {
+ 		String taskName = NLS.bind(Messages.Director_Task_Installing, request.getProfile().getProperty(IProfile.PROP_INSTALL_FOLDER));
+ 		SubMonitor sub = SubMonitor.convert(monitor, taskName, PlanWork + EngineWork);
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+index 84d0d95..e269754 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/director/SimplePlanner.java
+@@ -27,7 +27,6 @@ import org.eclipse.equinox.internal.provisional.p2.metadata.query.UpdateQuery;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.query.*;
+-import org.eclipse.osgi.util.NLS;
+ 
+ public class SimplePlanner implements IPlanner {
+ 	private static boolean DEBUG = Tracing.DEBUG_PLANNER_OPERANDS;
+@@ -36,13 +35,6 @@ public class SimplePlanner implements IPlanner {
+ 	private static final String PLANNER_MARKER = "private.org.eclipse.equinox.p2.planner.installed"; //$NON-NLS-1$
+ 	public static final String INCLUSION_RULES = "org.eclipse.equinox.p2.internal.inclusion.rules"; //$NON-NLS-1$
+ 
+-	private IProfile getProfile(String profileId) {
+-		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(DirectorActivator.context, IProfileRegistry.class.getName());
+-		if (profileRegistry == null)
+-			return null;
+-		return profileRegistry.getProfile(profileId);
+-	}
+-
+ 	private ProvisioningPlan generateProvisioningPlan(IStatus status, Collection fromState, Collection toState, ProfileChangeRequest changeRequest) {
+ 		InstallableUnitOperand[] iuOperands = generateOperations(fromState, toState);
+ 		PropertyOperand[] propertyOperands = generatePropertyOperations(changeRequest);
+@@ -157,33 +149,6 @@ public class SimplePlanner implements IPlanner {
+ 		return new OperationGenerator().generateOperation(fromState, toState);
+ 	}
+ 
+-	public ProvisioningPlan getRevertPlan(IInstallableUnit profileSnapshot, ProvisioningContext context, IProgressMonitor monitor) {
+-		SubMonitor sub = SubMonitor.convert(monitor, ExpandWork);
+-		sub.setTaskName(Messages.Director_Task_Resolving_Dependencies);
+-		try {
+-			MultiStatus result = new MultiStatus(DirectorActivator.PI_DIRECTOR, 1, Messages.Director_Revert_Problems, null);
+-
+-			if (!Boolean.valueOf(profileSnapshot.getProperty(IInstallableUnit.PROP_TYPE_PROFILE)).booleanValue()) {
+-				result.add(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, NLS.bind(Messages.Director_Unexpected_IU, profileSnapshot.getId())));
+-				return new ProvisioningPlan(result);
+-			}
+-			IProfile profile = getProfile(profileSnapshot.getId());
+-			if (profile == null) {
+-				result.add(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, NLS.bind(Messages.Director_Unexpected_IU, profileSnapshot.getId())));
+-				return new ProvisioningPlan(result);
+-			}
+-			IProfile revertProfile = FormerState.IUToProfile(profileSnapshot, profile, context, sub.newChild(ExpandWork / 2));
+-
+-			ProfileChangeRequest profileChangeRequest = FormerState.generateProfileDeltaChangeRequest(profile, revertProfile);
+-			return getProvisioningPlan(profileChangeRequest, context, sub.newChild(ExpandWork / 2));
+-
+-		} catch (CoreException e) {
+-			return new ProvisioningPlan(e.getStatus());
+-		} finally {
+-			sub.done();
+-		}
+-	}
+-
+ 	public ProvisioningPlan getRevertPlan(IProfile currentProfile, IProfile revertProfile, ProvisioningContext context, IProgressMonitor monitor) {
+ 		SubMonitor sub = SubMonitor.convert(monitor, ExpandWork);
+ 		sub.setTaskName(Messages.Director_Task_Resolving_Dependencies);
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/rollback/FormerState.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/rollback/FormerState.java
+index 48df3e1..d6ebb9b 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/rollback/FormerState.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/p2/rollback/FormerState.java
+@@ -8,146 +8,17 @@
+  ******************************************************************************/
+ package org.eclipse.equinox.internal.p2.rollback;
+ 
+-import java.net.URI;
+ import java.util.*;
+ import java.util.Map.Entry;
+-import org.eclipse.core.runtime.*;
+-import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+-import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+-import org.eclipse.equinox.internal.p2.director.*;
+-import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+-import org.eclipse.equinox.internal.provisional.p2.core.Version;
+-import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+-import org.eclipse.equinox.internal.provisional.p2.core.eventbus.SynchronousProvisioningListener;
+-import org.eclipse.equinox.internal.provisional.p2.core.repository.IRepository;
++import org.eclipse.equinox.internal.p2.director.SimplePlanner;
+ import org.eclipse.equinox.internal.provisional.p2.director.ProfileChangeRequest;
+-import org.eclipse.equinox.internal.provisional.p2.engine.*;
++import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory.InstallableUnitDescription;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.query.InstallableUnitQuery;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
+-import org.eclipse.equinox.internal.provisional.p2.query.*;
++import org.eclipse.equinox.internal.provisional.p2.query.Collector;
+ 
+ public class FormerState {
+ 
+-	public static final String IUPROP_PREFIX = "---IUPROPERTY---"; //$NON-NLS-1$
+-	public static final String IUPROP_POSTFIX = "---IUPROPERTYKEY---"; //$NON-NLS-1$
+-	private static long lastTimestamp;
+-	URI location = null;
+-
+-	Hashtable generatedIUs = new Hashtable(); //key profile id, value the iu representing this profile
+-
+-	private synchronized static long uniqueTimestamp() {
+-		long timewaited = 0;
+-		long timestamp = System.currentTimeMillis();
+-		while (timestamp == lastTimestamp) {
+-			if (timewaited > 1000)
+-				throw new IllegalStateException("uniquetimestamp failed"); //$NON-NLS-1$
+-			try {
+-				Thread.sleep(10);
+-			} catch (InterruptedException e) {
+-				// reset interrupted status
+-				Thread.currentThread().interrupt();
+-			}
+-			timewaited += 10;
+-			timestamp = System.currentTimeMillis();
+-		}
+-		lastTimestamp = timestamp;
+-		return timestamp;
+-	}
+-
+-	public FormerState(URI repoLocation) {
+-		if (repoLocation == null)
+-			throw new IllegalArgumentException("Repository location can't be null"); //$NON-NLS-1$
+-		IProvisioningEventBus eventBus = (IProvisioningEventBus) ServiceHelper.getService(DirectorActivator.context, IProvisioningEventBus.SERVICE_NAME);
+-		location = repoLocation;
+-
+-		//listen for pre-event. to snapshot the profile
+-		eventBus.addListener(new SynchronousProvisioningListener() {
+-			public void notify(EventObject o) {
+-				if (o instanceof BeginOperationEvent) {
+-					BeginOperationEvent event = (BeginOperationEvent) o;
+-					IInstallableUnit iuForProfile = profileToIU(event.getProfile());
+-					generatedIUs.put(event.getProfile().getProfileId(), iuForProfile);
+-				} else if (o instanceof ProfileEvent) {
+-					ProfileEvent event = (ProfileEvent) o;
+-					if (event.getReason() == ProfileEvent.CHANGED)
+-						getRepository().addInstallableUnits(new IInstallableUnit[] {(IInstallableUnit) generatedIUs.get(event.getProfileId())});
+-					return;
+-				} else if (o instanceof RollbackOperationEvent) {
+-					RollbackOperationEvent event = (RollbackOperationEvent) o;
+-					generatedIUs.remove(event.getProfile().getProfileId());
+-					return;
+-				}
+-				//TODO We need to decide what to do on profile removal				
+-				//				else if (o instanceof ProfileEvent) {
+-				//					ProfileEvent pe = (ProfileEvent) o;
+-				//					if (pe.getReason() == ProfileEvent.REMOVED) {
+-				//						profileRegistries.remove(pe.getProfile().getProfileId());
+-				//						persist();
+-				//					}
+-				//				}
+-			}
+-
+-		});
+-	}
+-
+-	IMetadataRepository getRepository() {
+-		IMetadataRepositoryManager manager = (IMetadataRepositoryManager) ServiceHelper.getService(DirectorActivator.context, IMetadataRepositoryManager.class.getName());
+-		try {
+-			return manager.loadRepository(location, null);
+-		} catch (ProvisionException e) {
+-			//fall through and create a new repository
+-		}
+-		try {
+-			Map properties = new HashMap(1);
+-			properties.put(IRepository.PROP_SYSTEM, Boolean.TRUE.toString());
+-			return manager.createRepository(location, "Agent rollback repository", IMetadataRepositoryManager.TYPE_SIMPLE_REPOSITORY, properties); //$NON-NLS-1$
+-		} catch (ProvisionException e) {
+-			LogHelper.log(e);
+-		}
+-		throw new IllegalStateException("Unable to open or create Agent's rollback repository"); //$NON-NLS-1$
+-	}
+-
+-	public static IInstallableUnit profileToIU(IProfile profile) {
+-		InstallableUnitDescription result = new MetadataFactory.InstallableUnitDescription();
+-		result.setProperty(IInstallableUnit.PROP_TYPE_PROFILE, Boolean.TRUE.toString());
+-		result.setId(profile.getProfileId());
+-		result.setVersion(new Version(0, 0, 0, Long.toString(uniqueTimestamp())));
+-		result.setRequiredCapabilities(IUTransformationHelper.toRequirements(profile.query(InstallableUnitQuery.ANY, new Collector(), null).iterator(), false));
+-		// Save the profile properties
+-		// TODO we aren't marking these properties in any special way to indicate they came from profile properties.  Should we?
+-		Map properties = profile.getProperties();
+-		Iterator iter = properties.keySet().iterator();
+-		while (iter.hasNext()) {
+-			String key = (String) iter.next();
+-			result.setProperty(key, (String) properties.get(key));
+-		}
+-		// Save the IU profile properties
+-		Iterator allIUs = profile.query(InstallableUnitQuery.ANY, new Collector(), null).iterator();
+-		while (allIUs.hasNext()) {
+-			IInstallableUnit iu = (IInstallableUnit) allIUs.next();
+-			properties = profile.getInstallableUnitProperties(iu);
+-			iter = properties.keySet().iterator();
+-			while (iter.hasNext()) {
+-				String key = (String) iter.next();
+-				result.setProperty(IUPROP_PREFIX + iu.getId() + IUPROP_POSTFIX + key, (String) properties.get(key));
+-			}
+-		}
+-		return MetadataFactory.createInstallableUnit(result);
+-	}
+-
+-	public static IProfile IUToProfile(IInstallableUnit profileIU, IProfile profile, ProvisioningContext context, IProgressMonitor monitor) throws ProvisionException {
+-		try {
+-			return new FormerStateProfile(profileIU, profile, context);
+-		} finally {
+-			if (monitor != null)
+-				monitor.done();
+-		}
+-	}
+-
+ 	public static ProfileChangeRequest generateProfileDeltaChangeRequest(IProfile current, IProfile target) {
+ 		ProfileChangeRequest request = new ProfileChangeRequest(current);
+ 
+@@ -235,127 +106,4 @@ public class FormerState {
+ 			request.setProfileProperty(key, value);
+ 		}
+ 	}
+-
+-	public static class FormerStateProfile implements IProfile {
+-
+-		private String profileId;
+-		private HashMap profileProperties = new HashMap();
+-		private HashMap iuProfileProperties = new HashMap();
+-		private Set ius = new HashSet();
+-
+-		public FormerStateProfile(IInstallableUnit profileIU, IProfile profile, ProvisioningContext context) throws ProvisionException {
+-
+-			String profileTypeProperty = profileIU.getProperty(IInstallableUnit.PROP_TYPE_PROFILE);
+-			if (profileTypeProperty == null || !Boolean.valueOf(profileTypeProperty).booleanValue())
+-				throw new ProvisionException(new Status(IStatus.ERROR, DirectorActivator.PI_DIRECTOR, "Not a profile type IU"));
+-
+-			profileId = profileIU.getId();
+-			for (Iterator it = profileIU.getProperties().entrySet().iterator(); it.hasNext();) {
+-				Entry entry = (Entry) it.next();
+-				String key = (String) entry.getKey();
+-				if (key.startsWith(IUPROP_PREFIX)) {
+-					int postIndex = key.indexOf(FormerState.IUPROP_POSTFIX, FormerState.IUPROP_PREFIX.length());
+-					String iuId = key.substring(FormerState.IUPROP_PREFIX.length(), postIndex);
+-					Map iuProperties = (Map) iuProfileProperties.get(iuId);
+-					if (iuProperties == null) {
+-						iuProperties = new HashMap();
+-						iuProfileProperties.put(iuId, iuProperties);
+-					}
+-					String iuPropertyKey = key.substring(postIndex + FormerState.IUPROP_POSTFIX.length());
+-					iuProperties.put(iuPropertyKey, entry.getValue());
+-				} else {
+-					profileProperties.put(key, entry.getValue());
+-				}
+-			}
+-			profileProperties.remove(IInstallableUnit.PROP_TYPE_PROFILE);
+-
+-			List extraIUs = new ArrayList(profile.available(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+-			extraIUs.add(profileIU);
+-
+-			IInstallableUnit[] availableIUs = SimplePlanner.gatherAvailableInstallableUnits((IInstallableUnit[]) extraIUs.toArray(new IInstallableUnit[extraIUs.size()]), context.getMetadataRepositories(), context, new NullProgressMonitor());
+-
+-			Dictionary snapshotSelectionContext = SimplePlanner.createSelectionContext(profileProperties);
+-			IInstallableUnit[] allIUs = new IInstallableUnit[] {profileIU};
+-			Slicer slicer = new Slicer(allIUs, availableIUs, snapshotSelectionContext);
+-			IQueryable slice = slicer.slice(allIUs, new NullProgressMonitor());
+-			if (slice == null)
+-				throw new ProvisionException(slicer.getStatus());
+-
+-			Projector projector = new Projector(slice, snapshotSelectionContext);
+-			projector.encode(allIUs, new NullProgressMonitor());
+-			IStatus s = projector.invokeSolver(new NullProgressMonitor());
+-
+-			if (s.getSeverity() == IStatus.ERROR) {
+-				//log the error from the new solver so it is not lost
+-				LogHelper.log(s);
+-				//We invoke the old resolver to get explanations for now
+-				IStatus oldResolverStatus = new NewDependencyExpander(allIUs, null, availableIUs, snapshotSelectionContext, false).expand(new NullProgressMonitor());
+-				if (!oldResolverStatus.isOK())
+-					s = oldResolverStatus;
+-				throw new ProvisionException(s);
+-			}
+-			ius.addAll(projector.extractSolution());
+-			ius.remove(profileIU);
+-		}
+-
+-		public Map getInstallableUnitProperties(IInstallableUnit iu) {
+-			Map iuProperties = (Map) iuProfileProperties.get(iu.getId());
+-			if (iuProperties == null) {
+-				return Collections.EMPTY_MAP;
+-			}
+-			return Collections.unmodifiableMap(iuProperties);
+-		}
+-
+-		public String getInstallableUnitProperty(IInstallableUnit iu, String key) {
+-			return (String) getInstallableUnitProperties(iu).get(key);
+-		}
+-
+-		public Map getLocalProperties() {
+-			return Collections.unmodifiableMap(profileProperties);
+-		}
+-
+-		public String getLocalProperty(String key) {
+-			return (String) profileProperties.get(key);
+-		}
+-
+-		public IProfile getParentProfile() {
+-			return null;
+-		}
+-
+-		public String getProfileId() {
+-			return profileId;
+-		}
+-
+-		public Map getProperties() {
+-			return Collections.unmodifiableMap(profileProperties);
+-		}
+-
+-		public String getProperty(String key) {
+-			return (String) profileProperties.get(key);
+-		}
+-
+-		public String[] getSubProfileIds() {
+-			return null;
+-		}
+-
+-		public long getTimestamp() {
+-			return 0;
+-		}
+-
+-		public boolean hasSubProfiles() {
+-			return false;
+-		}
+-
+-		public boolean isRootProfile() {
+-			return true;
+-		}
+-
+-		public Collector query(Query query, Collector collector, IProgressMonitor monitor) {
+-			return query.perform(ius.iterator(), collector);
+-		}
+-
+-		public Collector available(Query query, Collector collector, IProgressMonitor monitor) {
+-			return query(query, collector, monitor);
+-		}
+-	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IDirector.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IDirector.java
+index 06d7b80..e47a2ed 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IDirector.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IDirector.java
+@@ -10,12 +10,10 @@
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.provisional.p2.director;
+ 
+-import java.net.URI;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.equinox.internal.provisional.p2.engine.IProfile;
+ import org.eclipse.equinox.internal.provisional.p2.engine.ProvisioningContext;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ 
+ /**
+  * Directors are responsible for determining what should be done to a given 
+@@ -40,21 +38,13 @@ public interface IDirector {
+ 	public IStatus provision(ProfileChangeRequest profileChangeRequest, ProvisioningContext context, IProgressMonitor monitor);
+ 
+ 	/**
+-	 * Reverts the profile to a previous state described in the give InstallableUnit.
++	 * Reverts the profile to a previous state described in the target revertProfile.
+ 	 * 
+-	 * @param previous The installable unit that describes the previous state of the profile
+ 	 * @param profile The profile to revert
++	 * @param revertProfile The profile snapshot state to revert to
+ 	 * @param context The provisioning context used for finding resources
+ 	 * @param monitor a progress monitor, or <code>null</code> if progress
+ 	 *    reporting is not desired
+ 	 */
+-	public IStatus revert(IInstallableUnit previous, IProfile profile, ProvisioningContext context, IProgressMonitor monitor);
+-
+-	/**
+-	 * Returns the location of the director's rollback repository, where information about
+-	 * previous profile states is stored.
+-	 */
+-	public URI getRollbackRepositoryLocation();
+-
+ 	public IStatus revert(IProfile profile, IProfile revertProfile, ProvisioningContext context, IProgressMonitor monitor);
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IPlanner.java b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IPlanner.java
+index 7a34fde..5d197e0 100644
+--- a/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IPlanner.java
++++ b/bundles/org.eclipse.equinox.p2.director/src/org/eclipse/equinox/internal/provisional/p2/director/IPlanner.java
+@@ -25,8 +25,6 @@ import org.eclipse.equinox.internal.provisional.p2.metadata.IInstallableUnit;
+ public interface IPlanner {
+ 	public ProvisioningPlan getProvisioningPlan(ProfileChangeRequest profileChangeRequest, ProvisioningContext context, IProgressMonitor monitor);
+ 
+-	public ProvisioningPlan getRevertPlan(IInstallableUnit profileSnapshot, ProvisioningContext context, IProgressMonitor monitor);
+-
+ 	public IInstallableUnit[] updatesFor(IInstallableUnit toUpdate, ProvisioningContext context, IProgressMonitor monitor);
+ 
+ 	public ProvisioningPlan getRevertPlan(IProfile currentProfile, IProfile revertProfile, ProvisioningContext context, IProgressMonitor monitor);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
+index 19b49d9..a983237 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/director/RollbackTest.java
+@@ -75,57 +75,6 @@ public class RollbackTest extends AbstractProvisioningTest {
+ 		}
+ 	}
+ 
+-	private void assertEmptyRollbackRepo() {
+-		try {
+-			IMetadataRepository rollbackRepo = getRollbackRepository();
+-			IInstallableUnit[] ius = (IInstallableUnit[]) rollbackRepo.query(InstallableUnitQuery.ANY, new Collector(), null).toArray(IInstallableUnit.class);
+-			assertEquals("0.01", 0, ius.length);
+-		} catch (ProvisionException e) {
+-			return;
+-		}
+-	}
+-
+-	public void testOLDRollbackProfileProperties() throws ProvisionException {
+-		assertEmptyRollbackRepo();
+-
+-		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
+-		request1.setProfileProperty("test1", "test");
+-		request1.setProfileProperty("test2", "test");
+-		IStatus status = director.provision(request1, null, new NullProgressMonitor());
+-		assertEquals("1.0", IStatus.OK, status.getCode());
+-		assertEquals("2.0", "test", profile.getProperty("test1"));
+-		assertEquals("3.0", "test", profile.getProperty("test2"));
+-
+-		IInstallableUnit[] ius = (IInstallableUnit[]) getRollbackRepository().query(InstallableUnitQuery.ANY, new Collector(), null).toArray(IInstallableUnit.class);
+-		assertEquals("4.0", 1, ius.length);
+-		IInstallableUnit emptyProfileIU = ius[0];
+-
+-		ProfileChangeRequest request2 = new ProfileChangeRequest(profile);
+-		request2.removeProfileProperty("test1");
+-		request2.setProfileProperty("test2", "bad");
+-		request2.setProfileProperty("test3", "test");
+-		status = director.provision(request2, null, new NullProgressMonitor());
+-		assertEquals("5.0", IStatus.OK, status.getCode());
+-		assertEquals("6.0", null, profile.getProperty("test1"));
+-		assertEquals("7.0", "bad", profile.getProperty("test2"));
+-		assertEquals("8.0", "test", profile.getProperty("test3"));
+-
+-		ius = (IInstallableUnit[]) getRollbackRepository().query(InstallableUnitQuery.ANY, new Collector(), null).toArray(IInstallableUnit.class);
+-		assertEquals("9.0", 2, ius.length);
+-
+-		IInstallableUnit revertProfileIU = null;
+-		for (int i = 0; i < ius.length; i++) {
+-			if (!ius[i].equals(emptyProfileIU))
+-				revertProfileIU = ius[i];
+-		}
+-
+-		status = director.revert(revertProfileIU, profile, new ProvisioningContext(), new NullProgressMonitor());
+-		assertEquals("10.0", IStatus.OK, status.getCode());
+-		assertEquals("11.0", "test", profile.getProperty("test1"));
+-		assertEquals("12.0", "test", profile.getProperty("test2"));
+-		assertEquals("13.0", null, profile.getProperty("test3"));
+-	}
+-
+ 	public void testRollbackProfileProperties() {
+ 		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(TestActivator.getContext(), IProfileRegistry.class.getName());
+ 
+@@ -160,52 +109,6 @@ public class RollbackTest extends AbstractProvisioningTest {
+ 		assertEquals("13.0", null, profile.getProperty("test3"));
+ 	}
+ 
+-	public void testOLDRollbackIUs() throws ProvisionException {
+-		assertEmptyRollbackRepo();
+-
+-		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
+-		request1.addInstallableUnits(new IInstallableUnit[] {a1});
+-		request1.addInstallableUnits(new IInstallableUnit[] {b1});
+-		IStatus status = director.provision(request1, null, new NullProgressMonitor());
+-		assertEquals("1.0", IStatus.OK, status.getCode());
+-
+-		List profileIUs = new ArrayList(profile.query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+-		assertTrue("2.0", profileIUs.contains(a1));
+-		assertTrue("3.0", profileIUs.contains(b1));
+-
+-		IInstallableUnit[] ius = (IInstallableUnit[]) getRollbackRepository().query(InstallableUnitQuery.ANY, new Collector(), null).toArray(IInstallableUnit.class);
+-		assertEquals("4.0", 1, ius.length);
+-		IInstallableUnit emptyProfileIU = ius[0];
+-
+-		ProfileChangeRequest request2 = new ProfileChangeRequest(profile);
+-		request2.removeInstallableUnits(new IInstallableUnit[] {a1});
+-		request2.addInstallableUnits(new IInstallableUnit[] {c1});
+-		status = director.provision(request2, null, new NullProgressMonitor());
+-		assertEquals("5.0", IStatus.OK, status.getCode());
+-
+-		profileIUs = new ArrayList(profile.query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+-		assertFalse("6.0", profileIUs.contains(a1));
+-		assertTrue("7.0", profileIUs.contains(b1));
+-		assertTrue("8.0", profileIUs.contains(c1));
+-
+-		ius = (IInstallableUnit[]) getRollbackRepository().query(InstallableUnitQuery.ANY, new Collector(), null).toArray(IInstallableUnit.class);
+-		assertEquals("9.0", 2, ius.length);
+-
+-		IInstallableUnit revertProfileIU = null;
+-		for (int i = 0; i < ius.length; i++) {
+-			if (!ius[i].equals(emptyProfileIU))
+-				revertProfileIU = ius[i];
+-		}
+-
+-		status = director.revert(revertProfileIU, profile, new ProvisioningContext(), new NullProgressMonitor());
+-		assertEquals("10.0", IStatus.OK, status.getCode());
+-
+-		profileIUs = new ArrayList(profile.query(InstallableUnitQuery.ANY, new Collector(), null).toCollection());
+-		assertTrue("11.0", profileIUs.contains(a1));
+-		assertTrue("12.0", profileIUs.contains(b1));
+-		assertFalse("13.0", profileIUs.contains(c1));
+-	}
+-
+ 	public void testRollbackIUs() {
+ 		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(TestActivator.getContext(), IProfileRegistry.class.getName());
+ 
+@@ -245,46 +148,6 @@ public class RollbackTest extends AbstractProvisioningTest {
+ 		assertFalse("13.0", profileIUs.contains(c1));
+ 	}
+ 
+-	public void testOLDRollbackIUProfileProperties() throws ProvisionException {
+-		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
+-		request1.addInstallableUnits(new IInstallableUnit[] {a1});
+-		request1.setInstallableUnitProfileProperty(a1, "test1", "test");
+-		request1.setInstallableUnitProfileProperty(a1, "test2", "test");
+-		IStatus status = director.provision(request1, null, new NullProgressMonitor());
+-		assertEquals("1.0", IStatus.OK, status.getCode());
+-		assertEquals("2.0", "test", profile.getInstallableUnitProperty(a1, "test1"));
+-		assertEquals("3.0", "test", profile.getInstallableUnitProperty(a1, "test2"));
+-
+-		IInstallableUnit[] ius = (IInstallableUnit[]) getRollbackRepository().query(InstallableUnitQuery.ANY, new Collector(), null).toArray(IInstallableUnit.class);
+-		assertEquals("4.0", 1, ius.length);
+-		IInstallableUnit emptyProfileIU = ius[0];
+-
+-		ProfileChangeRequest request2 = new ProfileChangeRequest(profile);
+-		request2.removeInstallableUnitProfileProperty(a1, "test1");
+-		request2.setInstallableUnitProfileProperty(a1, "test2", "bad");
+-		request2.setInstallableUnitProfileProperty(a1, "test3", "test");
+-		status = director.provision(request2, null, new NullProgressMonitor());
+-		assertEquals("5.0", IStatus.OK, status.getCode());
+-		assertEquals("6.0", null, profile.getInstallableUnitProperty(a1, "test1"));
+-		assertEquals("7.0", "bad", profile.getInstallableUnitProperty(a1, "test2"));
+-		assertEquals("8.0", "test", profile.getInstallableUnitProperty(a1, "test3"));
+-
+-		ius = (IInstallableUnit[]) getRollbackRepository().query(InstallableUnitQuery.ANY, new Collector(), null).toArray(IInstallableUnit.class);
+-		assertEquals("9.0", 2, ius.length);
+-
+-		IInstallableUnit revertProfileIU = null;
+-		for (int i = 0; i < ius.length; i++) {
+-			if (!ius[i].equals(emptyProfileIU))
+-				revertProfileIU = ius[i];
+-		}
+-
+-		status = director.revert(revertProfileIU, profile, new ProvisioningContext(), new NullProgressMonitor());
+-		assertEquals("10.0", IStatus.OK, status.getCode());
+-		assertEquals("11.0", "test", profile.getInstallableUnitProperty(a1, "test1"));
+-		assertEquals("12.0", "test", profile.getInstallableUnitProperty(a1, "test2"));
+-		assertEquals("13.0", null, profile.getInstallableUnitProperty(a1, "test3"));
+-	}
+-
+ 	public void testRollbackIUProfileProperties() {
+ 		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(TestActivator.getContext(), IProfileRegistry.class.getName());
+ 
+@@ -320,49 +183,6 @@ public class RollbackTest extends AbstractProvisioningTest {
+ 		assertEquals("13.0", null, profile.getInstallableUnitProperty(a1, "test3"));
+ 	}
+ 
+-	public void testOLDRollbackDependentIUProfileProperties() throws ProvisionException {
+-		assertEmptyRollbackRepo();
+-
+-		ProfileChangeRequest request1 = new ProfileChangeRequest(profile);
+-		request1.addInstallableUnits(new IInstallableUnit[] {d1});
+-		request1.setInstallableUnitProfileProperty(d1, "test1", "test");
+-		request1.setInstallableUnitProfileProperty(a1, "test2", "test");
+-		IStatus status = director.provision(request1, null, new NullProgressMonitor());
+-		assertEquals("1.0", IStatus.OK, status.getCode());
+-		assertEquals("2.0", "test", profile.getInstallableUnitProperty(d1, "test1"));
+-		assertEquals("3.0", "test", profile.getInstallableUnitProperty(a1, "test2"));
+-
+-		IInstallableUnit[] ius = (IInstallableUnit[]) getRollbackRepository().query(InstallableUnitQuery.ANY, new Collector(), null).toArray(IInstallableUnit.class);
+-		assertEquals("4.0", 1, ius.length);
+-		IInstallableUnit emptyProfileIU = ius[0];
+-
+-		ProfileChangeRequest request2 = new ProfileChangeRequest(profile);
+-		request2.removeInstallableUnits(new IInstallableUnit[] {d1});
+-		request2.addInstallableUnits(new IInstallableUnit[] {b1});
+-		request2.setInstallableUnitProfileProperty(b1, "test3", "test");
+-
+-		status = director.provision(request2, null, new NullProgressMonitor());
+-		assertEquals("5.0", IStatus.OK, status.getCode());
+-		assertEquals("6.0", null, profile.getInstallableUnitProperty(d1, "test1"));
+-		assertEquals("7.0", null, profile.getInstallableUnitProperty(a1, "test2"));
+-		assertEquals("8.0", "test", profile.getInstallableUnitProperty(b1, "test3"));
+-
+-		ius = (IInstallableUnit[]) getRollbackRepository().query(InstallableUnitQuery.ANY, new Collector(), null).toArray(IInstallableUnit.class);
+-		assertEquals("9.0", 2, ius.length);
+-
+-		IInstallableUnit revertProfileIU = null;
+-		for (int i = 0; i < ius.length; i++) {
+-			if (!ius[i].equals(emptyProfileIU))
+-				revertProfileIU = ius[i];
+-		}
+-
+-		status = director.revert(revertProfileIU, profile, new ProvisioningContext(), new NullProgressMonitor());
+-		assertEquals("10.0", IStatus.OK, status.getCode());
+-		assertEquals("11.0", "test", profile.getInstallableUnitProperty(d1, "test1"));
+-		assertEquals("12.0", "test", profile.getInstallableUnitProperty(a1, "test2"));
+-		assertEquals("13.0", null, profile.getInstallableUnitProperty(b1, "test3"));
+-	}
+-
+ 	public void testRollbackDependentIUProfileProperties() {
+ 		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(TestActivator.getContext(), IProfileRegistry.class.getName());
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/End2EndTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/End2EndTest.java
+index 8c298c1..130b3e5 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/End2EndTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/full/End2EndTest.java
+@@ -16,7 +16,6 @@ import java.util.*;
+ import org.eclipse.core.runtime.*;
+ import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
+-import org.eclipse.equinox.internal.p2.director.app.LatestIUVersionCollector;
+ import org.eclipse.equinox.internal.provisional.frameworkadmin.*;
+ import org.eclipse.equinox.internal.provisional.p2.artifact.repository.IArtifactRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.core.ProvisionException;
+@@ -27,7 +26,6 @@ import org.eclipse.equinox.internal.provisional.p2.engine.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.*;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.MetadataFactory.InstallableUnitDescription;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.query.InstallableUnitQuery;
+-import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepository;
+ import org.eclipse.equinox.internal.provisional.p2.metadata.repository.IMetadataRepositoryManager;
+ import org.eclipse.equinox.internal.provisional.p2.query.Collector;
+ import org.eclipse.equinox.p2.tests.AbstractProvisioningTest;
+@@ -133,16 +131,13 @@ public class End2EndTest extends AbstractProvisioningTest {
+ 	}
+ 
+ 	private void rollbackPlatformSource(IProfile profile2, File installFolder) {
+-		IMetadataRepository rollbackRepo = null;
+-		try {
+-			rollbackRepo = metadataRepoManager.loadRepository(director.getRollbackRepositoryLocation(), new NullProgressMonitor());
+-		} catch (ProvisionException e) {
+-			fail("Can't find rollback repository");
+-		}
+-		Collector collector = rollbackRepo.query(new InstallableUnitQuery(profile2.getProfileId()), new LatestIUVersionCollector(), new NullProgressMonitor());
+-		assertEquals(1, collector.size());
++		IProfileRegistry profileRegistry = (IProfileRegistry) ServiceHelper.getService(TestActivator.getContext(), IProfileRegistry.class.getName());
++		long[] timestamps = profileRegistry.listProfileTimestamps(profile2.getProfileId());
++		assertEquals(3, timestamps.length);
++
++		IProfile revertProfile = profileRegistry.getProfile(profile2.getProfileId(), timestamps[1]);
+ 
+-		IStatus s = director.revert((IInstallableUnit) collector.iterator().next(), profile2, new ProvisioningContext(), new NullProgressMonitor());
++		IStatus s = director.revert(profile2, revertProfile, new ProvisioningContext(), new NullProgressMonitor());
+ 		assertTrue(s.isOK());
+ 
+ 		validateInstallContentFor34(installFolder);

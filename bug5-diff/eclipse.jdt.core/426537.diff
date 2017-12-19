@@ -1,0 +1,875 @@
+commit 2d053de9651cebac3cf0a82f4012b7196ccb5c83
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sun Feb 16 02:49:50 2014 +0100
+
+    Bug 426537 - [1.8][inference] Eclipse compiler thinks I<? super J> is
+    compatible with I<J<?>> - raw type J involved
+
+84	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+3	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+12	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+9	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+9	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+index c81555c..5dc7c59 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest_1_8.java
+@@ -2631,4 +2631,88 @@ public void testBug429424() {
+ 			"\n"
+ 		});
+ }
++public void _testBug426537() {
++	runNegativeTest(
++		new String[] {
++			"X.java",
++			"public class X {\n" + 
++			"	void foo(J[] list, I<J<?>> i) {\n" + 
++			"		sort(list, i);\n" + 
++			"	}\n" + 
++			"	\n" + 
++			"	<T> T[] sort(T[] list, I<? super T> i) {\n" + 
++			"		return list;\n" + 
++			"	}\n" + 
++			"}\n" + 
++			"interface I<T> {}\n" + 
++			"interface J<T> {}\n"
++		},
++		"----------\n" + 
++		"1. WARNING in X.java (at line 2)\n" + 
++		"	void foo(J[] list, I<J<?>> i) {\n" + 
++		"	         ^\n" + 
++		"J is a raw type. References to generic type J<T> should be parameterized\n" + 
++		"----------\n" + 
++		"2. ERROR in X.java (at line 3)\n" + 
++		"	sort(list, i);\n" + 
++		"	^^^^\n" + 
++		"The method sort(T[], I<? super T>) in the type X is not applicable for the arguments (J[], I<J<?>>)\n" + 
++		"----------\n");
++}
++public void testBug426537b() {
++	runConformTest(
++		new String[] {
++			"Test.java",
++			"interface C<T, A, R> {}\n" + 
++			"\n" + 
++			"class MImpl<K, V> {}\n" + 
++			"\n" + 
++			"interface S<T> { T get(); }\n" + 
++			"\n" + 
++			"public class Test {\n" + 
++			"	static <T, K, D> C<T, ?, MImpl<K, D>> m1() {\n" + 
++			"        return m2(MImpl::new);\n" + 
++			"    }\n" + 
++			"    \n" + 
++			"    static <T, K, D, M extends MImpl<K, D>> C<T, ?, M> m2(S<M> s) {\n" + 
++			"    	return null;\n" + 
++			"    }\n" + 
++			"}\n" + 
++			"\n"
++		});
++}
++public void testBug426537c() {
++	// touching MImpl#RAW before type inference we got undesired results from #typeArguments() 
++	runConformTest(
++		new String[] {
++			"Ups.java",
++			"public class Ups {\n" + 
++			"    static Object innocent(MImpl o) {\n" + 
++			"            return o.remove(\"nice\");\n" + // method lookup triggers initialization of the RawTypeBinding.
++			"    }\n" + 
++			"}\n",
++			"Test.java",
++			"interface S<T> { T get(); }\n" + 
++			"interface F<T, R> { R apply(T t); }\n" + 
++			"interface C<T, A, R> { }\n" + 
++			"interface IM<K,V> {}\n" + 
++			"class MImpl<K,V>  implements IM<K,V> { \n" + 
++			"	public V remove(Object key) { return null; } \n" + 
++			"}\n" + 
++			"public final class Test {\n" + 
++			"\n" + 
++			"    static <T, K, A, D>\n" + 
++			"    C<T, ?, IM<K, D>> m1(F<? super T, ? extends K> f, C<? super T, A, D> c) {\n" + 
++			"        return m2(f, MImpl::new, c);\n" + 
++			"    }\n" + 
++			"\n" + 
++			"    static <T, K, D, A, M extends IM<K, D>>\n" + 
++			"    C<T, ?, M> m2(F<? super T, ? extends K> classifier,\n" + 
++			"                                  S<M> mapFactory,\n" + 
++			"                                  C<? super T, A, D> downstream) {\n" + 
++			"    	return null;\n" + 
++			"    }\n" + 
++			"}\n"
++		});
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+index 8da7ce5..6c7dd23 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/ReferenceExpression.java
+@@ -29,6 +29,7 @@
+  *							Bug 427438 - [1.8][compiler] NPE at org.eclipse.jdt.internal.compiler.ast.ConditionalExpression.generateCode(ConditionalExpression.java:280)
+  *							Bug 428264 - [1.8] method reference of generic class causes problems (wrong inference result or NPE)
+  *							Bug 392238 - [1.8][compiler][null] Detect semantically invalid null type annotations
++ *							Bug 426537 - [1.8][inference] Eclipse compiler thinks I<? super J> is compatible with I<J<?>> - raw type J involved
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contribution for
+  *                          Bug 383624 - [1.8][compiler] Revive code generation support for type annotations (from Olivier's work)
+  *******************************************************************************/
+@@ -381,7 +382,8 @@ public class ReferenceExpression extends FunctionalExpression implements Invocat
+     	}
+ 
+     	if (this.expectedType == null && this.expressionContext == INVOCATION_CONTEXT) {
+-    		this.exactMethodBinding = isMethodReference() ? scope.getExactMethod(lhsType, this.selector, this) : scope.getExactConstructor(lhsType, this);
++    		if (lhsType != null && !lhsType.isRawType()) // RawType::m and RawType::new are not exact method references
++    			this.exactMethodBinding = isMethodReference() ? scope.getExactMethod(lhsType, this.selector, this) : scope.getExactConstructor(lhsType, this);
+     		return new PolyTypeBinding(this);
+ 		}
+ 		super.resolveType(scope);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+index a32a7af..e62ffc6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintExpressionFormula.java
+@@ -207,7 +207,7 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 									|| exprType.isCompatibleWith(r)))
+ 								return FALSE;
+ 						} else {
+-							result.add(new ConstraintExpressionFormula(expr, r, COMPATIBLE));
++							result.add(new ConstraintExpressionFormula(expr, r, COMPATIBLE, this.isSoft));
+ 						}
+ 					}
+ 				}
+@@ -302,7 +302,9 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 			MethodBinding original = compileTimeDecl.original();
+ 			if (reference.typeArguments == null
+ 					&& ((original.typeVariables() != Binding.NO_TYPE_VARIABLES && r.mentionsAny(original.typeVariables(), -1))
+-						|| (original.isConstructor() && original.declaringClass.typeVariables() != Binding.NO_TYPE_VARIABLES && r.mentionsAny(original.declaringClass.typeVariables(), -1)))) 
++						|| (original.isConstructor() && original.declaringClass.typeVariables() != Binding.NO_TYPE_VARIABLES)))
++							// not checking r.mentionsAny for constructors, because A::new resolves to the raw type
++							// whereas in fact the type of all expressions of this shape depends on their type variable (if any)
+ 			{
+ 				SuspendedInferenceRecord prevInvocation = inferenceContext.enterPolyInvocation(reference, null/*no invocation arguments available*/);
+ 
+@@ -311,7 +313,11 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 					inferInvocationApplicability(inferenceContext, original, functionType.parameters, original.isConstructor()/*mimic a diamond?*/, inferenceContext.inferenceKind);
+ 					if (!inferPolyInvocationType(inferenceContext, reference, r, original))
+ 						return FALSE;
+-					return null; // already incorporated
++					if (!original.isConstructor() 
++							|| reference.receiverType.isRawType()  // note: rawtypes may/may not have typeArguments() depending on initialization state
++							|| reference.receiverType.typeArguments() == null)
++						return null; // already incorporated
++					// for Foo<Bar>::new we need to (illegally) add one more constraint below to get to the Bar
+ 				} catch (InferenceFailureException e) {
+ 					return FALSE;
+ 				} finally {
+@@ -398,7 +404,9 @@ class ConstraintExpressionFormula extends ConstraintFormula {
+ 						toResolve = true;
+ 				}
+ 				if (toResolve) {
+-					BoundSet solution = inferenceContext.solve(); // TODO: minimal resolving for only α
++					BoundSet solution = inferenceContext.solve(new InferenceVariable[]{alpha});
++					if (solution == null)
++						return false;
+ 					TypeBinding u = solution.getInstantiation(alpha, null).capture(inferenceContext.scope, invocationSite.sourceStart()); // TODO make position unique?
+ 					ConstraintTypeFormula newConstraint = ConstraintTypeFormula.create(u, targetType, COMPATIBLE);
+ 					return inferenceContext.reduceAndIncorporate(newConstraint);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+index 78254da..9c53717 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ConstraintTypeFormula.java
+@@ -306,7 +306,15 @@ class ConstraintTypeFormula extends ConstraintFormula {
+ 				}
+ 				return FALSE;
+ 			case Binding.INTERSECTION_TYPE:
+-				InferenceContext18.missingImplementation("NYI"); //$NON-NLS-1$
++				superCandidate = ((WildcardBinding) superCandidate).allBounds();
++				//$FALL-THROUGH$
++			case Binding.INTERSECTION_CAST_TYPE:
++				TypeBinding[] intersectingTypes = ((IntersectionCastTypeBinding) superCandidate).intersectingTypes;
++				ConstraintFormula[] result = new ConstraintFormula[intersectingTypes.length];
++				for (int i = 0; i < intersectingTypes.length; i++) {
++					result[i] = ConstraintTypeFormula.create(subCandidate, intersectingTypes[i], SUBTYPE, this.isSoft);
++				}
++				return result;
+ 		}
+ 		throw new IllegalStateException("Unexpected RHS "+superCandidate); //$NON-NLS-1$
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index fb0dcf1..b6484d0 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -858,6 +858,15 @@ public class InferenceContext18 {
+ 
+ 		return resolve(this.inferenceVariables);
+ 	}
++	
++	public /*@Nullable*/ BoundSet solve(InferenceVariable[] toResolve) throws InferenceFailureException {
++		if (!reduce())
++			return null;
++		if (!this.currentBounds.incorporate(this))
++			return null;
++
++		return resolve(toResolve);
++	}
+ 
+ 	/**
+ 	 * JLS 18.2. reduce all initial constraints 
+commit a570286b736c470e3a8d4706cda3b67517e91cfc
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Sat Mar 8 19:16:06 2014 +0530
+
+    Partial fix for Bug 426537 - [1.8][inference] Eclipse compiler thinks
+    I<? super J> is compatible with I<J<?>> - raw type J involved
+
+1	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/BatchCompilerTest.java
+195	2	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+45	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+11	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/CompilerOptions.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/BatchCompilerTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/BatchCompilerTest.java
+index 668eb3b..831d36a 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/BatchCompilerTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/BatchCompilerTest.java
+@@ -1913,6 +1913,7 @@ public void test012b(){
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.emulateJavacBug8031744\" value=\"enabled\"/>\n" +
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.generateClassFiles\" value=\"enabled\"/>\n" + 
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.maxProblemPerUnit\" value=\"100\"/>\n" + 
++			"		<option key=\"org.eclipse.jdt.core.compiler.postResolutionRawTypeCompatibilityCheck\" value=\"enabled\"/>\n" +
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.problem.annotationSuperInterface\" value=\"warning\"/>\n" + 
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.problem.assertIdentifier\" value=\"warning\"/>\n" + 
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.problem.autoboxing\" value=\"ignore\"/>\n" + 
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+index 8cdcacb..52a569e 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+@@ -4261,7 +4261,7 @@ public void testBug428366() {
+ 		"Zork cannot be resolved to a type\n" + 
+ 		"----------\n");
+ }
+-// https://bugs.eclipse.org/bugs/show_bug.cgi?id=429733, [1.8][bytecode] Bad type on operand stack
++//https://bugs.eclipse.org/bugs/show_bug.cgi?id=429733, [1.8][bytecode] Bad type on operand stack
+ public void test429733() {
+ 	if (this.complianceLevel < ClassFileConstants.JDK1_7)
+ 		return; // uses diamond.
+@@ -4285,7 +4285,7 @@ public void test429733() {
+ 		},
+ 		"1.1");
+ }
+-// https://bugs.eclipse.org/bugs/show_bug.cgi?id=429733, [1.8][bytecode] Bad type on operand stack
++//https://bugs.eclipse.org/bugs/show_bug.cgi?id=429733, [1.8][bytecode] Bad type on operand stack
+ public void test429733a() {
+ 	if (this.complianceLevel < ClassFileConstants.JDK1_7)
+ 		return; // uses diamond.
+@@ -4348,5 +4348,198 @@ public void test429733c() {
+ 		},
+ 		"1.1");
+ }
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=426537,  [1.8][inference] Eclipse compiler thinks I<? super J> is compatible with I<J<?>> - raw type J involved 
++public void testBug426537() { // non generic case
++	runNegativeTest(
++		new String[] {
++			"X.java",
++			"public class X {\n" +
++			"	void foo(J[] list, I<J<?>> i) {\n" +
++			"		sort(list, i);\n" +
++			"	}\n" +
++			"	J[] sort(J[] list, I<? super J> i) {\n" +
++			"		return list;\n" +
++			"	}\n" +
++			"}\n" +
++			"interface I<T> {}\n" +
++			"interface J<T> {}\n"
++		},
++		"----------\n" + 
++		"1. WARNING in X.java (at line 2)\n" + 
++		"	void foo(J[] list, I<J<?>> i) {\n" + 
++		"	         ^\n" + 
++		"J is a raw type. References to generic type J<T> should be parameterized\n" + 
++		"----------\n" + 
++		"2. ERROR in X.java (at line 3)\n" + 
++		"	sort(list, i);\n" + 
++		"	^^^^\n" + 
++		"The method sort(J[], I<? super J>) in the type X is not applicable for the arguments (J[], I<J<?>>)\n" + 
++		"----------\n" + 
++		"3. WARNING in X.java (at line 5)\n" + 
++		"	J[] sort(J[] list, I<? super J> i) {\n" + 
++		"	^\n" + 
++		"J is a raw type. References to generic type J<T> should be parameterized\n" + 
++		"----------\n" + 
++		"4. WARNING in X.java (at line 5)\n" + 
++		"	J[] sort(J[] list, I<? super J> i) {\n" + 
++		"	         ^\n" + 
++		"J is a raw type. References to generic type J<T> should be parameterized\n" + 
++		"----------\n" + 
++		"5. WARNING in X.java (at line 5)\n" + 
++		"	J[] sort(J[] list, I<? super J> i) {\n" + 
++		"	                             ^\n" + 
++		"J is a raw type. References to generic type J<T> should be parameterized\n" + 
++		"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=426537,  [1.8][inference] Eclipse compiler thinks I<? super J> is compatible with I<J<?>> - raw type J involved 
++public void testBug426537_generic() {
++	runNegativeTest(
++		new String[] {
++			"X.java",
++			"public class X {\n" +
++			"	void foo(J[] list, I<J<?>> i) {\n" +
++			"		sort(list, i);\n" +
++			"	}\n" +
++			"	<T> T[] sort(T[] list, I<? super T> i) {\n" +
++			"		return list;\n" +
++			"	}\n" +
++			"}\n" +
++			"interface I<T> {}\n" +
++			"interface J<T> {}\n"
++		},
++		"----------\n" + 
++		"1. WARNING in X.java (at line 2)\n" + 
++		"	void foo(J[] list, I<J<?>> i) {\n" + 
++		"	         ^\n" + 
++		"J is a raw type. References to generic type J<T> should be parameterized\n" + 
++		"----------\n" + 
++		"2. ERROR in X.java (at line 3)\n" + 
++		"	sort(list, i);\n" + 
++		"	^^^^\n" + 
++		"The method sort(T[], I<? super T>) in the type X is not applicable for the arguments (J[], I<J<?>>)\n" + 
++		"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=427957, [1.8] Type inference incorrect when a wildcard is missing 
++public void testBug427957() {
++	runNegativeTest(
++		new String[] {
++			"X.java",
++			"public class X {\n" +
++			"    <T> void sort(T[] a, I<? super T> c) { }\n" +
++			"    void foo(I[] e, I<I<?>> comp) {\n" +
++			"        sort(e, comp);\n" +
++			"    }\n" +
++			"}\n" +
++			"interface I<T> {}\n"
++		},
++		"----------\n" + 
++		"1. WARNING in X.java (at line 3)\n" + 
++		"	void foo(I[] e, I<I<?>> comp) {\n" + 
++		"	         ^\n" + 
++		"I is a raw type. References to generic type I<T> should be parameterized\n" + 
++		"----------\n" + 
++		"2. ERROR in X.java (at line 4)\n" + 
++		"	sort(e, comp);\n" + 
++		"	^^^^\n" + 
++		"The method sort(T[], I<? super T>) in the type X is not applicable for the arguments (I[], I<I<?>>)\n" + 
++		"----------\n");
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=427957, [1.8] Type inference incorrect when a wildcard is missing 
++public void testBug427957a() { // verify escape hatch works.
++	if (this.complianceLevel < ClassFileConstants.JDK1_8)  
++		return;
++	Map customOptions = getCompilerOptions();
++	customOptions.put(CompilerOptions.OPTION_PostResolutionRawTypeCompatibilityCheck, CompilerOptions.DISABLED);
++	runNegativeTest(
++		new String[] {
++			"X.java",
++			"public class X {\n" +
++			"    <T> void sort(T[] a, I<? super T> c) { }\n" +
++			"    void foo(I[] e, I<I<?>> comp) {\n" +
++			"        sort(e, comp);\n" +
++			"    }\n" +
++			"}\n" +
++			"interface I<T> {}\n"
++		},
++		"----------\n" + 
++		"1. WARNING in X.java (at line 3)\n" + 
++		"	void foo(I[] e, I<I<?>> comp) {\n" + 
++		"	         ^\n" + 
++		"I is a raw type. References to generic type I<T> should be parameterized\n" + 
++		"----------\n", null, true, customOptions);
++}
++// https://bugs.eclipse.org/bugs/show_bug.cgi?id=427992,  [1.8] compiler difference to javac involving a raw array
++public void test427992() {
++	if (this.complianceLevel < ClassFileConstants.JDK1_6)
++		return; // uses @Override
++	runNegativeTest(
++		new String[] {
++			"X.java",
++			"import static org.junit.Assert.assertArrayEquals;\n" +
++			"import java.util.Arrays;\n" +
++			"import org.junit.Test;\n" +
++			"public class X {\n" +
++			"  @Test(expected = IllegalArgumentException.class)\n" +
++			"  public void shouldThrowExceptionWhenClassesAreNotInSameInheritanceTree() {\n" +
++			"    Arrays.sort(new Class[] {Chimp.class, Cat.class}, ClassInheritanceDepthComparator.INSTANCE);\n" +
++			"  }\n" +
++			"  public static class Animal {\n" +
++			"  }\n" +
++			"  public static class Monkey extends Animal {\n" +
++			"  }\n" +
++			"  public static class Chimp extends Monkey {\n" +
++			"  }\n" +
++			"  public static class Cat extends Animal {\n" +
++			"  }\n" +
++			"public static class ClassInheritanceDepthComparator implements Comparator<Class<?>> {\n" +
++			"  public static final ClassInheritanceDepthComparator INSTANCE = new ClassInheritanceDepthComparator();\n" +
++			"  @Override\n" +
++			"  public int compare(Class<?> c1, Class<?> c2) {\n" +
++			"    if(c1.equals(c2)) {\n" +
++			"      return 0;\n" +
++			"    }\n" +
++			"    if(c1.isAssignableFrom(c2)) {\n" +
++			"      return -1;\n" +
++			"    }\n" +
++			"    if(c2.isAssignableFrom(c1)) {\n" +
++			"      return 1;\n" +
++			"    }\n" +
++			"    throw new IllegalArgumentException(\"classes to compare must be in the same inheritance tree: \" + c1 + \"; \" + c2);\n" +
++			"  }\n" +
++			"}\n" +
++			"}\n"
++		},
++		"----------\n" + 
++		"1. ERROR in X.java (at line 1)\n" + 
++		"	import static org.junit.Assert.assertArrayEquals;\n" + 
++		"	              ^^^^^^^^^\n" + 
++		"The import org.junit cannot be resolved\n" + 
++		"----------\n" + 
++		"2. ERROR in X.java (at line 3)\n" + 
++		"	import org.junit.Test;\n" + 
++		"	       ^^^^^^^^^\n" + 
++		"The import org.junit cannot be resolved\n" + 
++		"----------\n" + 
++		"3. ERROR in X.java (at line 5)\n" + 
++		"	@Test(expected = IllegalArgumentException.class)\n" + 
++		"	 ^^^^\n" + 
++		"Test cannot be resolved to a type\n" + 
++		"----------\n" + 
++		"4. ERROR in X.java (at line 7)\n" + 
++		"	Arrays.sort(new Class[] {Chimp.class, Cat.class}, ClassInheritanceDepthComparator.INSTANCE);\n" + 
++		"	       ^^^^\n" + 
++		"The method sort(T[], Comparator<? super T>) in the type Arrays is not applicable for the arguments (Class[], X.ClassInheritanceDepthComparator)\n" + 
++		"----------\n" + 
++		"5. ERROR in X.java (at line 17)\n" + 
++		"	public static class ClassInheritanceDepthComparator implements Comparator<Class<?>> {\n" + 
++		"	                                                               ^^^^^^^^^^\n" + 
++		"Comparator cannot be resolved to a type\n" + 
++		"----------\n" + 
++		"6. ERROR in X.java (at line 20)\n" + 
++		"	public int compare(Class<?> c1, Class<?> c2) {\n" + 
++		"	           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" + 
++		"The method compare(Class<?>, Class<?>) of type X.ClassInheritanceDepthComparator must override or implement a supertype method\n" + 
++		"----------\n");
++}
+ }
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index c48f280..2cd3ff7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -868,6 +868,51 @@ protected void findMethodBinding(BlockScope scope, TypeBinding[] argumentTypes)
+ 			? scope.getImplicitMethod(this.selector, argumentTypes, this)
+ 			: scope.getMethod(this.actualReceiverType, this.selector, argumentTypes, this);
+ 	resolvePolyExpressionArguments(this, this.binding, argumentTypes, scope);
++	
++	/* There are embedded assumptions in the JLS8 type inference scheme that a successful solution of the type equations results in an
++	   applicable method. This appears to be a tenuous assumption, at least one not made by the JLS7 engine or the reference compiler and 
++	   there are cases where this assumption would appear invalid: See https://bugs.eclipse.org/bugs/show_bug.cgi?id=426537, where we allow 
++	   certain compatibility constrains around raw types to be violated. 
++       
++       Here, we filter out such inapplicable methods with raw type usage that may have sneaked past overload resolution and type inference, 
++       playing the devils advocate, blaming the invocations with raw arguments that should not go blameless. At this time this is in the 
++       nature of a point fix and is not a general solution which needs to come later (that also includes AE, QAE and ECC)
++    */
++	final CompilerOptions compilerOptions = scope.compilerOptions();
++	if (compilerOptions.sourceLevel >= ClassFileConstants.JDK1_8 && this.binding instanceof ParameterizedGenericMethodBinding && this.binding.isValidBinding()) {
++		if (!compilerOptions.postResolutionRawTypeCompatibilityCheck)
++			return;
++		ParameterizedGenericMethodBinding pgmb = (ParameterizedGenericMethodBinding) this.binding;
++		InferenceContext18 ctx = getInferenceContext(pgmb);
++		if (ctx == null || ctx.stepCompleted < InferenceContext18.BINDINGS_UPDATED)
++			return;
++		int length = pgmb.typeArguments == null ? 0 : pgmb.typeArguments.length;
++		boolean sawRawType = false;
++		for (int i = 0;  i < length; i++) {
++			/* Must check compatibility against capture free method. Formal parameters cannot have captures, but our machinery is not up to snuff to
++			   construct a PGMB without captures at the moment - for one thing ITCB does not support uncapture() yet, for another, INTERSECTION_CAST_TYPE
++			   does not appear fully hooked up into isCompatibleWith and isEquivalent to everywhere. At the moment, bail out if we see capture.
++			*/   
++			if (pgmb.typeArguments[i].isCapture())
++				return;
++			if (pgmb.typeArguments[i].isRawType())
++				sawRawType = true;
++		}
++		if (!sawRawType)
++			return;
++		length = this.arguments == null ? 0 : this.arguments.length;
++		if (length == 0)
++			return;
++		TypeBinding [] finalArgumentTypes = new TypeBinding[length];
++		for (int i = 0; i < length; i++) {
++			TypeBinding finalArgumentType = this.arguments[i].resolvedType;
++			if (finalArgumentType == null || !finalArgumentType.isValidBinding())  // already sided with the devil.
++				return;
++			finalArgumentTypes[i] = finalArgumentType; 
++		}
++		if (scope.parameterCompatibilityLevel(this.binding, finalArgumentTypes, false) == Scope.NOT_COMPATIBLE)
++			this.binding = new ProblemMethodBinding(this.binding.original(), this.binding.selector, finalArgumentTypes, ProblemReasons.NotFound);
++	}
+ }
+ 
+ @Override
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/CompilerOptions.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/CompilerOptions.java
+index 548717e..bcdb628 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/CompilerOptions.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/CompilerOptions.java
+@@ -150,6 +150,7 @@ public class CompilerOptions {
+ 	// OPTION_Store_Annotations: undocumented option for testing purposes
+ 	public static final String OPTION_Store_Annotations = "org.eclipse.jdt.core.compiler.storeAnnotations"; //$NON-NLS-1$
+ 	public static final String OPTION_EmulateJavacBug8031744 = "org.eclipse.jdt.core.compiler.emulateJavacBug8031744"; //$NON-NLS-1$
++	public static final String OPTION_PostResolutionRawTypeCompatibilityCheck = "org.eclipse.jdt.core.compiler.postResolutionRawTypeCompatibilityCheck"; //$NON-NLS-1$
+ 	public static final String OPTION_ReportRedundantSuperinterface =  "org.eclipse.jdt.core.compiler.problem.redundantSuperinterface"; //$NON-NLS-1$
+ 	public static final String OPTION_ReportComparingIdentical =  "org.eclipse.jdt.core.compiler.problem.comparingIdentical"; //$NON-NLS-1$
+ 	public static final String OPTION_ReportMissingSynchronizedOnInheritedMethod =  "org.eclipse.jdt.core.compiler.problem.missingSynchronizedOnInheritedMethod"; //$NON-NLS-1$
+@@ -412,6 +413,8 @@ public class CompilerOptions {
+ 	public boolean processAnnotations;
+ 	/** Store annotations */
+ 	public boolean storeAnnotations;
++	/** extra check for raw type compatibility post overload resolution */
++	public boolean postResolutionRawTypeCompatibilityCheck = true;
+ 	/** Specify if need to report missing override annotation for a method implementing an interface method (java 1.6 and above)*/
+ 	public boolean reportMissingOverrideAnnotationForInterfaceMethodImplementation;
+ 	/** Indicate if annotation processing generates classfiles */
+@@ -1137,6 +1140,7 @@ public class CompilerOptions {
+ 		optionsMap.put(OPTION_Process_Annotations, this.processAnnotations ? ENABLED : DISABLED);
+ 		optionsMap.put(OPTION_Store_Annotations, this.storeAnnotations ? ENABLED : DISABLED);
+ 		optionsMap.put(OPTION_EmulateJavacBug8031744, this.emulateJavacBug8031744 ? ENABLED : DISABLED);
++		optionsMap.put(OPTION_PostResolutionRawTypeCompatibilityCheck, this.postResolutionRawTypeCompatibilityCheck ? ENABLED : DISABLED);
+ 		optionsMap.put(OPTION_ReportRedundantSuperinterface, getSeverityString(RedundantSuperinterface));
+ 		optionsMap.put(OPTION_ReportComparingIdentical, getSeverityString(ComparingIdentical));
+ 		optionsMap.put(OPTION_ReportMissingSynchronizedOnInheritedMethod, getSeverityString(MissingSynchronizedModifierInInheritedMethod));
+@@ -1812,6 +1816,13 @@ public class CompilerOptions {
+ 				this.emulateJavacBug8031744 = false;
+ 			}
+ 		}
++		if ((optionValue = optionsMap.get(OPTION_PostResolutionRawTypeCompatibilityCheck)) != null) {
++			if (ENABLED.equals(optionValue)) {
++				this.postResolutionRawTypeCompatibilityCheck = true;
++			} else if (DISABLED.equals(optionValue)) {
++				this.postResolutionRawTypeCompatibilityCheck = false;
++			}
++		}
+ 		if ((optionValue = optionsMap.get(OPTION_ReportUninternedIdentityComparison)) != null) {
+ 			if (ENABLED.equals(optionValue)) {
+ 				this.complainOnUninternedIdentityComparison = true;
+commit fff3d1bb7cd12822df70202db7e6a801aeeb63a2
+Author: ssankaran <srikanth_sankaran@in.ibm.com>
+Date:   Sun Nov 2 10:37:29 2014 +0530
+
+    Fixed Bug 426537 - [1.8][inference] Eclipse compiler thinks I<? super J>
+    is compatible with I<J<?>> - raw type J involved
+
+0	1	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/BatchCompilerTest.java
+0	24	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+21	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+0	41	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+0	11	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/CompilerOptions.java
+9	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/AnnotatableTypeSystem.java
+27	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+5	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+4	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeSystem.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/BatchCompilerTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/BatchCompilerTest.java
+index 0e9ba73..0593e57 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/BatchCompilerTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/BatchCompilerTest.java
+@@ -1909,7 +1909,6 @@ public void test012b(){
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.emulateJavacBug8031744\" value=\"enabled\"/>\n" +
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.generateClassFiles\" value=\"enabled\"/>\n" + 
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.maxProblemPerUnit\" value=\"100\"/>\n" + 
+-			"		<option key=\"org.eclipse.jdt.core.compiler.postResolutionRawTypeCompatibilityCheck\" value=\"enabled\"/>\n" +
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.problem.annotationSuperInterface\" value=\"warning\"/>\n" + 
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.problem.assertIdentifier\" value=\"warning\"/>\n" + 
+ 			"		<option key=\"org.eclipse.jdt.core.compiler.problem.autoboxing\" value=\"ignore\"/>\n" + 
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+index 29762ff..5484a1a 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/GenericsRegressionTest.java
+@@ -4444,30 +4444,6 @@ public void testBug427957() {
+ 		"The method sort(T[], I<? super T>) in the type X is not applicable for the arguments (I[], I<I<?>>)\n" + 
+ 		"----------\n");
+ }
+-// https://bugs.eclipse.org/bugs/show_bug.cgi?id=427957, [1.8] Type inference incorrect when a wildcard is missing 
+-public void testBug427957a() { // verify escape hatch works.
+-	if (this.complianceLevel < ClassFileConstants.JDK1_8)  
+-		return;
+-	Map customOptions = getCompilerOptions();
+-	customOptions.put(CompilerOptions.OPTION_PostResolutionRawTypeCompatibilityCheck, CompilerOptions.DISABLED);
+-	runNegativeTest(
+-		new String[] {
+-			"X.java",
+-			"public class X {\n" +
+-			"    <T> void sort(T[] a, I<? super T> c) { }\n" +
+-			"    void foo(I[] e, I<I<?>> comp) {\n" +
+-			"        sort(e, comp);\n" +
+-			"    }\n" +
+-			"}\n" +
+-			"interface I<T> {}\n"
+-		},
+-		"----------\n" + 
+-		"1. WARNING in X.java (at line 3)\n" + 
+-		"	void foo(I[] e, I<I<?>> comp) {\n" + 
+-		"	         ^\n" + 
+-		"I is a raw type. References to generic type I<T> should be parameterized\n" + 
+-		"----------\n", null, true, customOptions);
+-}
+ // https://bugs.eclipse.org/bugs/show_bug.cgi?id=427992,  [1.8] compiler difference to javac involving a raw array
+ public void test427992() {
+ 	if (this.complianceLevel < ClassFileConstants.JDK1_6)
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+index 4d3ea1c..ff3ae0f 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+@@ -6871,4 +6871,25 @@ public void test445669() {
+ 		"Null type mismatch: required \'@NonNull Z\' but the provided value is null\n" + 
+ 		"----------\n");
+ }
++public void testArrayOfArrays() {
++	this.runNegativeTestWithLibs(
++		new String[] {
++			"X.java",
++			"import java.util.ArrayList;\n" +
++			"import java.util.Arrays;\n" +
++			"import org.eclipse.jdt.annotation.*;\n" +
++			"public class X {\n" +
++			"   public static void main(String[] args) {\n" +
++			"      String [] @Nullable [] @NonNull [] arr = new String[][][] {};\n" +
++			"      ArrayList<String[][]> al = new ArrayList<String [][]>(Arrays.asList(arr));\n" +
++			"   }\n" +
++			"}\n",
++		},
++		"----------\n" + 
++		"1. WARNING in X.java (at line 6)\n" + 
++		"	String [] @Nullable [] @NonNull [] arr = new String[][][] {};\n" + 
++		"	                                         ^^^^^^^^^^^^^^^^^^^\n" + 
++		"Null type safety (type annotations): The expression of type \'String[][][]\' needs unchecked conversion to conform to \'String [] @Nullable[] @NonNull[]\'\n" + 
++		"----------\n");
++}
+ }
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+index 72952f8..268d4c3 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/MessageSend.java
+@@ -880,47 +880,6 @@ protected TypeBinding findMethodBinding(BlockScope scope) {
+ 	
+ 	resolvePolyExpressionArguments(this, this.binding, this.argumentTypes, scope);
+ 	
+-	/* There are embedded assumptions in the JLS8 type inference scheme that a successful solution of the type equations results in an
+-	   applicable method. This appears to be a tenuous assumption, at least one not made by the JLS7 engine or the reference compiler and 
+-	   there are cases where this assumption would appear invalid: See https://bugs.eclipse.org/bugs/show_bug.cgi?id=426537, where we allow 
+-	   certain compatibility constrains around raw types to be violated. 
+-       
+-       Here, we filter out such inapplicable methods with raw type usage that may have sneaked past overload resolution and type inference, 
+-       playing the devils advocate, blaming the invocations with raw arguments that should not go blameless. At this time this is in the 
+-       nature of a point fix and is not a general solution which needs to come later (that also includes AE, QAE and ECC)
+-    */
+-	final CompilerOptions compilerOptions = scope.compilerOptions();
+-	if (compilerOptions.sourceLevel >= ClassFileConstants.JDK1_8 && this.binding instanceof ParameterizedGenericMethodBinding && this.binding.isValidBinding()) {
+-		if (!compilerOptions.postResolutionRawTypeCompatibilityCheck)
+-			return this.binding.returnType;
+-		ParameterizedGenericMethodBinding pgmb = (ParameterizedGenericMethodBinding) this.binding;
+-		int length = pgmb.typeArguments == null ? 0 : pgmb.typeArguments.length;
+-		boolean sawRawType = false;
+-		for (int i = 0;  i < length; i++) {
+-			/* Must check compatibility against capture free method. Formal parameters cannot have captures, but our machinery is not up to snuff to
+-			   construct a PGMB without captures at the moment - for one thing ITCB does not support uncapture() yet, for another, INTERSECTION_CAST_TYPE
+-			   does not appear fully hooked up into isCompatibleWith and isEquivalent to everywhere. At the moment, bail out if we see capture.
+-			*/   
+-			if (pgmb.typeArguments[i].isCapture())
+-				return this.binding.returnType;
+-			if (pgmb.typeArguments[i].isRawType())
+-				sawRawType = true;
+-		}
+-		if (!sawRawType)
+-			return this.binding.returnType;
+-		length = this.arguments == null ? 0 : this.arguments.length;
+-		if (length == 0)
+-			return this.binding.returnType;
+-		TypeBinding [] finalArgumentTypes = new TypeBinding[length];
+-		for (int i = 0; i < length; i++) {
+-			TypeBinding finalArgumentType = this.arguments[i].resolvedType;
+-			if (finalArgumentType == null || !finalArgumentType.isValidBinding())  // already sided with the devil.
+-				return this.binding.returnType;
+-			finalArgumentTypes[i] = finalArgumentType; 
+-		}
+-		if (scope.parameterCompatibilityLevel(this.binding, finalArgumentTypes, false) == Scope.NOT_COMPATIBLE)
+-			this.binding = new ProblemMethodBinding(this.binding.original(), this.binding.selector, finalArgumentTypes, ProblemReasons.NotFound);
+-	}
+ 	return this.binding.returnType;
+ }
+ 
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/CompilerOptions.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/CompilerOptions.java
+index 596b01d..e85734b 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/CompilerOptions.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/impl/CompilerOptions.java
+@@ -146,7 +146,6 @@ public class CompilerOptions {
+ 	// OPTION_Store_Annotations: undocumented option for testing purposes
+ 	public static final String OPTION_Store_Annotations = "org.eclipse.jdt.core.compiler.storeAnnotations"; //$NON-NLS-1$
+ 	public static final String OPTION_EmulateJavacBug8031744 = "org.eclipse.jdt.core.compiler.emulateJavacBug8031744"; //$NON-NLS-1$
+-	public static final String OPTION_PostResolutionRawTypeCompatibilityCheck = "org.eclipse.jdt.core.compiler.postResolutionRawTypeCompatibilityCheck"; //$NON-NLS-1$
+ 	public static final String OPTION_ReportRedundantSuperinterface =  "org.eclipse.jdt.core.compiler.problem.redundantSuperinterface"; //$NON-NLS-1$
+ 	public static final String OPTION_ReportComparingIdentical =  "org.eclipse.jdt.core.compiler.problem.comparingIdentical"; //$NON-NLS-1$
+ 	public static final String OPTION_ReportMissingSynchronizedOnInheritedMethod =  "org.eclipse.jdt.core.compiler.problem.missingSynchronizedOnInheritedMethod"; //$NON-NLS-1$
+@@ -409,8 +408,6 @@ public class CompilerOptions {
+ 	public boolean processAnnotations;
+ 	/** Store annotations */
+ 	public boolean storeAnnotations;
+-	/** extra check for raw type compatibility post overload resolution */
+-	public boolean postResolutionRawTypeCompatibilityCheck = true;
+ 	/** Specify if need to report missing override annotation for a method implementing an interface method (java 1.6 and above)*/
+ 	public boolean reportMissingOverrideAnnotationForInterfaceMethodImplementation;
+ 	/** Indicate if annotation processing generates classfiles */
+@@ -1136,7 +1133,6 @@ public class CompilerOptions {
+ 		optionsMap.put(OPTION_Process_Annotations, this.processAnnotations ? ENABLED : DISABLED);
+ 		optionsMap.put(OPTION_Store_Annotations, this.storeAnnotations ? ENABLED : DISABLED);
+ 		optionsMap.put(OPTION_EmulateJavacBug8031744, this.emulateJavacBug8031744 ? ENABLED : DISABLED);
+-		optionsMap.put(OPTION_PostResolutionRawTypeCompatibilityCheck, this.postResolutionRawTypeCompatibilityCheck ? ENABLED : DISABLED);
+ 		optionsMap.put(OPTION_ReportRedundantSuperinterface, getSeverityString(RedundantSuperinterface));
+ 		optionsMap.put(OPTION_ReportComparingIdentical, getSeverityString(ComparingIdentical));
+ 		optionsMap.put(OPTION_ReportMissingSynchronizedOnInheritedMethod, getSeverityString(MissingSynchronizedModifierInInheritedMethod));
+@@ -1812,13 +1808,6 @@ public class CompilerOptions {
+ 				this.emulateJavacBug8031744 = false;
+ 			}
+ 		}
+-		if ((optionValue = optionsMap.get(OPTION_PostResolutionRawTypeCompatibilityCheck)) != null) {
+-			if (ENABLED.equals(optionValue)) {
+-				this.postResolutionRawTypeCompatibilityCheck = true;
+-			} else if (DISABLED.equals(optionValue)) {
+-				this.postResolutionRawTypeCompatibilityCheck = false;
+-			}
+-		}
+ 		if ((optionValue = optionsMap.get(OPTION_ReportUninternedIdentityComparison)) != null) {
+ 			if (ENABLED.equals(optionValue)) {
+ 				this.complainOnUninternedIdentityComparison = true;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/AnnotatableTypeSystem.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/AnnotatableTypeSystem.java
+index d588c51..fc0bc74 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/AnnotatableTypeSystem.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/AnnotatableTypeSystem.java
+@@ -65,7 +65,15 @@ public class AnnotatableTypeSystem extends TypeSystem {
+ 	   type later.
+ 	*/
+ 	public ArrayBinding getArrayType(TypeBinding leafType, int dimensions, AnnotationBinding [] annotations) {
+-		
++		if (leafType instanceof ArrayBinding) { // substitution attempts can cause this, don't create array of arrays.
++			dimensions += leafType.dimensions();
++			AnnotationBinding[] leafAnnotations = leafType.getTypeAnnotations();
++			leafType = leafType.leafComponentType();
++			AnnotationBinding [] allAnnotations = new AnnotationBinding[leafAnnotations.length + annotations.length + 1];
++			System.arraycopy(annotations, 0, allAnnotations, 0, annotations.length);
++			System.arraycopy(leafAnnotations, 0, allAnnotations, annotations.length + 1 /* leave a null */, leafAnnotations.length);
++			annotations = allAnnotations;
++		}
+ 		ArrayBinding nakedType = null;
+ 		TypeBinding[] derivedTypes = getDerivedTypes(leafType);
+ 		for (int i = 0, length = derivedTypes.length; i < length; i++) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+index 30cee15..41ba454 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/InferenceContext18.java
+@@ -130,8 +130,11 @@ public class InferenceContext18 {
+ 	InferenceVariable[] inferenceVariables;
+ 	/** Number of inference variables. */
+ 	int variableCount = 0;
++
+ 	/** Constraints that have not yet been reduced and incorporated. */
+ 	ConstraintFormula[] initialConstraints;
++	ConstraintExpressionFormula[] finalConstraints; // for final revalidation at a "macroscopic" level
++
+ 	/** The accumulated type bounds etc. */
+ 	BoundSet currentBounds;
+ 
+@@ -239,13 +242,16 @@ public class InferenceContext18 {
+ 		int len = checkVararg ? parameters.length - 1 : Math.min(parameters.length, this.invocationArguments.length);
+ 		int maxConstraints = checkVararg ? this.invocationArguments.length : len;
+ 		int numConstraints = 0;
++		boolean ownConstraints;
+ 		if (this.initialConstraints == null) {
+ 			this.initialConstraints = new ConstraintFormula[maxConstraints];
++			ownConstraints = true;
+ 		} else {
+ 			numConstraints = this.initialConstraints.length;
+ 			maxConstraints += numConstraints;
+ 			System.arraycopy(this.initialConstraints, 0,
+ 					this.initialConstraints=new ConstraintFormula[maxConstraints], 0, numConstraints);
++			ownConstraints = false; // these are lifted from a nested poly expression.
+ 		}
+ 		for (int i = 0; i < len; i++) {
+ 			if (this.invocationArguments[i].isPertinentToApplicability(parameters[i], method)) {
+@@ -266,6 +272,10 @@ public class InferenceContext18 {
+ 			this.initialConstraints = ConstraintFormula.NO_CONSTRAINTS;
+ 		else if (numConstraints < maxConstraints)
+ 			System.arraycopy(this.initialConstraints, 0, this.initialConstraints = new ConstraintFormula[numConstraints], 0, numConstraints);
++		if (ownConstraints) { // lifted constraints get validated at their own context.
++			final int length = this.initialConstraints.length;
++			System.arraycopy(this.initialConstraints, 0, this.finalConstraints = new ConstraintExpressionFormula[length], 0, length);
++		}
+ 	}
+ 
+ 	private InferenceVariable[] addInitialTypeVariableSubstitutions(TypeBinding[] typeVariables) {
+@@ -785,6 +795,7 @@ public class InferenceContext18 {
+ 	 * @throws InferenceFailureException a compile error has been detected during inference
+ 	 */
+ 	public /*@Nullable*/ BoundSet solve(boolean inferringApplicability) throws InferenceFailureException {
++
+ 		if (!reduce())
+ 			return null;
+ 		if (!this.currentBounds.incorporate(this))
+@@ -792,7 +803,22 @@ public class InferenceContext18 {
+ 		if (inferringApplicability)
+ 			this.b2 = this.currentBounds.copy(); // Preserve the result after reduction, without effects of resolve() for later use in invocation type inference.
+ 
+-		return resolve(this.inferenceVariables);
++		BoundSet solution = resolve(this.inferenceVariables);
++		
++		/* If inferring applicability make a final pass over the initial constraints preserved as final constraints to make sure they hold true at a macroscopic level.
++		   See https://bugs.eclipse.org/bugs/show_bug.cgi?id=426537#c55 onwards.
++		*/
++		if (inferringApplicability && solution != null && this.finalConstraints != null) {
++			for (ConstraintExpressionFormula constraint: this.finalConstraints) {
++				if (constraint.left.isPolyExpression())
++					continue; // avoid redundant re-inference, inner poly's own constraints get validated in its own context & poly invocation type inference proved compatibility against target. 
++				constraint.applySubstitution(solution, this.inferenceVariables);
++				if (!this.currentBounds.reduceOneConstraint(this, constraint)) {
++					return null;
++				}
++			}
++		}
++		return solution;
+ 	}
+ 	
+ 	public /*@Nullable*/ BoundSet solve() throws InferenceFailureException {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+index 971ad86..ce588c5 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/Scope.java
+@@ -4605,6 +4605,11 @@ public abstract class Scope {
+ 					TypeBinding shallowParameter = InferenceContext18.getParameter(shallowOriginal.parameters, i, context.isVarArgs());
+ 					if (shallowParameter.isPertinentToApplicability(argument, shallowOriginal))
+ 						return NOT_COMPATIBLE;
++					
++					/* We ask the inverted question here, because we do want to check compatibility against lambdas and reference expressions that are not pertinent to
++					  applicability on account of being type elided and not being an exact method reference respectively i.e if we call 
++					  argument.isPertinentToApplicability(shallowParameter, shallowOriginal), it will answer true if type elided and we will miss catching incompatibilities.
++					*/ 
+ 				}
+ 			}
+ 			switch (inferenceKind) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeSystem.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeSystem.java
+index 91fb137..e9bd89d 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeSystem.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/TypeSystem.java
+@@ -202,6 +202,10 @@ public class TypeSystem {
+ 	   See ArrayBinding.swapUnresolved for further special case handling if incoming leafType is a URB that would resolve to a raw type later.
+ 	*/ 
+ 	public ArrayBinding getArrayType(TypeBinding leafType, int dimensions) {
++		if  (leafType instanceof ArrayBinding) {
++			dimensions += leafType.dimensions();
++			leafType = leafType.leafComponentType();
++		}
+ 		TypeBinding unannotatedLeafType = getUnannotatedType(leafType);
+ 		TypeBinding[] derivedTypes = this.types[unannotatedLeafType.id];
+ 		int i, length = derivedTypes.length;

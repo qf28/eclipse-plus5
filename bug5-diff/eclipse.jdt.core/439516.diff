@@ -1,0 +1,512 @@
+commit 63231f253dc3aaae18caf57a7f77da85f8cefe96
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Mon Jul 14 12:40:07 2014 +0200
+
+    Bug 439516 - [1.8][null] NonNullByDefault wrongly applied to implicit
+    type bound of binary type
+
+25	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+23	9	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/NonNullDefaultAwareTypeAnnotationWalker.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/TypeAnnotationWalker.java
+4	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
+10	9	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+index 376b52d..ae505e7 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+@@ -5383,6 +5383,31 @@ public void testTypeVariable7err() {
+ 		"Null type safety (type annotations): The expression of type \'String\' needs unchecked conversion to conform to \'@NonNull String\'\n" + 
+ 		"----------\n");
+ }
++// Bug 439516 - [1.8][null] NonNullByDefault wrongly applied to implicit type bound of binary type
++public void testTypeVariable10() {
++	runConformTestWithLibs(
++		new String[] {
++			"X.java",
++			"@org.eclipse.jdt.annotation.NonNullByDefault\n" +
++			"public class X<T> {\n" +
++			"	void test(T t) {}\n" +
++			"}\n"
++		},
++		getCompilerOptions(),
++		"");
++	runConformTestWithLibs(
++		false, 
++		new String[] {
++			"Y.java",
++			"public class Y {\n" +
++			"	void foo(X<@org.eclipse.jdt.annotation.Nullable String> xs) {\n" +
++			"		xs.test(null);\n" +
++			"	}\n" +
++			"}\n"
++		}, 
++		getCompilerOptions(), 
++		"");
++}
+ public void testBug434600() {
+ 	runConformTestWithLibs(
+ 		new String[] {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/NonNullDefaultAwareTypeAnnotationWalker.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/NonNullDefaultAwareTypeAnnotationWalker.java
+index fd8105b..cac02c8 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/NonNullDefaultAwareTypeAnnotationWalker.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/NonNullDefaultAwareTypeAnnotationWalker.java
+@@ -16,6 +16,7 @@ import org.eclipse.jdt.internal.compiler.env.IBinaryElementValuePair;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryTypeAnnotation;
+ import org.eclipse.jdt.internal.compiler.lookup.Binding;
+ import org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment;
++import org.eclipse.jdt.internal.compiler.lookup.TypeIds;
+ 
+ /**
+  * A type annotation walker that adds missing NonNull annotations according to the current default.
+@@ -25,6 +26,8 @@ public class NonNullDefaultAwareTypeAnnotationWalker extends TypeAnnotationWalke
+ 	private int defaultNullness;
+ 	private boolean atDefaultLocation;
+ 	private boolean nextIsDefaultLocation;
++	private boolean atTypeBound;
++	private boolean nextIsTypeBound;
+ 	private boolean isEmpty;
+ 	IBinaryAnnotation nonNullAnnotation;
+ 
+@@ -38,24 +41,26 @@ public class NonNullDefaultAwareTypeAnnotationWalker extends TypeAnnotationWalke
+ 	
+ 	/** Create an initial walker without 'real' type annotations, but with a nonnull default. */
+ 	public NonNullDefaultAwareTypeAnnotationWalker(int defaultNullness, LookupEnvironment environment) {
+-		this(defaultNullness, getNonNullAnnotation(environment), false);
++		this(defaultNullness, getNonNullAnnotation(environment), false, false);
+ 	}
+ 
+ 	/** Get restricted walker, still with non-empty type annotations. */
+ 	NonNullDefaultAwareTypeAnnotationWalker(IBinaryTypeAnnotation[] typeAnnotations, long newMatches, int newPathPtr,
+-						int defaultNullness, IBinaryAnnotation nonNullAnnotation, boolean atDefaultLocation) {
++						int defaultNullness, IBinaryAnnotation nonNullAnnotation, boolean atDefaultLocation, boolean atTypeBound) {
+ 		super(typeAnnotations, newMatches, newPathPtr);
+ 		this.defaultNullness = defaultNullness;
+ 		this.nonNullAnnotation = nonNullAnnotation;
+ 		this.atDefaultLocation = atDefaultLocation;
++		this.atTypeBound = atTypeBound;
+ 	}
+ 
+ 	/** Create a restricted walker without 'real' type annotations, but with a nonnull default. */
+-	NonNullDefaultAwareTypeAnnotationWalker(int defaultNullness, IBinaryAnnotation nonNullAnnotation, boolean atDefaultLocation) {
++	NonNullDefaultAwareTypeAnnotationWalker(int defaultNullness, IBinaryAnnotation nonNullAnnotation, boolean atDefaultLocation, boolean atTypeBound) {
+ 		super(null, 0, 0);
+ 		this.nonNullAnnotation = nonNullAnnotation;
+ 		this.defaultNullness = defaultNullness;
+ 		this.atDefaultLocation = atDefaultLocation;
++		this.atTypeBound = atTypeBound;
+ 		this.isEmpty = true;
+ 	}
+ 	
+@@ -79,16 +84,19 @@ public class NonNullDefaultAwareTypeAnnotationWalker extends TypeAnnotationWalke
+ 		// considers nextIsDefaultLocation as the new atDefaultLocation
+ 		try {
+ 			// do we have any change at all?
+-			if (this.matches == newMatches && this.pathPtr == newPathPtr && this.atDefaultLocation == this.nextIsDefaultLocation)
++			if (this.matches == newMatches && this.pathPtr == newPathPtr
++					&& this.atDefaultLocation == this.nextIsDefaultLocation && this.atTypeBound == this.nextIsTypeBound)
+ 				return this;
+ 			// are we running out of real type annotations?
+ 			if (newMatches == 0 || this.typeAnnotations == null || this.typeAnnotations.length == 0)
+-				return new NonNullDefaultAwareTypeAnnotationWalker(this.defaultNullness, this.nonNullAnnotation, this.nextIsDefaultLocation);
++				return new NonNullDefaultAwareTypeAnnotationWalker(this.defaultNullness, this.nonNullAnnotation, 
++												this.nextIsDefaultLocation, this.nextIsTypeBound);
+ 			// proceed as normal, but pass on our specific fields, too:
+ 			return new NonNullDefaultAwareTypeAnnotationWalker(this.typeAnnotations, newMatches, newPathPtr,
+-																this.defaultNullness, this.nonNullAnnotation, this.nextIsDefaultLocation);
++												this.defaultNullness, this.nonNullAnnotation, this.nextIsDefaultLocation, this.nextIsTypeBound);
+ 		} finally {
+ 			this.nextIsDefaultLocation = false; // expire
++			this.nextIsTypeBound = false;
+ 		}
+ 	}
+ 	
+@@ -109,6 +117,7 @@ public class NonNullDefaultAwareTypeAnnotationWalker extends TypeAnnotationWalke
+ 	@Override
+ 	public TypeAnnotationWalker toTypeBound(short boundIndex) {
+ 		this.nextIsDefaultLocation = (this.defaultNullness & Binding.DefaultLocationTypeBound) != 0;
++		this.nextIsTypeBound = true;
+ 		if (this.isEmpty) return restrict(this.matches, this.pathPtr);
+ 		return super.toTypeBound(boundIndex);
+ 	}
+@@ -116,6 +125,7 @@ public class NonNullDefaultAwareTypeAnnotationWalker extends TypeAnnotationWalke
+ 	@Override
+ 	public TypeAnnotationWalker toTypeParameterBounds(boolean isClassTypeParameter, int parameterRank) {
+ 		this.nextIsDefaultLocation = (this.defaultNullness & Binding.DefaultLocationTypeBound) != 0;
++		this.nextIsTypeBound = true;
+ 		if (this.isEmpty) return restrict(this.matches, this.pathPtr);
+ 		return super.toTypeParameterBounds(isClassTypeParameter, parameterRank);
+ 	}
+@@ -123,6 +133,7 @@ public class NonNullDefaultAwareTypeAnnotationWalker extends TypeAnnotationWalke
+ 	@Override
+ 	public TypeAnnotationWalker toTypeArgument(int rank) {
+ 		this.nextIsDefaultLocation = (this.defaultNullness & Binding.DefaultLocationTypeArgument) != 0;
++		this.nextIsTypeBound = false;
+ 		if (this.isEmpty) return restrict(this.matches, this.pathPtr);
+ 		return super.toTypeArgument(rank);
+ 	}
+@@ -130,14 +141,17 @@ public class NonNullDefaultAwareTypeAnnotationWalker extends TypeAnnotationWalke
+ 	@Override
+ 	public TypeAnnotationWalker toTypeParameter(boolean isClassTypeParameter, int rank) {
+ 		this.nextIsDefaultLocation = (this.defaultNullness & Binding.DefaultLocationTypeParameter) != 0;
++		this.nextIsTypeBound = false;
+ 		if (this.isEmpty) return restrict(this.matches, this.pathPtr);
+ 		return super.toTypeParameter(isClassTypeParameter, rank);
+ 	}
+ 
+ 	@Override
+-	public IBinaryAnnotation[] getAnnotationsAtCursor() {
+-		IBinaryAnnotation[] normalAnnotations = this.isEmpty ? null : super.getAnnotationsAtCursor();
+-		if (this.atDefaultLocation) {
++	public IBinaryAnnotation[] getAnnotationsAtCursor(int currentTypeId) {
++		IBinaryAnnotation[] normalAnnotations = this.isEmpty ? null : super.getAnnotationsAtCursor(currentTypeId);
++		if (this.atDefaultLocation && 
++				!(this.atTypeBound && currentTypeId == TypeIds.T_JavaLangObject)) // for CLIMB-to-top consider a j.l.Object type bound as no explicit type bound
++		{
+ 			if (normalAnnotations == null || normalAnnotations.length == 0)
+ 				return new IBinaryAnnotation[] { this.nonNullAnnotation };
+ 			int len = normalAnnotations.length;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/TypeAnnotationWalker.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/TypeAnnotationWalker.java
+index 9f189b7..3e525b7 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/TypeAnnotationWalker.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/TypeAnnotationWalker.java
+@@ -41,7 +41,7 @@ public class TypeAnnotationWalker {
+ 		public TypeAnnotationWalker toTypeBound(short boundIndex) { return this; }
+ 		public TypeAnnotationWalker toTypeParameter(boolean isClassTypeParameter, int rank) { return this; }
+ 		public TypeAnnotationWalker toNextDetail(int detailKind) { return this; }
+-		public IBinaryAnnotation[] getAnnotationsAtCursor() { return NO_ANNOTATIONS; }
++		public IBinaryAnnotation[] getAnnotationsAtCursor(int currentTypeId) { return NO_ANNOTATIONS; }
+ 	};
+ 	
+ 	final protected IBinaryTypeAnnotation[] typeAnnotations;	// the actual material we're managing here
+@@ -298,7 +298,7 @@ public class TypeAnnotationWalker {
+ 	 * Retrieve the type annotations at the current position
+ 	 * reached by invocations of toXYZ() methods.
+ 	 */
+-	public IBinaryAnnotation[] getAnnotationsAtCursor() {
++	public IBinaryAnnotation[] getAnnotationsAtCursor(int currentTypeId) {
+ 		int length = this.typeAnnotations.length;
+ 		IBinaryAnnotation[] filtered = new IBinaryAnnotation[length];
+ 		long ptr = 1;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
+index bfe7fcb..b6ed2c8 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/BinaryTypeBinding.java
+@@ -27,6 +27,7 @@
+  *								Bug 429958 - [1.8][null] evaluate new DefaultLocation attribute of @NonNullByDefault
+  *								Bug 390889 - [1.8][compiler] Evaluate options to support 1.7- projects against 1.8 JRE.
+  *								Bug 438458 - [1.8][null] clean up handling of null type annotations wrt type variables
++ *								Bug 439516 - [1.8][null] NonNullByDefault wrongly applied to implicit type bound of binary type
+  *    Jesper Steen Moller - Contributions for
+  *								Bug 412150 [1.8] [compiler] Enable reflected parameter names during annotation processing
+  *								Bug 412153 - [1.8][compiler] Check validity of annotations which may be repeatable
+@@ -744,7 +745,7 @@ private MethodBinding createMethod(IBinaryMethod method, long sourceLevel, char[
+ 		? new MethodBinding(methodModifiers, parameters, exceptions, this)
+ 		: new MethodBinding(methodModifiers, method.getSelector(), returnType, parameters, exceptions, this);
+ 	
+-	IBinaryAnnotation[] receiverAnnotations = walker.toReceiver().getAnnotationsAtCursor();
++	IBinaryAnnotation[] receiverAnnotations = walker.toReceiver().getAnnotationsAtCursor(0);
+ 	if (receiverAnnotations != null && receiverAnnotations.length > 0) {
+ 		result.receiver = this.environment.createAnnotatedType(this, createAnnotations(receiverAnnotations, this.environment, missingTypeNames));
+ 	}
+@@ -753,7 +754,7 @@ private MethodBinding createMethod(IBinaryMethod method, long sourceLevel, char[
+ 		IBinaryAnnotation[] annotations = method.getAnnotations();
+ 	    if (annotations == null || annotations.length == 0)
+ 	    	if (method.isConstructor())
+-	    		annotations = walker.toMethodReturn().getAnnotationsAtCursor(); // FIXME: When both exist, order could become an issue.
++	    		annotations = walker.toMethodReturn().getAnnotationsAtCursor(0); // FIXME: When both exist, order could become an issue.
+ 		result.setAnnotations(
+ 			createAnnotations(annotations, this.environment, missingTypeNames),
+ 			paramAnnotations,
+@@ -865,7 +866,7 @@ private TypeVariableBinding[] createTypeVariables(SignatureWrapper wrapper, bool
+ 						int colon = CharOperation.indexOf(Util.C_COLON, typeSignature, i);
+ 						char[] variableName = CharOperation.subarray(typeSignature, i, colon);
+ 						TypeVariableBinding typeVariable = new TypeVariableBinding(variableName, this, rank, this.environment);
+-						AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.toTypeParameter(isClassTypeParameter, rank++).getAnnotationsAtCursor(), 
++						AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.toTypeParameter(isClassTypeParameter, rank++).getAnnotationsAtCursor(0), 
+ 																										this.environment, missingTypeNames);
+ 						if (annotations != null && annotations != Binding.NO_ANNOTATIONS)
+ 							typeVariable.setTypeAnnotations(annotations, this.environment.globalOptions.isAnnotationBasedNullAnalysisEnabled);
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+index a242000..5fe450c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/LookupEnvironment.java
+@@ -25,6 +25,7 @@
+  *								Bug 416190 - [1.8][null] detect incompatible overrides due to null type annotations
+  *								Bug 424624 - [1.8][null] if a static-object with annotation @NonNull is used, a warning is shown
+  *								Bug 438458 - [1.8][null] clean up handling of null type annotations wrt type variables
++ *								Bug 439516 - [1.8][null] NonNullByDefault wrongly applied to implicit type bound of binary type
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.compiler.lookup;
+ 
+@@ -1257,7 +1258,7 @@ TypeBinding getTypeFromSignature(char[] signature, int start, int end, boolean i
+ 	AnnotationBinding [][] annotationsOnDimensions = null;
+ 	if (dimension > 0 && walker != TypeAnnotationWalker.EMPTY_ANNOTATION_WALKER) {
+ 		for (int i = 0; i < dimension; i++) {
+-			AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(), this, missingTypeNames);
++			AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(0), this, missingTypeNames);
+ 			if (annotations != Binding.NO_ANNOTATIONS) { 
+ 				if (annotationsOnDimensions == null)
+ 					annotationsOnDimensions = new AnnotationBinding[dimension][];
+@@ -1342,7 +1343,7 @@ private TypeBinding annotateType(TypeBinding binding, TypeAnnotationWalker walke
+ 	}
+ 	AnnotationBinding [][] annotations = null;
+ 	for (int i = 0; i < depth; i++) {
+-		AnnotationBinding[] annots = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(), this, missingTypeNames);
++		AnnotationBinding[] annots = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(binding.id), this, missingTypeNames);
+ 		if (annots != null && annots.length > 0) {
+ 			if (annotations == null)
+ 				annotations = new AnnotationBinding[depth][];
+@@ -1387,7 +1388,7 @@ public TypeBinding getTypeFromTypeSignature(SignatureWrapper wrapper, TypeVariab
+ 	AnnotationBinding [][] annotationsOnDimensions = null;
+ 	if (dimension > 0 && walker != TypeAnnotationWalker.EMPTY_ANNOTATION_WALKER) {
+ 		for (int i = 0; i < dimension; i++) {
+-			AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(), this, missingTypeNames);
++			AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(0), this, missingTypeNames);
+ 			if (annotations != Binding.NO_ANNOTATIONS) { 
+ 				if (annotationsOnDimensions == null)
+ 					annotationsOnDimensions = new AnnotationBinding[dimension][];
+@@ -1432,7 +1433,7 @@ public TypeBinding getTypeFromTypeSignature(SignatureWrapper wrapper, TypeVariab
+ 	if (actualEnclosing != null) { // convert needed if read some static member type
+ 		actualEnclosing = (ReferenceBinding) convertToRawType(actualEnclosing, false /*do not force conversion of enclosing types*/);
+ 	}
+-	AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(), this, missingTypeNames);
++	AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(actualType.id), this, missingTypeNames);
+ 	TypeBinding[] typeArguments = getTypeArgumentsFromSignature(wrapper, staticVariables, enclosingType, actualType, missingTypeNames, walker);
+ 	ParameterizedTypeBinding parameterizedType = createParameterizedType(actualType, typeArguments, actualEnclosing, annotations);
+ 
+@@ -1446,7 +1447,7 @@ public TypeBinding getTypeFromTypeSignature(SignatureWrapper wrapper, TypeVariab
+ 		if (memberType == null)
+ 			this.problemReporter.corruptedSignature(parameterizedType, wrapper.signature, memberStart); // aborts
+ 		walker = walker.toNextNestedType();
+-		annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(), this, missingTypeNames);
++		annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(memberType.id), this, missingTypeNames);
+ 		if (wrapper.signature[wrapper.start] == '<') {
+ 			wrapper.start++; // skip '<'
+ 			typeArguments = getTypeArgumentsFromSignature(wrapper, staticVariables, enclosingType, memberType, missingTypeNames, walker);
+@@ -1460,7 +1461,7 @@ public TypeBinding getTypeFromTypeSignature(SignatureWrapper wrapper, TypeVariab
+ }
+ 
+ private TypeBinding getTypeFromTypeVariable(TypeVariableBinding typeVariableBinding, int dimension, AnnotationBinding [][] annotationsOnDimensions, TypeAnnotationWalker walker, char [][][] missingTypeNames) {
+-	AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(), this, missingTypeNames);
++	AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(0), this, missingTypeNames);
+ 	if (annotations != null && annotations != Binding.NO_ANNOTATIONS)
+ 		typeVariableBinding = (TypeVariableBinding) createAnnotatedType(typeVariableBinding, new AnnotationBinding [][] { annotations });
+ 
+@@ -1487,18 +1488,18 @@ TypeBinding getTypeFromVariantTypeSignature(
+ 			// ? super aType
+ 			wrapper.start++;
+ 			TypeBinding bound = getTypeFromTypeSignature(wrapper, staticVariables, enclosingType, missingTypeNames, walker.toWildcardBound());
+-			AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(), this, missingTypeNames);
++			AnnotationBinding [] annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(0), this, missingTypeNames);
+ 			return this.typeSystem.getWildcard(genericType, rank, bound, null /*no extra bound*/, Wildcard.SUPER, annotations);
+ 		case '+' :
+ 			// ? extends aType
+ 			wrapper.start++;
+ 			bound = getTypeFromTypeSignature(wrapper, staticVariables, enclosingType, missingTypeNames, walker.toWildcardBound());
+-			annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(), this, missingTypeNames);
++			annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(0), this, missingTypeNames);
+ 			return this.typeSystem.getWildcard(genericType, rank, bound, null /*no extra bound*/, Wildcard.EXTENDS, annotations);
+ 		case '*' :
+ 			// ?
+ 			wrapper.start++;
+-			annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(), this, missingTypeNames);
++			annotations = BinaryTypeBinding.createAnnotations(walker.getAnnotationsAtCursor(0), this, missingTypeNames);
+ 			return this.typeSystem.getWildcard(genericType, rank, null, null /*no extra bound*/, Wildcard.UNBOUND, annotations);
+ 		default :
+ 			return getTypeFromTypeSignature(wrapper, staticVariables, enclosingType, missingTypeNames, walker);
+commit eba39b7d16632d43ea13707b696b73d1b911dc13
+Author: Stephan Herrmann <stephan.herrmann@berlin.de>
+Date:   Sun Jul 20 11:15:50 2014 +0200
+
+    Bug 439516 - [1.8][null] NonNullByDefault wrongly applied to implicit
+    type bound of binary type
+    - warning for explicit "<T extends Object>"
+
+3	1	org.eclipse.jdt.annotation/src/org/eclipse/jdt/annotation/DefaultLocation.java
+3	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+26	0	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+4	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+9	4	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeReference.java
+8	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+2	0	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+diff --git a/org.eclipse.jdt.annotation/src/org/eclipse/jdt/annotation/DefaultLocation.java b/org.eclipse.jdt.annotation/src/org/eclipse/jdt/annotation/DefaultLocation.java
+index 5d78d54..02677bf 100644
+--- a/org.eclipse.jdt.annotation/src/org/eclipse/jdt/annotation/DefaultLocation.java
++++ b/org.eclipse.jdt.annotation/src/org/eclipse/jdt/annotation/DefaultLocation.java
+@@ -80,7 +80,9 @@ public enum DefaultLocation {
+ 	
+ 	/**
+ 	 * Defines that a given {@link NonNullByDefault} annotation should affect all unannotated
+-	 * explicit type bounds within the scope of the annotated declaration.
++	 * explicit type bounds within the scope of the annotated declaration. A type bound of
++	 * type {@link java.lang.Object} is <strong>never</strong> considered as an explicit bound,
++	 * i.e., <code>T extends Object</code> is never affected by {@link NonNullByDefault}.
+ 	 * 
+ 	 * <h2>Example</h2>
+ 	 * <pre> @NonNullByDefault(TYPE_BOUND)
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+index 5ab2e5c..1a8ca33 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/CompilerInvocationTests.java
+@@ -33,6 +33,7 @@
+  *								Bug 424637 - [1.8][compiler][null] AIOOB in ReferenceExpression.resolveType with a method reference to Files::walk
+  *								Bug 418743 - [1.8][null] contradictory annotations on invocation of generic method not reported
+  *								Bug 430150 - [1.8][null] stricter checking against type variables
++ *								Bug 439516 - [1.8][null] NonNullByDefault wrongly applied to implicit type bound of binary type
+  *     Jesper S Moller - Contributions for
+  *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+@@ -592,6 +593,7 @@ public void test011_problem_categories() {
+ 		expectedProblemAttributes.put("IllegalVisibilityModifierCombinationForMemberType", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
+ 		expectedProblemAttributes.put("IllegalVisibilityModifierCombinationForMethod", new ProblemAttributes(CategorizedProblem.CAT_MEMBER));
+ 		expectedProblemAttributes.put("IllegalVisibilityModifierForInterfaceMemberType", new ProblemAttributes(CategorizedProblem.CAT_TYPE));
++		expectedProblemAttributes.put("ImplicitObjectBoundNoNullDefault", new ProblemAttributes(CategorizedProblem.CAT_INTERNAL));
+ 		expectedProblemAttributes.put("ImportAmbiguous", DEPRECATED);
+ 		expectedProblemAttributes.put("ImportInheritedNameHidesEnclosingName", DEPRECATED);
+ 		expectedProblemAttributes.put("ImportInternalNameProvided", DEPRECATED);
+@@ -1413,6 +1415,7 @@ public void test012_compiler_problems_tuning() {
+ 		expectedProblemAttributes.put("IllegalVisibilityModifierCombinationForMemberType", SKIP);
+ 		expectedProblemAttributes.put("IllegalVisibilityModifierCombinationForMethod", SKIP);
+ 		expectedProblemAttributes.put("IllegalVisibilityModifierForInterfaceMemberType", SKIP);
++		expectedProblemAttributes.put("ImplicitObjectBoundNoNullDefault", SKIP);
+ 		expectedProblemAttributes.put("ImportAmbiguous", SKIP);
+ 		expectedProblemAttributes.put("ImportInheritedNameHidesEnclosingName", SKIP);
+ 		expectedProblemAttributes.put("ImportInternalNameProvided", SKIP);
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+index ae505e7..4b92fec 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/NullTypeAnnotationTest.java
+@@ -5408,6 +5408,32 @@ public void testTypeVariable10() {
+ 		getCompilerOptions(), 
+ 		"");
+ }
++// Bug 439516 - [1.8][null] NonNullByDefault wrongly applied to implicit type bound of binary type
++// warning for explicit "<T extends Object>"
++public void testTypeVariable11() {
++	runNegativeTestWithLibs(
++		new String[] {
++			"X.java",
++			"import org.eclipse.jdt.annotation.DefaultLocation;\n" +
++			"@org.eclipse.jdt.annotation.NonNullByDefault({DefaultLocation.TYPE_BOUND})\n" + // not: PARAMETER
++			"public class X<T extends Object> {\n" +
++			"	void test(T t) {}\n" +
++			"}\n",
++			"Y.java",
++			"public class Y {\n" +
++			"	void foo(X<@org.eclipse.jdt.annotation.Nullable String> xs) {\n" +
++			"		xs.test(null);\n" +
++			"	}\n" +
++			"}\n"
++		}, 
++		getCompilerOptions(), 
++		"----------\n" + 
++		"1. WARNING in X.java (at line 3)\n" + 
++		"	public class X<T extends Object> {\n" + 
++		"	                         ^^^^^^\n" + 
++		"The explicit type bound \'Object\' is not affected by the nullness default for DefaultLocation.TYPE_BOUND.\n" + 
++		"----------\n");
++}
+ public void testBug434600() {
+ 	runConformTestWithLibs(
+ 		new String[] {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+index b84e5e4..6f5d0b4 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/core/compiler/IProblem.java
+@@ -192,6 +192,7 @@
+  *									NonNullDefaultDetailIsNotEvaluated
+  *									NullNotCompatibleToFreeTypeVariable
+  *									NullityMismatchAgainstFreeTypeVariable
++ *									ImplicitObjectBoundNoNullDefault
+  *      Jesper S Moller  - added the following constants
+  *									TargetTypeNotAFunctionalInterface
+  *									OuterLocalMustBeEffectivelyFinal
+@@ -1790,6 +1791,9 @@ void setSourceStart(int sourceStart);
+ 	int NullNotCompatibleToFreeTypeVariable = 969;
+ 	/** @since 3.10 */
+ 	int NullityMismatchAgainstFreeTypeVariable = 970;
++	/** @since 3.11 */
++	int ImplicitObjectBoundNoNullDefault = 971;
++
+ 
+ 	// Java 8 work
+ 	/** @since 3.10 */
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeReference.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeReference.java
+index d2acbf5..4dfada6 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeReference.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/TypeReference.java
+@@ -18,6 +18,7 @@
+  *								Bug 429958 - [1.8][null] evaluate new DefaultLocation attribute of @NonNullByDefault
+  *								Bug 434570 - Generic type mismatch for parametrized class annotation attribute with inner class
+  *								Bug 434600 - Incorrect null analysis error reporting on type parameters
++ *								Bug 439516 - [1.8][null] NonNullByDefault wrongly applied to implicit type bound of binary type
+  *        Andy Clement (GoPivotal, Inc) aclement@gopivotal.com - Contributions for
+  *                          Bug 383624 - [1.8][compiler] Revive code generation support for type annotations (from Olivier's work)
+  *                          Bug 409236 - [1.8][compiler] Type annotations on intersection cast types dropped by code generator
+@@ -631,12 +632,16 @@ protected void resolveAnnotations(Scope scope, int location) {
+ 			&& (this.resolvedType.tagBits & TagBits.AnnotationNullMASK) == 0
+ 			&& !this.resolvedType.isTypeVariable()
+ 			&& !this.resolvedType.isWildcard()
+-			&& location != 0 
++			&& location != 0
+ 			&& scope.hasDefaultNullnessFor(location)) 
+ 	{
+-		LookupEnvironment environment = scope.environment();
+-		AnnotationBinding[] annots = new AnnotationBinding[]{environment.getNonNullAnnotation()};
+-		this.resolvedType = environment.createAnnotatedType(this.resolvedType, annots);
++		if (location == Binding.DefaultLocationTypeBound && this.resolvedType.id == TypeIds.T_JavaLangObject) {
++			scope.problemReporter().implicitObjectBoundNoNullDefault(this);
++		} else {
++			LookupEnvironment environment = scope.environment();
++			AnnotationBinding[] annots = new AnnotationBinding[]{environment.getNonNullAnnotation()};
++			this.resolvedType = environment.createAnnotatedType(this.resolvedType, annots);
++		}
+ 	}
+ }
+ public int getAnnotatableLevels() {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+index b948b91..a40eb68 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/ProblemReporter.java
+@@ -50,6 +50,7 @@
+  *								Bug 390889 - [1.8][compiler] Evaluate options to support 1.7- projects against 1.8 JRE.
+  *								Bug 430150 - [1.8][null] stricter checking against type variables
+  *								Bug 434600 - Incorrect null analysis error reporting on type parameters
++ *								Bug 439516 - [1.8][null] NonNullByDefault wrongly applied to implicit type bound of binary type
+  *      Jesper S Moller <jesper@selskabet.org> -  Contributions for
+  *								bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+  *								bug 382721 - [1.8][compiler] Effectively final variables needs special treatment
+@@ -9789,6 +9790,13 @@ public void nullityMismatchTypeArgument(TypeBinding typeVariable, TypeBinding ty
+ 			location.sourceEnd);
+ }
+ 
++public void implicitObjectBoundNoNullDefault(TypeReference reference) {
++	this.handle(IProblem.ImplicitObjectBoundNoNullDefault,
++			NoArgument, NoArgument,
++			ProblemSeverities.Warning,
++			reference.sourceStart, reference.sourceEnd);
++}
++
+ public void dereferencingNullableExpression(Expression expression) {
+ 	if (expression instanceof MessageSend) {
+ 		MessageSend send = (MessageSend) expression;
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+index 9bb1d16..2f6d243 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/problem/messages.properties
+@@ -39,6 +39,7 @@
+ #							Bug 392245 - [1.8][compiler][null] Define whether / how @NonNullByDefault applies to TYPE_USE locations
+ #							Bug 430150 - [1.8][null] stricter checking against type variables
+ #							Bug 434600 - Incorrect null analysis error reporting on type parameters
++#							Bug 439516 - [1.8][null] NonNullByDefault wrongly applied to implicit type bound of binary type
+ #		Jesper S Moller <jesper@selskabet.org> - Contributions for
+ #							bug 382701 - [1.8][compiler] Implement semantic analysis of Lambda expressions & Reference expression
+ #							bug 384567 - [1.5][compiler] Compiler accepts illegal modifiers on package declaration
+@@ -823,6 +824,7 @@
+ #968 temporary warning has been removed
+ 969 = Null type mismatch (type annotations): ''null'' is not compatible to the free type variable ''{0}''
+ 970 = Null type mismatch (type annotations): required ''{0}'' but this expression has type ''{1}'', where ''{0}'' is a free type variable
++971 = The explicit type bound 'Object' is not affected by the nullness default for DefaultLocation.TYPE_BOUND.
+ 
+ # Java 8
+ 1001 = Syntax error, modifiers and annotations are not allowed for the lambda parameter {0} as its type is elided

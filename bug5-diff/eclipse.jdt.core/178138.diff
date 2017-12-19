@@ -1,0 +1,249 @@
+commit 6d93b4bb6f9802710e765aaa00d3450185e4689f
+Author: Walter Harley <wharley>
+Date:   Thu May 10 00:13:58 2007 +0000
+
+    Bug 178138 - don't write to log when a factory path entry is missing
+
+3	3	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
+11	1	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptPlugin.java
+49	4	org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/FactoryLoaderTests.java
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
+index dd729fc..4d5666e 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AnnotationProcessorFactoryLoader.java
+@@ -468,12 +468,12 @@ public class AnnotationProcessorFactoryLoader {
+ 		}
+ 		catch( Exception e )
+ 		{
+-			AptPlugin.log(e, "Failed to load " + factoryName); //$NON-NLS-1$
++			AptPlugin.trace("Failed to load factory " + factoryName, e); //$NON-NLS-1$
+ 			failureHandler.addFailedFactory(factoryName);
+ 		}
+ 		catch ( NoClassDefFoundError ncdfe )
+ 		{
+-			AptPlugin.log(ncdfe, "Failed to load " + factoryName); //$NON-NLS-1$
++			AptPlugin.trace("Failed to load " + factoryName, ncdfe); //$NON-NLS-1$
+ 			failureHandler.addFailedFactory(factoryName);
+ 		}
+ 		return f;
+@@ -592,7 +592,7 @@ public class AnnotationProcessorFactoryLoader {
+ 						clazz = classLoader.loadClass(factoryName);
+ 						factory = new ClassServiceFactory(clazz);
+ 					} catch (ClassNotFoundException e) {
+-						AptPlugin.log(e, "Unable to load annotation processor " + factoryName); //$NON-NLS-1$
++						AptPlugin.trace("Unable to load annotation processor " + factoryName, e); //$NON-NLS-1$
+ 						failureHandler.addFailedFactory(factoryName);
+ 					} 
+ 				}
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptPlugin.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptPlugin.java
+index 56cc771..450f486 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptPlugin.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/AptPlugin.java
+@@ -191,6 +191,16 @@ public class AptPlugin extends Plugin {
+ 		}
+ 	}
+ 	
++	/**
++	 * Convenience method to report an exception in debug trace mode.
++	 */
++	public static void trace(String msg, Throwable t) {
++		trace(msg);
++		if (DEBUG) {
++			t.printStackTrace(System.out);
++		}
++	}
++	
+ 	private static AptProject getAptProject(IJavaProject javaProject, boolean create){
+ 		synchronized(PROJECT_MAP){
+ 			AptProject aptProject = PROJECT_MAP.get(javaProject);
+@@ -237,5 +247,5 @@ public class AptPlugin extends Plugin {
+ 	public static Class<?> getJava6ProcessorClass() {
+ 		return _java6ProcessorClass;
+ 	}
+-	
++
+ }
+diff --git a/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/FactoryLoaderTests.java b/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/FactoryLoaderTests.java
+index f33703f..b1f7bbf 100644
+--- a/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/FactoryLoaderTests.java
++++ b/org.eclipse.jdt.apt.tests/src/org/eclipse/jdt/apt/tests/FactoryLoaderTests.java
+@@ -15,9 +15,12 @@ import java.io.File;
+ 
+ import junit.framework.Test;
+ import junit.framework.TestSuite;
++
++import org.eclipse.core.resources.IMarker;
+ import org.eclipse.core.resources.IProject;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.Path;
++import org.eclipse.jdt.apt.core.internal.AptPlugin;
+ import org.eclipse.jdt.apt.core.util.AptConfig;
+ import org.eclipse.jdt.apt.core.util.IFactoryPath;
+ import org.eclipse.jdt.apt.tests.external.annotations.classloader.ColorAnnotationProcessor;
+@@ -34,6 +37,7 @@ public class FactoryLoaderTests extends APTTestBase {
+ 	
+ 	private File _extJar; // external annotation jar
+ 	private IPath _extVarJar; // external annotation jar, as a classpath-var-relative path
++	private IPath _projectPath; // initialized in setUp(), cleared in tearDown()
+ 	
+ 	private final static String TEMPJARDIR_CPVAR = "FACTORYLOADERTEST_TEMP"; //$NON-NLS-1$
+ 	
+@@ -49,11 +53,9 @@ public class FactoryLoaderTests extends APTTestBase {
+ 	public void setUp() throws Exception {
+ 		super.setUp();
+ 		
+-		// project will be deleted by super-class's tearDown() method
+-		IPath projectPath = env.getProject( getProjectName() ).getFullPath(); //$NON-NLS-1$
+-		
++		_projectPath = env.getProject( getProjectName() ).getFullPath();
+ 		_extJar = TestUtil.createAndAddExternalAnnotationJar(
+-				env.getJavaProject( projectPath ));
++				env.getJavaProject( _projectPath ));
+ 		
+ 		// Create a classpath variable for the same jar file, so we can
+ 		// refer to it that way.
+@@ -126,6 +128,48 @@ public class FactoryLoaderTests extends APTTestBase {
+ 		assertFalse(LoaderTestAnnotationProcessor.isLoaded());
+ 	}
+ 
++	// Test what happens when the factory path contains a jar file that can't be found.
++	public void testNonexistentEntry() throws Exception {
++		LoaderTestAnnotationProcessor.clearLoaded();
++		IProject project = env.getProject( getProjectName() );
++		fullBuild( project.getFullPath() );
++		expectingNoProblems();
++		assertFalse(LoaderTestAnnotationProcessor.isLoaded());
++		
++		IJavaProject jproj = env.getJavaProject( getProjectName() );
++		IFactoryPath ifp = AptConfig.getFactoryPath(jproj);
++		
++		// add bogus entry to factory list, and rebuild.
++		File bogusJar = new File("bogusJar.jar"); // assumed to not exist
++		ifp.addExternalJar(bogusJar);
++		
++		// verify that a problem marker was added.
++		AptConfig.setFactoryPath(jproj, ifp);
++		fullBuild( project.getFullPath() );
++		IMarker[] markers = getAllAPTMarkers(_projectPath);
++		assertEquals(1, markers.length);
++		assertEquals(AptPlugin.APT_LOADER_PROBLEM_MARKER, markers[0].getType());
++		String message = markers[0].getAttribute(IMarker.MESSAGE, "");
++		assertTrue(message.contains("bogusJar.jar"));
++		
++		// remove bogus entry, add _extJar to the factory list as an external jar, and rebuild.
++		ifp.removeExternalJar(bogusJar);
++		ifp.addExternalJar(_extJar);
++		AptConfig.setFactoryPath(jproj, ifp);
++		
++		// rebuild and verify that the processor was loaded and the problems were removed.
++		LoaderTestAnnotationProcessor.clearLoaded();
++		fullBuild( project.getFullPath() );
++		expectingNoProblems();
++		assertTrue(LoaderTestAnnotationProcessor.isLoaded());
++		
++		// Verify that we were able to run the ColorAnnotationProcessor successfully
++		assertTrue(ColorAnnotationProcessor.wasSuccessful());
++		
++		// restore to the original
++		AptConfig.setFactoryPath(jproj, ifp);
++	}
++
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.jdt.core.tests.builder.Tests#tearDown()
+ 	 */
+@@ -134,6 +178,7 @@ public class FactoryLoaderTests extends APTTestBase {
+ 		JavaCore.removeClasspathVariable( TEMPJARDIR_CPVAR, null );
+ 		_extJar = null;
+ 		_extVarJar = null;
++		_projectPath = null;
+ 		super.tearDown();
+ 	}
+ 	
+commit ad2c4a8c65748ae32b4cd6ecaf2a53aeec92a8ac
+Author: Walter Harley <wharley>
+Date:   Fri Apr 4 22:29:38 2008 +0000
+
+    Bug 178138: don't log messages about missing processor factory jars.  Also, fix incorrect severity value in missing processor jar markers.
+
+1	2	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/LoadFailureHandler.java
+1	5	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/VarJarFactoryContainer.java
+1	5	org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/WkspJarFactoryContainer.java
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/LoadFailureHandler.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/LoadFailureHandler.java
+index d9b03ca..59df020 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/LoadFailureHandler.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/LoadFailureHandler.java
+@@ -17,7 +17,6 @@ import java.util.List;
+ import org.eclipse.core.resources.IMarker;
+ import org.eclipse.core.resources.IProject;
+ import org.eclipse.core.runtime.CoreException;
+-import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.jdt.core.IJavaProject;
+ 
+ /**
+@@ -112,7 +111,7 @@ public class LoadFailureHandler {
+ 						},
+ 						new Object[] {
+ 							message,
+-							IStatus.ERROR,
++							IMarker.SEVERITY_ERROR,
+ 							Messages.AnnotationProcessorFactoryLoader_factorypath,
+ 							AptPlugin.APT_MARKER_SOURCE_ID
+ 						}
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/VarJarFactoryContainer.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/VarJarFactoryContainer.java
+index b93ef33..642309f 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/VarJarFactoryContainer.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/VarJarFactoryContainer.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2005, 2007 BEA Systems, Inc.
++ * Copyright (c) 2005, 2008 BEA Systems, Inc.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -14,7 +14,6 @@ package org.eclipse.jdt.apt.core.internal;
+ import java.io.File;
+ 
+ import org.eclipse.core.runtime.IPath;
+-import org.eclipse.core.runtime.IStatus;
+ import org.eclipse.jdt.core.JavaCore;
+ 
+ /**
+@@ -37,9 +36,6 @@ public class VarJarFactoryContainer extends JarFactoryContainer {
+ 		}
+ 		else {
+ 			_jarFile = null;
+-			IStatus s = AptPlugin.createWarningStatus(
+-				null, "The factorypath entry " + _id + " could not be resolved"); //$NON-NLS-1$ //$NON-NLS-2$
+-			AptPlugin.log(s);
+ 		}
+ 	}
+ 
+diff --git a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/WkspJarFactoryContainer.java b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/WkspJarFactoryContainer.java
+index 6ca7512..08ff154 100644
+--- a/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/WkspJarFactoryContainer.java
++++ b/org.eclipse.jdt.apt.core/src/org/eclipse/jdt/apt/core/internal/WkspJarFactoryContainer.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2005, 2007 BEA Systems, Inc.
++ * Copyright (c) 2005, 2008 BEA Systems, Inc.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -17,7 +17,6 @@ import org.eclipse.core.resources.IResource;
+ import org.eclipse.core.resources.IWorkspaceRoot;
+ import org.eclipse.core.resources.ResourcesPlugin;
+ import org.eclipse.core.runtime.IPath;
+-import org.eclipse.core.runtime.IStatus;
+ 
+ /**
+  * Annotation processor factory container based on a jar file 
+@@ -50,9 +49,6 @@ public class WkspJarFactoryContainer extends JarFactoryContainer {
+ 		}
+ 		else {
+ 			_jarFile = null;
+-			IStatus s = AptPlugin.createWarningStatus(
+-				null, "The factorypath entry " + _id + " does not refer to a jar file"); //$NON-NLS-1$ //$NON-NLS-2$
+-			AptPlugin.log(s);
+ 		}
+ 	}
+ 

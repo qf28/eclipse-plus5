@@ -1,0 +1,3802 @@
+commit 987f5d7e7834ef4bffab4d2ca9d55df1983438e3
+Author: Jay Arthanareeswaran <jarthana@in.ibm.com>
+Date:   Wed Oct 19 16:23:52 2016 +0530
+
+    Bug 486011 - [1.9][model] Java 9 Support in Java Model
+    
+    Preliminary code select changes
+
+2	0	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AllJavaModelTests.java
+19	1	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/ISelectionRequestor.java
+21	0	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/SelectionEngine.java
+2	2	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnExportReference.java
+13	1	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnModuleReference.java
+4	0	org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetToCuMapper.java
+4	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NamedMember.java
+22	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SelectionRequestor.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AllJavaModelTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AllJavaModelTests.java
+index ae76838..d9db009 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AllJavaModelTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/AllJavaModelTests.java
+@@ -207,6 +207,8 @@ private static Class[] getAllTestClasses() {
+ 
+ 		// Java model changes related to Java 8
+ 		JavaElement8Tests.class,
++
++		Java9ElementTests.class,
+ 	};
+ 
+ 	Class[] deprecatedClasses = getDeprecatedJDOMTestClasses();
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/ISelectionRequestor.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/ISelectionRequestor.java
+index cd0b4bb..1209112 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/ISelectionRequestor.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/ISelectionRequestor.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2009 IBM Corporation and others.
++ * Copyright (c) 2000, 2016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *******************************************************************************/
+@@ -52,6 +56,20 @@ public interface ISelectionRequestor {
+ 		int end);
+ 
+ 	/**
++	 * Code assist notification of a module selection.
++	 *
++	 * @param moduleName name of the module
++	 * @param uniqueKey unique key of this module
++	 * @param start Start of the selection
++	 * @param end End of the selection
++	 */
++	void acceptModule(
++			char[] moduleName,
++			char[] uniqueKey,
++			int start,
++			int end);
++
++	/**
+ 	 * Code assist notification of a compilation error detected during selection.
+ 	 *  @param error CategorizedProblem
+ 	 *      Only problems which are categorized as errors are notified to the requestor,
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/SelectionEngine.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/SelectionEngine.java
+index c139857..179c57f 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/SelectionEngine.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/SelectionEngine.java
+@@ -964,6 +964,19 @@ public final class SelectionEngine extends Engine implements ISearchRequestor {
+ 						}
+ 					}
+ 				}
++				if (parsedUnit.isModuleInfo()) {
++					ModuleDeclaration module = (ModuleDeclaration) parsedUnit.types[0];//TODO, could be null
++					ExportReference[] exports = module.exports;
++					if (exports != null) {
++						for (ExportReference exportReference : exports) {
++							if (exportReference instanceof SelectionOnExportReference) {
++								char[][] tokens = ((SelectionOnExportReference) exportReference).tokens;
++								this.noProposal = false;
++								this.requestor.acceptPackage(CharOperation.concatWith(tokens, '.'));
++							}
++						}
++					}
++				} 
+ 				if (parsedUnit.types != null || parsedUnit.isPackageInfo()) {
+ 					if(selectDeclaration(parsedUnit))
+ 						return;
+@@ -1298,6 +1311,14 @@ public final class SelectionEngine extends Engine implements ISearchRequestor {
+ 			this.acceptedAnswer = true;
+ 		} else if(binding instanceof BaseTypeBinding) {
+ 			this.acceptedAnswer = true;
++		} else if (binding instanceof ModuleBinding) {
++			this.noProposal = false;
++			ModuleBinding moduleBinding = (ModuleBinding) binding;
++			this.requestor.acceptModule(
++					moduleBinding.moduleName,
++					moduleBinding.computeUniqueKey(),
++					this.actualSelectionStart,
++					this.actualSelectionEnd);
+ 		}
+ 	}
+ 	/*
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnExportReference.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnExportReference.java
+index 36c0005..c258d86 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnExportReference.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnExportReference.java
+@@ -35,9 +35,9 @@ public class SelectionOnExportReference extends ExportReference {
+ 
+ 	public SelectionOnExportReference(char[][] tokens, long[] sourcePositions) {
+ 		super(tokens, sourcePositions);
+-		// TODO Auto-generated constructor stub
+ 	}
+-	public StringBuffer print(int indent, StringBuffer output, boolean withOnDemand) {
++
++	public StringBuffer print(int indent, StringBuffer output) {
+ 
+ 		printIndent(indent, output).append("<SelectOnExport:"); //$NON-NLS-1$
+ 		for (int i = 0; i < this.tokens.length; i++) {
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnModuleReference.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnModuleReference.java
+index d2d3ac8..4944626 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnModuleReference.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionOnModuleReference.java
+@@ -16,13 +16,25 @@
+ package org.eclipse.jdt.internal.codeassist.select;
+ 
+ import org.eclipse.jdt.internal.compiler.ast.ModuleReference;
++import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
++import org.eclipse.jdt.internal.compiler.lookup.Scope;
+ 
+ public class SelectionOnModuleReference extends ModuleReference {
+ 
+ 	public SelectionOnModuleReference(char[][] tokens, long[] sourcePositions) {
+ 		super(tokens, sourcePositions);
+ 	}
+-	public StringBuffer print(int tab, StringBuffer output, boolean withOnDemand) {
++
++	public ModuleBinding resolve(Scope scope) {
++		super.resolve(scope);
++		if (this.binding != null) {
++			throw new SelectionNodeFound(this.binding);
++		} else {
++			throw new SelectionNodeFound();
++		}
++	}
++
++	public StringBuffer print(int tab, StringBuffer output) {
+ 		printIndent(tab, output).append("<SelectOnModuleReference:"); //$NON-NLS-1$
+ 		for (int i = 0; i < this.tokens.length; i++) {
+ 			if (i > 0) output.append('.');
+diff --git a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetToCuMapper.java b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetToCuMapper.java
+index c8391d0..1fdfb58 100644
+--- a/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetToCuMapper.java
++++ b/org.eclipse.jdt.core/eval/org/eclipse/jdt/internal/eval/CodeSnippetToCuMapper.java
+@@ -321,6 +321,10 @@ public ISelectionRequestor getSelectionRequestor(final ISelectionRequestor origi
+ 		public void acceptMethodTypeParameter(char[] declaringTypePackageName, char[] declaringTypeName, char[] selector, int selectorStart, int selectorEnd, char[] typeParameterName,boolean isDeclaration, int start, int end) {
+ 			originalRequestor.acceptMethodTypeParameter(declaringTypePackageName, declaringTypeName, selector, selectorStart, selectorEnd, typeParameterName, isDeclaration, start, end);
+ 		}
++		@Override
++		public void acceptModule(char[] moduleName, char[] uniqueKey, int start, int end) {
++			originalRequestor.acceptModule(moduleName, uniqueKey, start, end);
++		}
+ 	};
+ }
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NamedMember.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NamedMember.java
+index 02639ea..c65a7e5 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NamedMember.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NamedMember.java
+@@ -304,6 +304,10 @@ public abstract class NamedMember extends Member {
+ 			public void acceptMethodTypeParameter(char[] declaringTypePackageName, char[] declaringTypeName, char[] selector, int selectorStart, int selcetorEnd, char[] typeParameterName, boolean isDeclaration, int start, int end) {
+ 				// ignore
+ 			}
++			@Override
++			public void acceptModule(char[] moduleName, char[] uniqueKey, int start, int end) {
++				// ignore
++			}
+ 
+ 		}
+ 		TypeResolveRequestor requestor = new TypeResolveRequestor();
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SelectionRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SelectionRequestor.java
+index 305cfe6..145c260 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SelectionRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SelectionRequestor.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2016 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *******************************************************************************/
+@@ -19,6 +23,7 @@ import org.eclipse.jdt.core.ICompilationUnit;
+ import org.eclipse.jdt.core.IField;
+ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.IMethod;
++import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.IPackageFragment;
+ import org.eclipse.jdt.core.ISourceRange;
+ import org.eclipse.jdt.core.IType;
+@@ -43,6 +48,7 @@ import org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeVariableBinding;
++import org.eclipse.jdt.internal.core.NameLookup.Answer;
+ import org.eclipse.jdt.internal.core.util.HandleFactory;
+ import org.eclipse.jdt.internal.core.util.Util;
+ 
+@@ -168,6 +174,12 @@ protected void acceptBinaryMethod(
+ 		acceptBinaryMethod(type, method, uniqueKey, isConstructor);
+ 	}
+ }
++@Override
++public void acceptModule(char[] moduleName, char[] uniqueKey, int start, int end) {
++	IModuleDescription module = resolveModule(moduleName);
++	addElement(module);
++	// TODO: Implement use cases to construct modules from location/key
++}
+ /**
+  * Resolve the type.
+  */
+@@ -905,6 +917,15 @@ public IJavaElement[] getElements() {
+ 	}
+ 	return this.elements;
+ }
++protected IModuleDescription resolveModule(char[] moduleName) {
++	if (this.openable instanceof CompilationUnit) {
++		// Do what's needed. Question is, how are we going to look up for modules somewhere else in a workspace?
++		// The question is esp. when the usecase is about completing on a module name in a requires clause.
++		Answer answer = this.nameLookup.findModule(new String(moduleName));
++		return answer.module;
++	}
++	return null;
++}
+ /**
+  * Resolve the type
+  */
+commit 279152beda9141939083ad9ed1f5782eb729f730
+Author: Jay Arthanareeswaran <jarthana@in.ibm.com>
+Date:   Wed Oct 19 18:52:56 2016 +0530
+
+    Bug Bug 486011 - Partial revert
+    
+    Reverting the change to the stop-gap API in JavaCore to enable builds to
+    succeed.
+
+23	16	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+12	11	org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+17	10	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 4b3281c..7f0429d 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -31,7 +31,6 @@ import org.eclipse.core.runtime.NullProgressMonitor;
+ import org.eclipse.core.runtime.Path;
+ import org.eclipse.jdt.core.IClasspathEntry;
+ import org.eclipse.jdt.core.IJavaProject;
+-import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.IPackageFragmentRoot;
+ import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
+@@ -46,7 +45,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 	}
+ 
+ 	static {
+-//		 TESTS_NAMES = new String[] { "test_ModuleSourcePathContainer" };
++//		 TESTS_NAMES = new String[] { "testConvertToModule" };
+ 	}
+ 	private static boolean isJRE9 = false;
+ 	public static Test suite() {
+@@ -63,7 +62,7 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 
+ 	public void setUpSuite() throws Exception {
+ 		super.setUpSuite();
+-		System.setProperty("modules.to.load", "java.baserequires java.desktop;java.rmi;java.sql;");
++		System.setProperty("modules.to.load", "java.base,java.desktop;java.rmi;java.sql;");
+ 		this.currentProject = createJava9Project("P1");
+ 		this.createFile("P1/src/module-info.java", "");
+ 		this.createFolder("P1/src/com/greetings");
+@@ -690,19 +689,27 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 				}
+ 			}
+ 			assertNotNull("should not be null", theRoot);
+-			IModuleDescription mod = JavaCore.createModuleFromPackageRoot(null, project);
+-			assertEquals("incorrect value", "ConvertToModule", mod.getElementName());
+-			IModuleDescription.IPackageExport[] exports = mod.getExportedPackages();
+-			assertEquals("incorrect value", 2, exports.length);
+-			assertEquals("incorrect value", "org.eclipse.jdt.test", exports[0].getPackageName());
+-			assertEquals("incorrect value", "org.eclipse.test", exports[1].getPackageName());
+-			
+-			IModuleDescription.IModuleReference[] mods = mod.getRequiredModules();
+-			assertEquals("incorrect value", 4, mods.length);
+-			assertEquals("incorrect value", "java.base", mods[0].getModuleName());
+-			assertEquals("incorrect value", "java.desktop", mods[1].getModuleName());
+-			assertEquals("incorrect value", "java.rmi", mods[2].getModuleName());
+-			assertEquals("incorrect value", "java.sql", mods[3].getModuleName());
++			String mod = JavaCore.createModuleFromPackageRoot(null, theRoot);
++			String lineDelimiter = System.getProperty("line.separator", "\n");
++			assertEquals("module-info is incorrect", 
++					"module ConvertToModule {" + lineDelimiter + "" +
++					"	exports org.eclipse.jdt.test;" + lineDelimiter +
++					"	exports org.eclipse.test;" + lineDelimiter + lineDelimiter +
++					"	requires java.base;" + lineDelimiter +
++					"	requires java.desktop;" + lineDelimiter +
++					"	requires java.rmi;" + lineDelimiter +
++					"	requires java.sql;" + lineDelimiter + lineDelimiter +
++					"}" ,mod);
++			mod = JavaCore.createModuleFromPackageRoot("my.module", theRoot);
++			assertEquals("module-info is incorrect", 
++					"module my.module {" + lineDelimiter +
++					"	exports org.eclipse.jdt.test;" + lineDelimiter +
++					"	exports org.eclipse.test;" + lineDelimiter + lineDelimiter +
++					"	requires java.base;" + lineDelimiter +
++					"	requires java.desktop;" + lineDelimiter +
++					"	requires java.rmi;" + lineDelimiter +
++					"	requires java.sql;" + lineDelimiter + lineDelimiter +
++					"}" ,mod);
+ 
+ 		} finally {
+ 			this.deleteProject("ConvertToModule");
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+index 788ef50..d06ebc6 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+@@ -5825,24 +5825,25 @@ public final class JavaCore extends Plugin {
+ 		return Long.compare(CompilerOptions.versionToJdkLevel(first), CompilerOptions.versionToJdkLevel(second));
+ 	}
+ 	/**
+-	 * Creates a {@link IModuleDescription} for the given Java project and with the given 
+-	 * name. The module name is optional and a null argument can be passed to indicate that the
+-	 * project's name to be used as the module name.
++	 * Creates a corresponding module-info as a String for the given source package fragment root and with
++	 * the given name. The module name is optional and a null argument can be passed to indicate that the
++	 * package fragment root's element name to be used as the module name.
+ 	 *
+-	 * This is a utility method and computes the module description by looking at the source files inside
+-	 * the project and which modules within the project's build path are needed in order to 
+-	 * successfully compile the source files.
++	 * This is a utility method and computes a module configuration by looking at the source files inside
++	 * the package fragment root and what modules within the project's build path are needed in order to 
++	 * successfully compile the source files. For non-source package fragment roots
++	 * (i.e., {@link IPackageFragmentRoot#isArchive()} returns true), this method returns null.
+ 	 *
+-	 * Note this is a long-running operation and it is recommended that clients run this in a background thread.
++	 * Note this is a long-running operation and it is preferable that clients run this in a background thread.
+ 	 *
+ 	 * @param moduleName name to be used for the new module. A null indicates that the package fragment root element's name to be used
+-	 * @param project the Java project for which the module is sought
+-	 * @return the module-info content as a {@link IModuleDescription}
++	 * @param root the package fragment root for which the module is sought
++	 * @return the module-info content as a String
+ 	 * @throws CoreException
+ 	 * @since 3.13 BETA_JAVA9
+ 	 */
+-	public static IModuleDescription createModuleFromPackageRoot(String moduleName, IJavaProject project) throws CoreException {
+-		return ModuleUtil.createModuleFromPackageRoot(moduleName, project);
++	public static String createModuleFromPackageRoot(String moduleName, IPackageFragmentRoot root) throws CoreException {
++		return ModuleUtil.createModuleFromPackageRoot(moduleName, root);
+ 	}
+ 
+ 	/* (non-Javadoc)
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+index ded3e91..2547671 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+@@ -55,6 +55,22 @@ import org.eclipse.jdt.internal.core.builder.ProblemFactory;
+ 
+ public class ModuleUtil {
+ 
++	public static String createModuleFromPackageRoot(String moduleName, IPackageFragmentRoot root) throws CoreException {
++		IJavaProject project = root.getJavaProject();
++		String lineDelimiter = null;
++		if (project != null) {
++			IScopeContext[] scopeContext;
++			// project preference
++			scopeContext = new IScopeContext[] { new ProjectScope(project.getProject()) };
++			lineDelimiter = Platform.getPreferencesService().getString(Platform.PI_RUNTIME, Platform.PREF_LINE_SEPARATOR, null, scopeContext);
++		}
++		if (lineDelimiter == null) {
++			lineDelimiter = System.getProperty("line.separator", "\n"); //$NON-NLS-1$ //$NON-NLS-2$
++		}
++		LocalModuleImpl module = (LocalModuleImpl) createModuleFromPackageFragmentRoot(moduleName, project);
++		return module.toString(lineDelimiter);
++	}
++
+ 	public static IModuleDescription createModuleFromPackageRoot(String moduleName, IJavaProject root) throws CoreException {
+ 		return createModuleFromPackageFragmentRoot(moduleName, root.getJavaProject());
+ 	}
+@@ -123,16 +139,7 @@ public class ModuleUtil {
+ 		return newCompiler;
+ 	}
+ 	private static IModuleDescription createModuleFromPackageFragmentRoot(String moduleName, IJavaProject project) throws CoreException {
+-		String lineDelimiter = null;
+-		if (project != null) {
+-			IScopeContext[] scopeContext;
+-			// project preference
+-			scopeContext = new IScopeContext[] { new ProjectScope(project.getProject()) };
+-			lineDelimiter = Platform.getPreferencesService().getString(Platform.PI_RUNTIME, Platform.PREF_LINE_SEPARATOR, null, scopeContext);
+-		}
+-		if (lineDelimiter == null) {
+-			lineDelimiter = System.getProperty("line.separator", "\n"); //$NON-NLS-1$ //$NON-NLS-2$
+-		}
++
+ 		ModuleAccumulatorEnvironment environment = new ModuleAccumulatorEnvironment(project);
+ 		Compiler compiler = newCompiler(environment, project);
+ 		LocalModuleImpl module = new LocalModuleImpl(moduleName == null ? project.getElementName() : moduleName);
+commit e1882fb7451cd4afded135030307a827a4d3a76c
+Author: Jay Arthanareeswaran <jarthana@in.ibm.com>
+Date:   Sat Oct 22 15:10:17 2016 +0530
+
+    Bug 486011 - Follow up bugs for model and selection
+    
+    Change-Id: I49dfe82f4e20747118abeccfd8fb2ecae4c83e81
+    Signed-off-by: Jay Arthanareeswaran <jarthana@in.ibm.com>
+
+2	2	org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+126	6	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+0	1	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+11	14	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionOnModuleReference.java
+16	4	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionParser.java
+5	33	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+10	1	org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
+3	3	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironmentRequestor.java
+23	20	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+diff --git a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+index 281e300..7c19290 100644
+--- a/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
++++ b/org.eclipse.jdt.core.tests.compiler/src/org/eclipse/jdt/core/tests/compiler/regression/ModuleCompilationTests.java
+@@ -957,7 +957,7 @@ public class ModuleCompilationTests extends BatchCompilerTest {
+ 		runNegativeTest(new String[]{}, 
+ 				buffer.toString(),
+ 				"",
+-				"incorrectly formatted option: --add-exports mod.one=mod.two,mod.three\r\n",
++				"incorrectly formatted option: --add-exports mod.one=mod.two,mod.three\n",
+ 				false);
+ 	}
+ 	public void test021() {
+@@ -991,7 +991,7 @@ public class ModuleCompilationTests extends BatchCompilerTest {
+ 		runNegativeTest(new String[]{}, 
+ 				buffer.toString(), 
+ 				"",
+-				"incorrectly formatted option: --add-reads mod.one/mod.two\r\n",
++				"incorrectly formatted option: --add-reads mod.one/mod.two\n",
+ 				false);
+ 	}
+ 	public void test022() {
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+index c2807e2..4896c5e 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+@@ -28,7 +28,7 @@ import junit.framework.Test;
+ public class Java9ElementTests extends AbstractJavaModelTests { 
+ 
+ 	static {
+-//		TESTS_NAMES = new String[] {"test001"};
++//		TESTS_NAMES = new String[] {"test009"};
+ 	}
+ 
+ 	public Java9ElementTests(String name) {
+@@ -41,8 +41,7 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 		try {
+ 			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
+ 			project.open(null);
+-				String fileContent =  "module my.mod{\n" +
+-						 "}";
++				String fileContent =  "module my.mod{}\n";
+ 				createFile(	"/Java9Elements/src/module-info.java",	fileContent);
+ 
+ 				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
+@@ -99,7 +98,8 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 		try {
+ 			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
+ 			project.open(null);
+-				String fileContent =  "module my.mod{\n" +
++				String fileContent =  
++						"module my.mod{\n" +
+ 						 "	exports p.q.r;" +
+ 						 "	exports a.b.c;\n" +
+ 						 "}";
+@@ -136,7 +136,8 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 		try {
+ 			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
+ 			project.open(null);
+-				String fileContent =  "module my.mod{\n" +
++				String fileContent =  
++						"module my.mod{\n" +
+ 						 "	provides com.socket.spi.NetworkSocketProvider\n" +
+ 						 "      with org.fastsocket.FastNetworkSocketProvider;\n" +
+ 						 "}";
+@@ -169,7 +170,8 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 		try {
+ 			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
+ 			project.open(null);
+-				String fileContent =  "module my.mod{\n" +
++				String fileContent =  
++						"module my.mod{\n" +
+ 						 "	uses com.socket.spi.NetworkSocketProvider;\n" +
+ 						 "}";
+ 				createFile(	"/Java9Elements/src/module-info.java",	fileContent);
+@@ -195,4 +197,122 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 			deleteProject("Java9Elements");
+ 		}
+ 	}
++	public void test006() throws Exception {
++		try {
++			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++			String fileContent =  
++					"module my.mod{\n" +
++					"	exports p.q.r;" +
++					"	exports a.b.c;\n" +
++					"	requires java.sql;\n" +
++					"	requires public java.desktop;\n" +
++					"}";
++			createFile(	"/Java9Elements/src/module-info.java",	fileContent);
++
++			project = createJavaProject("Java9Elements2", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++			fileContent =  "module your.mod{\n" +
++					"	requires my.mod;\n" +
++					"	requires public java.desktop;\n" +
++					"}";
++			createFile(	"/Java9Elements2/src/module-info.java",	fileContent);
++
++			ICompilationUnit unit = getCompilationUnit("/Java9Elements2/src/module-info.java");
++			int start = fileContent.indexOf("y.mod");
++			IJavaElement[] elements = unit.codeSelect(start, 0);
++			assertEquals("Incorrect no of elements", 1, elements.length);
++			assertEquals("Incorrect element type", IJavaElement.JAVA_MODULE, elements[0].getElementType());
++			assertEquals("incorrect element name", "my.mod", elements[0].getElementName());
++		}
++		finally {
++			deleteProject("Java9Elements");
++			deleteProject("Java9Elements2");
++		}
++	}
++	public void test007() throws Exception {
++		try {
++			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++			String fileContent =  
++					"module my.mod{\n" +
++					"	exports p.q.r;" +
++					"	exports a.b.c;\n" +
++					"}";
++			createFile(	"/Java9Elements/src/module-info.java",	fileContent);
++
++			project = createJavaProject("Java9Elements2", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++			fileContent =  
++					"module your.mod{\n" +
++					"	requires my.mod;\n" +
++					"}";
++			createFile(	"/Java9Elements2/src/module-info.java",	fileContent);
++
++			ICompilationUnit unit = getCompilationUnit("/Java9Elements2/src/module-info.java");
++			int start = fileContent.lastIndexOf(".mod");
++			IJavaElement[] elements = unit.codeSelect(start, 0);
++			assertEquals("Incorrect no of elements", 1, elements.length);
++			assertEquals("Incorrect element type", IJavaElement.JAVA_MODULE, elements[0].getElementType());
++			assertEquals("incorrect element name", "my.mod", elements[0].getElementName());
++		}
++		finally {
++			deleteProject("Java9Elements");
++			deleteProject("Java9Elements2");
++		}	
++	}
++	public void test008() throws Exception {
++		try {
++			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++			String fileContent =  "module my.mod {\n" +
++					"	exports p.q.r to your.mod;" +
++					"}";
++			createFolder("/Java9Elements/src/p/q/r");
++			createFile(	"/Java9Elements/src/module-info.java",	fileContent);
++			int start = fileContent.indexOf("your.mod");
++
++			project = createJavaProject("Java9Elements2", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++			fileContent =  "module your.mod{\n" +
++					"	requires my.mod;\n" +
++					"}";
++			createFile(	"/Java9Elements2/src/module-info.java",	fileContent);
++
++			ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
++
++			IJavaElement[] elements = unit.codeSelect(start, 0);
++			assertEquals("Incorrect no of elements", 1, elements.length);
++			assertEquals("Incorrect element type", IJavaElement.JAVA_MODULE, elements[0].getElementType());
++			assertEquals("incorrect element name", "your.mod", elements[0].getElementName());
++		}
++		finally {
++			deleteProject("Java9Elements");
++			deleteProject("Java9Elements2");
++		}	
++	}
++	public void test009() throws Exception {
++		try {
++			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++			String fileContent =  "module my.mod {\n" +
++					"	exports p.q.r;" +
++					"}";
++			createFolder("/Java9Elements/src/p/q/r");
++			createFile("/Java9Elements/src/package-info.java",
++					"package p.q.r;");
++			createFile("/Java9Elements/src/module-info.java",	fileContent);
++			int start = fileContent.indexOf("r;");
++
++			ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
++
++			IJavaElement[] elements = unit.codeSelect(start, 0);
++			assertEquals("Incorrect no of elements", 1, elements.length);
++			assertEquals("Incorrect element type", IJavaElement.PACKAGE_FRAGMENT, elements[0].getElementType());
++			assertEquals("incorrect element name", "p.q.r", elements[0].getElementName());
++		}
++		finally {
++			deleteProject("Java9Elements");
++		}	
++	}
+ }
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+index 110c46d..5fbf270 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/CompletionEngine.java
+@@ -10468,7 +10468,6 @@ public final class CompletionEngine
+ // 		ModuleBinding moduleBinding = this.lookupEnvironment.getModule(this.moduleDeclaration.moduleName);
+ //		if (moduleBinding == null) return;
+ //		IModuleContext moduleContext = moduleBinding.getModuleLookupContext();
+-		char[] modName = this.moduleDeclaration.name;
+ 		IModuleContext moduleContext = () -> {
+ 			return Stream.of((JavaProject)this.javaProject);
+ 		};
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionOnModuleReference.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionOnModuleReference.java
+index 5b04de7..d150085 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionOnModuleReference.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionOnModuleReference.java
+@@ -16,8 +16,10 @@
+ package org.eclipse.jdt.internal.codeassist.complete;
+ 
+ import org.eclipse.jdt.internal.compiler.ast.ModuleReference;
++import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
++import org.eclipse.jdt.internal.compiler.lookup.Scope;
+ 
+-public class CompletionOnModuleReference extends ModuleReference implements CompletionOnKeyword {
++public class CompletionOnModuleReference extends ModuleReference {
+ 
+ 	public CompletionOnModuleReference(char[] ident, long pos) {
+ 		this(new char[][]{ident}, new long[]{pos});
+@@ -25,19 +27,14 @@ public class CompletionOnModuleReference extends ModuleReference implements Comp
+ 	public CompletionOnModuleReference(char[][] tokens, long[] sourcePositions) {
+ 		super(tokens, sourcePositions);
+ 	}
+-	public CompletionOnModuleReference(char[][] tokens, long[] sourcePositions, int modifiers) {
+-		this(tokens, sourcePositions);
+-		this.modifiers = modifiers;
+-	}
+-	@Override
+-	public char[] getToken() {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-	@Override
+-	public char[][] getPossibleKeywords() {
+-		// TODO Auto-generated method stub
+-		return null;
++
++	public ModuleBinding resolve(Scope scope) {
++		super.resolve(scope);
++		if (this.binding != null) {
++			throw new CompletionNodeFound(this, this.binding, scope);
++		} else {
++			throw new CompletionNodeFound();
++		}
+ 	}
+ 	public StringBuffer print(int indent, StringBuffer output) {
+ 
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionParser.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionParser.java
+index dca47e2..9194bea 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionParser.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/complete/CompletionParser.java
+@@ -1585,7 +1585,6 @@ private boolean checkModuleInfoConstructs() {
+ 
+ /**
+  * TODO: remove this code once all constructs are implemented
+- * @return
+  */
+ @SuppressWarnings("unused")
+ private boolean _checkModuleInfoConstructs() {
+@@ -4588,8 +4587,22 @@ public ExportReference createAssistExportReference(char[][] tokens, long[] posit
+ public ImportReference createAssistImportReference(char[][] tokens, long[] positions, int mod){
+ 	return new CompletionOnImportReference(tokens, positions, mod);
+ }
+-public ModuleReference createAssistModuleReference(char[][] tokens, long[] positions, int mod){
+-	return new CompletionOnModuleReference(tokens, positions, mod);
++@Override
++public ModuleReference createAssistModuleReference(int index) {
++	/* retrieve identifiers subset and whole positions, the assist node positions
++	should include the entire replaced source. */
++	int length = this.identifierLengthStack[this.identifierLengthPtr];
++	char[][] subset = identifierSubSet(index+1); // include the assistIdentifier
++	this.identifierLengthPtr--;
++	this.identifierPtr -= length;
++	long[] positions = new long[length];
++	System.arraycopy(
++			this.identifierPositionStack,
++			this.identifierPtr + 1,
++			positions,
++			0,
++			length);
++	return new CompletionOnModuleReference(subset, positions);
+ }
+ @Override
+ public ModuleDeclaration createAssistModuleDeclaration(CompilationResult compilationResult, char[][] tokens,
+@@ -5595,5 +5608,4 @@ protected boolean isInModuleStatements() {
+ 			isInProvidesStatement() ||
+ 			isInUsessStatement();
+ }
+-
+ }
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+index 215bc74..5b6c2a2 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/impl/AssistParser.java
+@@ -1027,22 +1027,9 @@ protected void consumeSingleExportsTargetName() {
+ 		super.consumeSingleExportsTargetName();
+ 		return;
+ 	}
+-	/* retrieve identifiers subset and whole positions, the assist node positions
+-	should include the entire replaced source. */
+-	int length = this.identifierLengthStack[this.identifierLengthPtr];
+-	char[][] subset = identifierSubSet(index+1); // include the assistIdentifier
+-	this.identifierLengthPtr--;
+-	this.identifierPtr -= length;
+-	long[] positions = new long[length];
+-	System.arraycopy(
+-			this.identifierPositionStack,
+-			this.identifierPtr + 1,
+-			positions,
+-			0,
+-			length);
+-		
++
+ 	/* build specific assist node on targetted exports statement */
+-	ModuleReference reference = createAssistModuleReference(subset, positions, 0 /* no modifiers */);
++	ModuleReference reference = createAssistModuleReference(index);
+ 	this.assistNode = reference;
+ 	this.lastCheckPoint = reference.sourceEnd + 1;
+ 	pushOnAstStack(reference);
+@@ -1074,23 +1061,8 @@ protected void consumeSingleRequiresModuleName() {
+ 		return;
+ 	}
+ 
+-	/* retrieve identifiers subset and whole positions, the assist node positions
+-	should include the entire replaced source. */
+-	int length = this.identifierLengthStack[this.identifierLengthPtr];
+-	char[][] subset = identifierSubSet(index+1); // include the assistIdentifier
+-	this.identifierLengthPtr--;
+-	this.identifierPtr -= length;
+-	long[] positions = new long[length];
+-	System.arraycopy(
+-			this.identifierPositionStack,
+-			this.identifierPtr + 1,
+-			positions,
+-			0,
+-			length);
+-		
+-	int modifiers1 = this.intStack[this.intPtr--];
+ 	/* build specific assist node on requires statement */
+-	ModuleReference reference = createAssistModuleReference(subset, positions, modifiers1);
++	ModuleReference reference = createAssistModuleReference(index);
+ 	this.assistNode = reference;
+ 	this.lastCheckPoint = reference.sourceEnd + 1;
+ 	pushOnAstStack(reference);
+@@ -1098,7 +1070,7 @@ protected void consumeSingleRequiresModuleName() {
+ 	if (this.currentToken == TokenNameSEMICOLON){
+ 		reference.declarationSourceEnd = this.scanner.currentPosition - 1;
+ 	} else {
+-		reference.declarationSourceEnd = (int) positions[length-1];
++		reference.declarationSourceEnd = (int) reference.sourcePositions[reference.tokens.length-1];
+ 	}
+ 	//endPosition is just before the ;
+ 	reference.declarationSourceStart = this.intStack[this.intPtr--];
+@@ -1362,7 +1334,7 @@ protected void consumeTypeImportOnDemandDeclarationName() {
+ }
+ public abstract ExportReference createAssistExportReference(char[][] tokens, long[] positions);
+ public abstract ImportReference createAssistImportReference(char[][] tokens, long[] positions, int mod);
+-public abstract ModuleReference createAssistModuleReference(char[][] tokens, long[] positions, int mod);
++public abstract ModuleReference createAssistModuleReference(int index);
+ public abstract ImportReference createAssistPackageReference(char[][] tokens, long[] positions);
+ public abstract NameReference createQualifiedAssistNameReference(char[][] previousIdentifiers, char[] assistName, long[] positions);
+ public abstract TypeReference createQualifiedAssistTypeReference(char[][] previousIdentifiers, char[] assistName, long[] positions);
+diff --git a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
+index d7dd33a..725e1f3 100644
+--- a/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
++++ b/org.eclipse.jdt.core/codeassist/org/eclipse/jdt/internal/codeassist/select/SelectionParser.java
+@@ -1603,7 +1603,16 @@ public  String toString() {
+ 	return s + super.toString();
+ }
+ @Override
+-public ModuleReference createAssistModuleReference(char[][] tokens, long[] positions, int mod) {
++public ModuleReference createAssistModuleReference(int index) {
++	// ignore index, all segments of the module name are part of a single identifier.
++	/* retrieve identifiers subset and whole positions, the assist node positions
++	should include the entire replaced source. */
++	int length;
++	char[][] tokens = new char[length = this.identifierLengthStack[this.identifierLengthPtr--]][];
++	this.identifierPtr -= length;
++	long[] positions = new long[length];
++	System.arraycopy(this.identifierStack, this.identifierPtr + 1, tokens, 0, length);
++	System.arraycopy(this.identifierPositionStack, this.identifierPtr + 1, positions, 0, length);
+ 	return new SelectionOnModuleReference(tokens, positions);
+ }
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironmentRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironmentRequestor.java
+index 589265d..1a5ce90 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironmentRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SearchableEnvironmentRequestor.java
+@@ -13,6 +13,7 @@ package org.eclipse.jdt.internal.core;
+ import org.eclipse.jdt.core.IInitializer;
+ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.IJavaProject;
++import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.IPackageFragment;
+ import org.eclipse.jdt.core.IType;
+ import org.eclipse.jdt.core.JavaCore;
+@@ -21,7 +22,6 @@ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.codeassist.ISearchRequestor;
+ import org.eclipse.jdt.internal.compiler.env.AccessRuleSet;
+ import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+-import org.eclipse.jdt.internal.compiler.env.IModule;
+ import org.eclipse.jdt.internal.compiler.env.AccessRestriction;
+ 
+ /**
+@@ -86,8 +86,8 @@ public void acceptInitializer(IInitializer initializer) {
+ public void acceptPackageFragment(IPackageFragment packageFragment) {
+ 	this.requestor.acceptPackage(packageFragment.getElementName().toCharArray());
+ }
+-public void acceptModule(IModule module) {
+-	this.requestor.acceptModule(module.name());
++public void acceptModule(IModuleDescription module) {
++	this.requestor.acceptModule(module.getElementName().toCharArray());
+ }
+ /**
+  * @see IJavaElementRequestor
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+index 2547671..8c97212 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+@@ -46,15 +46,14 @@ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.core.BasicCompilationUnit;
+ import org.eclipse.jdt.internal.core.ModuleRequirement;
+ import org.eclipse.jdt.internal.core.NamedMember;
+-import org.eclipse.jdt.internal.core.OpenableElementInfo;
+ import org.eclipse.jdt.internal.core.PackageExport;
+-import org.eclipse.jdt.internal.core.PackageFragmentRoot;
+-import org.eclipse.jdt.internal.core.SourceRefElement;
+ import org.eclipse.jdt.internal.core.builder.NameEnvironment;
+ import org.eclipse.jdt.internal.core.builder.ProblemFactory;
+ 
+ public class ModuleUtil {
+ 
++	private static String[] EMPTRY_STRING_ARRAY = new String[0];
++
+ 	public static String createModuleFromPackageRoot(String moduleName, IPackageFragmentRoot root) throws CoreException {
+ 		IJavaProject project = root.getJavaProject();
+ 		String lineDelimiter = null;
+@@ -149,14 +148,6 @@ public class ModuleUtil {
+ 		Set<org.eclipse.jdt.internal.compiler.env.ICompilationUnit> toCompile = new HashSet<>();
+ 		IPackageFragmentRoot[] roots = project.getPackageFragmentRoots();
+ 		for (IPackageFragmentRoot root : roots) {
+-			if (root.isArchive()) {
+-				PackageFragmentRoot lib = (PackageFragmentRoot) root;
+-				IModuleDescription mod = ((OpenableElementInfo) lib.getElementInfo()).getModule();
+-				if (mod != null) {
+-					ModuleRequirement ref = new ModuleRequirement(module, mod.getElementName());
+-					required.add(ref);
+-				}
+-			}
+ 			if (root.getKind() == IPackageFragmentRoot.K_SOURCE) {
+ 				IJavaElement[] children = root.getChildren();
+ 				for (IJavaElement child : children) {
+@@ -166,7 +157,7 @@ public class ModuleUtil {
+ 						ICompilationUnit[] units = fragment.getCompilationUnits();
+ 						if (units.length != 0) {
+ 							String pack = fragment.getElementName();
+-							exports.add(new PackageExport(module, fragment.getElementName()));
++							exports.add(new LocalPackageExportImpl(pack, EMPTRY_STRING_ARRAY));
+ 							for (ICompilationUnit iUnit : units) {
+ 								org.eclipse.jdt.internal.compiler.env.ICompilationUnit sourceFile = 
+ 										new BasicCompilationUnit(iUnit.getSource().toCharArray(), CharOperation.splitOn('.', pack.toCharArray()), iUnit.getPath().toOSString());
+@@ -193,7 +184,7 @@ public class ModuleUtil {
+ 		module.setExports(packs);
+ 		String[] mods = environment.getModules();
+ 		for (String string : mods) {
+-			required.add(new ModuleRequirement(module, string));
++			required.add(new LocalModuleReferenceImpl(string, false));
+ 		}
+ 		Collections.sort(required, new Comparator<IModuleDescription.IModuleReference>() {
+ 			@Override
+@@ -276,12 +267,12 @@ class LocalModuleImpl extends NamedMember implements IModuleDescription {
+ 		return JAVA_MODULE;
+ 	}
+ }
+-class LocalModuleReferenceImpl extends SourceRefElement implements IModuleDescription.IModuleReference {
++class LocalModuleReferenceImpl extends ModuleRequirement {
+ 	String name;
+ 	boolean isPublic = false;
+-	LocalModuleReferenceImpl(char[] name, boolean isPublic) {
+-		super(null);
+-		this.name = new String(name);
++	LocalModuleReferenceImpl(String name, boolean isPublic) {
++		super(null, name);
++		this.name = name;
+ 		this.isPublic = isPublic;
+ 	}
+ 	@Override
+@@ -304,13 +295,19 @@ class LocalModuleReferenceImpl extends SourceRefElement implements IModuleDescri
+ 	protected char getHandleMementoDelimiter() {
+ 		return 0;
+ 	}
++	public boolean equals(Object o) {
++		if (!(o instanceof LocalModuleReferenceImpl)) {
++			return false;
++		}
++		return this.name.equals(((LocalModuleReferenceImpl) o).name);
++	}
+ 	
+ }
+-class LocalPackageExportImpl extends SourceRefElement implements IModuleDescription.IPackageExport {
++class LocalPackageExportImpl extends PackageExport {
+ 	private String pkgName;
+ 	private String[] targets;
+ 	LocalPackageExportImpl(String pkgName, String[] targets) {
+-		super(null);
++		super(null, pkgName);
+ 		this.pkgName = pkgName;
+ 		this.targets = targets;
+ 	}
+@@ -340,4 +337,10 @@ class LocalPackageExportImpl extends SourceRefElement implements IModuleDescript
+ 	protected char getHandleMementoDelimiter() {
+ 		return 0;
+ 	}
+-}
+\ No newline at end of file
++	public boolean equals(Object o) {
++		if (!(o instanceof LocalPackageExportImpl)) {
++			return false;
++		}
++		return this.pkgName.equals(((LocalPackageExportImpl) o).pkgName);
++	}
++}
+commit 4fbf882e97b6977b3cda5aba254e7b63df299e14
+Author: Jay Arthanareeswaran <jarthana@in.ibm.com>
+Date:   Thu Jan 12 12:11:32 2017 +0530
+
+    Bug 486011 - [1.9][model] Java 9 Support in Java Model
+    
+    Implement exports to and opens to as per new JLS
+    
+    Change-Id: I3a6c9350ee49991cc68401112ffd286fd895f0c0
+    Signed-off-by: Jay Arthanareeswaran <jarthana@in.ibm.com>
+
+137	1	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+30	2	org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/BasicModule.java
+6	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ModuleInfo.java
+10	3	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModule.java
+1	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/PackageExportImpl.java
+2	2	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+10	1	org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleEnvironment.java
+9	1	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaElement.java
+11	1	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IModuleDescription.java
+3	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/ISourceElementRequestor.java
+31	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/SourceElementNotifier.java
+7	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+22	3	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
+30	2	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+96	10	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleDescriptionInfo.java
+5	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleInfo.java
+7	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+72	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/OpenPackageStatement.java
+1	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageExport.java
+8	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceModule.java
+8	3	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/BasicModule.java
+7	1	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+1	1	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/BinaryIndexer.java
+4	4	org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/SourceIndexerRequestor.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+index da3c4bf..101d1cd 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2016 IBM Corporation and others.
++ * Copyright (c) 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -19,6 +19,7 @@ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.IModuleDescription.IModuleReference;
++import org.eclipse.jdt.core.IModuleDescription.IOpenPackage;
+ import org.eclipse.jdt.core.IModuleDescription.IPackageExport;
+ import org.eclipse.jdt.core.IModuleDescription.IProvidedService;
+ import org.eclipse.jdt.core.tests.util.AbstractCompilerTest;
+@@ -338,4 +339,139 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 			deleteProject("Java9Elements");
+ 		}
+ 	}
++	public void test011() throws Exception {
++		try {
++			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++				String fileContent =  "module my.mod{" +
++									"	provides a.b.C with a.b.CImpl, a.b.DImpl;\n" + 
++									"	opens a.b;" +
++									"}\n";
++				createFolder("/Java9Elements/src/a/b");
++				createFile("/Java9Elements/src/a/b/C.java",
++						"package a.b;\n" + 
++						"public interface C {}");
++				createFile("/Java9Elements/src/a/b/CImpl.java",
++						"package a.b;\n" + 
++						"public class CImpl implements C {}");
++				createFile(	"/Java9Elements/src/module-info.java",	fileContent);
++
++				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
++				IModuleDescription mod = unit.getModule();
++				assertNotNull("Module should not be null", mod);
++				IProvidedService[] services = mod.getProvidedServices();
++				assertNotNull("should not be null", services);
++				assertEquals("Incorrect no of services", 1, services.length);
++				assertEquals("incorrect service name", "a.b.C", services[0].getServiceName());
++				
++				String[] implementationNames = services[0].getImplementationNames();
++				assertNotNull("should not be null", implementationNames);
++				assertEquals("Incorrect no of implementations", 2, implementationNames.length);
++				assertEquals("incorrect service implementation name", "a.b.CImpl", implementationNames[0]);
++				assertEquals("incorrect service implementation name", "a.b.DImpl", implementationNames[1]);
++				IOpenPackage[] openedPackages = mod.getOpenedPackages();
++				assertNotNull("should not be null", openedPackages);
++				assertEquals("Incorrect no of open packages", 1, openedPackages.length);
++				assertEquals("incorrect package name", "a.b", openedPackages[0].getPackageName());
++				String[] targetModules = openedPackages[0].getTargetModules();
++				assertNotNull("should not be null", targetModules);
++				assertEquals("Incorrect no of open packages", 0, targetModules.length);
++		}
++		finally {
++			deleteProject("Java9Elements");
++		}
++	}
++	public void test012() throws Exception {
++		try {
++			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++				String fileContent =  "module my.mod{" +
++									"	provides a.b.C with a.b.CImpl, a.b.DImpl;\n" + 
++									"}\n";
++				createFolder("/Java9Elements/src/a/b");
++				createFile("/Java9Elements/src/a/b/C.java",
++						"package a.b;\n" + 
++						"public interface C {}");
++				createFile("/Java9Elements/src/a/b/CImpl.java",
++						"package a.b;\n" + 
++						"public class CImpl implements C {}");
++				createFile(	"/Java9Elements/src/module-info.java",	fileContent);
++
++				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
++				IModuleDescription mod = unit.getModule();
++				assertNotNull("Module should not be null", mod);
++				IProvidedService[] services = mod.getProvidedServices();
++				assertNotNull("should not be null", services);
++				assertEquals("Incorrect no of services", 1, services.length);
++				assertEquals("incorrect service name", "a.b.C", services[0].getServiceName());
++				
++				String[] implementationNames = services[0].getImplementationNames();
++				assertNotNull("should not be null", implementationNames);
++				assertEquals("Incorrect no of implementations", 2, implementationNames.length);
++				assertEquals("incorrect service implementation name", "a.b.CImpl", implementationNames[0]);
++				assertEquals("incorrect service implementation name", "a.b.DImpl", implementationNames[1]);
++		}
++		finally {
++			deleteProject("Java9Elements");
++		}
++	}
++	public void test013() throws Exception {
++		try {
++			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++				String fileContent =  "module my.mod{" +
++									"	opens a.b to java.base, java.sql;" +
++									"}\n";
++				createFolder("/Java9Elements/src/a/b");
++				createFile(	"/Java9Elements/src/module-info.java",	fileContent);
++
++				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
++				IModuleDescription mod = unit.getModule();
++				assertNotNull("Module should not be null", mod);
++				IProvidedService[] services = mod.getProvidedServices();
++				assertNotNull("should not be null", services);
++				assertEquals("Incorrect no of services", 0, services.length);
++				
++				IOpenPackage[] openedPackages = mod.getOpenedPackages();
++				assertNotNull("should not be null", openedPackages);
++				assertEquals("Incorrect no of open packages", 1, openedPackages.length);
++				assertEquals("incorrect package name", "a.b", openedPackages[0].getPackageName());
++				String[] targetModules = openedPackages[0].getTargetModules();
++				assertNotNull("should not be null", targetModules);
++				assertEquals("Incorrect no of open packages", 2, targetModules.length);
++				assertEquals("incorrect module name", "java.base", targetModules[0]);
++				assertEquals("incorrect module name", "java.sql", targetModules[1]);
++		}
++		finally {
++			deleteProject("Java9Elements");
++		}
++	}
++	public void test014() throws Exception {
++		try {
++			IJavaProject project = createJavaProject("Java9Elements", new String[] {"src"}, new String[] {"JCL18_LIB"}, "bin", "1.9");
++			project.open(null);
++				String fileContent =  "module my.mod{" +
++									"	exports a.b to java.base, java.sql;" +
++									"}\n";
++				createFolder("/Java9Elements/src/a/b");
++				createFile(	"/Java9Elements/src/module-info.java",	fileContent);
++
++				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
++				IModuleDescription mod = unit.getModule();
++				assertNotNull("Module should not be null", mod);
++				
++				IPackageExport[] exported = mod.getExportedPackages();
++				assertNotNull("should not be null", exported);
++				assertEquals("Incorrect no of open packages", 1, exported.length);
++				assertEquals("incorrect package name", "a.b", exported[0].getPackageName());
++				String[] targetModules = exported[0].getTargetModules();
++				assertNotNull("should not be null", targetModules);
++				assertEquals("Incorrect no of open packages", 2, targetModules.length);
++				assertEquals("incorrect module name", "java.base", targetModules[0]);
++				assertEquals("incorrect module name", "java.sql", targetModules[1]);
++		}
++		finally {
++			deleteProject("Java9Elements");
++		}
++	}
+ }
+diff --git a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/BasicModule.java b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/BasicModule.java
+index e6509d0..ac25060 100644
+--- a/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/BasicModule.java
++++ b/org.eclipse.jdt.core/batch/org/eclipse/jdt/internal/compiler/batch/BasicModule.java
+@@ -24,6 +24,7 @@ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.ast.ExportsStatement;
+ import org.eclipse.jdt.internal.compiler.ast.ModuleDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.ModuleReference;
++import org.eclipse.jdt.internal.compiler.ast.OpensStatement;
+ import org.eclipse.jdt.internal.compiler.ast.RequiresStatement;
+ import org.eclipse.jdt.internal.compiler.ast.ProvidesStatement;
+ import org.eclipse.jdt.internal.compiler.ast.TypeReference;
+@@ -78,6 +79,18 @@ public class BasicModule implements IModule {
+ 		}
+ 		return ser;
+ 	}
++	private static PackageExportImpl createPackageOpen(OpensStatement ref) {
++		PackageExportImpl exp = new PackageExportImpl();
++		exp.pack = ref.pkgName;
++		ModuleReference[] imp = ref.targets;
++		if (imp != null) {
++			exp.exportedTo = new char[imp.length][];
++			for(int j = 0; j < imp.length; j++) {
++				exp.exportedTo = imp[j].tokens;
++			}
++		}
++		return exp;
++	}
+ 
+ 	boolean isAutomodule;
+ 	char[] name;
+@@ -85,6 +98,7 @@ public class BasicModule implements IModule {
+ 	IModule.IPackageExport[] exports;
+ 	char[][] uses;
+ 	Service[] provides;
++	IModule.IPackageExport[] opens;
+ 	public BasicModule(ModuleDeclaration descriptor, IModulePathEntry root) {
+ 		this.name = descriptor.moduleName;
+ 		if (descriptor.requiresCount > 0) {
+@@ -123,6 +137,16 @@ public class BasicModule implements IModule {
+ 				this.provides[i] = createService(services[i].serviceInterface, services[i].implementations);
+ 			}
+ 		}
++		if (descriptor.opensCount > 0) {
++			OpensStatement[] refs = descriptor.opens;
++			this.exports = new PackageExportImpl[refs.length];
++			for (int i = 0; i < refs.length; i++) {
++				PackageExportImpl exp = createPackageOpen(refs[i]);
++				this.exports[i] = exp;
++			}
++		} else {
++			this.exports = new PackageExportImpl[0];
++		}
+ 		this.isAutomodule = false; // Just to be explicit
+ 	}
+ 	public BasicModule(char[] name, boolean isAuto) {
+@@ -149,7 +173,11 @@ public class BasicModule implements IModule {
+ 	}
+ 	@Override
+ 	public IService[] provides() {
+-		return this.provides();
++		return this.provides;
++	}
++	@Override
++	public IModule.IPackageExport[] opens() {
++		return this.opens;
+ 	}
+ 	@Override
+ 	public boolean isAutomatic() {
+@@ -176,7 +204,7 @@ public class BasicModule implements IModule {
+ 				.map(e -> {
+ 					PackageExportImpl exp = new PackageExportImpl();
+ 					exp.pack = ((PackageExportImpl )e).name();
+-					exp.exportedTo = ((PackageExportImpl )e).exportedTo();
++					exp.exportedTo = ((PackageExportImpl )e).targets();
+ 					return exp;
+ 				}))
+ 			.collect(
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ModuleInfo.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ModuleInfo.java
+index b0b8b7c..240f95a 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ModuleInfo.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/classfmt/ModuleInfo.java
+@@ -72,6 +72,10 @@ public class ModuleInfo extends ClassFileStruct implements IModule {
+ 	public IService[] provides() {
+ 		return this.provides;
+ 	}
++	@Override
++	public IModule.IPackageExport[] opens() {
++		return this.opens;
++	}
+ 	public void addReads(char[] modName) {
+ 		Predicate<char[]> shouldAdd = m -> {
+ 			return Stream.of(this.requires).map(ref -> ref.name()).noneMatch(n -> CharOperation.equals(modName, n));
+@@ -92,7 +96,7 @@ public class ModuleInfo extends ClassFileStruct implements IModule {
+ 				.map(e -> {
+ 					PackageExportInfo exp = new PackageExportInfo();
+ 					exp.packageName = e.name();
+-					exp.exportedTo = e.exportedTo();
++					exp.exportedTo = e.targets();
+ 					return exp;
+ 				}))
+ 			.collect(
+@@ -281,7 +285,7 @@ public class ModuleInfo extends ClassFileStruct implements IModule {
+ 		}
+ 
+ 		@Override
+-		public char[][] exportedTo() {
++		public char[][] targets() {
+ 			return this.exportedTo;
+ 		}
+ 		public String toString() {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModule.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModule.java
+index 20622a0..a0dd12c 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModule.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/IModule.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2016 IBM Corporation and others.
++ * Copyright (c) 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -23,6 +23,7 @@ public interface IModule {
+ 	public static char[][] NO_USES = new char[0][];
+ 	public static IService[] NO_PROVIDES = new IService[0];
+ 	public static IModule[] NO_MODULES = new IModule[0];
++	public static IPackageExport[] NO_OPENS = new IPackageExport[0];
+ 
+ 	public char[] name();
+ 
+@@ -34,6 +35,12 @@ public interface IModule {
+ 
+ 	public IService[] provides();
+ 
++	/*
++	 * the opens package statement is very similar to package export statement, hence
++	 * the same internal models are being used here.
++	 */
++	public IPackageExport[] opens();
++
+ 	public interface IModuleReference {
+ 		public char[] name();
+ 		public default boolean isTransitive() {
+@@ -47,9 +54,9 @@ public interface IModule {
+ 
+ 	public interface IPackageExport {
+ 		public char[] name();
+-		public char[][] exportedTo();
++		public char[][] targets();
+ 		public default boolean isQualified() {
+-			char[][] targets = exportedTo();
++			char[][] targets = targets();
+ 			return targets != null && targets.length > 0;
+ 		}
+ 	}
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/PackageExportImpl.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/PackageExportImpl.java
+index f54faa8..d035933 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/PackageExportImpl.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/env/PackageExportImpl.java
+@@ -23,7 +23,7 @@ public class PackageExportImpl implements IModule.IPackageExport {
+ 	}
+ 
+ 	@Override
+-	public char[][] exportedTo() {
++	public char[][] targets() {
+ 		return this.exportedTo;
+ 	}
+ 	public String toString() {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+index 219c9af..8347182 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleBinding.java
+@@ -188,7 +188,7 @@ public class ModuleBinding extends Binding {
+ 			}
+ 			Predicate<IPackageExport> isTargeted = IPackageExport::isQualified;
+ 			Predicate<IPackageExport> isExportedTo = e -> 
+-				Stream.of(e.exportedTo()).map(ref -> this.environment.getModule(ref)).filter(m -> m != null).anyMatch(client::equals);
++				Stream.of(e.targets()).map(ref -> this.environment.getModule(ref)).filter(m -> m != null).anyMatch(client::equals);
+ 			
+ 			return Stream.of(this.exports).filter(e -> CharOperation.equals(pkg.readableName(), e.name()))
+ 					.anyMatch(isTargeted.negate().or(isExportedTo));
+@@ -413,7 +413,7 @@ public class ModuleBinding extends Binding {
+ 				IPackageExport export = this.exports[i];
+ 				buffer.append("\n\t"); //$NON-NLS-1$
+ 				buffer.append(export.name());
+-				char[][] targets = export.exportedTo();
++				char[][] targets = export.targets();
+ 				if (targets != null) {
+ 					buffer.append("to "); //$NON-NLS-1$
+ 					for (int j = 0; j < targets.length; j++) {
+diff --git a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleEnvironment.java b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleEnvironment.java
+index f2c0d4f..e3e42cc 100644
+--- a/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleEnvironment.java
++++ b/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/ModuleEnvironment.java
+@@ -68,6 +68,10 @@ public abstract class ModuleEnvironment implements IModuleAwareNameEnvironment {
+ 		public IService[] provides() {
+ 			return null;
+ 		}
++		@Override
++		public IPackageExport[] opens() {
++			return null;
++		}
+ 
+ 	};
+ 	public static final class AutoModule implements IModule {
+@@ -100,6 +104,11 @@ public abstract class ModuleEnvironment implements IModuleAwareNameEnvironment {
+ 			return IModule.NO_PROVIDES;
+ 		}
+ 
++		@Override
++		public IPackageExport[] opens() {
++			return NO_OPENS;
++		}
++
+ 		public boolean isAutomatic() {
+ 			return true;
+ 		}
+@@ -171,7 +180,7 @@ public abstract class ModuleEnvironment implements IModuleAwareNameEnvironment {
+ 		if (exports != null && exports.length > 0) {
+ 			for (IModule.IPackageExport iPackageExport : exports) {
+ 				if (CharOperation.equals(iPackageExport.name(), pack)) {
+-					char[][] exportedTo = iPackageExport.exportedTo();
++					char[][] exportedTo = iPackageExport.targets();
+ 					if (exportedTo == null || exportedTo.length == 0) {
+ 						return true;
+ 					}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaElement.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaElement.java
+index 2fee0cb..a9cb81e 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaElement.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaElement.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2016 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -20,6 +20,7 @@ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.jobs.ISchedulingRule;
+ import org.eclipse.jdt.core.IModuleDescription.IModuleReference;
++import org.eclipse.jdt.core.IModuleDescription.IOpenPackage;
+ import org.eclipse.jdt.core.IModuleDescription.IPackageExport;
+ import org.eclipse.jdt.core.IModuleDescription.IProvidedService;
+ 
+@@ -169,6 +170,13 @@ public interface IJavaElement extends IAdaptable {
+ 	 *@since 3.13 BETA_JAVA9
+ 	 */
+ 	int SERVICE = 20;
++	/**
++	 * Constant represents packages opened to other modules. A Java element with this type
++	 * can be safely cast to {@link IOpenPackage}.
++	 *
++	 *@since 3.13 BETA_JAVA9
++	 */
++	int OPEN_PACKAGE = 21;
+ 
+ 	/**
+ 	 * Returns whether this Java element exists in the model.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IModuleDescription.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IModuleDescription.java
+index 5464dfc..f7f07f9 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IModuleDescription.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IModuleDescription.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2016 IBM Corporation.
++ * Copyright (c) 2017 IBM Corporation.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -68,6 +68,10 @@ public interface IModuleDescription extends IMember {
+ 	 * @return the services used by this module.
+ 	 */
+ 	public String[] getUsedServices() throws JavaModelException;
++	/**
++	 * 
++	 */
++	public IOpenPackage[] getOpenedPackages() throws JavaModelException;
+ 
+ 	/**
+ 	 * Represents a <code>exports</code> statement in a Java module description.
+@@ -132,4 +136,10 @@ public interface IModuleDescription extends IMember {
+ 		 */
+ 		public String[] getImplementationNames();
+ 	}
++	/**
++	 * 
++	 */
++	public interface IOpenPackage extends IPackageExport {
++		// Essentially same as IPackageExport
++	}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/ISourceElementRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/ISourceElementRequestor.java
+index cf954df..195671d 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/ISourceElementRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/ISourceElementRequestor.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2016 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -56,6 +56,7 @@ public interface ISourceElementRequestor {
+ 		public RequiresInfo[] requires;
+ 		public PackageExportInfo[] exports;
+ 		public ServicesInfo[] services;
++		public PackageExportInfo[] opens;
+ 		public char[][] usedServices;
+ 	}
+ 	public static class RequiresInfo {
+@@ -64,7 +65,7 @@ public interface ISourceElementRequestor {
+ 	}
+ 	public static class PackageExportInfo {
+ 		public char[] pkgName;
+-		public char[] targetModule;
++		public char[][] targets;
+ 	}
+ 	public static class ServicesInfo {
+ 		public char[] serviceName;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/SourceElementNotifier.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/SourceElementNotifier.java
+index 4271144..9663736 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/SourceElementNotifier.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/compiler/SourceElementNotifier.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2016 IBM Corporation and others.
++ * Copyright (c) 2008, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -36,6 +36,7 @@ import org.eclipse.jdt.internal.compiler.ast.ClassLiteralAccess;
+ import org.eclipse.jdt.internal.compiler.ast.CompilationUnitDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.ConstructorDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.ExplicitConstructorCall;
++import org.eclipse.jdt.internal.compiler.ast.ExportsStatement;
+ import org.eclipse.jdt.internal.compiler.ast.Expression;
+ import org.eclipse.jdt.internal.compiler.ast.FieldDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.ImportReference;
+@@ -43,6 +44,7 @@ import org.eclipse.jdt.internal.compiler.ast.Initializer;
+ import org.eclipse.jdt.internal.compiler.ast.MessageSend;
+ import org.eclipse.jdt.internal.compiler.ast.MethodDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.ModuleDeclaration;
++import org.eclipse.jdt.internal.compiler.ast.OpensStatement;
+ import org.eclipse.jdt.internal.compiler.ast.QualifiedAllocationExpression;
+ import org.eclipse.jdt.internal.compiler.ast.ThisReference;
+ import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
+@@ -737,7 +739,16 @@ private void fillModuleInfo(TypeDeclaration typeDeclaration, ISourceElementReque
+ 		ISourceElementRequestor.PackageExportInfo exps[] = new ISourceElementRequestor.PackageExportInfo[mod.exportsCount];
+ 		for (int i = 0; i < mod.exportsCount; i++) {
+ 			ISourceElementRequestor.PackageExportInfo exp = new ISourceElementRequestor.PackageExportInfo();
+-			exp.pkgName = mod.exports[i].pkgName;
++			ExportsStatement exportsStatement = mod.exports[i];
++			exp.pkgName = exportsStatement.pkgName;
++			if (exportsStatement.targets == null) {
++				exp.targets = CharOperation.NO_CHAR_CHAR;
++			} else {
++				exp.targets = new char[exportsStatement.targets.length][];
++				for(int j = 0; j < exp.targets.length; j++) {
++					exp.targets[j] = CharOperation.concatWith(exportsStatement.targets[j].tokens, '.');
++				}
++			}
+ 			exps[i] = exp;
+ 		}					
+ 		modInfo.exports = exps;
+@@ -762,6 +773,24 @@ private void fillModuleInfo(TypeDeclaration typeDeclaration, ISourceElementReque
+ 		}
+ 		modInfo.usedServices = uses;
+ 	}
++	if (mod.opensCount > 0) {
++		ISourceElementRequestor.PackageExportInfo opens[] = new ISourceElementRequestor.PackageExportInfo[mod.opensCount];
++		for (int i = 0; i < mod.opensCount; i++) {
++			ISourceElementRequestor.PackageExportInfo op = new ISourceElementRequestor.PackageExportInfo();
++			OpensStatement openStmt = mod.opens[i];
++			op.pkgName = openStmt.pkgName;
++			if (openStmt.targets == null) {
++				op.targets = CharOperation.NO_CHAR_CHAR;
++			} else {
++				op.targets = new char[openStmt.targets.length][];
++				for(int j = 0; j < op.targets.length; j++) {
++					op.targets[j] = CharOperation.concatWith(openStmt.targets[j].tokens, '.');
++				}
++			}
++			opens[i] = op;
++		}
++		modInfo.opens = opens;
++	}
+ }
+ /*
+  * Sort the given ast nodes by their positions.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+index 875f3ba..1b7730a 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+@@ -56,6 +56,13 @@ public class BinaryModule extends BinaryMember implements IModuleDescription {
+ 		return CharOperation.toStrings(names);
+ 	}
+ 	@Override
++	public IOpenPackage[] getOpenedPackages() throws JavaModelException {
++		ArrayList list = getChildrenOfType(OPEN_PACKAGE);
++		IModuleDescription.IOpenPackage[] array= new IModuleDescription.IOpenPackage[list.size()];
++		list.toArray(array);
++		return array;
++	}
++	@Override
+ 	public int getFlags() throws JavaModelException {
+ 		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
+ 		return info.getModifiers();
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
+index 5a4e706..fc6d93d 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2015 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *******************************************************************************/
+@@ -260,7 +264,7 @@ private void generateModuleInfos(ClassFile classFile, ClassFileReader info, Hash
+ 		IPackageExport[] exportedPackages = modDecl.exports();
+ 		if (exportedPackages != null) {
+ 			for (IPackageExport iPackageExport : exportedPackages) {
+-				generatePackageExportInfos(handle, newElements, iPackageExport.name(), iPackageExport.exportedTo(), childrenHandles);
++				generatePackageExportInfos(handle, newElements, iPackageExport.name(), iPackageExport.targets(), childrenHandles);
+ 			}
+ 		}
+ 		IModuleReference[] requiredModules = modDecl.requires();
+@@ -276,6 +280,12 @@ private void generateModuleInfos(ClassFile classFile, ClassFileReader info, Hash
+ 			}
+ 		}
+ 		moduleInfo.usedServices = modDecl.uses();
++		IPackageExport[] opens = modDecl.opens();
++		if (opens != null) {
++			for (IPackageExport iPackageExport : exportedPackages) {
++				generatOpensInfos(handle, newElements, iPackageExport.name(), iPackageExport.targets(), childrenHandles);
++			}
++		}
+ 		setModule(handle);
+ 		newElements.put(handle, moduleInfo);
+ 	}
+@@ -292,7 +302,7 @@ private void generateServiceInfos(BinaryModule parentHandle, HashMap newElements
+ 	while (newElements.containsKey(service))
+ 		service.occurrenceCount++;
+ 	newElements.put(service, info);
+-} 
++}
+ private void generateModuleRequirementInfos(BinaryModule parentHandle, HashMap newElements, char[] moduleName, int modifiers, ArrayList requiresHandles) {
+ 	ModuleRequirement requirement = new ModuleRequirement(parentHandle, new String(moduleName));
+ 	ModuleReferenceInfo info = new ModuleReferenceInfo();
+@@ -311,6 +321,15 @@ private void generatePackageExportInfos(BinaryModule parentHandle, HashMap newEl
+ 		exportStmt.occurrenceCount++;
+ 	newElements.put(exportStmt, info);
+ }
++private void generatOpensInfos(BinaryModule parentHandle, HashMap newElements, char[] pkgName, char[][] target, ArrayList requiresHandles) {
++	OpenPackageStatement openStmt = new OpenPackageStatement(parentHandle, new String(pkgName));
++	ModuleDescriptionInfo.PackageExportInfo info = new ModuleDescriptionInfo.PackageExportInfo();
++	info.pack = pkgName;
++	info.target = target;
++	while (newElements.containsKey(openStmt))
++		openStmt.occurrenceCount++;
++	newElements.put(openStmt, info);
++}
+ /**
+  * Creates the handles and infos for the methods of the given binary type.
+  * Adds new handles to the given vector.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+index 6adfaaf..21c469e 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+@@ -1,10 +1,14 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2014 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+  * http://www.eclipse.org/legal/epl-v10.html
+  *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
+  *******************************************************************************/
+@@ -541,7 +545,25 @@ private void acceptPackageExport(PackageExportInfo exportInfo, JavaElementInfo p
+ 
+ 	org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo info = new org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo();
+ 	info.pack = exportInfo.pkgName;
+-	info.target = new char[][]{exportInfo.targetModule};
++	info.target = new char[exportInfo.targets.length][];
++	for(int i = 0; i < info.targets().length; i++) {
++		info.target[i] = exportInfo.targets[i]; // TODO: confirm if it is okay to use the array as is instead of making a copy.
++	}
++	this.newElements.put(handle, info);
++	addToChildren(parentInfo, handle);
++}
++private void acceptOpensPackage(PackageExportInfo opensInfo, JavaElementInfo parentInfo) {
++	JavaElement parentHandle = (JavaElement) this.handleStack.peek();
++	String pkgName = new String(opensInfo.pkgName);
++	OpenPackageStatement handle = new OpenPackageStatement(parentHandle, pkgName);
++	resolveDuplicates(handle); // TODO: really necessary?
++
++	org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo info = new org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo();
++	info.pack = opensInfo.pkgName;
++	info.target = new char[opensInfo.targets.length][];
++	for(int i = 0; i < info.targets().length; i++) {
++		info.target[i] = opensInfo.targets[i]; // TODO: confirm if it is okay to use the array as is instead of making a copy.
++	}
+ 	this.newElements.put(handle, info);
+ 	addToChildren(parentInfo, handle);
+ }
+@@ -596,6 +618,12 @@ private org.eclipse.jdt.internal.core.ModuleDescriptionInfo createModuleInfo(Mod
+ 		}
+ 		info.usedServices = services;
+ 	}
++	if (modInfo.opens != null) {
++		for (int i = 0, length = modInfo.opens.length; i < length; i++) {
++			PackageExportInfo expInfo = modInfo.opens[i];
++			acceptOpensPackage(expInfo, info);
++		}
++	}
+ 	return info;
+ }
+ private SourceTypeElementInfo createTypeInfo(TypeInfo typeInfo, SourceType handle) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleDescriptionInfo.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleDescriptionInfo.java
+index 28c3ab1..09ff6eb 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleDescriptionInfo.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleDescriptionInfo.java
+@@ -20,18 +20,27 @@ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.ast.ExportsStatement;
+ import org.eclipse.jdt.internal.compiler.ast.ModuleDeclaration;
+ import org.eclipse.jdt.internal.compiler.ast.ModuleReference;
++import org.eclipse.jdt.internal.compiler.ast.OpensStatement;
++import org.eclipse.jdt.internal.compiler.ast.ProvidesStatement;
+ import org.eclipse.jdt.internal.compiler.ast.RequiresStatement;
++import org.eclipse.jdt.internal.compiler.ast.TypeReference;
++import org.eclipse.jdt.internal.compiler.ast.UsesStatement;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+ 
+ public class ModuleDescriptionInfo extends AnnotatableInfo implements IModule {
+ 
+ 	protected static final char[][] NO_USES = new char[0][0];
++	protected static final ModuleReferenceInfo[] NO_REQUIRES = new ModuleReferenceInfo[0];
++	protected static final PackageExportInfo[] NO_EXPORTS = new PackageExportInfo[0];
++	protected static final ServiceInfo[] NO_PROVIDES = new ServiceInfo[0];
++	protected static final PackageExportInfo[] NO_OPENS = new PackageExportInfo[0];
+ 
+ 	protected IJavaElement[] children = JavaElement.NO_ELEMENTS;
+ 
+ 	ModuleReferenceInfo[] requires;
+ 	PackageExportInfo[] exports;
+ 	ServiceInfo[] services;
++	PackageExportInfo[] opens;
+ 	char[][] usedServices;
+ 	IModuleDescription handle;
+ 	char[] name;
+@@ -51,10 +60,12 @@ public class ModuleDescriptionInfo extends AnnotatableInfo implements IModule {
+ 		char[][] target;
+ 		public String toString() {
+ 			StringBuffer buffer = new StringBuffer();
+-			
+ 			buffer.append(this.pack);
+ 			if (this.target != null) {
+-				buffer.append(this.target);
++				buffer.append(" to "); //$NON-NLS-1$
++				for (char[] mod : this.target) {
++					buffer.append(mod);
++				}
+ 			}
+ 			buffer.append(';');
+ 			return buffer.toString();
+@@ -66,10 +77,11 @@ public class ModuleDescriptionInfo extends AnnotatableInfo implements IModule {
+ 		}
+ 
+ 		@Override
+-		public char[][] exportedTo() {
++		public char[][] targets() {
+ 			return this.target;
+ 		}
+ 	}
++
+ 	static class ServiceInfo extends MemberElementInfo implements IModule.IService {
+ 		char[] serviceName;
+ 		char[][] implNames;
+@@ -83,7 +95,6 @@ public class ModuleDescriptionInfo extends AnnotatableInfo implements IModule {
+ 		}
+ 		public String toString() {
+ 			StringBuffer buffer = new StringBuffer();
+-			buffer.append("provides "); //$NON-NLS-1$
+ 			buffer.append(this.serviceName);
+ 			buffer.append(" with "); //$NON-NLS-1$
+ 			for (int i = 0; i < this.implNames.length; i++) {
+@@ -108,23 +119,50 @@ public class ModuleDescriptionInfo extends AnnotatableInfo implements IModule {
+ 				mod.requires[i].modifiers = refs[i].modifiers;
+ 			}
+ 		} else {
+-			mod.requires = new ModuleReferenceInfo[0];
++			mod.requires = NO_REQUIRES;
+ 		}
+ 		if (module.exportsCount > 0) {
+ 			ExportsStatement[] refs = module.exports;
+ 			mod.exports = new PackageExportInfo[refs.length];
+ 			for (int i = 0; i < refs.length; i++) {
+-				PackageExportInfo exp = createPackageExport(refs, i);
++				PackageExportInfo exp = createPackageExport(refs[i]);
+ 				mod.exports[i] = exp;
+ 			}
+ 		} else {
+-			mod.exports = new PackageExportInfo[0];
++			mod.exports = NO_EXPORTS;
++		}
++		if (module.usesCount > 0) {
++			UsesStatement[] uses = module.uses;
++			mod.usedServices = new char[uses.length][];
++			for (int i = 0; i < uses.length; i++) {
++				mod.usedServices[i] = CharOperation.concatWith(uses[i].serviceInterface.getTypeName(), '.');
++			}
++		} else {
++			mod.usedServices = NO_USES;
++		}
++		if (module.servicesCount > 0) {
++			ProvidesStatement[] provides = module.services;
++			mod.services = new ServiceInfo[provides.length];
++			for (int i = 0; i < provides.length; i++) {
++				mod.services[i] = createService(provides[i]);
++			}
++		} else {
++			mod.services = NO_PROVIDES;
++		}
++		if (module.opensCount > 0) {
++			OpensStatement[] opens = module.opens;
++			mod.opens = new PackageExportInfo[opens.length];
++			for (int i = 0; i < opens.length; i++) {
++				PackageExportInfo op = createOpensInfo(opens[i]);
++				mod.opens[i] = op;
++			}
++		} else {
++			mod.opens = NO_OPENS;
+ 		}
+ 		return mod;
+ 	}
+ 
+-	private static PackageExportInfo createPackageExport(ExportsStatement[] refs, int i) {
+-		ExportsStatement ref = refs[i];
++	private static PackageExportInfo createPackageExport(ExportsStatement ref) {
+ 		PackageExportInfo exp = new PackageExportInfo();
+ 		exp.pack = ref.pkgName;
+ 		ModuleReference[] imp = ref.targets;
+@@ -136,6 +174,29 @@ public class ModuleDescriptionInfo extends AnnotatableInfo implements IModule {
+ 		}
+ 		return exp;
+ 	}
++	private static PackageExportInfo createOpensInfo(OpensStatement opens) {
++		PackageExportInfo open = new PackageExportInfo();
++		open.pack = opens.pkgName;
++		ModuleReference[] imp = opens.targets;
++		if (imp != null) {
++			open.target = new char[imp.length][];
++			for(int j = 0; j < imp.length; j++) {
++				open.target[j] = imp[j].moduleName;
++			}
++		}
++		return open;
++	}
++
++	private static ServiceInfo createService(ProvidesStatement provides) {
++		ServiceInfo info = new ServiceInfo();
++		info.serviceName = CharOperation.concatWith(provides.serviceInterface.getTypeName(), '.');
++		TypeReference[] implementations = provides.implementations;
++		info.implNames = new char[implementations.length][];
++		for(int i = 0; i < implementations.length; i++) {
++			info.implNames[i] = CharOperation.concatWith(implementations[i].getTypeName(), '.');
++		}
++		return info;
++	}
+ 
+ 	protected void setHandle(IModuleDescription handle) {
+ 		this.handle = handle;
+@@ -169,6 +230,11 @@ public class ModuleDescriptionInfo extends AnnotatableInfo implements IModule {
+ 		return this.services;
+ 	}
+ 
++	@Override
++	public IPackageExport[] opens() {
++		return this.opens;
++	}
++
+ 	public String toString() {
+ 		StringBuffer buffer = new StringBuffer(getClass().getName());
+ 		toStringContent(buffer);
+@@ -199,7 +265,27 @@ public class ModuleDescriptionInfo extends AnnotatableInfo implements IModule {
+ 				buffer.append(this.exports[i].toString()).append('\n');
+ 			}
+ 		}
+-		//TODO add the rest of the stuff
++		if (this.usedServices != null && this.usedServices.length > 0) {
++			buffer.append('\n');
++			for(int i = 0; i < this.usedServices.length; i++) {
++				buffer.append("\tuses "); //$NON-NLS-1$
++				buffer.append(this.usedServices[i].toString()).append('\n');
++			}
++		}
++		if (this.services != null && this.services.length > 0) {
++			buffer.append('\n');
++			for(int i = 0; i < this.services.length; i++) {
++				buffer.append("\tprovides "); //$NON-NLS-1$
++				buffer.append(this.services[i].toString()).append('\n');
++			}
++		}
++		if (this.opens != null && this.opens.length > 0) {
++			buffer.append('\n');
++			for(int i = 0; i < this.opens.length; i++) {
++				buffer.append("\topens "); //$NON-NLS-1$
++				buffer.append(this.opens[i].toString()).append('\n');
++			}
++		}
+ 		buffer.append('\n').append('}').toString();
+ 	}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleInfo.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleInfo.java
+index 0b04766..579d2f3 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleInfo.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleInfo.java
+@@ -60,6 +60,7 @@ public class ModuleInfo extends SourceTypeElementInfo implements IModule {
+ 	PackageExportImpl[] exports;
+ 	char[][] uses;
+ 	Service[] provides;
++	PackageExportImpl[] opens;
+ 
+ 	@Override
+ 	public char[] name() {
+@@ -143,7 +144,10 @@ public class ModuleInfo extends SourceTypeElementInfo implements IModule {
+ 	}
+ 	@Override
+ 	public IService[] provides() {
+-		return this.provides();
++		return this.provides;
++	}
++	public IPackageExport[] opens() {
++		return this.opens;
+ 	}
+ 	public String toString() {
+ 		StringBuffer buffer = new StringBuffer(getClass().getName());
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+index 58fca8e..206d0c1 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2016 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -333,6 +333,12 @@ public class NameLookup implements SuffixConstants {
+ 			// TODO Auto-generated method stub
+ 			return null;
+ 		}
++
++		@Override
++		public IOpenPackage[] getOpenedPackages() throws JavaModelException {
++			// TODO Auto-generated method stub
++			return null;
++		}
+ 	}
+ 
+ 	public static class Answer {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/OpenPackageStatement.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/OpenPackageStatement.java
+new file mode 100644
+index 0000000..7249f49
+--- /dev/null
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/OpenPackageStatement.java
+@@ -0,0 +1,72 @@
++/*******************************************************************************
++ * Copyright (c) 2017 IBM Corporation.
++ * All rights reserved. This program and the accompanying materials
++ * are made available under the terms of the Eclipse Public License v1.0
++ * which accompanies this distribution, and is available at
++ * http://www.eclipse.org/legal/epl-v10.html
++ *
++ * This is an implementation of an early-draft specification developed under the Java
++ * Community Process (JCP) and is made available for testing and evaluation purposes
++ * only. The code is not compatible with any specification of the JCP.
++ *
++ * Contributors:
++ *     IBM Corporation - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.jdt.internal.core;
++
++import org.eclipse.jdt.core.IModuleDescription;
++import org.eclipse.jdt.core.ISourceRange;
++import org.eclipse.jdt.core.JavaModelException;
++import org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo;
++import org.eclipse.jdt.internal.core.util.Util;
++
++public class OpenPackageStatement extends SourceRefElement implements IModuleDescription.IOpenPackage {
++
++	private String pack;
++	public OpenPackageStatement(JavaElement parent, String pack) {
++		super(parent);
++		this.pack = pack;
++	}
++	@Override
++	public String getPackageName() {
++		return this.pack;
++	}
++	@Override
++	public String[] getTargetModules() throws JavaModelException {
++		PackageExportInfo info = (PackageExportInfo) getElementInfo();
++		char[][] targets = info.targets();
++		if (targets == null || targets.length == 0)
++			return NO_STRINGS;
++		String[] t = new String[targets.length];
++		for(int i = 0; i < t.length; i++) {
++			t[i] = new String(targets[i]);
++		}
++		return t;
++	}
++	public String toString() {
++		StringBuffer buffer = new StringBuffer();
++		buffer.append(this.pack);
++		buffer.append(';');
++		return buffer.toString();
++	}
++	@Override
++	public int getElementType() {
++		return OPEN_PACKAGE;
++	}
++	public ISourceRange getNameRange() throws JavaModelException {
++		return null;
++	}
++	@Override
++	protected char getHandleMementoDelimiter() {
++		return 0;
++	}
++	public int hashCode() {
++		int hash = super.hashCode();
++		return Util.combineHashCodes(hash, this.pack.hashCode());
++	}
++	public boolean equals(Object o) {
++		if (!(o instanceof OpenPackageStatement)) 
++			return false;
++		return super.equals(o) && this.pack.equals(((OpenPackageStatement) o).pack);
++	}
++}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageExport.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageExport.java
+index a581c77..efe4284 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageExport.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageExport.java
+@@ -34,7 +34,7 @@ public class PackageExport extends SourceRefElement implements IModuleDescriptio
+ 	@Override
+ 	public String[] getTargetModules() throws JavaModelException {
+ 		PackageExportInfo info = (PackageExportInfo) getElementInfo();
+-		char[][] targets = info.exportedTo();
++		char[][] targets = info.targets();
+ 		if (targets == null || targets.length == 0)
+ 			return NO_STRINGS;
+ 		String[] t = new String[targets.length];
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceModule.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceModule.java
+index 5752270..14e7b73 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceModule.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/SourceModule.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2016 IBM Corporation.
++ * Copyright (c) 2017 IBM Corporation.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -55,6 +55,13 @@ public class SourceModule extends NamedMember implements IModuleDescription {
+ 		}
+ 		return CharOperation.toStrings(names);
+ 	}
++	@Override
++	public IOpenPackage[] getOpenedPackages() throws JavaModelException {
++		ArrayList list = getChildrenOfType(OPEN_PACKAGE);
++		IModuleDescription.IOpenPackage[] array= new IModuleDescription.IOpenPackage[list.size()];
++		list.toArray(array);
++		return array;
++	}
+ 	
+ 	@Override
+ 	public int getFlags() throws JavaModelException {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/BasicModule.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/BasicModule.java
+index 63048d0..17d7086 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/BasicModule.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/builder/BasicModule.java
+@@ -34,7 +34,7 @@ public class BasicModule implements IModule {
+ 		}
+ 
+ 		@Override
+-		public char[][] exportedTo() {
++		public char[][] targets() {
+ 			return this.exportedTo;
+ 		}
+ 		public String toString() {
+@@ -81,6 +81,7 @@ public class BasicModule implements IModule {
+ 	IModule.IPackageExport[] exports;
+ 	char[][] uses;
+ 	Service[] provides;
++	IModule.IPackageExport[] opens;
+ 	ClasspathLocation root;
+ 	boolean isAutomodule;
+ 	public BasicModule(char[] name, ClasspathLocation root, boolean isAutomodule) {
+@@ -108,7 +109,11 @@ public class BasicModule implements IModule {
+ 	}
+ 	@Override
+ 	public IService[] provides() {
+-		return this.provides();
++		return this.provides;
++	}
++	@Override
++	public IPackageExport[] opens() {
++		return this.opens;
+ 	}
+ 	@Override
+ 	public boolean isAutomatic() {
+@@ -135,7 +140,7 @@ public class BasicModule implements IModule {
+ 				.map(e -> {
+ 					PackageExport exp = new PackageExport();
+ 					exp.pack = ((PackageExport )e).name();
+-					exp.exportedTo = ((PackageExport )e).exportedTo();
++					exp.exportedTo = ((PackageExport )e).targets();
+ 					return exp;
+ 				}))
+ 			.collect(
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+index 8c97212..4abe148 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2016 IBM Corporation.
++ * Copyright (c) 2017 IBM Corporation.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -202,6 +202,8 @@ class LocalModuleImpl extends NamedMember implements IModuleDescription {
+ 	IModuleDescription.IPackageExport[] exports = null;
+ 	IModuleDescription.IModuleReference[] requires = null;
+ 	IModuleDescription.IProvidedService[] services = null;
++	IModuleDescription.IOpenPackage[] opened = null;
++
+ 	String[] used = null;
+ 	LocalModuleImpl(String name) {
+ 		super(null, name);
+@@ -228,6 +230,10 @@ class LocalModuleImpl extends NamedMember implements IModuleDescription {
+ 	public String[] getUsedServices() {
+ 		return this.used;
+ 	}
++	@Override
++	public IOpenPackage[] getOpenedPackages() throws JavaModelException {
++		return this.opened;
++	}
+ 
+ 	public String toString(String lineDelimiter) {
+ 		StringBuffer buffer = new StringBuffer();
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/BinaryIndexer.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/BinaryIndexer.java
+index c695f58..3e45562 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/BinaryIndexer.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/BinaryIndexer.java
+@@ -851,7 +851,7 @@ public class BinaryIndexer extends AbstractIndexer implements SuffixConstants {
+ 		if (exportedPackages != null) {
+ 			for (IPackageExport pack : exportedPackages) {
+ 				addModuleExportedPackages(pack.name());
+-				char[][] tgtTokens = pack.exportedTo();
++				char[][] tgtTokens = pack.targets();
+ 				char[] tgt = tgtTokens != null ? CharOperation.concatWith(tgtTokens, '.') : CharOperation.NO_CHAR;
+ 				if (!tgt.equals(CharOperation.NO_CHAR)) addModuleExportedPackages(tgt);
+ 			}
+diff --git a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/SourceIndexerRequestor.java b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/SourceIndexerRequestor.java
+index e827c9c..384fe31 100644
+--- a/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/SourceIndexerRequestor.java
++++ b/org.eclipse.jdt.core/search/org/eclipse/jdt/internal/core/search/indexing/SourceIndexerRequestor.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2000, 2016 IBM Corporation and others.
++ * Copyright (c) 2000, 2017 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -315,9 +315,9 @@ public void enterModule(ModuleInfo moduleInfo) {
+ 		for (ISourceElementRequestor.PackageExportInfo packInfo : moduleInfo.exports) {
+ 			if (packInfo == null || packInfo.pkgName == null || packInfo.pkgName.equals(CharOperation.NO_CHAR)) continue;
+ 			this.indexer.addModuleExportedPackages(packInfo.pkgName);
+-			char[] tgt = packInfo.targetModule;
+-			if (tgt != null && tgt == CharOperation.NO_CHAR) 
+-				this.indexer.addModuleReference(tgt);
++			char[][] tgt = packInfo.targets;
++			if (tgt != null && tgt == CharOperation.NO_CHAR_CHAR) 
++				this.indexer.addModuleReference(CharOperation.concatWith(tgt, '.'));
+ 		}
+ 	}
+ }
+commit f340773f66190080b93bec7737b5315a691c289d
+Author: Jay Arthanareeswaran <jarthana@in.ibm.com>
+Date:   Tue Apr 25 09:09:46 2017 +0530
+
+    Bug 486011 - [1.9][model] Java 9 Support in Java Model
+    
+    Remove all but the top level module related Java elements.
+    
+    Change-Id: If10131e990c47fe75562a057927bfd228b6ca1d7
+    Signed-off-by: Jay Arthanareeswaran <jarthana@in.ibm.com>
+
+1	106	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+2	22	org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+0	35	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaElement.java
+0	113	org.eclipse.jdt.core/model/org/eclipse/jdt/core/IModuleDescription.java
+15	15	org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+27	44	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/AbstractModule.java
+1	28	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+1	81	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
+0	90	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+90	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleDescriptionInfo.java
+4	6	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModulePathContainer.java
+0	60	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleRequirement.java
+1	31	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+0	72	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/OpenPackageStatement.java
+0	87	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageExport.java
+1	0	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
+0	76	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ProvidedService.java
+7	206	org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+index aae4ea3..dbc8822 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/Java9ElementTests.java
+@@ -21,14 +21,11 @@ import org.eclipse.jdt.core.ICompilationUnit;
+ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.IJavaProject;
+ import org.eclipse.jdt.core.IModuleDescription;
+-import org.eclipse.jdt.core.IModuleDescription.IModuleReference;
+-import org.eclipse.jdt.core.IModuleDescription.IOpenPackage;
+-import org.eclipse.jdt.core.IModuleDescription.IPackageExport;
+-import org.eclipse.jdt.core.IModuleDescription.IProvidedService;
+ import org.eclipse.jdt.core.IPackageFragment;
+ import org.eclipse.jdt.core.IType;
+ import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.core.tests.util.AbstractCompilerTest;
++import org.eclipse.jdt.internal.compiler.env.IModule.IPackageExport;
+ import org.eclipse.jdt.internal.core.BinaryModule;
+ 
+ import junit.framework.Test;
+@@ -55,12 +52,6 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
+ 				IModuleDescription mod = unit.getModule();
+ 				assertNotNull("Module should not be null", mod);
+-				IPackageExport[] exportedPackages = mod.getExportedPackages();
+-				assertNotNull("should not be null", exportedPackages);
+-				assertEquals("Incorrect no of exports", 0, exportedPackages.length);
+-				IModuleReference[] requiredModules = mod.getRequiredModules();
+-				assertNotNull("should not be null", requiredModules);
+-				assertEquals("Incorrect no of required modules", 0, requiredModules.length);
+ 		}
+ 		finally {
+ 			deleteProject("Java9Elements");
+@@ -81,22 +72,6 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
+ 				IModuleDescription mod = unit.getModule();
+ 				assertNotNull("Module should not be null", mod);
+-				IPackageExport[] exportedPackages = mod.getExportedPackages();
+-				assertNotNull("should not be null", exportedPackages);
+-				assertEquals("Incorrect no of exports", 2, exportedPackages.length);
+-				IPackageExport export = exportedPackages[0];
+-				assertEquals("Incorrect package name", "p.q.r", export.getPackageName());
+-				export = exportedPackages[1];
+-				assertEquals("Incorrect package name", "a.b.c", export.getPackageName());
+-				IModuleReference[] requiredModules = mod.getRequiredModules();
+-				assertNotNull("should not be null", requiredModules);
+-				assertEquals("Incorrect no of required modules", 2, requiredModules.length);
+-				IModuleReference ref = requiredModules[0];
+-				assertEquals("Incorrect package name", "java.sql", ref.getModuleName());
+-				assertFalse("Module requires should not be public", ref.isPublic());
+-				ref = requiredModules[1];
+-				assertEquals("Incorrect package name", "java.desktop", ref.getModuleName());
+-				assertTrue("Module requires should be public", ref.isPublic());
+ 		}
+ 		finally {
+ 			deleteProject("Java9Elements");
+@@ -154,23 +129,6 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
+ 				IModuleDescription mod = unit.getModule();
+ 				assertNotNull("Module should not be null", mod);
+-				IPackageExport[] exportedPackages = mod.getExportedPackages();
+-				assertNotNull("should not be null", exportedPackages);
+-				assertEquals("Incorrect no of exports", 0, exportedPackages.length);
+-				IModuleReference[] requiredModules = mod.getRequiredModules();
+-				assertNotNull("should not be null", requiredModules);
+-				assertEquals("Incorrect no of required modules", 0, requiredModules.length);
+-				IProvidedService[] providedServices = mod.getProvidedServices();
+-				assertNotNull("should not be null", providedServices);
+-				assertEquals("Incorrect no of services", 1, providedServices.length);
+-				IProvidedService service = providedServices[0];
+-				assertEquals("Incorrect value", "com.socket.spi.NetworkSocketProvider", service.getServiceName());
+-				String[] impls = service.getImplementationNames();
+-				assertEquals("Incorrect value", 1, impls.length);
+-				assertEquals("Incorrect value", "org.fastsocket.FastNetworkSocketProvider", impls[0]);
+-				String[] usedServices = mod.getUsedServices();
+-				assertNotNull("should not be null", usedServices);
+-				assertEquals("Incorrect no of required modules", 0, usedServices.length);
+ 		}
+ 		finally {
+ 			deleteProject("Java9Elements");
+@@ -189,19 +147,6 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
+ 				IModuleDescription mod = unit.getModule();
+ 				assertNotNull("Module should not be null", mod);
+-				IPackageExport[] exportedPackages = mod.getExportedPackages();
+-				assertNotNull("should not be null", exportedPackages);
+-				assertEquals("Incorrect no of exports", 0, exportedPackages.length);
+-				IModuleReference[] requiredModules = mod.getRequiredModules();
+-				assertNotNull("should not be null", requiredModules);
+-				assertEquals("Incorrect no of required modules", 0, requiredModules.length);
+-				IProvidedService[] providedServices = mod.getProvidedServices();
+-				assertNotNull("should not be null", providedServices);
+-				assertEquals("Incorrect no of services", 0, providedServices.length);
+-				String[] usedServices = mod.getUsedServices();
+-				assertNotNull("should not be null", usedServices);
+-				assertEquals("Incorrect no of services", 1, usedServices.length);
+-				assertEquals("incorrect value", "com.socket.spi.NetworkSocketProvider", usedServices[0]);
+ 		}
+ 		finally {
+ 			deleteProject("Java9Elements");
+@@ -366,23 +311,6 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
+ 				IModuleDescription mod = unit.getModule();
+ 				assertNotNull("Module should not be null", mod);
+-				IProvidedService[] services = mod.getProvidedServices();
+-				assertNotNull("should not be null", services);
+-				assertEquals("Incorrect no of services", 1, services.length);
+-				assertEquals("incorrect service name", "a.b.C", services[0].getServiceName());
+-				
+-				String[] implementationNames = services[0].getImplementationNames();
+-				assertNotNull("should not be null", implementationNames);
+-				assertEquals("Incorrect no of implementations", 2, implementationNames.length);
+-				assertEquals("incorrect service implementation name", "a.b.CImpl", implementationNames[0]);
+-				assertEquals("incorrect service implementation name", "a.b.DImpl", implementationNames[1]);
+-				IOpenPackage[] openedPackages = mod.getOpenedPackages();
+-				assertNotNull("should not be null", openedPackages);
+-				assertEquals("Incorrect no of open packages", 1, openedPackages.length);
+-				assertEquals("incorrect package name", "a.b", openedPackages[0].getPackageName());
+-				String[] targetModules = openedPackages[0].getTargetModules();
+-				assertNotNull("should not be null", targetModules);
+-				assertEquals("Incorrect no of open packages", 0, targetModules.length);
+ 		}
+ 		finally {
+ 			deleteProject("Java9Elements");
+@@ -407,16 +335,6 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
+ 				IModuleDescription mod = unit.getModule();
+ 				assertNotNull("Module should not be null", mod);
+-				IProvidedService[] services = mod.getProvidedServices();
+-				assertNotNull("should not be null", services);
+-				assertEquals("Incorrect no of services", 1, services.length);
+-				assertEquals("incorrect service name", "a.b.C", services[0].getServiceName());
+-				
+-				String[] implementationNames = services[0].getImplementationNames();
+-				assertNotNull("should not be null", implementationNames);
+-				assertEquals("Incorrect no of implementations", 2, implementationNames.length);
+-				assertEquals("incorrect service implementation name", "a.b.CImpl", implementationNames[0]);
+-				assertEquals("incorrect service implementation name", "a.b.DImpl", implementationNames[1]);
+ 		}
+ 		finally {
+ 			deleteProject("Java9Elements");
+@@ -435,19 +353,6 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
+ 				IModuleDescription mod = unit.getModule();
+ 				assertNotNull("Module should not be null", mod);
+-				IProvidedService[] services = mod.getProvidedServices();
+-				assertNotNull("should not be null", services);
+-				assertEquals("Incorrect no of services", 0, services.length);
+-				
+-				IOpenPackage[] openedPackages = mod.getOpenedPackages();
+-				assertNotNull("should not be null", openedPackages);
+-				assertEquals("Incorrect no of open packages", 1, openedPackages.length);
+-				assertEquals("incorrect package name", "a.b", openedPackages[0].getPackageName());
+-				String[] targetModules = openedPackages[0].getTargetModules();
+-				assertNotNull("should not be null", targetModules);
+-				assertEquals("Incorrect no of open packages", 2, targetModules.length);
+-				assertEquals("incorrect module name", "java.base", targetModules[0]);
+-				assertEquals("incorrect module name", "java.sql", targetModules[1]);
+ 		}
+ 		finally {
+ 			deleteProject("Java9Elements");
+@@ -466,16 +371,6 @@ public class Java9ElementTests extends AbstractJavaModelTests {
+ 				ICompilationUnit unit = getCompilationUnit("/Java9Elements/src/module-info.java");
+ 				IModuleDescription mod = unit.getModule();
+ 				assertNotNull("Module should not be null", mod);
+-				
+-				IPackageExport[] exported = mod.getExportedPackages();
+-				assertNotNull("should not be null", exported);
+-				assertEquals("Incorrect no of open packages", 1, exported.length);
+-				assertEquals("incorrect package name", "a.b", exported[0].getPackageName());
+-				String[] targetModules = exported[0].getTargetModules();
+-				assertNotNull("should not be null", targetModules);
+-				assertEquals("Incorrect no of open packages", 2, targetModules.length);
+-				assertEquals("incorrect module name", "java.base", targetModules[0]);
+-				assertEquals("incorrect module name", "java.sql", targetModules[1]);
+ 		}
+ 		finally {
+ 			deleteProject("Java9Elements");
+diff --git a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+index 2a9e3c0..c3a6f00 100644
+--- a/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
++++ b/org.eclipse.jdt.core.tests.model/src/org/eclipse/jdt/core/tests/model/ModuleBuilderTests.java
+@@ -705,28 +705,8 @@ public class ModuleBuilderTests extends ModifyingResourceTests {
+ 				}
+ 			}
+ 			assertNotNull("should not be null", theRoot);
+-			String mod = JavaCore.createModuleFromPackageRoot(null, theRoot);
+-			String lineDelimiter = System.getProperty("line.separator", "\n");
+-			assertEquals("module-info is incorrect", 
+-					"module ConvertToModule {" + lineDelimiter + "" +
+-					"	exports org.eclipse.jdt.test;" + lineDelimiter +
+-					"	exports org.eclipse.test;" + lineDelimiter + lineDelimiter +
+-					"	requires java.base;" + lineDelimiter +
+-					"	requires java.desktop;" + lineDelimiter +
+-					"	requires java.rmi;" + lineDelimiter +
+-					"	requires java.sql;" + lineDelimiter + lineDelimiter +
+-					"}" ,mod);
+-			mod = JavaCore.createModuleFromPackageRoot("my.module", theRoot);
+-			assertEquals("module-info is incorrect", 
+-					"module my.module {" + lineDelimiter +
+-					"	exports org.eclipse.jdt.test;" + lineDelimiter +
+-					"	exports org.eclipse.test;" + lineDelimiter + lineDelimiter +
+-					"	requires java.base;" + lineDelimiter +
+-					"	requires java.desktop;" + lineDelimiter +
+-					"	requires java.rmi;" + lineDelimiter +
+-					"	requires java.sql;" + lineDelimiter + lineDelimiter +
+-					"}" ,mod);
+-
++			String[] modules = JavaCore.getReferencedModules(project);
++			assertStringsEqual("incorrect result", new String[]{"java.base", "java.desktop", "java.rmi", "java.sql"}, modules);
+ 		} finally {
+ 			this.deleteProject("ConvertToModule");
+ 			 JavaCore.setOptions(javaCoreOptions);
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaElement.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaElement.java
+index a9cb81e..1ae4d5f 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaElement.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IJavaElement.java
+@@ -19,10 +19,6 @@ import org.eclipse.core.runtime.IAdaptable;
+ import org.eclipse.core.runtime.IPath;
+ import org.eclipse.core.runtime.IProgressMonitor;
+ import org.eclipse.core.runtime.jobs.ISchedulingRule;
+-import org.eclipse.jdt.core.IModuleDescription.IModuleReference;
+-import org.eclipse.jdt.core.IModuleDescription.IOpenPackage;
+-import org.eclipse.jdt.core.IModuleDescription.IPackageExport;
+-import org.eclipse.jdt.core.IModuleDescription.IProvidedService;
+ 
+ /**
+  * Common protocol for all elements provided by the Java model.
+@@ -148,37 +144,6 @@ public interface IJavaElement extends IAdaptable {
+ 	int JAVA_MODULE = 17;
+ 
+ 	/**
+-	 * Constant represents a package export statement in a module descriptor.
+-	 * A Java element with this type can be safely cast to {@link IPackageExport}.
+-	 *
+-	 * @since 3.13 BETA_JAVA9
+-	 */
+-	int PACKAGE_EXPORT = 18;
+-
+-	/**
+-	 * Constant represents a <code>requires</code> statement in a module descriptor.
+-	 * A Java element with this type can be safely cast to {@link IModuleReference}.
+-	 *
+-	 * @since 3.13 BETA_JAVA9
+-	 */
+-	int MODULE_REFERENCE = 19;
+-
+-	/**
+-	 * Constant represents services provided by a Java module. A Java element with this type
+-	 * can be safely cast to {@link IProvidedService}.
+-	 *
+-	 *@since 3.13 BETA_JAVA9
+-	 */
+-	int SERVICE = 20;
+-	/**
+-	 * Constant represents packages opened to other modules. A Java element with this type
+-	 * can be safely cast to {@link IOpenPackage}.
+-	 *
+-	 *@since 3.13 BETA_JAVA9
+-	 */
+-	int OPEN_PACKAGE = 21;
+-
+-	/**
+ 	 * Returns whether this Java element exists in the model.
+ 	 * <p>
+ 	 * Java elements are handle objects that may or may not be backed by an
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IModuleDescription.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IModuleDescription.java
+index f7f07f9..d8e3011 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IModuleDescription.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/IModuleDescription.java
+@@ -24,122 +24,9 @@ package org.eclipse.jdt.core;
+  * 		requires java.sql;
+  * }
+  * </pre>
+- * In this example, the Java module descriptor contains two <code>exports</code> 
+- * statements ({@link IPackageExport}) and a <code>requires</code> clause ({@link IModuleReference})
+  *
+  * @since 3.13 BETA_JAVA9
+  */
+ public interface IModuleDescription extends IMember {
+ 
+-	/**
+-	 * Returns all the packages exported by this module. The exports appear
+-	 * in the order they are declared in the source or class file.
+-	 *
+-	 * @exception JavaModelException if this element does not exist or if an
+-	 *		exception occurs while accessing its corresponding resource.
+-	 * @return the exported packages
+-	 */
+-	public IPackageExport[] getExportedPackages() throws JavaModelException;
+-
+-	/**
+-	 * Returns all the modules this module requires. The required modules appear
+-	 * in the order they are declared in the source or class file.
+-	 *
+-	 * @exception JavaModelException if this element does not exist or if an
+-	 *		exception occurs while accessing its corresponding resource.
+-	 * @return the required modules
+-	 */
+-	public IModuleReference[] getRequiredModules() throws JavaModelException;
+-
+-	/**
+-	 * Returns all the services that this module provides.
+-	 *
+-	 * @exception JavaModelException if this element does not exist or if an
+-	 *		exception occurs while accessing its corresponding resource.
+-	 * @return services provided by this module
+-	 */
+-	public IProvidedService[] getProvidedServices() throws JavaModelException;
+-
+-	/**
+-	 * Returns all the services that this module declares to be using.
+-	 *
+-	 * @exception JavaModelException if this element does not exist or if an
+-	 *		exception occurs while accessing its corresponding resource.
+-	 * @return the services used by this module.
+-	 */
+-	public String[] getUsedServices() throws JavaModelException;
+-	/**
+-	 * 
+-	 */
+-	public IOpenPackage[] getOpenedPackages() throws JavaModelException;
+-
+-	/**
+-	 * Represents a <code>exports</code> statement in a Java module description.
+-	 */
+-	public interface IPackageExport extends IJavaElement, ISourceReference {
+-
+-		/**
+-		 * Returns the name of the package being exported.
+-		 *	TODO: This is redundant, can easily be fulfilled with getElementName()
+-		 * @return the exported package name
+-		 */
+-		public String getPackageName();
+-
+-		/**
+-		 * Returns the modules that this package is specifically being
+-		 * exported to. 
+-		 * 
+-		 * @return the modules that this package is being exported to.
+-		 * @throws JavaModelException
+-		 */
+-		String[] getTargetModules() throws JavaModelException;
+-	}
+-
+-	/**
+-	 * Represents a <code>requires</code> clause in a Java module description.
+-	 */
+-	public interface IModuleReference  extends IJavaElement, ISourceReference {
+-
+-		/**
+-		 * Returns the name of the required module.
+-		 * TODO: This is redundant, can easily be fulfilled with getElementName()
+-		 * @return the required module name
+-		 */
+-		public String getModuleName();
+-
+-		/**
+-		 * Specifies whether this module is being re-exported by depending module. In other words,
+-		 * the package and types defined in this module will be visible to other modules that declare the
+-		 * referring module in their <code>requires</code> clause.
+-		 *
+-		 * @return whether this module is made public by the referring module.
+-		 * @throws JavaModelException
+-		 */
+-		public boolean isPublic() throws JavaModelException;
+-	}
+-	/**
+-	 * Represents a <code>provides with</code> clause in a Java module description 
+-	 */
+-	public interface IProvidedService extends IJavaElement, ISourceReference {
+-		/**
+-		 * Returns the name of the service being provided, which is usually the
+-		 * fully qualified name of the interface.
+-		 *
+-		 * @return the service name
+-		 */
+-		public String getServiceName();
+-		/**
+-		 * Returns the name of the class that provides an implementation for the declared 
+-		 * service. This is usually the fully qualified name of the implementing type.
+-		 *
+-		 * @return the name of the implementation
+-		 */
+-		public String[] getImplementationNames();
+-	}
+-	/**
+-	 * 
+-	 */
+-	public interface IOpenPackage extends IPackageExport {
+-		// Essentially same as IPackageExport
+-	}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+index a2bf4a0..f4db023 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/core/JavaCore.java
+@@ -5912,25 +5912,25 @@ public final class JavaCore extends Plugin {
+ 		return Long.compare(CompilerOptions.versionToJdkLevel(first), CompilerOptions.versionToJdkLevel(second));
+ 	}
+ 	/**
+-	 * Creates a corresponding module-info as a String for the given source package fragment root and with
+-	 * the given name. The module name is optional and a null argument can be passed to indicate that the
+-	 * package fragment root's element name to be used as the module name.
+-	 *
+-	 * This is a utility method and computes a module configuration by looking at the source files inside
+-	 * the package fragment root and what modules within the project's build path are needed in order to 
+-	 * successfully compile the source files. For non-source package fragment roots
+-	 * (i.e., {@link IPackageFragmentRoot#isArchive()} returns true), this method returns null.
+-	 *
+-	 * Note this is a long-running operation and it is preferable that clients run this in a background thread.
++	 * Returns an array of module names referenced by this project indirectly. 
++	 * This is a helper method that can be used to construct a Java module 
++	 * description of an existing project. The referenced modules can either be 
++	 * system modules or user modules found in project build path in the form of 
++	 * libraries.
++	 * The prerequisites for this to be effective are:
++	 * <ul>
++	 * <li>the project is already in compliance level 9 or above.
++	 * <li>the system library on the build path of the project is a modularized Java Runtime.
++	 * </ul>
+ 	 *
+-	 * @param moduleName name to be used for the new module. A null indicates that the package fragment root element's name to be used
+-	 * @param root the package fragment root for which the module is sought
+-	 * @return the module-info content as a String
++	 * @param project
++	 *            the project whose referenced modules to be computed
++	 * @return an array of String containing module names
+ 	 * @throws CoreException
+ 	 * @since 3.13 BETA_JAVA9
+ 	 */
+-	public static String createModuleFromPackageRoot(String moduleName, IPackageFragmentRoot root) throws CoreException {
+-		return ModuleUtil.createModuleFromPackageRoot(moduleName, root);
++	public static String[] getReferencedModules(IJavaProject project) throws CoreException {
++		return ModuleUtil.getReferencedModules(project);
+ 	}
+ 
+ 	/* (non-Javadoc)
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/AbstractModule.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/AbstractModule.java
+index 378f7e6..84a90d9 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/AbstractModule.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/AbstractModule.java
+@@ -14,53 +14,35 @@
+  *******************************************************************************/
+ package org.eclipse.jdt.internal.core;
+ 
+-import java.util.ArrayList;
+-
+ import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.JavaModelException;
+-import org.eclipse.jdt.core.compiler.CharOperation;
++import org.eclipse.jdt.internal.compiler.env.IModule.IModuleReference;
++import org.eclipse.jdt.internal.compiler.env.IModule.IPackageExport;
++import org.eclipse.jdt.internal.compiler.env.IModule.IService;
+ 
+-@SuppressWarnings({ "rawtypes", "unchecked" })
+-public abstract class AbstractModule extends BinaryMember implements IModuleDescription {
++public abstract class AbstractModule extends NamedMember implements IModuleDescription {
+ 	protected AbstractModule(JavaElement parent, String name) {
+ 		super(parent, name);
+ 	}
+-	@Override
+-	public IModuleDescription.IModuleReference[] getRequiredModules() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(MODULE_REFERENCE);
+-		IModuleDescription.IModuleReference[] array= new IModuleDescription.IModuleReference[list.size()];
+-		list.toArray(array);
+-		return array;
++	public IModuleReference[] getRequiredModules() throws JavaModelException {
++		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
++		return info.requires();
+ 	}
+-	@Override
+-	public IModuleDescription.IPackageExport[] getExportedPackages() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(PACKAGE_EXPORT);
+-		IModuleDescription.IPackageExport[] array= new IModuleDescription.IPackageExport[list.size()];
+-		list.toArray(array);
+-		return array;
++	public IPackageExport[] getExportedPackages() throws JavaModelException {
++		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
++		return info.exports();
+ 	}
+-	@Override
+-	public IModuleDescription.IProvidedService[] getProvidedServices() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(SERVICE);
+-		IModuleDescription.IProvidedService[] array= new IModuleDescription.IProvidedService[list.size()];
+-		list.toArray(array);
+-		return array;
++	public IService[] getProvidedServices() throws JavaModelException {
++		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
++		return info.provides();
+ 	}
+-	@Override
+-	public String[] getUsedServices() throws JavaModelException {
++	public char[][] getUsedServices() throws JavaModelException {
+ 		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
+-		char[][] names= info.uses();
+-		if (names == null || names.length == 0) {
+-			return NO_STRINGS;
+-		}
+-		return CharOperation.toStrings(names);
++		return info.uses();
+ 	}
+-	@Override
+-	public IOpenPackage[] getOpenedPackages() throws JavaModelException {
+-		ArrayList list = getChildrenOfType(OPEN_PACKAGE);
+-		IModuleDescription.IOpenPackage[] array= new IModuleDescription.IOpenPackage[list.size()];
+-		list.toArray(array);
+-		return array;
++	public IPackageExport[] getOpenedPackages() throws JavaModelException {
++		ModuleDescriptionInfo info = (ModuleDescriptionInfo) getElementInfo();
++		return info.opens();
+ 	}
+ 	public String getKey(boolean forceOpen) throws JavaModelException {
+ 		return getKey(this, forceOpen);
+@@ -76,8 +58,8 @@ public abstract class AbstractModule extends BinaryMember implements IModuleDesc
+ 		return buffer.toString();
+ 	}
+ 	protected void toStringContent(StringBuffer buffer, String lineDelimiter) throws JavaModelException {
+-		IModuleDescription.IPackageExport[] exports = getExportedPackages();
+-		IModuleDescription.IModuleReference[] requires = getRequiredModules();
++		IPackageExport[] exports = getExportedPackages();
++		IModuleReference[] requires = getRequiredModules();
+ 		buffer.append("module "); //$NON-NLS-1$
+ 		buffer.append(this.name).append(' ');
+ 		buffer.append('{').append(lineDelimiter);
+@@ -92,23 +74,24 @@ public abstract class AbstractModule extends BinaryMember implements IModuleDesc
+ 		if (requires != null) {
+ 			for(int i = 0; i < requires.length; i++) {
+ 				buffer.append("\trequires "); //$NON-NLS-1$
+-				if (requires[i].isPublic()) {
++				if (requires[i].isTransitive()) {
+ 					buffer.append(" public "); //$NON-NLS-1$
+ 				}
+-				buffer.append(requires[i].getElementName());
++				buffer.append(requires[i].name());
+ 				buffer.append(';').append(lineDelimiter);
+ 			}
+ 		}
+ 		buffer.append(lineDelimiter).append('}').toString();
+ 	}
+-	@Override
+-	public int getElementType() {
+-		return JAVA_MODULE;
+-	}
++
+ 	/**
+ 	 * @see JavaElement#getHandleMemento()
+ 	 */
+ 	protected char getHandleMementoDelimiter() {
+ 		return JavaElement.JEM_MODULE;
+ 	}
++	@Override
++	public int getElementType() {
++		return JAVA_MODULE;
++	}
+ }
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+index 20ca4ac..422db16 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/BinaryModule.java
+@@ -15,7 +15,6 @@
+ package org.eclipse.jdt.internal.core;
+ 
+ import org.eclipse.jdt.core.IJavaElement;
+-import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.JavaModelException;
+ 
+ public class BinaryModule extends AbstractModule {
+@@ -48,30 +47,4 @@ public class BinaryModule extends AbstractModule {
+ 		}
+ 		return buffer.toString();
+ 	}
+-	protected void toStringContent(StringBuffer buffer, String lineDelimiter) throws JavaModelException {
+-		IModuleDescription.IPackageExport[] exports = getExportedPackages();
+-		IModuleDescription.IModuleReference[] requires = getRequiredModules();
+-		buffer.append("module "); //$NON-NLS-1$
+-		buffer.append(this.name).append(' ');
+-		buffer.append('{').append(lineDelimiter);
+-		if (exports != null) {
+-			for(int i = 0; i < exports.length; i++) {
+-				buffer.append("\texports "); //$NON-NLS-1$
+-				buffer.append(exports[i].toString());
+-				buffer.append(lineDelimiter);
+-			}
+-		}
+-		buffer.append(lineDelimiter);
+-		if (requires != null) {
+-			for(int i = 0; i < requires.length; i++) {
+-				buffer.append("\trequires "); //$NON-NLS-1$
+-				if (requires[i].isPublic()) {
+-					buffer.append(" public "); //$NON-NLS-1$
+-				}
+-				buffer.append(requires[i].getElementName());
+-				buffer.append(';').append(lineDelimiter);
+-			}
+-		}
+-		buffer.append(lineDelimiter).append('}').toString();
+-	}
+-}
++}
+\ No newline at end of file
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
+index 077f548..00bc217 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ClassFileInfo.java
+@@ -28,14 +28,9 @@ import org.eclipse.jdt.internal.compiler.env.IBinaryMethod;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryNestedType;
+ import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+ import org.eclipse.jdt.internal.compiler.env.IModule;
+-import org.eclipse.jdt.internal.compiler.env.IModule.IModuleReference;
+-import org.eclipse.jdt.internal.compiler.env.IModule.IPackageExport;
+-import org.eclipse.jdt.internal.compiler.env.IModule.IService;
+ import org.eclipse.jdt.internal.compiler.lookup.TagBits;
+ import org.eclipse.jdt.internal.compiler.lookup.TypeConstants;
+ import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+-import org.eclipse.jdt.internal.core.ModuleDescriptionInfo.ModuleReferenceInfo;
+-import org.eclipse.jdt.internal.core.ModuleDescriptionInfo.ServiceInfo;
+ 
+ /**
+  * Element info for <code>ClassFile</code> handles.
+@@ -264,86 +259,11 @@ private void generateModuleInfos(ClassFile classFile, IBinaryType info, HashMap
+ 	if (modDecl != null) {
+ 		char[] modName = modDecl.name();
+ 		BinaryModule handle = new BinaryModule(classFile, new String(modName));
+-		ModuleDescriptionInfo moduleInfo = new ModuleDescriptionInfo();
+-		moduleInfo.name = modName;
+-		// It is illegal to add module to ClassFile's children because
+-		// we use ClassFile itself to store binary children of BinaryModule,
+-		// which means module can't be part of its own children list.
+-		// childrenHandles.add(handle); 
+-		IPackageExport[] exportedPackages = modDecl.exports();
+-		if (exportedPackages != null) {
+-			for (IPackageExport iPackageExport : exportedPackages) {
+-				generatePackageExportInfos(handle, newElements, iPackageExport.name(), iPackageExport.targets(), childrenHandles);
+-			}
+-		}
+-		IModuleReference[] requiredModules = modDecl.requires();
+-		if (requiredModules != null) {
+-			for (IModuleReference iModuleReference : requiredModules) {
+-				generateModuleRequirementInfos(handle, newElements, iModuleReference.name(), iModuleReference.getModifiers(), childrenHandles);
+-			}
+-		}
+-		IService[] provides = modDecl.provides();
+-		if (provides != null) {
+-			for (IService iSer : provides) {
+-				generateServiceInfos(handle, newElements, iSer.name(), iSer.with(), childrenHandles);
+-			}
+-		}
+-		moduleInfo.usedServices = modDecl.uses();
+-		IPackageExport[] opens = modDecl.opens();
+-		if (opens != null) {
+-			for (IPackageExport iPackageExport : exportedPackages) {
+-				generatOpensInfos(handle, newElements, iPackageExport.name(), iPackageExport.targets(), childrenHandles);
+-			}
+-		}
++		ModuleDescriptionInfo moduleInfo = ModuleDescriptionInfo.createModule(modDecl);
+ 		setModule(handle);
+ 		newElements.put(handle, moduleInfo);
+ 	}
+ }
+-private void generateServiceInfos(BinaryModule parentHandle, HashMap newElements, char[] serviceName, char[][] implNames, ArrayList childrenHandles) {
+-	ServiceInfo info = new ServiceInfo();
+-	info.serviceName = serviceName;
+-	String[] implementations = new String[implNames.length];
+-	for (int i = 0; i < implNames.length; i++) {
+-		implementations[i] = new String(implNames[i]);
+-	}
+-	info.implNames = implNames;
+-	ProvidedService service = new ProvidedService(parentHandle, new String(serviceName), implementations);
+-	while (newElements.containsKey(service))
+-		service.occurrenceCount++;
+-	newElements.put(service, info);
+-	childrenHandles.add(service);
+-	
+-}
+-private void generateModuleRequirementInfos(BinaryModule parentHandle, HashMap newElements, char[] moduleName, int modifiers, ArrayList childrenHandles) {
+-	ModuleRequirement requirement = new ModuleRequirement(parentHandle, new String(moduleName));
+-	ModuleReferenceInfo info = new ModuleReferenceInfo();
+-	info.name = moduleName;
+-	info.modifiers = modifiers;
+-	while (newElements.containsKey(requirement))
+-		requirement.occurrenceCount++;
+-	newElements.put(requirement, info);
+-	childrenHandles.add(requirement);
+-}
+-private void generatePackageExportInfos(BinaryModule parentHandle, HashMap newElements, char[] pkgName, char[][] target, ArrayList childrenHandles) {
+-	PackageExport exportStmt = new PackageExport(parentHandle, new String(pkgName));
+-	ModuleDescriptionInfo.PackageExportInfo info = new ModuleDescriptionInfo.PackageExportInfo();
+-	info.pack = pkgName;
+-	info.target = target;
+-	while (newElements.containsKey(exportStmt))
+-		exportStmt.occurrenceCount++;
+-	newElements.put(exportStmt, info);
+-	childrenHandles.add(exportStmt);
+-}
+-private void generatOpensInfos(BinaryModule parentHandle, HashMap newElements, char[] pkgName, char[][] target, ArrayList childrenHandles) {
+-	OpenPackageStatement openStmt = new OpenPackageStatement(parentHandle, new String(pkgName));
+-	ModuleDescriptionInfo.PackageExportInfo info = new ModuleDescriptionInfo.PackageExportInfo();
+-	info.pack = pkgName;
+-	info.target = target;
+-	while (newElements.containsKey(openStmt))
+-		openStmt.occurrenceCount++;
+-	newElements.put(openStmt, info);
+-	childrenHandles.add(openStmt);
+-}
+ /**
+  * Creates the handles and infos for the methods of the given binary type.
+  * Adds new handles to the given vector.
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+index 21c469e..bb0c2e2 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+@@ -525,65 +525,6 @@ public void enterType(TypeInfo typeInfo) {
+ 		((TypeInfo) parentInfo).childrenCategories.put(handle, typeInfo.categories);
+ 	addToChildren(parentInfo, handle);
+ }
+-private void acceptModuleRequirement(RequiresInfo requiresInfo, JavaElementInfo parentInfo) {
+-	JavaElement parentHandle = (JavaElement) this.handleStack.peek();
+-	String pkgName = new String(requiresInfo.moduleName);
+-	ModuleRequirement handle = new ModuleRequirement(parentHandle, pkgName);
+-	resolveDuplicates(handle); // TODO: really necessary?
+-
+-	org.eclipse.jdt.internal.core.ModuleDescriptionInfo.ModuleReferenceInfo info = new org.eclipse.jdt.internal.core.ModuleDescriptionInfo.ModuleReferenceInfo();
+-	info.name = requiresInfo.moduleName;
+-	info.modifiers = requiresInfo.modifiers;
+-	this.newElements.put(handle, info);
+-	addToChildren(parentInfo, handle);
+-}
+-private void acceptPackageExport(PackageExportInfo exportInfo, JavaElementInfo parentInfo) {
+-	JavaElement parentHandle = (JavaElement) this.handleStack.peek();
+-	String pkgName = new String(exportInfo.pkgName);
+-	PackageExport handle = new PackageExport(parentHandle, pkgName);
+-	resolveDuplicates(handle); // TODO: really necessary?
+-
+-	org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo info = new org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo();
+-	info.pack = exportInfo.pkgName;
+-	info.target = new char[exportInfo.targets.length][];
+-	for(int i = 0; i < info.targets().length; i++) {
+-		info.target[i] = exportInfo.targets[i]; // TODO: confirm if it is okay to use the array as is instead of making a copy.
+-	}
+-	this.newElements.put(handle, info);
+-	addToChildren(parentInfo, handle);
+-}
+-private void acceptOpensPackage(PackageExportInfo opensInfo, JavaElementInfo parentInfo) {
+-	JavaElement parentHandle = (JavaElement) this.handleStack.peek();
+-	String pkgName = new String(opensInfo.pkgName);
+-	OpenPackageStatement handle = new OpenPackageStatement(parentHandle, pkgName);
+-	resolveDuplicates(handle); // TODO: really necessary?
+-
+-	org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo info = new org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo();
+-	info.pack = opensInfo.pkgName;
+-	info.target = new char[opensInfo.targets.length][];
+-	for(int i = 0; i < info.targets().length; i++) {
+-		info.target[i] = opensInfo.targets[i]; // TODO: confirm if it is okay to use the array as is instead of making a copy.
+-	}
+-	this.newElements.put(handle, info);
+-	addToChildren(parentInfo, handle);
+-}
+-private void acceptProvidedServices(ServicesInfo serInfo, JavaElementInfo parentInfo) {
+-	JavaElement parentHandle = (JavaElement) this.handleStack.peek();
+-	String serviceName = new String(serInfo.serviceName);
+-//	String implName = new String(serInfo.implName);
+-	String[] implNames = new String[serInfo.implNames.length];
+-	for (int i = 0; i < implNames.length; i++) {
+-		implNames[i] = new String(serInfo.implNames[i]);
+-	}
+-	ProvidedService handle = new ProvidedService(parentHandle, serviceName, implNames);
+-//	resolveDuplicates(handle); // TODO: really necessary?
+-
+-	org.eclipse.jdt.internal.core.ModuleDescriptionInfo.ServiceInfo info = new org.eclipse.jdt.internal.core.ModuleDescriptionInfo.ServiceInfo();
+-	info.serviceName = serInfo.serviceName;
+-	info.implNames = serInfo.implNames;
+-	this.newElements.put(handle, info);
+-	addToChildren(parentInfo, handle);
+-}
+ private org.eclipse.jdt.internal.core.ModuleDescriptionInfo createModuleInfo(ModuleInfo modInfo, org.eclipse.jdt.internal.core.SourceModule handle) {
+ 	org.eclipse.jdt.internal.core.ModuleDescriptionInfo info = org.eclipse.jdt.internal.core.ModuleDescriptionInfo.createModule((ModuleDeclaration) modInfo.node);
+ 	info.setHandle(handle);
+@@ -593,37 +534,6 @@ private org.eclipse.jdt.internal.core.ModuleDescriptionInfo createModuleInfo(Mod
+ 	info.setNameSourceEnd(modInfo.nameSourceEnd);
+ 	this.newElements.put(handle, info);
+ 
+-	if (modInfo.requires != null) {
+-		for (int i = 0, length = modInfo.requires.length; i < length; i++) {
+-			RequiresInfo reqInfo = modInfo.requires[i];
+-			acceptModuleRequirement(reqInfo, info);
+-		}
+-	}
+-	if (modInfo.exports != null) {
+-		for (int i = 0, length = modInfo.exports.length; i < length; i++) {
+-			PackageExportInfo expInfo = modInfo.exports[i];
+-			acceptPackageExport(expInfo, info);
+-		}
+-	}
+-	if (modInfo.services != null) {
+-		for (int i = 0, length = modInfo.services.length; i < length; i++) {
+-			ServicesInfo serInfo = modInfo.services[i];
+-			acceptProvidedServices(serInfo, info);
+-		}
+-	}
+-	if (modInfo.usedServices != null) {
+-		char[][] services = new char[modInfo.usedServices.length][];
+-		for (int i = 0, length = modInfo.usedServices.length; i < length; i++) {
+-			services[i] = modInfo.usedServices[i];
+-		}
+-		info.usedServices = services;
+-	}
+-	if (modInfo.opens != null) {
+-		for (int i = 0, length = modInfo.opens.length; i < length; i++) {
+-			PackageExportInfo expInfo = modInfo.opens[i];
+-			acceptOpensPackage(expInfo, info);
+-		}
+-	}
+ 	return info;
+ }
+ private SourceTypeElementInfo createTypeInfo(TypeInfo typeInfo, SourceType handle) {
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleDescriptionInfo.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleDescriptionInfo.java
+index 09ff6eb..99aec49 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleDescriptionInfo.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleDescriptionInfo.java
+@@ -106,6 +106,96 @@ public class ModuleDescriptionInfo extends AnnotatableInfo implements IModule {
+ 			return buffer.toString();
+ 		}
+ 	}
++	
++	public static ModuleDescriptionInfo createModule(IModule module) {
++		ModuleDescriptionInfo mod = new ModuleDescriptionInfo();
++		mod.name = module.name();
++		if (module.requires().length > 0) {
++			IModuleReference[] refs = module.requires();
++			mod.requires = new ModuleReferenceInfo[refs.length];
++			for (int i = 0; i < refs.length; i++) {
++				mod.requires[i] = new ModuleReferenceInfo();
++				mod.requires[i].name = refs[i].name(); // Check why ModuleReference#tokens must be a char[][] and not a char[] or String;
++				mod.requires[i].modifiers = refs[i].getModifiers();
++			}
++		} else {
++			mod.requires = NO_REQUIRES;
++		}
++		if (module.exports().length > 0) {
++			IPackageExport[] refs = module.exports();
++			mod.exports = new PackageExportInfo[refs.length];
++			for (int i = 0; i < refs.length; i++) {
++				PackageExportInfo exp = createPackageExport(refs[i]);
++				mod.exports[i] = exp;
++			}
++		} else {
++			mod.exports = NO_EXPORTS;
++		}
++		if (module.uses().length > 0) {
++			char[][] uses = module.uses();
++			mod.usedServices = new char[uses.length][];
++			for (int i = 0; i < uses.length; i++) {
++				mod.usedServices[i] = uses[i];
++			}
++		} else {
++			mod.usedServices = NO_USES;
++		}
++		if (module.provides().length > 0) {
++			IService[] provides = module.provides();
++			mod.services = new ServiceInfo[provides.length];
++			for (int i = 0; i < provides.length; i++) {
++				mod.services[i] = createService(provides[i]);
++			}
++		} else {
++			mod.services = NO_PROVIDES;
++		}
++		if (module.opens().length > 0) {
++			IPackageExport[] opens = module.opens();
++			mod.opens = new PackageExportInfo[opens.length];
++			for (int i = 0; i < opens.length; i++) {
++				PackageExportInfo op = createOpensInfo(opens[i]);
++				mod.opens[i] = op;
++			}
++		} else {
++			mod.opens = NO_OPENS;
++		}
++		return mod;
++	}
++	private static PackageExportInfo createPackageExport(IModule.IPackageExport ref) {
++		PackageExportInfo exp = new PackageExportInfo();
++		exp.pack = ref.name();
++		char[][] targets = ref.targets();
++		if (targets != null) {
++			exp.target = new char[targets.length][];
++			for(int j = 0; j < targets.length; j++) {
++				exp.target[j] = targets[j];
++			}
++		}
++		return exp;
++	}
++	private static PackageExportInfo createOpensInfo(IModule.IPackageExport opens) {
++		PackageExportInfo open = new PackageExportInfo();
++		open.pack = opens.name();
++		char[][] targets = opens.targets();
++		if (targets != null) {
++			open.target = new char[targets.length][];
++			for(int j = 0; j < targets.length; j++) {
++				open.target[j] = targets[j];
++			}
++		}
++		return open;
++	}
++
++	private static ServiceInfo createService(IModule.IService provides) {
++		ServiceInfo info = new ServiceInfo();
++		info.serviceName = provides.name();
++		char[][] implementations = provides.with();
++		info.implNames = new char[implementations.length][];
++		for(int i = 0; i < implementations.length; i++) {
++			info.implNames[i] = implementations[i];
++		}
++		return info;
++	}
+ 
+ 	public static ModuleDescriptionInfo createModule(ModuleDeclaration module) {
+ 		ModuleDescriptionInfo mod = new ModuleDescriptionInfo();
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModulePathContainer.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModulePathContainer.java
+index 5503b9c..ca2293b 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModulePathContainer.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModulePathContainer.java
+@@ -22,8 +22,6 @@ import org.eclipse.core.runtime.Path;
+ import org.eclipse.jdt.core.IClasspathContainer;
+ import org.eclipse.jdt.core.IClasspathEntry;
+ import org.eclipse.jdt.core.IJavaProject;
+-import org.eclipse.jdt.core.IModuleDescription;
+-import org.eclipse.jdt.core.IModuleDescription.IModuleReference;
+ import org.eclipse.jdt.core.JavaCore;
+ import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.internal.compiler.env.IModulePathEntry;
+@@ -41,11 +39,11 @@ public class ModulePathContainer implements IClasspathContainer{
+ 		List<IClasspathEntry> entries = new ArrayList<>();
+ 		ModuleSourcePathManager manager = JavaModelManager.getModulePathManager();
+ 		try {
+-			IModuleDescription module = ((JavaProject)this.project).getModuleDescription();
++			AbstractModule module = (AbstractModule) ((JavaProject)this.project).getModuleDescription();
+ 			if (module == null)
+ 				return new IClasspathEntry[0];
+-			for (IModuleReference ref : module.getRequiredModules()) {
+-				IModulePathEntry entry = manager.getModuleRoot(ref.getModuleName());
++			for (org.eclipse.jdt.internal.compiler.env.IModule.IModuleReference ref : module.getRequiredModules()) {
++				IModulePathEntry entry = manager.getModuleRoot(new String(ref.name()));
+ 				JavaProject refRoot = null;
+ 				if (entry instanceof ProjectEntry) {
+ 					refRoot = ((ProjectEntry) entry).project;
+@@ -53,7 +51,7 @@ public class ModulePathContainer implements IClasspathContainer{
+ 				if (refRoot == null)
+ 					continue;
+ 				IPath path = refRoot.getPath();
+-				entries.add(JavaCore.newProjectEntry(path, ref.isPublic()));
++				entries.add(JavaCore.newProjectEntry(path, ref.isTransitive()));
+ 			}
+ 		} catch (JavaModelException e) {
+ 			// ignore
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleRequirement.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleRequirement.java
+deleted file mode 100644
+index 6516591..0000000
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ModuleRequirement.java
++++ /dev/null
+@@ -1,60 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2016 IBM Corporation.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * This is an implementation of an early-draft specification developed under the Java
+- * Community Process (JCP) and is made available for testing and evaluation purposes
+- * only. The code is not compatible with any specification of the JCP.
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.jdt.internal.core;
+-
+-import org.eclipse.jdt.core.IModuleDescription;
+-import org.eclipse.jdt.core.ISourceRange;
+-import org.eclipse.jdt.core.JavaModelException;
+-import org.eclipse.jdt.internal.core.ModuleDescriptionInfo.ModuleReferenceInfo;
+-import org.eclipse.jdt.internal.core.util.Util;
+-
+-public class ModuleRequirement extends SourceRefElement implements IModuleDescription.IModuleReference {
+-	String name;
+-	boolean isPublic = false;
+-	public ModuleRequirement(JavaElement parent, final String name) {
+-		super(parent);
+-		this.name = name;
+-	}
+-	@Override
+-	public boolean isPublic() throws JavaModelException {
+-		ModuleReferenceInfo info = (ModuleReferenceInfo) getElementInfo();
+-		return info.isTransitive();
+-	}
+-	@Override
+-	public String getModuleName() {
+-		return this.name;
+-	}
+-	@Override
+-	public int getElementType() {
+-		return MODULE_REFERENCE;
+-	}
+-	public ISourceRange getNameRange() throws JavaModelException {
+-		return null;
+-	}
+-	@Override
+-	protected char getHandleMementoDelimiter() {
+-		return 0;
+-	}
+-	public int hashCode() {
+-		int hash = super.hashCode();
+-		return Util.combineHashCodes(hash, this.name.hashCode());
+-	}
+-	public boolean equals(Object o) {
+-		if (!(o instanceof ModuleRequirement)) 
+-			return false;
+-		// Don't take isPublic into account?
+-		return super.equals(o) && this.name.equals(((ModuleRequirement) o).name);
+-	}
+-}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+index 635cb57..b1d3894 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/NameLookup.java
+@@ -309,36 +309,6 @@ public class NameLookup implements SuffixConstants {
+ 			// TODO Auto-generated method stub
+ 			return null;
+ 		}
+-
+-		@Override
+-		public String[] getUsedServices() throws JavaModelException {
+-			// TODO Auto-generated method stub
+-			return null;
+-		}
+-
+-		@Override
+-		public IModuleReference[] getRequiredModules() throws JavaModelException {
+-			// TODO Auto-generated method stub
+-			return null;
+-		}
+-
+-		@Override
+-		public IProvidedService[] getProvidedServices() throws JavaModelException {
+-			// TODO Auto-generated method stub
+-			return null;
+-		}
+-
+-		@Override
+-		public IPackageExport[] getExportedPackages() throws JavaModelException {
+-			// TODO Auto-generated method stub
+-			return null;
+-		}
+-
+-		@Override
+-		public IOpenPackage[] getOpenedPackages() throws JavaModelException {
+-			// TODO Auto-generated method stub
+-			return null;
+-		}
+ 	}
+ 
+ 	public static class Answer {
+@@ -1292,7 +1262,7 @@ public class NameLookup implements SuffixConstants {
+ 				// TODO Auto-generated catch block
+ 			}
+ 		}
+-		if (modules.length == 1) { // TODO what to do??
++		if (modules.length > 0) { // TODO what to do??
+ 			return new Answer(modules[0]);
+ 		}
+ 		return null;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/OpenPackageStatement.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/OpenPackageStatement.java
+deleted file mode 100644
+index 7249f49..0000000
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/OpenPackageStatement.java
++++ /dev/null
+@@ -1,72 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2017 IBM Corporation.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * This is an implementation of an early-draft specification developed under the Java
+- * Community Process (JCP) and is made available for testing and evaluation purposes
+- * only. The code is not compatible with any specification of the JCP.
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.jdt.internal.core;
+-
+-import org.eclipse.jdt.core.IModuleDescription;
+-import org.eclipse.jdt.core.ISourceRange;
+-import org.eclipse.jdt.core.JavaModelException;
+-import org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo;
+-import org.eclipse.jdt.internal.core.util.Util;
+-
+-public class OpenPackageStatement extends SourceRefElement implements IModuleDescription.IOpenPackage {
+-
+-	private String pack;
+-	public OpenPackageStatement(JavaElement parent, String pack) {
+-		super(parent);
+-		this.pack = pack;
+-	}
+-	@Override
+-	public String getPackageName() {
+-		return this.pack;
+-	}
+-	@Override
+-	public String[] getTargetModules() throws JavaModelException {
+-		PackageExportInfo info = (PackageExportInfo) getElementInfo();
+-		char[][] targets = info.targets();
+-		if (targets == null || targets.length == 0)
+-			return NO_STRINGS;
+-		String[] t = new String[targets.length];
+-		for(int i = 0; i < t.length; i++) {
+-			t[i] = new String(targets[i]);
+-		}
+-		return t;
+-	}
+-	public String toString() {
+-		StringBuffer buffer = new StringBuffer();
+-		buffer.append(this.pack);
+-		buffer.append(';');
+-		return buffer.toString();
+-	}
+-	@Override
+-	public int getElementType() {
+-		return OPEN_PACKAGE;
+-	}
+-	public ISourceRange getNameRange() throws JavaModelException {
+-		return null;
+-	}
+-	@Override
+-	protected char getHandleMementoDelimiter() {
+-		return 0;
+-	}
+-	public int hashCode() {
+-		int hash = super.hashCode();
+-		return Util.combineHashCodes(hash, this.pack.hashCode());
+-	}
+-	public boolean equals(Object o) {
+-		if (!(o instanceof OpenPackageStatement)) 
+-			return false;
+-		return super.equals(o) && this.pack.equals(((OpenPackageStatement) o).pack);
+-	}
+-}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageExport.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageExport.java
+deleted file mode 100644
+index f783278..0000000
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageExport.java
++++ /dev/null
+@@ -1,87 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2016, 2017 IBM Corporation.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * This is an implementation of an early-draft specification developed under the Java
+- * Community Process (JCP) and is made available for testing and evaluation purposes
+- * only. The code is not compatible with any specification of the JCP.
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.jdt.internal.core;
+-
+-import org.eclipse.jdt.core.IModuleDescription;
+-import org.eclipse.jdt.core.ISourceRange;
+-import org.eclipse.jdt.core.JavaModelException;
+-import org.eclipse.jdt.internal.core.ModuleDescriptionInfo.PackageExportInfo;
+-import org.eclipse.jdt.internal.core.util.Util;
+-
+-public class PackageExport extends SourceRefElement implements IModuleDescription.IPackageExport {
+-
+-	private String pack;
+-	public PackageExport(JavaElement parent, String pack) {
+-		super(parent);
+-		this.pack = pack;
+-	}
+-	@Override
+-	public String getPackageName() {
+-		return this.pack;
+-	}
+-	@Override
+-	public String[] getTargetModules() throws JavaModelException {
+-		PackageExportInfo info = (PackageExportInfo) getElementInfo();
+-		char[][] targets = info.targets();
+-		if (targets == null || targets.length == 0)
+-			return NO_STRINGS;
+-		String[] t = new String[targets.length];
+-		for(int i = 0; i < t.length; i++) {
+-			t[i] = new String(targets[i]);
+-		}
+-		return t;
+-	}
+-	public String toString() {
+-		StringBuffer buffer = new StringBuffer();
+-		buffer.append(this.pack);
+-		String[] s;
+-		try {
+-			s = getTargetModules();
+-			if (s != null && s.length > 0) {
+-				buffer.append(" to "); //$NON-NLS-1$
+-				int l = s.length - 1;
+-				for (int i = 0; i < l; ++i) {
+-					buffer.append(s[i] + ',');
+-				}
+-				buffer.append(s[l]);  // no comma
+-			}
+-		} catch (JavaModelException e) {
+-			// TODO Auto-generated catch block
+-			e.printStackTrace();
+-		}
+-		buffer.append(';');
+-		return buffer.toString();
+-	}
+-	@Override
+-	public int getElementType() {
+-		return PACKAGE_EXPORT;
+-	}
+-	public ISourceRange getNameRange() throws JavaModelException {
+-		return null;
+-	}
+-	@Override
+-	protected char getHandleMementoDelimiter() {
+-		return 0;
+-	}
+-	public int hashCode() {
+-		int hash = super.hashCode();
+-		return Util.combineHashCodes(hash, this.pack.hashCode());
+-	}
+-	public boolean equals(Object o) {
+-		if (!(o instanceof PackageExport)) 
+-			return false;
+-		return super.equals(o) && this.pack.equals(((PackageExport) o).pack);
+-	}
+-}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
+index f64a590..4944722 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/PackageFragmentRoot.java
+@@ -879,6 +879,7 @@ public IModuleDescription getModuleDescription() {
+ 			}
+ 		}
+ 	} catch (JavaModelException e) {
++		e.printStackTrace();
+ 		//
+ 	}
+ 	return null;
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ProvidedService.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ProvidedService.java
+deleted file mode 100644
+index 495efb3..0000000
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/ProvidedService.java
++++ /dev/null
+@@ -1,76 +0,0 @@
+-/*******************************************************************************
+- * Copyright (c) 2016 IBM Corporation.
+- * All rights reserved. This program and the accompanying materials
+- * are made available under the terms of the Eclipse Public License v1.0
+- * which accompanies this distribution, and is available at
+- * http://www.eclipse.org/legal/epl-v10.html
+- *
+- * This is an implementation of an early-draft specification developed under the Java
+- * Community Process (JCP) and is made available for testing and evaluation purposes
+- * only. The code is not compatible with any specification of the JCP.
+- *
+- * Contributors:
+- *     IBM Corporation - initial API and implementation
+- *******************************************************************************/
+-package org.eclipse.jdt.internal.core;
+-
+-import org.eclipse.jdt.core.IModuleDescription;
+-import org.eclipse.jdt.core.ISourceRange;
+-import org.eclipse.jdt.core.JavaModelException;
+-import org.eclipse.jdt.internal.core.util.Util;
+-
+-public class ProvidedService extends SourceRefElement implements IModuleDescription.IProvidedService {
+-
+-	private String service;
+-	private String[] impl;
+-	public ProvidedService(JavaElement parent, String service, String[] impl) {
+-		super(parent);
+-		this.service = service;
+-		this.impl = impl;
+-	}
+-	@Override
+-	public String getServiceName() {
+-		return this.service;
+-	}
+-	@Override
+-	public String[] getImplementationNames() {
+-		return this.impl;
+-	}
+-	public String toString() {
+-		StringBuffer buffer = new StringBuffer();
+-		buffer.append("provides "); //$NON-NLS-1$
+-		buffer.append(this.service);
+-		buffer.append(" with "); //$NON-NLS-1$
+-		for (int i = 0; i < this.impl.length; i++) {
+-			buffer.append(this.impl[i]);
+-			if (i < this.impl.length - 1)
+-				buffer.append(", "); //$NON-NLS-1$
+-		}
+-		buffer.append(';');
+-		return buffer.toString();
+-	}
+-	@Override
+-	public int getElementType() {
+-		return SERVICE;
+-	}
+-	public ISourceRange getNameRange() throws JavaModelException {
+-		return null;
+-	}
+-	@Override
+-	protected char getHandleMementoDelimiter() {
+-		return 0;
+-	}
+-	public int hashCode() {
+-		int hash = super.hashCode();
+-		hash = Util.combineHashCodes(hash, this.service.hashCode());
+-		return Util.combineHashCodes(hash, this.impl.hashCode());
+-	}
+-	public boolean equals(Object o) {
+-		if (!(o instanceof ProvidedService)) 
+-			return false;
+-		ProvidedService other = (ProvidedService) o;
+-		return super.equals(o) && 
+-				this.service.equals(other.service)
+-				&& this.impl.equals(other.impl);
+-	}
+-}
+diff --git a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+index 4abe148..cae7e64 100644
+--- a/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
++++ b/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/util/ModuleUtil.java
+@@ -23,18 +23,12 @@ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Set;
+ 
+-import org.eclipse.core.resources.ProjectScope;
+ import org.eclipse.core.runtime.CoreException;
+-import org.eclipse.core.runtime.Platform;
+-import org.eclipse.core.runtime.preferences.IScopeContext;
+ import org.eclipse.jdt.core.ICompilationUnit;
+ import org.eclipse.jdt.core.IJavaElement;
+ import org.eclipse.jdt.core.IJavaProject;
+-import org.eclipse.jdt.core.IModuleDescription;
+ import org.eclipse.jdt.core.IPackageFragment;
+ import org.eclipse.jdt.core.IPackageFragmentRoot;
+-import org.eclipse.jdt.core.ISourceRange;
+-import org.eclipse.jdt.core.JavaModelException;
+ import org.eclipse.jdt.core.compiler.CharOperation;
+ import org.eclipse.jdt.internal.compiler.CompilationResult;
+ import org.eclipse.jdt.internal.compiler.Compiler;
+@@ -44,36 +38,11 @@ import org.eclipse.jdt.internal.compiler.env.IModuleContext;
+ import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+ import org.eclipse.jdt.internal.core.BasicCompilationUnit;
+-import org.eclipse.jdt.internal.core.ModuleRequirement;
+-import org.eclipse.jdt.internal.core.NamedMember;
+-import org.eclipse.jdt.internal.core.PackageExport;
+ import org.eclipse.jdt.internal.core.builder.NameEnvironment;
+ import org.eclipse.jdt.internal.core.builder.ProblemFactory;
+ 
+ public class ModuleUtil {
+ 
+-	private static String[] EMPTRY_STRING_ARRAY = new String[0];
+-
+-	public static String createModuleFromPackageRoot(String moduleName, IPackageFragmentRoot root) throws CoreException {
+-		IJavaProject project = root.getJavaProject();
+-		String lineDelimiter = null;
+-		if (project != null) {
+-			IScopeContext[] scopeContext;
+-			// project preference
+-			scopeContext = new IScopeContext[] { new ProjectScope(project.getProject()) };
+-			lineDelimiter = Platform.getPreferencesService().getString(Platform.PI_RUNTIME, Platform.PREF_LINE_SEPARATOR, null, scopeContext);
+-		}
+-		if (lineDelimiter == null) {
+-			lineDelimiter = System.getProperty("line.separator", "\n"); //$NON-NLS-1$ //$NON-NLS-2$
+-		}
+-		LocalModuleImpl module = (LocalModuleImpl) createModuleFromPackageFragmentRoot(moduleName, project);
+-		return module.toString(lineDelimiter);
+-	}
+-
+-	public static IModuleDescription createModuleFromPackageRoot(String moduleName, IJavaProject root) throws CoreException {
+-		return createModuleFromPackageFragmentRoot(moduleName, root.getJavaProject());
+-	}
+-
+ 	static class ModuleAccumulatorEnvironment extends NameEnvironment {
+ 		public ModuleAccumulatorEnvironment(IJavaProject javaProject) {
+ 			super(javaProject);
+@@ -137,14 +106,12 @@ public class ModuleUtil {
+ 
+ 		return newCompiler;
+ 	}
+-	private static IModuleDescription createModuleFromPackageFragmentRoot(String moduleName, IJavaProject project) throws CoreException {
++	public static String[] getReferencedModules(IJavaProject project) throws CoreException {
+ 
+ 		ModuleAccumulatorEnvironment environment = new ModuleAccumulatorEnvironment(project);
+ 		Compiler compiler = newCompiler(environment, project);
+-		LocalModuleImpl module = new LocalModuleImpl(moduleName == null ? project.getElementName() : moduleName);
+-		List<IModuleDescription.IPackageExport> exports = new ArrayList<>();
+ 		// First go over the binary roots and see if any of them are modules
+-		List<IModuleDescription.IModuleReference> required = new ArrayList<>();
++		List<String> required = new ArrayList<>();
+ 		Set<org.eclipse.jdt.internal.compiler.env.ICompilationUnit> toCompile = new HashSet<>();
+ 		IPackageFragmentRoot[] roots = project.getPackageFragmentRoots();
+ 		for (IPackageFragmentRoot root : roots) {
+@@ -157,7 +124,6 @@ public class ModuleUtil {
+ 						ICompilationUnit[] units = fragment.getCompilationUnits();
+ 						if (units.length != 0) {
+ 							String pack = fragment.getElementName();
+-							exports.add(new LocalPackageExportImpl(pack, EMPTRY_STRING_ARRAY));
+ 							for (ICompilationUnit iUnit : units) {
+ 								org.eclipse.jdt.internal.compiler.env.ICompilationUnit sourceFile = 
+ 										new BasicCompilationUnit(iUnit.getSource().toCharArray(), CharOperation.splitOn('.', pack.toCharArray()), iUnit.getPath().toOSString());
+@@ -172,181 +138,16 @@ public class ModuleUtil {
+ 		org.eclipse.jdt.internal.compiler.env.ICompilationUnit[] sources = new org.eclipse.jdt.internal.compiler.env.ICompilationUnit[toCompile.size()];
+ 		toCompile.toArray(sources);
+ 		compiler.compile(sources);
+-		Collections.sort(exports, new Comparator<IModuleDescription.IPackageExport>() {
+-			@Override
+-			public int compare(IModuleDescription.IPackageExport o1, IModuleDescription.IPackageExport o2) {
+-				return o1.getPackageName().compareTo(
+-						o2.getPackageName());
+-			}
+-		});
+-		IModuleDescription.IPackageExport[] packs = new IModuleDescription.IPackageExport[exports.size()];
+-		packs = exports.toArray(packs);
+-		module.setExports(packs);
+ 		String[] mods = environment.getModules();
+ 		for (String string : mods) {
+-			required.add(new LocalModuleReferenceImpl(string, false));
++			required.add(string);
+ 		}
+-		Collections.sort(required, new Comparator<IModuleDescription.IModuleReference>() {
++		Collections.sort(required, new Comparator<String>() {
+ 			@Override
+-			public int compare(IModuleDescription.IModuleReference o1, IModuleDescription.IModuleReference o2) {
+-				return new String(o1.getModuleName()).compareTo(new String(o2.getModuleName()));
++			public int compare(String o1, String o2) {
++				return o1.compareTo(o2);
+ 			}
+ 		});
+-		IModuleDescription.IModuleReference[] refs = new IModuleDescription.IModuleReference[required.size()];
+-		refs = required.toArray(refs);
+-		module.setRequiredModules(refs);
+-		return module;
+-	}
+-}
+-class LocalModuleImpl extends NamedMember implements IModuleDescription {
+-	IModuleDescription.IPackageExport[] exports = null;
+-	IModuleDescription.IModuleReference[] requires = null;
+-	IModuleDescription.IProvidedService[] services = null;
+-	IModuleDescription.IOpenPackage[] opened = null;
+-
+-	String[] used = null;
+-	LocalModuleImpl(String name) {
+-		super(null, name);
+-	}
+-	@Override
+-	public IModuleReference[] getRequiredModules() throws JavaModelException {
+-		return this.requires;
+-	}
+-	public void setRequiredModules(IModuleDescription.IModuleReference[] requires) {
+-		this.requires = requires;
+-	}
+-	@Override
+-	public IPackageExport[] getExportedPackages() {
+-		return this.exports;
+-	}
+-	public void setExports(IPackageExport[] exports) {
+-		this.exports = exports;
+-	}
+-	@Override
+-	public IProvidedService[] getProvidedServices() {
+-		return this.services;
+-	}
+-	@Override
+-	public String[] getUsedServices() {
+-		return this.used;
+-	}
+-	@Override
+-	public IOpenPackage[] getOpenedPackages() throws JavaModelException {
+-		return this.opened;
+-	}
+-
+-	public String toString(String lineDelimiter) {
+-		StringBuffer buffer = new StringBuffer();
+-		toStringContent(buffer, lineDelimiter);
+-		return buffer.toString();
+-	}
+-	protected void toStringContent(StringBuffer buffer, String lineDelimiter) {
+-		buffer.append("module "); //$NON-NLS-1$
+-		buffer.append(this.name).append(' ');
+-		buffer.append('{').append(lineDelimiter);
+-		if (this.exports != null) {
+-			for(int i = 0; i < this.exports.length; i++) {
+-				buffer.append("\texports "); //$NON-NLS-1$
+-				buffer.append(this.exports[i].toString());
+-				buffer.append(lineDelimiter);
+-			}
+-		}
+-		buffer.append(lineDelimiter);
+-		if (this.requires != null) {
+-			for(int i = 0; i < this.requires.length; i++) {
+-				buffer.append("\trequires "); //$NON-NLS-1$
+-				try {
+-					if (this.requires[i].isPublic()) {
+-						buffer.append(" public "); //$NON-NLS-1$
+-					}
+-				} catch (JavaModelException e) {
+-					// Ignore as it is unlikely to get a JME
+-				}
+-				buffer.append(this.requires[i].getModuleName());
+-				buffer.append(';').append(lineDelimiter);
+-			}
+-		}
+-		buffer.append(lineDelimiter).append('}').toString();
+-	}
+-	@Override
+-	public int getElementType() {
+-		return JAVA_MODULE;
+-	}
+-}
+-class LocalModuleReferenceImpl extends ModuleRequirement {
+-	String name;
+-	boolean isPublic = false;
+-	LocalModuleReferenceImpl(String name, boolean isPublic) {
+-		super(null, name);
+-		this.name = name;
+-		this.isPublic = isPublic;
+-	}
+-	@Override
+-	public boolean isPublic() {
+-		return this.isPublic;
+-	}
+-	@Override
+-	public int getElementType() {
+-		return MODULE_REFERENCE;
+-	}
+-	@Override
+-	public String getModuleName() {
+-		return this.name;
+-	}
+-	@Override
+-	public ISourceRange getNameRange() throws JavaModelException {
+-		return null;
+-	}
+-	@Override
+-	protected char getHandleMementoDelimiter() {
+-		return 0;
+-	}
+-	public boolean equals(Object o) {
+-		if (!(o instanceof LocalModuleReferenceImpl)) {
+-			return false;
+-		}
+-		return this.name.equals(((LocalModuleReferenceImpl) o).name);
+-	}
+-	
+-}
+-class LocalPackageExportImpl extends PackageExport {
+-	private String pkgName;
+-	private String[] targets;
+-	LocalPackageExportImpl(String pkgName, String[] targets) {
+-		super(null, pkgName);
+-		this.pkgName = pkgName;
+-		this.targets = targets;
+-	}
+-	@Override
+-	public String getPackageName() {
+-		return this.pkgName;
+-	}
+-	@Override
+-	public String[] getTargetModules() {
+-		return this.targets;
+-	}
+-	public String toString() {
+-		StringBuffer buffer = new StringBuffer();
+-		buffer.append(this.pkgName);
+-		buffer.append(';');
+-		return buffer.toString();
+-	}
+-	@Override
+-	public int getElementType() {
+-		return PACKAGE_EXPORT;
+-	}
+-	@Override
+-	public ISourceRange getNameRange() throws JavaModelException {
+-		return null;
+-	}
+-	@Override
+-	protected char getHandleMementoDelimiter() {
+-		return 0;
+-	}
+-	public boolean equals(Object o) {
+-		if (!(o instanceof LocalPackageExportImpl)) {
+-			return false;
+-		}
+-		return this.pkgName.equals(((LocalPackageExportImpl) o).pkgName);
++		return required.toArray(new String[required.size()]);
+ 	}
+ }

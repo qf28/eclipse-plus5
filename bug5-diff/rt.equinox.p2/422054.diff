@@ -1,0 +1,1457 @@
+commit 73e3365d5687050be42fe7484560230fc36a99be
+Author: Krzysztof Daniel <kdaniel@redhat.com>
+Date:   Fri Dec 13 16:40:46 2013 +0100
+
+    Bug 422054: Create profile from existing bundles.info
+    
+    I've hijacked the bug for the purpose of something that is remotely
+    connected to the problem.
+    
+    Previous commit extends simpleconfigurator to load bundles from
+    different locations, but such an extension breaks p2, as the content of
+    OSGi application no longer corresponds to profile.
+    
+    In order to fix that, following things are done:
+    0. A fragment must contain valid P2 metadata next to the .info file.
+    1. User profile is dropped when there is master configuration change.
+    Also, when fragments are changed.
+    2. When a new surrogate profile is created, P2 will add to the master
+    profile all the units that are found in the fragments repos. Therefore
+    new user profile will contain all the units that were installed by the
+    simpleconfigurator. Fragment repos must be runnable.
+    3. The director application must be configured with extensions if it is
+    supposed to work.
+    
+    Change-Id: I6e857ea51dd32ae7fab39d9c39bec8a91eb203b7
+    Signed-off-by: Krzysztof Daniel <kdaniel@redhat.com>
+
+1	0	bundles/org.eclipse.equinox.p2.director.app/META-INF/MANIFEST.MF
+17	1	bundles/org.eclipse.equinox.p2.director.app/src/org/eclipse/equinox/internal/p2/director/app/DirectorApplication.java
+2	1	bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
+104	1	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/EngineActivator.java
+8	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+33	2	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+99	7	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
+4	0	bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+7	2	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/AbstractReconcilerTest.java
+4	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/AllTests.java
+8	7	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTests.java
+76	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTestsProfileSpoofEnabled.java
+227	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTestsProfileSpoofEnabledConfigured.java
+13	1	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/AbstractSharedInstallTest.java
+3	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/AllTests.java
+196	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/BaseChangeExtendedConfigured.java
+196	0	bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/BaseChangeExtendedConflicts.java
+diff --git a/bundles/org.eclipse.equinox.p2.director.app/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.director.app/META-INF/MANIFEST.MF
+index 486a488..1cb1231 100644
+--- a/bundles/org.eclipse.equinox.p2.director.app/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.director.app/META-INF/MANIFEST.MF
+@@ -13,6 +13,7 @@ Bundle-ActivationPolicy: lazy
+ Import-Package: org.eclipse.equinox.app,
+  org.eclipse.equinox.internal.p2.core.helpers,
+  org.eclipse.equinox.internal.p2.director,
++ org.eclipse.equinox.internal.p2.engine,
+  org.eclipse.equinox.internal.provisional.p2.core.eventbus,
+  org.eclipse.equinox.internal.provisional.p2.director,
+  org.eclipse.equinox.internal.provisional.p2.repository,
+diff --git a/bundles/org.eclipse.equinox.p2.director.app/src/org/eclipse/equinox/internal/p2/director/app/DirectorApplication.java b/bundles/org.eclipse.equinox.p2.director.app/src/org/eclipse/equinox/internal/p2/director/app/DirectorApplication.java
+index 7fdf9a9..d277253 100644
+--- a/bundles/org.eclipse.equinox.p2.director.app/src/org/eclipse/equinox/internal/p2/director/app/DirectorApplication.java
++++ b/bundles/org.eclipse.equinox.p2.director.app/src/org/eclipse/equinox/internal/p2/director/app/DirectorApplication.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2007, 2012 IBM Corporation and others.
++ * Copyright (c) 2007, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -11,6 +11,7 @@
+  *     EclipseSource - ongoing development
+  *     Sonatype, Inc. - ongoing development
+  *     Pascal Rapicault - Support for bundled macosx http://bugs.eclipse.org/57349
++ *     Red Hat, Inc. - support repositories passed via fragments (see bug 378329).
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.director.app;
+ 
+@@ -25,6 +26,7 @@ import org.eclipse.equinox.app.IApplication;
+ import org.eclipse.equinox.app.IApplicationContext;
+ import org.eclipse.equinox.internal.p2.core.helpers.*;
+ import org.eclipse.equinox.internal.p2.director.ProfileChangeRequest;
++import org.eclipse.equinox.internal.p2.engine.EngineActivator;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.IProvisioningEventBus;
+ import org.eclipse.equinox.internal.provisional.p2.core.eventbus.ProvisioningListener;
+ import org.eclipse.equinox.internal.provisional.p2.director.IDirector;
+@@ -566,6 +568,20 @@ public class DirectorApplication implements IApplication, ProvisioningListener {
+ 		if (!anyValid)
+ 			//all repositories failed to load
+ 			throw new ProvisionException(Messages.Application_NoRepositories);
++
++		if (!EngineActivator.EXTENDED)
++			return;
++
++		File[] extensions = EngineActivator.getExtensionsDirectories();
++
++		for (File f : extensions) {
++			metadataManager.addRepository(f.toURI());
++			metadataManager.setRepositoryProperty(f.toURI(), EngineActivator.P2_FRAGMENT_PROPERTY, Boolean.TRUE.toString());
++			metadataRepositoryLocations.add(f.toURI());
++			artifactManager.addRepository(f.toURI());
++			artifactManager.setRepositoryProperty(f.toURI(), EngineActivator.P2_FRAGMENT_PROPERTY, Boolean.TRUE.toString());
++			artifactRepositoryLocations.add(f.toURI());
++		}
+ 	}
+ 
+ 	private void initializeServices() throws CoreException {
+diff --git a/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF b/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
+index 20789fc..e44440b 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
++++ b/bundles/org.eclipse.equinox.p2.engine/META-INF/MANIFEST.MF
+@@ -8,11 +8,12 @@ Bundle-Vendor: %providerName
+ Bundle-Localization: plugin
+ Export-Package: org.eclipse.equinox.internal.p2.engine;
+   x-friends:="org.eclipse.equinox.p2.garbagecollector,
++   org.eclipse.equinox.p2.repository.tools,
+    org.eclipse.equinox.p2.touchpoint.eclipse,
+    org.eclipse.equinox.p2.touchpoint.natives,
+    org.eclipse.equinox.p2.ui.sdk.scheduler,
+    org.eclipse.pde.build,
+-   org.eclipse.equinox.p2.repository.tools",
++   org.eclipse.equinox.p2.director.app",
+  org.eclipse.equinox.internal.p2.engine.phases;x-friends:="org.eclipse.equinox.p2.director.app,org.eclipse.equinox.p2.repository.tools,org.eclipse.equinox.p2.ui.sdk.scheduler",
+  org.eclipse.equinox.p2.engine;version="2.2.0",
+  org.eclipse.equinox.p2.engine.query;version="2.0.0",
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/EngineActivator.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/EngineActivator.java
+index 3a96e85..5fc0e73 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/EngineActivator.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/EngineActivator.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- *  Copyright (c) 2007, 2010 IBM Corporation and others.
++ *  Copyright (c) 2007, 2013 IBM Corporation and others.
+  *  All rights reserved. This program and the accompanying materials
+  *  are made available under the terms of the Eclipse Public License v1.0
+  *  which accompanies this distribution, and is available at
+@@ -7,14 +7,33 @@
+  * 
+  *  Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Red Hat, Inc - fragments support added
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.engine;
+ 
++import java.io.*;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.util.*;
++import org.eclipse.core.runtime.IStatus;
++import org.eclipse.core.runtime.Status;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
++import org.eclipse.osgi.util.NLS;
+ import org.osgi.framework.BundleActivator;
+ import org.osgi.framework.BundleContext;
+ 
+ public class EngineActivator implements BundleActivator {
+ 	private static BundleContext context;
++	/**
++	 * as for now it is exactly the same variable as in simpleconfigurator Activator
++	 * @noreference This field is not intended to be referenced by clients.
++	 */
++	public static String EXTENSIONS = System.getProperty("p2.fragments"); //$NON-NLS-1$
++	public static boolean EXTENDED = EXTENSIONS != null;
++	private static final String LINK_KEY = "link"; //$NON-NLS-1$
++	private static final String LINK_FILE_EXTENSION = ".link"; //$NON-NLS-1$
++	private static final Set<File> reportedExtensions = Collections.synchronizedSet(new HashSet<File>(0));
++
+ 	public static final String ID = "org.eclipse.equinox.p2.engine"; //$NON-NLS-1$
+ 
+ 	/**
+@@ -56,6 +75,11 @@ public class EngineActivator implements BundleActivator {
+ 		return context;
+ 	}
+ 
++	/**
++	 * This property indicates repositories that are passed via the fragments mechanism.
++	 */
++	public static final String P2_FRAGMENT_PROPERTY = "p2.fragment"; //$NON-NLS-1$
++
+ 	public void start(BundleContext aContext) throws Exception {
+ 		EngineActivator.context = aContext;
+ 	}
+@@ -64,4 +88,83 @@ public class EngineActivator implements BundleActivator {
+ 		EngineActivator.context = null;
+ 	}
+ 
++	public static File[] getExtensionsDirectories() {
++		List<File> files = new ArrayList<File>(0);
++		if (EXTENSIONS != null) {
++			String[] locationToCheck = EXTENSIONS.split(","); //$NON-NLS-1$
++			for (String location : locationToCheck) {
++				try {
++					files.addAll(getInfoFilesFromLocation(location));
++				} catch (FileNotFoundException e) {
++					LogHelper.log(new Status(IStatus.ERROR, ID, NLS.bind(Messages.EngineActivator_0, location), e));
++				} catch (IOException e) {
++					LogHelper.log(new Status(IStatus.ERROR, ID, NLS.bind(Messages.EngineActivator_0, location), e));
++				} catch (URISyntaxException e) {
++					LogHelper.log(new Status(IStatus.ERROR, ID, NLS.bind(Messages.EngineActivator_0, location), e));
++				}
++			}
++		}
++		return files.toArray(new File[files.size()]);
++	}
++
++	// This method must match the implementation in the SimpleConfiguratorUtils with the only difference that
++	// parent folder of the metadata is returned.
++	private static ArrayList<File> getInfoFilesFromLocation(String locationToCheck) throws IOException, FileNotFoundException, URISyntaxException {
++		ArrayList<File> result = new ArrayList<File>(1);
++
++		File extensionsLocation = new File(locationToCheck);
++
++		if (extensionsLocation.exists() && extensionsLocation.isDirectory()) {
++			//extension location contains extensions
++			File[] extensions = extensionsLocation.listFiles();
++			for (File extension : extensions) {
++				if (extension.isFile() && extension.getName().endsWith(LINK_FILE_EXTENSION)) {
++					Properties link = new Properties();
++					link.load(new FileInputStream(extension));
++					String newInfoName = link.getProperty(LINK_KEY);
++					URI newInfoURI = new URI(newInfoName);
++					File newInfoFile = null;
++					if (newInfoURI.isAbsolute()) {
++						newInfoFile = new File(newInfoName);
++					} else {
++						newInfoFile = new File(extension.getParentFile(), newInfoName);
++					}
++					if (newInfoFile.exists()) {
++						extension = newInfoFile.getParentFile();
++					}
++				}
++
++				if (extension.isDirectory()) {
++					if (extension.canWrite()) {
++						synchronized (reportedExtensions) {
++							if (!reportedExtensions.contains(extension)) {
++								reportedExtensions.add(extension);
++								LogHelper.log(new Status(IStatus.ERROR, ID, NLS.bind(Messages.EngineActivator_1, extension)));
++							}
++						}
++						continue;
++					}
++					File[] listFiles = extension.listFiles();
++					// new magic - multiple info files, f.e.
++					//   egit.info (git feature)
++					//   cdt.link (properties file containing link=path) to other info file
++					for (File file : listFiles) {
++						//if it is a info file - load it
++						if (file.getName().endsWith(".info")) { //$NON-NLS-1$
++							result.add(extension);
++						}
++						// if it is a link - dereference it
++					}
++				} else {
++					synchronized (reportedExtensions) {
++						if (!reportedExtensions.contains(extension)) {
++							reportedExtensions.add(extension);
++							LogHelper.log(new Status(IStatus.WARNING, ID, NLS.bind(Messages.EngineActivator_3, extension)));
++						}
++					}
++				}
++			}
++		}
++		return result;
++	}
+ }
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+index 0b8d794..c3e0486 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/Messages.java
+@@ -36,6 +36,12 @@ public class Messages extends NLS {
+ 	public static String download_artifact;
+ 	public static String download_no_repository;
+ 	public static String Engine_Operation_Canceled_By_User;
++
++	public static String EngineActivator_0;
++
++	public static String EngineActivator_1;
++
++	public static String EngineActivator_3;
+ 	public static String error_parsing_profile;
+ 	public static String error_persisting_profile;
+ 	public static String forced_action_execute_error;
+@@ -107,6 +113,8 @@ public class Messages extends NLS {
+ 	public static String SimpleProfileRegistry_States_Error_Writing_File;
+ 	public static String SimpleProfileRegistry_state_not_found;
+ 
++	public static String SurrogateProfileHandler_1;
++
+ 	public static String thread_not_owner;
+ 	public static String touchpoint_commit_error;
+ 	public static String touchpoint_prepare_error;
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+index 8d55e00..b5e2301 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SimpleProfileRegistry.java
+@@ -7,6 +7,7 @@
+  * Contributors: 
+  *     IBM Corporation - initial API and implementation
+  *     Ericsson AB - ongoing development
++ *     Red Hat, Inc. - fragments support added.
+  ******************************************************************************/
+ package org.eclipse.equinox.internal.p2.engine;
+ 
+@@ -262,6 +263,8 @@ public class SimpleProfileRegistry implements IProfileRegistry, IAgentService {
+ 					//Now that we created a new profile. Tag it, override the property and register the timestamp in the agent registry for pickup by other  
+ 					internalSetProfileStateProperty(profile, profile.getTimestamp(), IProfile.STATE_PROP_SHARED_INSTALL, IProfile.STATE_SHARED_INSTALL_VALUE_NEW);
+ 					internalSetProfileStateProperty(profile, profile.getTimestamp(), SIMPLE_PROFILE_REGISTRY_INTERNAL + getBaseTimestamp(profile.getProfileId()), getBaseTimestamp(id));
++					//fragments support - remeber the property
++					internalSetProfileStateProperty(profile, profile.getTimestamp(), SIMPLE_PROFILE_REGISTRY_INTERNAL + getExtTimeStamp(), getExtTimeStamp());
+ 					agent.registerService(SERVICE_SHARED_INSTALL_NEW_TIMESTAMP, Long.toString(profile.getTimestamp()));
+ 				} else {
+ 					//This is the first time we create the shared profile. Tag it as such and also remember the timestamp of the base
+@@ -269,21 +272,45 @@ public class SimpleProfileRegistry implements IProfileRegistry, IAgentService {
+ 					String baseTimestamp = getBaseTimestamp(id);
+ 					if (baseTimestamp != null)
+ 						internalSetProfileStateProperty(profile, profile.getTimestamp(), SIMPLE_PROFILE_REGISTRY_INTERNAL + baseTimestamp, baseTimestamp);
++					String extTimestamp = getExtTimeStamp();
++					internalSetProfileStateProperty(profile, profile.getTimestamp(), SIMPLE_PROFILE_REGISTRY_INTERNAL + extTimestamp, extTimestamp);
+ 				}
+ 			}
+ 		}
+ 		return profile;
+ 	}
+ 
++	// get timestamp of fragments (extensions)
++	private String getExtTimeStamp() {
++		long result = -1;
++		if (!EngineActivator.EXTENDED) {
++			return Long.toString(result);
++		}
++		File[] extensions = EngineActivator.getExtensionsDirectories();
++		for (File extension : extensions) {
++			if (extension.lastModified() > result) {
++				result = extension.lastModified();
++			}
++		}
++		return Long.toString(result);
++	}
++
+ 	private boolean ignoreExistingProfile(IProfile profile) {
+ 		if (agent.getService(SERVICE_SHARED_INSTALL_NEW_TIMESTAMP) != null)
+ 			return false;
+ 
+ 		String baseTimestamp = getBaseTimestamp(profile.getProfileId());
+-		if (baseTimestamp == null)
++		String extTimestamp = getExtTimeStamp();
++		if (baseTimestamp == null) {
+ 			return false;
++		}
++
++		boolean extensionOK = true;
++		if (surrogateProfileHandler != null && surrogateProfileHandler.isSurrogate(profile)) {
++			extensionOK = (internalGetProfileStateProperties(profile, SIMPLE_PROFILE_REGISTRY_INTERNAL + extTimestamp, false).size() != 0);
++		}
+ 
+-		if (internalGetProfileStateProperties(profile, SIMPLE_PROFILE_REGISTRY_INTERNAL + baseTimestamp, false).size() != 0)
++		if ((internalGetProfileStateProperties(profile, SIMPLE_PROFILE_REGISTRY_INTERNAL + baseTimestamp, false).size() != 0) && extensionOK)
+ 			return false;
+ 
+ 		return true;
+@@ -671,6 +698,10 @@ public class SimpleProfileRegistry implements IProfileRegistry, IAgentService {
+ 	class Parser extends ProfileParser {
+ 		private final Map<String, ProfileHandler> profileHandlers = new HashMap<String, ProfileHandler>();
+ 
++		public Map<String, ProfileHandler> getProfileHandlers() {
++			return Collections.unmodifiableMap(profileHandlers);
++		}
++
+ 		public Parser(BundleContext context, String bundleId) {
+ 			super(context, bundleId);
+ 		}
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
+index e99a0f2..666f5d8 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/SurrogateProfileHandler.java
+@@ -8,17 +8,19 @@
+  *  Contributors:
+  *      IBM Corporation - initial API and implementation
+  *      Ericsson AB - Bug 400011 - [shared] Cleanup the SurrogateProfileHandler code
++ *      Red Hat, Inc. - fragments support added.
+  *******************************************************************************/
+ package org.eclipse.equinox.internal.p2.engine;
+ 
+-import java.io.File;
++import java.io.*;
+ import java.lang.ref.SoftReference;
+ import java.net.*;
+-import java.util.ArrayList;
+-import java.util.Iterator;
+-import org.eclipse.core.runtime.IProgressMonitor;
+-import org.eclipse.core.runtime.URIUtil;
++import java.util.*;
++import org.eclipse.core.runtime.*;
++import org.eclipse.equinox.internal.p2.core.helpers.LogHelper;
+ import org.eclipse.equinox.internal.p2.core.helpers.ServiceHelper;
++import org.eclipse.equinox.internal.p2.engine.ProfileParser.ProfileHandler;
++import org.eclipse.equinox.internal.p2.engine.SimpleProfileRegistry.Parser;
+ import org.eclipse.equinox.p2.core.IProvisioningAgent;
+ import org.eclipse.equinox.p2.engine.IProfile;
+ import org.eclipse.equinox.p2.metadata.*;
+@@ -26,6 +28,9 @@ import org.eclipse.equinox.p2.metadata.MetadataFactory.InstallableUnitDescriptio
+ import org.eclipse.equinox.p2.metadata.expression.ExpressionUtil;
+ import org.eclipse.equinox.p2.metadata.expression.IMatchExpression;
+ import org.eclipse.equinox.p2.query.*;
++import org.eclipse.equinox.p2.repository.IRepositoryManager;
++import org.eclipse.equinox.p2.repository.artifact.IArtifactRepositoryManager;
++import org.eclipse.equinox.p2.repository.metadata.IMetadataRepositoryManager;
+ import org.eclipse.osgi.service.datalocation.Location;
+ import org.eclipse.osgi.util.NLS;
+ 
+@@ -156,25 +161,112 @@ public class SurrogateProfileHandler implements ISurrogateProfileHandler {
+ 				return profile;
+ 		}
+ 
+-		final IProfile profile = registry.getProfile(id, currentTimestamp);
++		final Profile profile = (Profile) registry.getProfile(id, currentTimestamp);
+ 		if (profile != null)
+ 			cachedProfile = new SoftReference<IProfile>(profile);
++
++		if (!EngineActivator.EXTENDED) {
++			return profile;
++		}
++
++		setUpRepos();
+ 		return profile;
+ 	}
+ 
++	/**
++	 * Removes repositories from fragments locations as they might be obsolete and adds them back.
++	 */
++	private void setUpRepos() {
++		//clean old junk
++		IMetadataRepositoryManager metaManager = (IMetadataRepositoryManager) agent.getService(IMetadataRepositoryManager.SERVICE_NAME);
++		URI[] knownRepositories = metaManager.getKnownRepositories(IRepositoryManager.REPOSITORIES_LOCAL);
++		for (URI uri : knownRepositories) {
++			if ("true".equals(metaManager.getRepositoryProperty(uri, EngineActivator.P2_FRAGMENT_PROPERTY))) { //$NON-NLS-1$
++				metaManager.removeRepository(uri);
++			}
++		}
++
++		IArtifactRepositoryManager artifactManager = (IArtifactRepositoryManager) agent.getService(IArtifactRepositoryManager.SERVICE_NAME);
++		knownRepositories = artifactManager.getKnownRepositories(IRepositoryManager.REPOSITORIES_LOCAL);
++		for (URI uri : knownRepositories) {
++			if ("true".equals(artifactManager.getRepositoryProperty(uri, EngineActivator.P2_FRAGMENT_PROPERTY))) { //$NON-NLS-1$
++				artifactManager.removeRepository(uri);
++			}
++		}
++
++		File[] fragments = EngineActivator.getExtensionsDirectories();
++		for (File f : fragments) {
++			metaManager.addRepository(f.toURI());
++			metaManager.setRepositoryProperty(f.toURI(), EngineActivator.P2_FRAGMENT_PROPERTY, Boolean.TRUE.toString());
++			artifactManager.addRepository(f.toURI());
++			artifactManager.setRepositoryProperty(f.toURI(), EngineActivator.P2_FRAGMENT_PROPERTY, Boolean.TRUE.toString());
++		}
++	}
++
+ 	/* (non-Javadoc)
+ 	 * @see org.eclipse.equinox.internal.p2.engine.ISurrogateProfileHandler#createProfile(java.lang.String)
+ 	 */
+ 	public IProfile createProfile(String id) {
+-		final IProfile sharedProfile = getSharedProfile(id);
++		final Profile sharedProfile = (Profile) getSharedProfile(id);
+ 		if (sharedProfile == null)
+ 			return null;
+ 
++		if (!EngineActivator.EXTENDED) {
++			Profile userProfile = new Profile(agent, id, null, sharedProfile.getProperties());
++			userProfile.setProperty(PROP_SURROGATE, Boolean.TRUE.toString());
++			userProfile.setSurrogateProfileHandler(this);
++			updateProperties(sharedProfile, userProfile);
++			addSharedProfileBaseIUs(sharedProfile, userProfile);
++
++			return userProfile;
++		}
++
++		File[] extensionLocations = EngineActivator.getExtensionsDirectories();
++		Set<IInstallableUnit> added = new HashSet<IInstallableUnit>();
++		for (File extension : extensionLocations) {
++			if (extension.isDirectory()) {
++				File[] listFiles = extension.listFiles(new FileFilter() {
++
++					public boolean accept(File pathname) {
++						if (pathname.getName().endsWith(".profile")) { //$NON-NLS-1$
++							return true;
++						}
++						return false;
++					}
++				});
++				for (File profileFile : listFiles) {
++					Parser extensionParser = profileRegistry.new Parser(EngineActivator.getContext(), EngineActivator.ID);
++					try {
++						extensionParser.parse(profileFile);
++						//there is only one profile as we read only one
++						String key = extensionParser.getProfileHandlers().keySet().iterator().next();
++
++						ProfileHandler extensionHandler = extensionParser.getProfileHandlers().get(key);
++						IInstallableUnit[] installableUnits = extensionHandler.getInstallableUnits();
++						for (IInstallableUnit unit : installableUnits) {
++							if (!added.contains(unit)) {
++								added.add(unit);
++								sharedProfile.addInstallableUnit(unit);
++							}
++							Map<String, String> iuProperties = extensionHandler.getIUProperties(unit);
++							if (iuProperties != null && !iuProperties.isEmpty()) {
++								sharedProfile.addInstallableUnitProperties(unit, iuProperties);
++							}
++						}
++					} catch (IOException e) {
++						LogHelper.log(new Status(IStatus.ERROR, EngineActivator.ID, NLS.bind(Messages.SurrogateProfileHandler_1, profileFile), e));
++					}
++				}
++				continue;
++			}
++		}
++
+ 		Profile userProfile = new Profile(agent, id, null, sharedProfile.getProperties());
+ 		userProfile.setProperty(PROP_SURROGATE, Boolean.TRUE.toString());
+ 		userProfile.setSurrogateProfileHandler(this);
+ 		updateProperties(sharedProfile, userProfile);
+ 		addSharedProfileBaseIUs(sharedProfile, userProfile);
++
+ 		return userProfile;
+ 	}
+ 
+diff --git a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+index f5af6f2..68f2d86 100644
+--- a/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
++++ b/bundles/org.eclipse.equinox.p2.engine/src/org/eclipse/equinox/internal/p2/engine/messages.properties
+@@ -52,6 +52,7 @@ reg_dir_not_available=Registry Directory not available: {0}.
+ thread_not_owner=Thread not lock owner.
+ profile_lock_not_reentrant=Lock failed. Profile does not permit reentrant locking.
+ Shared_Profile=Shared profile
++SurrogateProfileHandler_1=Error while parsing extension profile {0}
+ shared_profile_not_found=Shared profile {0} not found.
+ 
+ ProfilePreferences_saving=Saving profile preferences
+@@ -90,6 +91,9 @@ rollingback_error=An error was detected while performing the engine operation an
+ rollingback_cancel=The engine operation was cancelled and the changes are being rolled back.
+ 
+ Engine_Operation_Canceled_By_User=Operation canceled by the user.
++EngineActivator_0=Error while loading repository from {0}
++EngineActivator_1=Fragment directory {0} is not read only and will not be scanned for fragments.
++EngineActivator_3=No idea what to do with {0}. It does not contain valid fragment.
+ InstallableUnitEvent_type_not_install_or_uninstall_or_configure=type must be either UNINSTALL(0) or INSTALL(1) or UNCONFIGURE(2) or CONFIGURE(3)
+ CertificateChecker_CertificateError=An invalid certificate was found.
+ CertificateChecker_CertificateRejected=One or more certificates rejected. Cannot proceed with installation.
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/AbstractReconcilerTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/AbstractReconcilerTest.java
+index ef88cc3..3ce8ba5 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/AbstractReconcilerTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/AbstractReconcilerTest.java
+@@ -8,6 +8,7 @@
+  *  Contributors:
+  *     IBM Corporation - initial API and implementation
+  *     Ericsson AB - Ongoing development
++ *     Red Hat, Inc. - Fragment support added.
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.reconciler.dropins;
+ 
+@@ -43,7 +44,7 @@ public class AbstractReconcilerTest extends AbstractProvisioningTest {
+ 	private static Properties archiveAndRepositoryProperties = null;
+ 
+ 	private String propertyToPlatformArchive;
+-	private boolean debug = false;
++	protected boolean debug = false;
+ 
+ 	static {
+ 		loadPlatformZipPropertiesFromFile();
+@@ -610,6 +611,10 @@ public class AbstractReconcilerTest extends AbstractProvisioningTest {
+ 	 * not expect 13 to be returned.
+ 	 */
+ 	protected int runEclipse(String message, File location, String[] args) {
++		return runEclipse(message, location, args, null);
++	}
++
++	protected int runEclipse(String message, File location, String[] args, File extensions) {
+ 		File root = new File(Activator.getBundleContext().getProperty("java.home"));
+ 		root = new File(root, "bin");
+ 		File exe = new File(root, "javaw.exe");
+@@ -635,7 +640,7 @@ public class AbstractReconcilerTest extends AbstractProvisioningTest {
+ 		this.debug = on;
+ 	}
+ 
+-	private void parseExitdata(String message) {
++	protected void parseExitdata(String message) {
+ 		// if the exit data contains a message telling us the location of the log file, then get it
+ 		String data = TestActivator.getContext().getProperty("eclipse.exitdata");
+ 		if (data == null)
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/AllTests.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/AllTests.java
+index 241a335..dc8d266 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/AllTests.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/AllTests.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- * Copyright (c) 2008, 2011 IBM Corporation and others.
++ * Copyright (c) 2008, 2013 IBM Corporation and others.
+  * All rights reserved. This program and the accompanying materials 
+  * are made available under the terms of the Eclipse Public License v1.0
+  * which accompanies this distribution, and is available at
+@@ -7,6 +7,7 @@
+  * 
+  * Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Red Hat, Inc. - Fragment support added.
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.reconciler.dropins;
+ 
+@@ -26,6 +27,8 @@ public class AllTests extends TestCase {
+ 		suite.addTest(ConfigurationTests.suite());
+ 		suite.addTest(FeaturePatchTest.suite());
+ 		suite.addTest(SharedInstallTests.suite());
++		suite.addTest(SharedInstallTestsProfileSpoofEnabled.suite());
++		suite.addTest(SharedInstallTestsProfileSpoofEnabledConfigured.suite());
+ 		suite.addTest(Bug362692.suite());
+ 		return suite;
+ 	}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTests.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTests.java
+index 7863e3e..8d0fbea 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTests.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTests.java
+@@ -1,5 +1,5 @@
+ /*******************************************************************************
+- *  Copyright (c) 2008, 2012 IBM Corporation and others.
++ *  Copyright (c) 2008, 2013 IBM Corporation and others.
+  *  All rights reserved. This program and the accompanying materials
+  *  are made available under the terms of the Eclipse Public License v1.0
+  *  which accompanies this distribution, and is available at
+@@ -7,6 +7,7 @@
+  * 
+  *  Contributors:
+  *     IBM Corporation - initial API and implementation
++ *     Red Hat, Inc. - fragments support added.
+  *******************************************************************************/
+ package org.eclipse.equinox.p2.tests.reconciler.dropins;
+ 
+@@ -19,9 +20,9 @@ import org.eclipse.equinox.internal.p2.updatesite.Activator;
+ 
+ public class SharedInstallTests extends AbstractReconcilerTest {
+ 
+-	private static final boolean WINDOWS = java.io.File.separatorChar == '\\';
+-	private static File readOnlyBase;
+-	private static File userBase;
++	protected static final boolean WINDOWS = java.io.File.separatorChar == '\\';
++	protected static File readOnlyBase;
++	protected static File userBase;
+ 
+ 	public static Test suite() {
+ 		TestSuite suite = new ReconcilerTestSuite();
+@@ -39,7 +40,7 @@ public class SharedInstallTests extends AbstractReconcilerTest {
+ 		super(name);
+ 	}
+ 
+-	public static void reconcileReadOnly(String message) {
++	public void reconcileReadOnly(String message) {
+ 		File root = new File(Activator.getBundleContext().getProperty("java.home"));
+ 		root = new File(root, "bin");
+ 		File exe = new File(root, "javaw.exe");
+@@ -67,13 +68,13 @@ public class SharedInstallTests extends AbstractReconcilerTest {
+ 		}
+ 	}
+ 
+-	private static void cleanupReadOnlyInstall() {
++	protected static void cleanupReadOnlyInstall() {
+ 		delete(userBase);
+ 		setReadOnly(readOnlyBase, false);
+ 		assertTrue("0.7", readOnlyBase.canWrite());
+ 	}
+ 
+-	private static void setupReadOnlyInstall() {
++	protected void setupReadOnlyInstall() {
+ 		readOnlyBase = new File(output, "eclipse");
+ 		assertTrue(readOnlyBase.canWrite());
+ 		setReadOnly(readOnlyBase, true);
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTestsProfileSpoofEnabled.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTestsProfileSpoofEnabled.java
+new file mode 100644
+index 0000000..1990e57
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTestsProfileSpoofEnabled.java
+@@ -0,0 +1,76 @@
++/*******************************************************************************
++ *  Copyright (c) 2013 IBM Corporation and others.
++ *  All rights reserved. This program and the accompanying materials
++ *  are made available under the terms of the Eclipse Public License v1.0
++ *  which accompanies this distribution, and is available at
++ *  http://www.eclipse.org/legal/epl-v10.html
++ * 
++ *  Contributors:
++ *     Red Hat, Inc. - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.p2.tests.reconciler.dropins;
++
++import java.io.File;
++import junit.framework.Test;
++import junit.framework.TestSuite;
++import org.eclipse.equinox.internal.p2.updatesite.Activator;
++
++public class SharedInstallTestsProfileSpoofEnabled extends SharedInstallTests {
++
++	public static Test suite() {
++		TestSuite suite = new ReconcilerTestSuite();
++		suite.setName(SharedInstallTestsProfileSpoofEnabled.class.getName());
++		suite.addTest(new SharedInstallTestsProfileSpoofEnabled("testBasicStartup"));
++		suite.addTest(new SharedInstallTestsProfileSpoofEnabled("testReadOnlyDropinsStartup"));
++		suite.addTest(new SharedInstallTestsProfileSpoofEnabled("testUserDropinsStartup"));
++		return suite;
++	}
++
++	/*
++	 * Constructor for the class.
++	 */
++	public SharedInstallTestsProfileSpoofEnabled(String name) {
++		super(name);
++	}
++
++	public void reconcileReadOnly(String message) {
++		File root = new File(Activator.getBundleContext().getProperty("java.home"));
++		root = new File(root, "bin");
++		File exe = new File(root, "javaw.exe");
++		if (!exe.exists())
++			exe = new File(root, "java");
++
++		String configuration = new File(userBase, "configuration").getAbsolutePath();
++		String[] command = new String[] {(new File(output, "eclipse/eclipse")).getAbsolutePath(), "--launcher.suppressErrors", "-debug", "-consolelog", "-nosplash", "-application", "org.eclipse.equinox.p2.reconciler.application", "-configuration", configuration, "-vm", exe.getAbsolutePath(), "-vmArgs", "-Dosgi.checkConfiguration=true", "-Dp2.simpleconfigurator.extensions=true"};
++		//			String[] command = new String[] {(new File(output, "eclipse/eclipse")).getAbsolutePath(), "--launcher.suppressErrors", "-debug", "-consolelog", "-nosplash", "-application", "org.eclipse.equinox.p2.reconciler.application", "-configuration", configuration, "-vm", exe.getAbsolutePath(), "-vmArgs", "-Dosgi.checkConfiguration=true", "-Dp2.simpleconfigurator.extended=true", "-Xdebug", "-Xrunjdwp:transport=dt_socket,address=8000,server=y,suspend=y"};
++		run(message, command);
++	}
++
++	//	public void testBasicStartup() throws IOException {
++	//		assertInitialized();
++	//		setupReadOnlyInstall();
++	//		try {
++	//			File userBundlesInfo = new File(userBase, "configuration/org.eclipse.equinox.simpleconfigurator/bundles.info");
++	//			File userConfigIni = new File(userBase, "configuration/config.ini");
++	//			assertFalse("0.1", userBundlesInfo.exists());
++	//			assertFalse("0.2", userConfigIni.exists());
++	//			reconcileReadOnly("0.21");
++	//			//this is a change from the profile scenario - bundles.info will be always created as there are p2 operations!
++	//			assertTrue("0.3", userBundlesInfo.exists());
++	//			assertTrue("0.4", userConfigIni.exists());
++	//
++	//			Properties props = new Properties();
++	//			InputStream is = new BufferedInputStream(new FileInputStream(userConfigIni));
++	//			try {
++	//				props.load(is);
++	//			} finally {
++	//				is.close();
++	//			}
++	//			assertTrue("0.5", props.containsKey("osgi.sharedConfiguration.area"));
++	//			// eclipse.p2.data.area doesn't appear in the nonextended tests, but I can't see why it's wrong
++	//			assertEquals("0.6", 2, props.size());
++	//		} finally {
++	//			cleanupReadOnlyInstall();
++	//		}
++	//	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTestsProfileSpoofEnabledConfigured.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTestsProfileSpoofEnabledConfigured.java
+new file mode 100644
+index 0000000..a47c0a0
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/reconciler/dropins/SharedInstallTestsProfileSpoofEnabledConfigured.java
+@@ -0,0 +1,227 @@
++/*******************************************************************************
++ *  Copyright (c) 2003 IBM Corporation and others.
++ *  All rights reserved. This program and the accompanying materials
++ *  are made available under the terms of the Eclipse Public License v1.0
++ *  which accompanies this distribution, and is available at
++ *  http://www.eclipse.org/legal/epl-v10.html
++ * 
++ *  Contributors:
++ *     Red Hat, Inc. - initial API and implementation
++ *******************************************************************************/
++package org.eclipse.equinox.p2.tests.reconciler.dropins;
++
++import java.io.*;
++import java.util.Properties;
++import junit.framework.Test;
++import junit.framework.TestSuite;
++import org.eclipse.core.runtime.Platform;
++import org.eclipse.equinox.internal.p2.updatesite.Activator;
++
++public class SharedInstallTestsProfileSpoofEnabledConfigured extends SharedInstallTestsProfileSpoofEnabled {
++
++	private File extensions;
++
++	public static Test suite() {
++		TestSuite suite = new ReconcilerTestSuite();
++		suite.setName(SharedInstallTestsProfileSpoofEnabledConfigured.class.getName());
++		suite.addTest(new SharedInstallTestsProfileSpoofEnabledConfigured("testBasicStartup"));
++		suite.addTest(new SharedInstallTestsProfileSpoofEnabledConfigured("testReadOnlyDropinsStartup"));
++		suite.addTest(new SharedInstallTestsProfileSpoofEnabledConfigured("testUserDropinsStartup"));
++		return suite;
++	}
++
++	/*
++	 * Constructor for the class.
++	 */
++	public SharedInstallTestsProfileSpoofEnabledConfigured(String name) {
++		super(name);
++	}
++
++	public void reconcileReadOnly(String message, File extensions) {
++		reconcileReadOnly(message, extensions, false);
++	}
++
++	public void reconcileReadOnly(String message, File extensions, boolean debug) {
++		File root = new File(Activator.getBundleContext().getProperty("java.home"));
++		root = new File(root, "bin");
++		File exe = new File(root, "javaw.exe");
++		if (!exe.exists())
++			exe = new File(root, "java");
++
++		String configuration = new File(userBase, "configuration").getAbsolutePath();
++		String command[];
++		if (!debug) {
++			if (extensions != null) {
++				command = new String[] {(new File(output, "eclipse/eclipse")).getAbsolutePath(), "--launcher.suppressErrors", "-debug", "-consolelog", "-nosplash", "-application", "org.eclipse.equinox.p2.reconciler.application", "-configuration", configuration, "-vm", exe.getAbsolutePath(), "-vmArgs", "-Dosgi.checkConfiguration=true", "-Dp2.fragments=" + extensions.toString()};
++			} else {
++				command = new String[] {(new File(output, "eclipse/eclipse")).getAbsolutePath(), "--launcher.suppressErrors", "-debug", "-consolelog", "-nosplash", "-application", "org.eclipse.equinox.p2.reconciler.application", "-configuration", configuration, "-vm", exe.getAbsolutePath(), "-vmArgs", "-Dosgi.checkConfiguration=true"};
++			}
++		} else {
++			if (extensions != null) {
++				command = new String[] {(new File(output, "eclipse/eclipse")).getAbsolutePath(), "--launcher.suppressErrors", "-debug", "-consolelog", "-nosplash", "-application", "org.eclipse.equinox.p2.reconciler.application", "-configuration", configuration, "-vm", exe.getAbsolutePath(), "-vmArgs", "-Dosgi.checkConfiguration=true", "-Dp2.fragments=" + extensions.toString(), "-Xdebug", "-Xrunjdwp:transport=dt_socket,address=8000,server=y,suspend=y"};
++			} else {
++				command = new String[] {(new File(output, "eclipse/eclipse")).getAbsolutePath(), "--launcher.suppressErrors", "-debug", "-consolelog", "-nosplash", "-application", "org.eclipse.equinox.p2.reconciler.application", "-configuration", configuration, "-vm", exe.getAbsolutePath(), "-vmArgs", "-Dosgi.checkConfiguration=true", "-Xdebug", "-Xrunjdwp:transport=dt_socket,address=8000,server=y,suspend=y"};
++			}
++		}
++		run(message, command);
++	}
++
++	@Override
++	protected void setUp() throws Exception {
++		super.setUp();
++		extensions = getTempFolder();
++		copy("", getTestData("", "testData/reconciler/extensions/ext1"), extensions);
++		setReadOnly(extensions, true);
++	}
++
++	@Override
++	protected void tearDown() throws Exception {
++		setReadOnly(extensions, false);
++		extensions.delete();
++		super.tearDown();
++	}
++
++	public void testBasicStartup() throws IOException {
++		assertInitialized();
++		setupReadOnlyInstall();
++		try {
++			File userBundlesInfo = new File(userBase, "configuration/org.eclipse.equinox.simpleconfigurator/bundles.info");
++			File userConfigIni = new File(userBase, "configuration/config.ini");
++			assertFalse("0.1", userBundlesInfo.exists());
++			assertFalse("0.2", userConfigIni.exists());
++			reconcileReadOnly("0.21", extensions);
++			assertFalse("0.3", userBundlesInfo.exists());
++			assertTrue("0.4", userConfigIni.exists());
++
++			Properties props = new Properties();
++			InputStream is = new BufferedInputStream(new FileInputStream(userConfigIni));
++			try {
++				props.load(is);
++			} finally {
++				is.close();
++			}
++			assertTrue("0.5", props.containsKey("osgi.sharedConfiguration.area"));
++			assertTrue("0.6", props.size() == 1);
++		} finally {
++			cleanupReadOnlyInstall();
++		}
++	}
++
++	public void testReadOnlyDropinsStartup() throws IOException {
++		if (Platform.getOS().equals(Platform.OS_MACOSX))
++			return;
++
++		assertInitialized();
++		assertDoesNotExistInBundlesInfo("0.1", "myBundle");
++		File jar = getTestData("2.0", "testData/reconciler/plugins/myBundle_1.0.0.jar");
++		add("0.2", "dropins", jar);
++		setupReadOnlyInstall();
++		try {
++			File userBundlesInfo = new File(userBase, "configuration/org.eclipse.equinox.simpleconfigurator/bundles.info");
++			File userConfigIni = new File(userBase, "configuration/config.ini");
++			assertFalse("0.1", userBundlesInfo.exists());
++			assertFalse("0.2", userConfigIni.exists());
++
++			reconcileReadOnly("0.21", extensions);
++
++			assertTrue("0.3", userBundlesInfo.exists());
++			assertTrue("0.4", userConfigIni.exists());
++
++			assertTrue(isInBundlesInfo(userBundlesInfo, "myBundle", null));
++			assertTrue(isInBundlesInfo(userBundlesInfo, "zzz", null));
++
++			// remove the bundle from the dropins and reconcile
++			setReadOnly(readOnlyBase, false);
++			assertTrue("0.7", readOnlyBase.canWrite());
++			remove("1.0", "dropins", "myBundle_1.0.0.jar");
++			setReadOnly(readOnlyBase, true);
++
++			reconcileReadOnly("0.21", extensions, false);
++
++			assertFalse(isInBundlesInfo(userBundlesInfo, "myBundle", null));
++			assertTrue(isInBundlesInfo(userBundlesInfo, "zzz", null));
++
++			reconcileReadOnly("0.2105", null, false);
++
++			// those two will never pass. Disabling extensions while no dropins change
++			// causes master profile to be loaded and user bundles *not* touched
++
++			//			assertFalse(isInBundlesInfo(userBundlesInfo, "myBundle", null));
++			//			assertFalse(isInBundlesInfo(userBundlesInfo, "zzz", null));
++
++			// only dropin change (or any other p2 operations) causes p2 to write a
++			// new, up-to-date bundles.info
++			setReadOnly(readOnlyBase, false);
++			assertTrue("0.7", readOnlyBase.canWrite());
++			add("0.211", "dropins", jar);
++			setReadOnly(readOnlyBase, true);
++
++			//no extension - new bundles.info should be written
++			reconcileReadOnly("0.22", null, false);
++
++			assertTrue(isInBundlesInfo(userBundlesInfo, "myBundle", null));
++			assertFalse(isInBundlesInfo(userBundlesInfo, "zzz", null));
++		} finally {
++			cleanupReadOnlyInstall();
++			// try to remove it in case an exception was thrown
++			remove("1.0", "dropins", "myBundle_1.0.0.jar");
++		}
++	}
++
++	public void testUserDropinsStartup() throws IOException {
++		if (Platform.getOS().equals(Platform.OS_MACOSX))
++			return;
++
++		assertInitialized();
++		assertDoesNotExistInBundlesInfo("0.1", "myBundle");
++		File jar = getTestData("2.0", "testData/reconciler/plugins/myBundle_1.0.0.jar");
++		File dropins = new File(userBase, "dropins");
++		setupReadOnlyInstall();
++		try {
++			dropins.mkdir();
++
++			copy("copying to dropins", jar, new File(dropins, jar.getName()));
++
++			File userBundlesInfo = new File(userBase, "configuration/org.eclipse.equinox.simpleconfigurator/bundles.info");
++			File userConfigIni = new File(userBase, "configuration/config.ini");
++			assertFalse("0.1", userBundlesInfo.exists());
++			assertFalse("0.2", userConfigIni.exists());
++
++			reconcileReadOnly("0.21", extensions);
++
++			assertTrue("0.3", userBundlesInfo.exists());
++			assertTrue("0.4", userConfigIni.exists());
++
++			assertTrue(isInBundlesInfo(userBundlesInfo, "myBundle", null));
++			assertTrue(isInBundlesInfo(userBundlesInfo, "zzz", null));
++			// remove the bundle from the dropins and reconcile
++			delete(dropins);
++
++			reconcileReadOnly("0.21", extensions);
++			assertFalse(isInBundlesInfo(userBundlesInfo, "myBundle", null));
++			assertTrue(isInBundlesInfo(userBundlesInfo, "zzz", null));
++
++			reconcileReadOnly("0.2105", null, false);
++
++			// those two will never pass. Disabling extensions while no dropins change
++			// causes master profile to be loaded and user bundles *not* touched
++
++			//			assertFalse(isInBundlesInfo(userBundlesInfo, "myBundle", null));
++			//			assertFalse(isInBundlesInfo(userBundlesInfo, "zzz", null));
++
++			// only dropin change (or any other p2 operations) causes p2 to write a
++			// new, up-to-date bundles.info
++
++			//no extension - new bundles.info should be written
++			dropins.mkdir();
++			copy("copying to dropins", jar, new File(dropins, jar.getName()));
++			reconcileReadOnly("0.22", null, false);
++
++			assertTrue(isInBundlesInfo(userBundlesInfo, "myBundle", null));
++			assertFalse(isInBundlesInfo(userBundlesInfo, "zzz", null));
++		} finally {
++			delete(dropins);
++			cleanupReadOnlyInstall();
++		}
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/AbstractSharedInstallTest.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/AbstractSharedInstallTest.java
+index 1d93928..e0efd9a 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/AbstractSharedInstallTest.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/AbstractSharedInstallTest.java
+@@ -6,6 +6,7 @@
+  * 
+  * Contributors: 
+  *     Ericsson AB - initial API and implementation
++ *     Red Hat, Inc. - fragments support
+  ******************************************************************************/
+ package org.eclipse.equinox.p2.tests.sharedinstall;
+ 
+@@ -103,6 +104,16 @@ public abstract class AbstractSharedInstallTest extends AbstractReconcilerTest {
+ 		runEclipse("Installing in user", output, new String[] {"-configuration", userBase.getAbsolutePath() + java.io.File.separatorChar + "configuration", "-application", "org.eclipse.equinox.p2.director", "-installIU", "p2TestFeature1.feature.group,Verifier.feature.group", "-repository", getTestRepo()});
+ 	}
+ 
++	@Override
++	protected void tearDown() throws Exception {
++		if (readOnlyBase != null && readOnlyBase.exists()) {
++			setReadOnly(readOnlyBase, false);
++		}
++		delete(readOnlyBase);
++		delete(userBase);
++		super.tearDown();
++	}
++
+ 	protected void installFeature1InUser() {
+ 		runEclipse("user2", output, new String[] {"-configuration", userBase.getAbsolutePath() + java.io.File.separatorChar + "configuration", "-application", "org.eclipse.equinox.p2.director", "-installIU", "p2TestFeature1.feature.group", "-repository", getTestRepo()});
+ 	}
+@@ -161,7 +172,7 @@ public abstract class AbstractSharedInstallTest extends AbstractReconcilerTest {
+ 		realExecuteVerifier(verificationProperties, false);
+ 	}
+ 
+-	private void realExecuteVerifier(Properties verificationProperties, boolean withConfigFlag) {
++	protected void realExecuteVerifier(Properties verificationProperties, boolean withConfigFlag) {
+ 		File verifierConfig = new File(getTempFolder(), "verification.properties");
+ 		try {
+ 			writeProperties(verifierConfig, verificationProperties);
+@@ -231,6 +242,7 @@ public abstract class AbstractSharedInstallTest extends AbstractReconcilerTest {
+ 
+ 	public static void setupReadOnlyInstall() {
+ 		readOnlyBase = new File(output, "eclipse");
++		readOnlyBase.mkdirs();
+ 		assertTrue(readOnlyBase.canWrite());
+ 		setReadOnly(readOnlyBase, true);
+ 		userBase = new File(output, "user");
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/AllTests.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/AllTests.java
+index eb6db23..fea2aa3 100644
+--- a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/AllTests.java
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/AllTests.java
+@@ -6,6 +6,7 @@
+  * 
+  * Contributors: 
+  *     Ericsson AB - initial API and implementation
++ *     Red Hat, Inc. - fragments support
+  ******************************************************************************/
+ package org.eclipse.equinox.p2.tests.sharedinstall;
+ 
+@@ -22,6 +23,8 @@ public class AllTests extends TestCase {
+ 	public static Test suite() {
+ 		TestSuite suite = new TestSuite(AllTests.class.getName());
+ 		suite.addTest(BaseChange.suite());
++		suite.addTest(BaseChangeExtendedConfigured.suite());
++		suite.addTest(BaseChangeExtendedConflicts.suite());
+ 		suite.addTest(BaseChangeWithoutUserChange.suite());
+ 		suite.addTest(Cancellation.suite());
+ 		suite.addTest(DoubleBaseChange.suite());
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/BaseChangeExtendedConfigured.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/BaseChangeExtendedConfigured.java
+new file mode 100644
+index 0000000..3504126
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/BaseChangeExtendedConfigured.java
+@@ -0,0 +1,196 @@
++/*******************************************************************************
++ * Copyright (c) 2013 Ericsson AB and others. All rights reserved. This
++ * program and the accompanying materials are made available under the terms of
++ * the Eclipse Public License v1.0 which accompanies this distribution, and is
++ * available at http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors: 
++ *     Ericsson AB - initial API and implementation
++ *     Red Hat, Inc. - fragment support
++ ******************************************************************************/
++package org.eclipse.equinox.p2.tests.sharedinstall;
++
++import java.io.File;
++import java.io.IOException;
++import java.util.*;
++import junit.framework.Test;
++import junit.framework.TestSuite;
++import org.eclipse.equinox.internal.p2.updatesite.Activator;
++import org.eclipse.equinox.p2.tests.reconciler.dropins.ReconcilerTestSuite;
++
++public class BaseChangeExtendedConfigured extends BaseChange {
++
++	public static Test suite() {
++		TestSuite suite = new ReconcilerTestSuite();
++		suite.setName(BaseChangeExtendedConfigured.class.getName());
++		suite.addTest(new BaseChangeExtendedConfigured("testBaseWithExtensionsChange"));
++		return suite;
++	}
++
++	private File extensions;
++
++	public BaseChangeExtendedConfigured(String name) {
++		super(name);
++	}
++
++	protected void realExecuteVerifier(Properties verificationProperties, boolean withConfigFlag, File... extensions) {
++		File verifierConfig = new File(getTempFolder(), "verification.properties");
++		try {
++			writeProperties(verifierConfig, verificationProperties);
++		} catch (IOException e) {
++			fail("Failing to write out properties to configure verifier", e);
++		}
++
++		String[] args = null;
++
++		if (withConfigFlag) {
++			args = new String[] {"-configuration", userBase.getAbsolutePath() + java.io.File.separatorChar + "configuration", "-application", "org.eclipse.equinox.p2.tests.verifier.application", "-verifier.properties", verifierConfig.getAbsolutePath(), "-consoleLog"};
++		} else {
++			args = new String[] {"-application", "org.eclipse.equinox.p2.tests.verifier.application", "-verifier.properties", verifierConfig.getAbsolutePath(), "-consoleLog"};
++		}
++
++		assertEquals(0, runEclipse("Running verifier", output, args, extensions));
++	}
++
++	protected void executeVerifier(Properties verificationProperties, File... extensions) {
++		realExecuteVerifier(verificationProperties, true, extensions);
++	}
++
++	protected int runEclipse(String message, File location, String[] args, File... extensions) {
++		File root = new File(Activator.getBundleContext().getProperty("java.home"));
++		root = new File(root, "bin");
++		File exe = new File(root, "javaw.exe");
++		if (!exe.exists())
++			exe = new File(root, "java");
++		assertTrue("Java executable not found in: " + exe.getAbsolutePath(), exe.exists());
++		List<String> command = new ArrayList<String>();
++		Collections.addAll(command, new String[] {(new File(location == null ? output : location, "eclipse/eclipse")).getAbsolutePath(), "--launcher.suppressErrors", "-nosplash", "-vm", exe.getAbsolutePath()});
++		Collections.addAll(command, args);
++		Collections.addAll(command, new String[] {"-vmArgs", "-Dosgi.checkConfiguration=true"});
++		if (extensions != null) {
++			String extensionParameter = "";
++			for (File f : extensions) {
++				extensionParameter += f.toString() + ",";
++			}
++			extensionParameter = extensionParameter.substring(0, extensionParameter.length() - 1);
++			Collections.addAll(command, new String[] {"-Dp2.fragments=" + extensionParameter});
++		}
++
++		// command-line if you want to run and allow a remote debugger to connect
++		if (debug)
++			Collections.addAll(command, new String[] {"-Xdebug", "-Xnoagent", "-Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=8000"});
++		int result = run(message, command.toArray(new String[command.size()]));
++		// 13 means that we wrote something out in the log file.
++		// so try and parse it and fail via that message if we can.
++		if (result == 13)
++			parseExitdata(message);
++		return result;
++	}
++
++	protected void installFeature1AndVerifierInUser(File... extension) {
++		//TODO Install something into eclipse - make sure that this can be done in an automated setup
++		runEclipse("Installing in user", output, new String[] {"-configuration", userBase.getAbsolutePath() + java.io.File.separatorChar + "configuration", "-application", "org.eclipse.equinox.p2.director", "-installIU", "p2TestFeature1.feature.group,Verifier.feature.group", "-repository", getTestRepo()}, extension);
++	}
++
++	protected void installFeature2InUser(File... extension) {
++		runEclipse("user2", output, new String[] {"-configuration", userBase.getAbsolutePath() + java.io.File.separatorChar + "configuration", "-application", "org.eclipse.equinox.p2.director", "-installIU", "p2TestFeature2.feature.group", "-repository", getTestRepo()}, extension);
++	}
++
++	protected void installVerifierInBase() {
++		setReadOnly(readOnlyBase, false);
++		runEclipse("Running eclipse", output, new String[] {"-application", "org.eclipse.equinox.p2.director", "-installIU", "Verifier.feature.group", "-repository", getTestRepo()});
++		setReadOnly(readOnlyBase, true);
++	}
++
++	@Override
++	protected void tearDown() throws Exception {
++		setReadOnly(extensions, false);
++		extensions.delete();
++		super.tearDown();
++	}
++
++	@Override
++	protected void setUp() throws Exception {
++		super.setUp();
++		extensions = getTestFolder("ext");
++		copy("", getTestData("", "testData/reconciler/extensions/ext1"), extensions);
++		setReadOnly(extensions, true);
++	}
++
++	public void testBaseWithExtensionsChange() {
++		assertInitialized();
++		setupReadOnlyInstall();
++
++		{ //install verifier and something else in user and checks there are there
++			// when extensions are enabled and configured
++			installFeature1AndVerifierInUser(extensions);
++			Properties verificationProperties = new Properties();
++			verificationProperties.setProperty("expectedBundleList", "p2TestBundle1,org.eclipse.equinox.p2.tests.verifier,zzz");
++			verificationProperties.setProperty("checkProfileResetFlag", "false");
++			verificationProperties.setProperty("not.sysprop.eclipse.ignoreUserConfiguration", "");
++			executeVerifier(verificationProperties, extensions);
++
++			assertTrue(isInUserBundlesInfo("p2TestBundle1"));
++			assertTrue(isInUserBundlesInfo("zzz"));
++			assertProfileStatePropertiesHasKey(getUserProfileFolder(), "_simpleProfileRegistry_internal_" + getMostRecentProfileTimestampFromBase());
++		}
++
++		{ //Now drop extensions.
++
++			// this is dummy call as verifier *was* dropped, and it can't fail in that case
++			//			executeVerifier(verificationProperties);
++
++			//install verifier again
++			installVerifierInBase();
++
++			// next start is with extensions, should find zzz and verifier, and no other bundles 
++			// as base was changed and user configuration is ignored
++			Properties verificationProperties = new Properties();
++			verificationProperties.setProperty("checkPresenceOfVerifier", "true");
++			verificationProperties.setProperty("unexpectedBundleList", "p2TestBundle1,yyy");
++			verificationProperties.setProperty("checkPresenceOfVerifier", "false");
++			verificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier,zzz");
++			verificationProperties.setProperty("checkProfileResetFlag", "false");
++			verificationProperties.setProperty("checkMigrationWizard", "true");
++			verificationProperties.setProperty("checkMigrationWizard.open", "true");
++			executeVerifier(verificationProperties, extensions);
++
++			assertTrue(isInUserBundlesInfo("p2TestBundle1")); //Despite the reset, the bundles.info is still on-disk unmodified since no provisioning has been done
++			assertProfileStatePropertiesHasKey(getUserProfileFolder(), "_simpleProfileRegistry_internal_" + getMostRecentProfileTimestampFromBase());
++
++			verificationProperties = new Properties();
++			//Execute the verifier another time, to check that the profile reset flag is not set
++			verificationProperties.setProperty("checkProfileResetFlag", "false");
++			verificationProperties.setProperty("checkPresenceOfVerifier", "false");
++			verificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier,zzz");
++			executeVerifier(verificationProperties, extensions);
++		}
++
++		{ //Now add something into the user install again
++			installFeature2InUser(extensions);
++			Properties verificationProperties = new Properties();
++			verificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier,zzz,p2TestBundle2");
++			executeVerifier(verificationProperties, extensions);
++
++			assertFalse(isInUserBundlesInfo("p2TestBundle1")); // was dropped some time ago
++			assertTrue(isInUserBundlesInfo("p2TestBundle2")); // was installed recently
++			assertTrue(isInUserBundlesInfo("org.eclipse.equinox.p2.tests.verifier")); //It is now coming from the base
++			assertTrue(isInUserBundlesInfo("zzz")); // from extensions
++
++			verificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier,zzz,p2TestBundle2");
++			executeVerifier(verificationProperties, extensions);
++
++			//verifier without extensions should drop all except verifier in the base
++			Properties newVerificationProperties = new Properties();
++			newVerificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier");
++			newVerificationProperties.setProperty("unexpectedBundleList", "zzz,p2TestBundle2,p2TestBundle1");
++			executeVerifier(newVerificationProperties);
++
++			// zzz again present, verifier present
++			// p2Test bundle visible, because all timestamp match properly again!
++			verificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier,zzz,p2TestBundle2,");
++			verificationProperties.setProperty("unexpectedBundleList", "p2TestBundle1");
++			executeVerifier(verificationProperties, extensions);
++		}
++	}
++}
+diff --git a/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/BaseChangeExtendedConflicts.java b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/BaseChangeExtendedConflicts.java
+new file mode 100644
+index 0000000..c35b0fd
+--- /dev/null
++++ b/bundles/org.eclipse.equinox.p2.tests/src/org/eclipse/equinox/p2/tests/sharedinstall/BaseChangeExtendedConflicts.java
+@@ -0,0 +1,196 @@
++/*******************************************************************************
++ * Copyright (c) 2013 Ericsson AB and others. All rights reserved. This
++ * program and the accompanying materials are made available under the terms of
++ * the Eclipse Public License v1.0 which accompanies this distribution, and is
++ * available at http://www.eclipse.org/legal/epl-v10.html
++ * 
++ * Contributors: 
++ *     Ericsson AB - initial API and implementation
++ *     Red Hat, Inc. - fragment support
++ ******************************************************************************/
++package org.eclipse.equinox.p2.tests.sharedinstall;
++
++import java.io.File;
++import java.io.IOException;
++import java.util.*;
++import junit.framework.Test;
++import junit.framework.TestSuite;
++import org.eclipse.equinox.internal.p2.updatesite.Activator;
++import org.eclipse.equinox.p2.tests.reconciler.dropins.ReconcilerTestSuite;
++
++public class BaseChangeExtendedConflicts extends BaseChange {
++
++	public static Test suite() {
++		TestSuite suite = new ReconcilerTestSuite();
++		suite.setName(BaseChangeExtendedConflicts.class.getName());
++		suite.addTest(new BaseChangeExtendedConflicts("testBundlesSpecifiedMultipleTimes"));
++		return suite;
++	}
++
++	private File extensions;
++
++	public BaseChangeExtendedConflicts(String name) {
++		super(name);
++	}
++
++	protected void realExecuteVerifier(Properties verificationProperties, boolean withConfigFlag, File... extensions) {
++		File verifierConfig = new File(getTempFolder(), "verification.properties");
++		try {
++			writeProperties(verifierConfig, verificationProperties);
++		} catch (IOException e) {
++			fail("Failing to write out properties to configure verifier", e);
++		}
++
++		String[] args = null;
++
++		if (withConfigFlag) {
++			args = new String[] {"-configuration", userBase.getAbsolutePath() + java.io.File.separatorChar + "configuration", "-application", "org.eclipse.equinox.p2.tests.verifier.application", "-verifier.properties", verifierConfig.getAbsolutePath(), "-consoleLog"};
++		} else {
++			args = new String[] {"-application", "org.eclipse.equinox.p2.tests.verifier.application", "-verifier.properties", verifierConfig.getAbsolutePath(), "-consoleLog"};
++		}
++
++		assertEquals(0, runEclipse("Running verifier", output, args, extensions));
++	}
++
++	protected void executeVerifier(Properties verificationProperties, File... extensions) {
++		realExecuteVerifier(verificationProperties, true, extensions);
++	}
++
++	protected int runEclipse(String message, File location, String[] args, File... extensions) {
++		File root = new File(Activator.getBundleContext().getProperty("java.home"));
++		root = new File(root, "bin");
++		File exe = new File(root, "javaw.exe");
++		if (!exe.exists())
++			exe = new File(root, "java");
++		assertTrue("Java executable not found in: " + exe.getAbsolutePath(), exe.exists());
++		List<String> command = new ArrayList<String>();
++		Collections.addAll(command, new String[] {(new File(location == null ? output : location, "eclipse/eclipse")).getAbsolutePath(), "--launcher.suppressErrors", "-nosplash", "-vm", exe.getAbsolutePath()});
++		Collections.addAll(command, args);
++		Collections.addAll(command, new String[] {"-vmArgs", "-Dosgi.checkConfiguration=true"});
++		if (extensions != null) {
++			String extensionParameter = "";
++			for (File f : extensions) {
++				extensionParameter += f.toString() + ",";
++			}
++			extensionParameter = extensionParameter.substring(0, extensionParameter.length() - 1);
++			Collections.addAll(command, new String[] {"-Dp2.fragments=" + extensionParameter});
++		}
++
++		// command-line if you want to run and allow a remote debugger to connect
++		if (debug)
++			Collections.addAll(command, new String[] {"-Xdebug", "-Xnoagent", "-Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=8000"});
++		int result = run(message, command.toArray(new String[command.size()]));
++		// 13 means that we wrote something out in the log file.
++		// so try and parse it and fail via that message if we can.
++		if (result == 13)
++			parseExitdata(message);
++		return result;
++	}
++
++	protected void installFeature1AndVerifierInUser(File... extension) {
++		//TODO Install something into eclipse - make sure that this can be done in an automated setup
++		runEclipse("Installing in user", output, new String[] {"-configuration", userBase.getAbsolutePath() + java.io.File.separatorChar + "configuration", "-application", "org.eclipse.equinox.p2.director", "-installIU", "p2TestFeature1.feature.group,Verifier.feature.group", "-repository", getTestRepo()}, extension);
++	}
++
++	protected void installFeature2InUser(File... extension) {
++		runEclipse("user2", output, new String[] {"-configuration", userBase.getAbsolutePath() + java.io.File.separatorChar + "configuration", "-application", "org.eclipse.equinox.p2.director", "-installIU", "p2TestFeature2.feature.group", "-repository", getTestRepo()}, extension);
++	}
++
++	protected void installVerifierInBase() {
++		setReadOnly(readOnlyBase, false);
++		runEclipse("Running eclipse", output, new String[] {"-application", "org.eclipse.equinox.p2.director", "-installIU", "Verifier.feature.group", "-repository", getTestRepo()});
++		setReadOnly(readOnlyBase, true);
++	}
++
++	@Override
++	protected void tearDown() throws Exception {
++		setReadOnly(extensions, false);
++		extensions.delete();
++		super.tearDown();
++	}
++
++	@Override
++	protected void setUp() throws Exception {
++		super.setUp();
++		extensions = getTestFolder("ext");
++		copy("", getTestData("", "testData/reconciler/extensions/ext1"), extensions);
++		setReadOnly(extensions, true);
++	}
++
++	public void testBundlesSpecifiedMultipleTimes() {
++		assertInitialized();
++		setupReadOnlyInstall();
++
++		{ //install verifier and something else in user and checks there are there
++			// when extensions are enabled and configured
++			installFeature1AndVerifierInUser(extensions, extensions);
++			Properties verificationProperties = new Properties();
++			verificationProperties.setProperty("expectedBundleList", "p2TestBundle1,org.eclipse.equinox.p2.tests.verifier,zzz");
++			verificationProperties.setProperty("checkProfileResetFlag", "false");
++			verificationProperties.setProperty("not.sysprop.eclipse.ignoreUserConfiguration", "");
++			executeVerifier(verificationProperties, extensions);
++
++			assertTrue(isInUserBundlesInfo("p2TestBundle1"));
++			assertTrue(isInUserBundlesInfo("zzz"));
++			assertProfileStatePropertiesHasKey(getUserProfileFolder(), "_simpleProfileRegistry_internal_" + getMostRecentProfileTimestampFromBase());
++		}
++
++		{ //Now drop extensions.
++
++			// this is dummy call as verifier *was* dropped, and it can't fail in that case
++			//			executeVerifier(verificationProperties);
++
++			//install verifier again
++			installVerifierInBase();
++
++			// next start is with extensions, should find zzz and verifier, and no other bundles 
++			// as base was changed and user configuration is ignored
++			Properties verificationProperties = new Properties();
++			verificationProperties.setProperty("checkPresenceOfVerifier", "true");
++			verificationProperties.setProperty("unexpectedBundleList", "p2TestBundle1,yyy");
++			verificationProperties.setProperty("checkPresenceOfVerifier", "false");
++			verificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier,zzz");
++			verificationProperties.setProperty("checkProfileResetFlag", "false");
++			verificationProperties.setProperty("checkMigrationWizard", "true");
++			verificationProperties.setProperty("checkMigrationWizard.open", "true");
++			executeVerifier(verificationProperties, extensions, extensions);
++
++			assertTrue(isInUserBundlesInfo("p2TestBundle1")); //Despite the reset, the bundles.info is still on-disk unmodified since no provisioning has been done
++			assertProfileStatePropertiesHasKey(getUserProfileFolder(), "_simpleProfileRegistry_internal_" + getMostRecentProfileTimestampFromBase());
++
++			verificationProperties = new Properties();
++			//Execute the verifier another time, to check that the profile reset flag is not set
++			verificationProperties.setProperty("checkProfileResetFlag", "false");
++			verificationProperties.setProperty("checkPresenceOfVerifier", "false");
++			verificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier,zzz");
++			executeVerifier(verificationProperties, extensions, extensions);
++		}
++
++		{ //Now add something into the user install again
++			installFeature2InUser(extensions, extensions);
++			Properties verificationProperties = new Properties();
++			verificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier,zzz,p2TestBundle2");
++			executeVerifier(verificationProperties, extensions, extensions);
++
++			assertFalse(isInUserBundlesInfo("p2TestBundle1")); // was dropped some time ago
++			assertTrue(isInUserBundlesInfo("p2TestBundle2")); // was installed recently
++			assertTrue(isInUserBundlesInfo("org.eclipse.equinox.p2.tests.verifier")); //It is now coming from the base
++			assertTrue(isInUserBundlesInfo("zzz")); // from extensions
++
++			verificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier,zzz,p2TestBundle2");
++			executeVerifier(verificationProperties, extensions, extensions);
++
++			//verifier without extensions should drop all except verifier in the base
++			Properties newVerificationProperties = new Properties();
++			newVerificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier");
++			newVerificationProperties.setProperty("unexpectedBundleList", "zzz,p2TestBundle2,p2TestBundle1");
++			executeVerifier(newVerificationProperties);
++
++			// zzz again present, verifier present
++			// p2Test bundle visible, because all timestamp match properly again!
++			verificationProperties.setProperty("expectedBundleList", "org.eclipse.equinox.p2.tests.verifier,zzz,p2TestBundle2,");
++			verificationProperties.setProperty("unexpectedBundleList", "p2TestBundle1");
++			executeVerifier(verificationProperties, extensions, extensions);
++		}
++	}
++}
